@@ -105,8 +105,21 @@ class World:
         return device.card.files[device.file]
 
 
-def copy_text(world, logical):
-    with open(world.engine.run.copies[logical].path, encoding="ascii") as f:
+def ended(world, device_id):
+    """Whether the engine last saw this device's run as ended. Read through the
+    engine, so it holds for the simulator and the firmware core alike."""
+    status = [d["status"] for d in world.engine.snapshot()["devices"] if d["id"] == device_id]
+    return bool(status) and status[0].get("ended") == "1"
+
+
+def copy_text(world, logical, folder=None):
+    """A device's copy in the current run's folder, or in ``folder``."""
+    if folder is None:
+        path = world.engine.run.copies[logical].path
+    else:
+        path = next(os.path.join(folder, n) for n in os.listdir(folder)
+                    if n.startswith(f"{logical}_FED"))
+    with open(path, encoding="ascii") as f:
         return f.read()
 
 
@@ -274,22 +287,78 @@ def run_checks(root):
           and copy_text(world, "B") == world.card_rows("COM4"))
 
     print("\n--- stopping ---")
+    world.unplug("COM4")            # B misses the Stop
+    world.run_for(1)
     world.engine.submit("stop")
     world.run_for(5)
     snap = world.engine.snapshot()
     check("the run stops", snap["state"] == "stopped")
-    check("each copy ends with the device's run_end row",
-          copy_text(world, "A").splitlines()[-1].split(",")[4] == "run_end"
+    check("the copy has the device's run_end row",
+          any(line.split(",")[4] == "run_end" for line in copy_text(world, "A").splitlines()[1:])
           and copy_text(world, "A") == world.card_rows("COM3"))
     with open(os.path.join(folder, "run.json")) as f:
         data = json.load(f)
     check("run.json records the stop", data["state"] == "stopped" and "stopped_at" in data)
+    end_row = [line for line in copy_text(world, "A").splitlines()[1:]
+               if line.split(",")[4] == "run_end"][0].split(",")
+    check("and where each device's data after Stop begins, from its own run_end row",
+          data.get("ended", {}).get("A") == {"time": end_row[0], "seq": int(end_row[2]),
+                                             "detail": ""}
+          and "B" not in data.get("ended", {}))
     world.run_for(600)
     check("the devices keep feeding after Stop",
           world.device("COM3").rule()["free_feed"] == "1")
+    feed(world, "COM3", 3)
+    world.run_for(60)
+    after_end = copy_text(world, "A").split(",run_end,", 1)[1].splitlines()[1:]
+    check("and what they write after Stop is still copied",
+          after_end and copy_text(world, "A") == world.card_rows("COM3"), f"{len(after_end)} rows")
+    world.plug("COM4")
+    world.run_for(60)
+    check("a device that was unplugged at Stop is stopped when it's back",
+          ended(world, 7) and copy_text(world, "B") == world.card_rows("COM4"))
+    with open(os.path.join(folder, "run.json")) as f:
+        data = json.load(f)
+    check("and run.json gets its later end too, keeping when Stop was pressed",
+          "B" in data["ended"] and data["ended"]["B"]["time"] > data["ended"]["A"]["time"]
+          and data["state"] == "stopped" and "stopped_at" in data)
     world.engine.submit("close")
     world.run_for(1)
     check("closing returns to Setup", world.engine.snapshot()["state"] == "setup")
+    feed(world, "COM3", 2)
+    world.run_for(60)
+    check("rows are still copied to the stopped run after New run",
+          copy_text(world, "A", folder) == world.card_rows("COM3"))
+    world.engine = world.new_engine()
+    world.engine.resume_latest()
+    feed(world, "COM3", 2)
+    world.run_for(60)
+    check("and after FNT restarts",
+          world.engine.snapshot()["state"] == "setup"
+          and copy_text(world, "A", folder) == world.card_rows("COM3"))
+
+    print("\n--- a Stop that FNT didn't finish ---")
+    world.engine.submit("start", protocol_text=PROTOCOL, binding={"A": 3, "B": 7}, seed=2)
+    world.run_for(5)
+    run = world.engine.run
+    feed(world, "COM3", 2)
+    world.run_for(40)
+    rows_before = world.card_rows("COM3")
+    world.act("COM3", lambda d: d.command("RUN:END"))      # as if FNT closed mid-Stop
+    world.engine = world.new_engine()
+    check("the run is picked up as still running", world.engine.resume_latest() == run.folder)
+    world.run_for(90)
+    check("a device whose run already ended isn't started over",
+          ended(world, 3) and world.card_rows("COM3").startswith(rows_before))
+    check("it's flagged instead",
+          any(p["kind"] == "ended" and p["device"] == "A"
+              for p in world.engine.snapshot()["problems"]))
+    world.engine.submit("stop")
+    world.run_for(5)
+    check("and Stop finishes the job",
+          world.engine.snapshot()["state"] == "stopped"
+          and not any(p["kind"] == "ended" and p["active"]
+                      for p in world.engine.snapshot()["problems"]))
 
 
 if __name__ == "__main__":

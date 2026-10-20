@@ -904,7 +904,57 @@ def check(text):
         compiled = compile_protocol(protocol, seed=0)
     except ProtocolError as exc:
         return None, protocol.warnings + exc.problems
-    return compiled, protocol.warnings
+    problems = protocol.warnings + _coherence(protocol, compiled)
+    if any(p.level == "error" for p in problems):
+        return None, problems
+    return compiled, problems
+
+
+def _coherence(protocol, compiled):
+    """Phases whose settings contradict each other, per device.
+
+    - A phase that ends only on rewards, where some device has no poke that
+      can earn one (``active: none``, at all hours), can never end there.
+    - Free feeding with an active poke: a pellet is nearly always in the well,
+      so the active poke almost never counts.
+    """
+    problems, seen = [], set()
+
+    def add(level, spec, message):
+        if (spec.name, message) not in seen:        # a rotation is several phases
+            seen.add((spec.name, message))
+            problems.append(Problem(message, spec.line, level))
+
+    for index, phase in enumerate(compiled.phases):
+        spec = protocol.phases[phase.source]
+        rules = {name: s.phases[index] for name, s in compiled.schedules.items()}
+        idle = [name for name, p in rules.items()
+                if all(r.get("active", p.rule["active"]) == "none"
+                       for r in [p.rule] + [w.settings for w in p.windows])]
+        rewards = [c for c in spec.until if c.kind == "rewards"]
+        if idle and rewards:
+            def unreachable(c):
+                if c.devices in (None, "all"):
+                    return True
+                if c.devices == "any":
+                    return len(idle) == len(rules)
+                return bool(set(c.devices) & set(idle))
+            if all(unreachable(c) for c in rewards):
+                who = ", ".join(idle)
+                if len(rewards) == len(spec.until):
+                    add("error", spec, f"'{spec.name}' only ends on rewards, but no poke "
+                                       f"can earn one on {who} (active: none)")
+                else:
+                    add("warning", spec, f"'{spec.name}': the rewards condition can't be met "
+                                         f"on {who} (active: none); only its other "
+                                         f"conditions can end it there")
+        busy = [name for name, p in rules.items()
+                if p.rule["free_feed"] == "1" and p.rule["active"] != "none"]
+        if busy:
+            add("warning", spec, f"'{spec.name}': with free feeding a pellet is nearly always "
+                                 f"in the well, so the active poke rarely counts on "
+                                 f"{', '.join(busy)}; set active: none")
+    return problems
 
 
 # ---------------------------------------------------------------------------
@@ -982,7 +1032,7 @@ def preview_text(compiled, t0, days=None):
 
     rows = preview(compiled, t0)
     zone = t0.strftime("%Z") or t0.strftime("UTC%z")
-    out = [f"{compiled.protocol.name}: {len(rows)} phases, starting "
+    out = [f"{compiled.protocol.name}: {sch.plural(len(rows), 'phase')}, starting "
            f"{when(t0)} ({zone})"]
     horizon = t0 + timedelta(days=days) if days else None
     for row in rows:

@@ -10,7 +10,7 @@ Time is simulated. ``advance`` jumps from one interesting moment to the next
 so weeks of schedule run in milliseconds.
 
     device = SimDevice(device_id=3, now=datetime(2026, 10, 20, 9, tzinfo=tz))
-    device.command("PING")            # -> ["PONG,id=3,fw=3.0,proto=3"]
+    device.command("PING")            # -> ["PONG,id=3,fw=3.1,proto=3"]
     device.poke("L")
     device.advance(2)
     device.retrieve()
@@ -29,7 +29,7 @@ from datetime import datetime, timedelta, timezone
 
 from . import schedule as sch
 
-FIRMWARE = "3.0"
+FIRMWARE = "3.1"
 PROTO = 3
 HEADER = ("time,ms,seq,phase,event,side,outcome,left,right,pellets,"
           "phase_rewards,phase_left,phase_right,retrieval_ms,poke_ms,detail")
@@ -228,6 +228,7 @@ class SimDevice:
         self.card.write("DEVICE.TXT", f"id={device_id}\noffset={offset}\n")
 
     def boot(self, cause):
+        self.lights = False          # LIGHTS:on never survives a boot
         self.boot_world = self.world
         self.holding = None
         self.staging = None
@@ -450,8 +451,11 @@ class SimDevice:
         if self.jams_pending:
             self.jams_pending -= 1
             self.well = "empty"
-            self.jammed = True
-            self.jam_retry_at = self.world + timedelta(seconds=JAM_RETRY_SECONDS)
+            # An earned or free pellet is owed and retried; one fed by hand
+            # is a bench check, reported and not retried.
+            self.jammed = self.dispense_reason != "manual"
+            self.jam_retry_at = (self.world + timedelta(seconds=JAM_RETRY_SECONDS)
+                                 if self.jammed else None)
             self._row("jam", detail=self.dispense_reason)
             return
         self.jammed = False
@@ -613,6 +617,11 @@ class SimDevice:
         if line == "FEED":
             result = self._dispense("manual")
             return self._reply(f"FEED,result={result}")
+        if head == "LIGHTS":
+            if arg not in ("on", "off"):
+                return self._reply("ERR,BAD_LIGHTS,on|off")
+            self.lights = arg == "on"
+            return self._reply(f"LIGHTS,on={int(self.lights)}")
         if head == "TEST":
             try:
                 cue = sch.parse_cue(arg)
@@ -661,6 +670,7 @@ class SimDevice:
             "jam": int(self.jammed),
             "uptime": int((self.world - self.boot_world).total_seconds()),
             "batt": BATTERY, "temp": TEMPERATURE, "hum": HUMIDITY,
+            "lights": int(self.lights),
         }
         return "STATUS," + ",".join(f"{k}={v}" for k, v in fields.items())
 
@@ -749,6 +759,7 @@ class SimDevice:
             self.schedule, self.sched_crc = self.next_schedule, self.next_crc
             self.next_schedule, self.next_crc = None, None
         self.run_id, self.t0, self.ended = run_id, t0.astimezone(self.zone), False
+        self.lights = False          # a run starts with the lights as its cues leave them
         self.file = f"{run_id}.CSV"
         self.card.write(self.file, HEADER + "\n")
         self.seq = self.left = self.right = self.pellets = 0

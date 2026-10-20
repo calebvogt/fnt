@@ -1,4 +1,12 @@
-"""Setup: choose a protocol and a FED3 for each of its devices, then Start.
+"""Setup: choose a protocol, number the FED3s to match it, then Start.
+
+Two columns: the protocol and its timeline on the left; on the right one row
+per FED3 plugged in: its port, its ID (its number, chosen from a list), its
+state, and bench tests (lights to find it, a tone, a pellet).
+
+A FED3's number is its place in the protocol: FED001 plays the protocol's
+first device, FED002 the second, and so on. To give a FED3 a part, give it
+that number.
 
 Nothing here talks to a device directly; it reads the engine's snapshot and
 submits commands, like the rest of the window.
@@ -6,12 +14,12 @@ submits commands, like the rest of the window.
 import os
 from datetime import datetime
 
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
-    QComboBox, QFileDialog, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog,
-    QLabel, QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy, QTableWidget,
-    QTableWidgetItem, QVBoxLayout, QWidget,
+    QComboBox, QFileDialog, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
+    QPlainTextEdit, QPushButton, QSplitter, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
 from .. import protocol as proto
@@ -19,11 +27,13 @@ from .. import schedule as sch
 from . import theme
 from .editor import ProtocolEditor
 
-NOT_CHOSEN = "— choose a FED3 —"
+TEST_TONE = "tone:4000:200"
+MIN_NUMBERS = 8             # the ID list always offers at least FED001-FED008
+PORT, ID, STATUS, TESTS = range(4)
 
 
-def device_label(device):
-    return f"FED{device['id']:03d}  ({device['port']})"
+def fed_name(number):
+    return f"FED{number:03d}"
 
 
 def device_health(device):
@@ -31,6 +41,8 @@ def device_health(device):
     if not device["connected"]:
         return "not connected", theme.BAD
     status = device["status"]
+    if not status:
+        return "connected · reading its status…", theme.MUTED
     parts, colour = [], theme.GOOD
     clock = status.get("clock")
     if clock == "ok":
@@ -41,8 +53,11 @@ def device_health(device):
         colour = theme.WARN
     if status.get("sd") == "ok":
         parts.append("SD ok")
-    elif status:
+    else:
         parts.append("SD error")
+        colour = theme.BAD
+    if status.get("jam") == "1":
+        parts.append("jammed")
         colour = theme.BAD
     parts.append(f"fw {device['firmware']}")
     if status.get("run") not in (None, "-") and status.get("ended") == "0":
@@ -52,8 +67,6 @@ def device_health(device):
 
 
 class SetupView(QWidget):
-    settings_changed = pyqtSignal()
-
     def __init__(self, engine, settings, parent=None):
         super().__init__(parent)
         self.engine = engine
@@ -62,9 +75,11 @@ class SetupView(QWidget):
         self.protocol_path = settings.value("protocol_path", "") or ""
         self.compiled = None
         self.snapshot = {}
-        self._combo_items = {}
+        self.rows = []              # (port, number) shown, in order
 
         layout = QVBoxLayout(self)
+        split = QSplitter(Qt.Horizontal)
+        split.setChildrenCollapsible(False)
 
         # --- protocol ------------------------------------------------------
         group = QGroupBox("Protocol")
@@ -78,40 +93,46 @@ class SetupView(QWidget):
             row.addWidget(button)
         g.addLayout(row)
         self.verdict = QLabel()
+        self.verdict.setWordWrap(True)
         g.addWidget(self.verdict)
         self.timeline = QPlainTextEdit()
         self.timeline.setReadOnly(True)
-        self.timeline.setFixedHeight(190)
         self.timeline.setLineWrapMode(QPlainTextEdit.NoWrap)
-        g.addWidget(self.timeline)
-        group.setSizePolicy(group.sizePolicy().horizontalPolicy(), QSizePolicy.Maximum)
-        layout.addWidget(group)
+        g.addWidget(self.timeline, 1)
+        split.addWidget(group)
 
         # --- devices -------------------------------------------------------
-        group = QGroupBox("Devices")
+        group = QGroupBox("FED3s")
         g = QVBoxLayout(group)
-        hint = QLabel("Choose which FED3 plays each device in the protocol. "
-                      "Feed and Test check a device on the bench.")
-        hint.setObjectName("muted")
-        g.addWidget(hint)
+        self.hint = QLabel()
+        self.hint.setObjectName("muted")
+        self.hint.setWordWrap(True)
+        g.addWidget(self.hint)
         self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Protocol device", "FED3", "Status", ""])
+        self.table.setHorizontalHeaderLabels(["Port", "ID", "Status", "Tests"])
+        self.table.horizontalHeaderItem(ID).setToolTip(
+            "The FED3's number, stored on its SD card. FED001 plays the protocol's first "
+            "device, FED002 the second, and so on. Choosing a number another FED3 has "
+            "swaps the two.")
         self.table.verticalHeader().setVisible(False)
         header = self.table.horizontalHeader()
-        for column in (0, 1, 3):
+        for column in (PORT, ID, TESTS):
             header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        header.setSectionResizeMode(STATUS, QHeaderView.Stretch)
         self.table.setSelectionMode(QTableWidget.NoSelection)
-        g.addWidget(self.table)
-        others_row = QHBoxLayout()
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        g.addWidget(self.table, 1)
+        self.missing = QLabel()
+        self.missing.setWordWrap(True)
+        g.addWidget(self.missing)
         self.others = QLabel()
         self.others.setWordWrap(True)
-        others_row.addWidget(self.others, 1)
-        renumber = theme.quiet(QPushButton("Renumber a FED3…"))
-        renumber.clicked.connect(self._renumber)
-        others_row.addWidget(renumber)
-        g.addLayout(others_row)
-        layout.addWidget(group)
+        g.addWidget(self.others)
+        split.addWidget(group)
+        split.setStretchFactor(0, 2)
+        split.setStretchFactor(1, 3)
+        split.setSizes([480, 720])
+        layout.addWidget(split, 1)
 
         # --- start -----------------------------------------------------------
         row = QHBoxLayout()
@@ -160,11 +181,13 @@ class SetupView(QWidget):
             c = self.compiled
             fnt = [p.name for p in c.phases if p.fnt]
             note = f" · needs FNT to end: {', '.join(fnt)}" if fnt else ""
-            self.verdict.setText(f"✓ {c.protocol.name} · {len(c.phases)} phases{note}")
+            self.verdict.setText(f"✓ {c.protocol.name} · {sch.plural(len(c.phases), 'phase')}"
+                                 f" · {sch.plural(len(c.protocol.devices), 'device')}{note}")
             self.verdict.setStyleSheet(f"color: {theme.GOOD};")
             t0 = datetime.now(sch.standard_timezone()).replace(second=0, microsecond=0)
             self.timeline.setPlainText(proto.preview_text(c, t0))
-        self._rebuild_table()
+        self.rows = None            # rebuild: what each number plays changed
+        self.update_view(self.snapshot)
 
     def _open(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open protocol", self.protocol_path or "",
@@ -179,8 +202,8 @@ class SetupView(QWidget):
     def _edit(self, new=False):
         text = "" if new else self.protocol_text
         if new or not text:
-            from .editor import TEMPLATES
-            text = next(iter(TEMPLATES.values()))
+            from .editor import DEFAULT_TEMPLATE, TEMPLATES
+            text = TEMPLATES[DEFAULT_TEMPLATE]
         editor = ProtocolEditor(text, self, path=None if new else self.protocol_path)
         if editor.exec_():
             path = editor.path
@@ -193,85 +216,128 @@ class SetupView(QWidget):
                     handle.write(editor.text())
             self._set_protocol(editor.text(), path or "")
 
-    # --- devices ---------------------------------------------------------
+    # --- numbers and the protocol's devices ----------------------------------
 
-    def _logical_devices(self):
-        return self.compiled.protocol.devices if self.compiled else []
+    def _roles(self):
+        return list(self.compiled.protocol.devices) if self.compiled else []
 
-    def _rebuild_table(self):
-        names = self._logical_devices()
-        self.table.setRowCount(len(names))
-        self._combo_items = {}
-        saved = self.settings.value("binding", {}) or {}
-        for row, name in enumerate(names):
-            self.table.setItem(row, 0, QTableWidgetItem(name))
-            combo = QComboBox()
-            combo.addItem(NOT_CHOSEN, None)
-            if name in saved:
-                combo.addItem(f"FED{int(saved[name]):03d}  (not connected)", int(saved[name]))
-                combo.setCurrentIndex(1)
-            combo.currentIndexChanged.connect(self._binding_changed)
-            self.table.setCellWidget(row, 1, combo)
-            self.table.setItem(row, 2, QTableWidgetItem(""))
-            bench = QWidget()
-            b = QHBoxLayout(bench)
-            b.setContentsMargins(0, 0, 0, 0)
-            for text, slot in (("Feed", self._feed), ("Test cue", self._test)):
-                button = theme.quiet(QPushButton(text))
-                button.clicked.connect(lambda _=False, n=name, s=slot: s(n))
-                b.addWidget(button)
-            self.table.setCellWidget(row, 3, bench)
-        self.update_view(self.snapshot)
+    def _plays(self, number):
+        """The protocol device a FED3 with this number plays, or None."""
+        roles = self._roles()
+        return roles[number - 1] if 1 <= number <= len(roles) else None
 
     def binding(self):
-        out = {}
-        for row, name in enumerate(self._logical_devices()):
-            combo = self.table.cellWidget(row, 1)
-            if combo and combo.currentData() is not None:
-                out[name] = combo.currentData()
-        return out
+        """Protocol device -> FED3 number: the nth device is FED00n."""
+        return {role: n for n, role in enumerate(self._roles(), start=1)}
 
-    def _binding_changed(self):
-        self.settings.setValue("binding", self.binding())
-        self.update_view(self.snapshot)
+    def _connected(self):
+        return [d for d in self.snapshot.get("devices", []) if d["connected"] and d["compatible"]]
 
-    def _chosen_device(self, logical):
-        device_id = self.binding().get(logical)
-        for device in self.snapshot.get("devices", []):
-            if device["connected"] and device["id"] == device_id:
-                return device
-        return None
+    def _device(self, port):
+        return next((d for d in self._connected() if d["port"] == port), None)
 
-    def _feed(self, logical):
-        device = self._chosen_device(logical)
-        if device:
-            self.engine.submit("feed", device=device["port"])
+    def _numbers(self):
+        """The choices in every ID list."""
+        taken = [d["id"] for d in self._connected()]
+        top = max([MIN_NUMBERS, len(self._roles()), len(taken)] + taken)
+        return list(range(1, top + 1))
 
-    def _test(self, logical):
-        device = self._chosen_device(logical)
+    def _renumber(self, port, combo):
+        device = self._device(port)
+        number = combo.currentData()
+        if not device or number is None or number == device["id"]:
+            return
+        # A number another FED3 already has: they swap.
+        other = next((d for d in self._connected()
+                      if d["id"] == number and d["port"] != port), None)
+        self.engine.submit("set_id", port=port, number=number)
+        if other:
+            self.engine.submit("set_id", port=other["port"], number=device["id"])
+
+    # --- the table ---------------------------------------------------------
+
+    def _wanted_rows(self):
+        """Connected FED3s in number order, and the numbers they can be given."""
+        devices = sorted(self._connected(), key=lambda d: (d["id"], d["port"]))
+        return [(d["port"], d["id"]) for d in devices], self._numbers(), self._roles()
+
+    def _rebuild(self, wanted):
+        rows, numbers, _ = wanted
+        self.rows = wanted
+        self.table.setRowCount(len(rows))
+        for row, (port, number) in enumerate(rows):
+            for column in (PORT, STATUS):
+                self.table.setItem(row, column, QTableWidgetItem(""))
+            combo = QComboBox()
+            for n in numbers:
+                role = self._plays(n)
+                combo.addItem(f"{fed_name(n)}" + (f"  ({role})" if role else ""), n)
+            combo.setCurrentIndex(max(combo.findData(number), 0))
+            combo.currentIndexChanged.connect(lambda _=0, p=port, c=combo: self._renumber(p, c))
+            self.table.setCellWidget(row, ID, combo)
+            tests = QWidget()
+            b = QHBoxLayout(tests)
+            b.setContentsMargins(2, 0, 2, 0)
+            lights = theme.small(QPushButton("Lights"))
+            lights.setObjectName("lights")
+            lights.setCheckable(True)
+            lights.setToolTip("Light this FED3 up to find it. It goes dark again when a run "
+                              "starts.")
+            lights.toggled.connect(lambda on, p=port: self._lights(p, on))
+            b.addWidget(lights)
+            for text, tip, slot in (("Tone", "Play the protocol's reward tone", self._tone),
+                                    ("Feed", "Dispense one pellet", self._feed)):
+                button = theme.small(QPushButton(text))
+                button.setToolTip(tip)
+                button.clicked.connect(lambda _=False, p=port, s=slot: s(p))
+                b.addWidget(button)
+            self.table.setCellWidget(row, TESTS, tests)
+
+    def _fill_row(self, row, port, number, preflight):
+        device = self._device(port)
+        item = self.table.item(row, PORT)
+        item.setText(port)
+        item.setToolTip(device["description"] if device else "")
+        role = self._plays(number)
+        if role and role in preflight and preflight[role] != "ok":
+            text, colour = f"pre-flight: {preflight[role]}", theme.BAD
+        elif device:
+            text, colour = device_health(device)
+        else:
+            text, colour = "not connected", theme.BAD
+        if role:
+            text = f"plays {role} · {text}"
+        elif self._roles():
+            text = f"not in this protocol · {text}"
+            colour = theme.MUTED if colour == theme.GOOD else colour
+        status = self.table.item(row, STATUS)
+        status.setText(text)
+        status.setToolTip(text)
+        status.setForeground(QColor(colour))
+        tests = self.table.cellWidget(row, TESTS)
+        lights = tests.findChild(QPushButton, "lights")
+        lights.blockSignals(True)
+        lights.setChecked(bool(device and device.get("lights")))
+        lights.blockSignals(False)
+
+    # --- bench tests -------------------------------------------------------
+
+    def _lights(self, port, on):
+        self.engine.submit("lights", device=port, on=on)
+
+    def _feed(self, port):
+        self.engine.submit("feed", device=port)
+
+    def _tone(self, port):
+        """The tone of the protocol's first reward cue, or a 4 kHz beep."""
+        device = self._device(port)
         if not device:
             return
-        cue = "tone:4000:200+flash:bar:0:0:30:0:500"
-        if self.compiled:
-            cue = self.compiled.schedules[logical].phases[0].rule["cue.reward"]
-            if cue == "none":
-                cue = "tone:4000:200+flash:bar:0:0:30:0:500"
-        self.engine.submit("test_cue", device=device["port"], cue=cue)
-
-    def _renumber(self):
-        devices = [d for d in self.snapshot.get("devices", []) if d["connected"]]
-        if not devices:
-            QMessageBox.information(self, "Renumber", "No FED3 is connected.")
-            return
-        labels = [device_label(d) for d in devices]
-        label, ok = QInputDialog.getItem(self, "Renumber a FED3", "FED3:", labels, 0, False)
-        if not ok:
-            return
-        device = devices[labels.index(label)]
-        number, ok = QInputDialog.getInt(self, "Renumber a FED3",
-                                         f"New number for {label}:", device["id"], 1, 999)
-        if ok:
-            self.engine.submit("set_id", port=device["port"], number=number)
+        cue, role = TEST_TONE, self._plays(device["id"])
+        if self.compiled and role:
+            reward = self.compiled.schedules[role].phases[0].rule["cue.reward"]
+            cue = next((a for a in reward.split("+") if a.startswith("tone:")), TEST_TONE)
+        self.engine.submit("test_cue", device=port, cue=cue)
 
     # --- folder and start ------------------------------------------------
 
@@ -300,55 +366,40 @@ class SetupView(QWidget):
 
     def update_view(self, snapshot):
         self.snapshot = snapshot or {}
-        devices = [d for d in self.snapshot.get("devices", []) if d["connected"] and d["compatible"]]
-        binding = self.binding()
+        connected = self._connected()
+        wanted = self._wanted_rows()
+        if wanted != self.rows:
+            self._rebuild(wanted)
         preflight = self.snapshot.get("preflight", {})
-        for row, name in enumerate(self._logical_devices()):
-            combo = self.table.cellWidget(row, 1)
-            if combo is None:
-                continue
-            wanted = [(device_label(d), d["id"]) for d in devices]
-            current = combo.currentData()
-            if current is not None and current not in [i for _, i in wanted]:
-                wanted.append((f"FED{current:03d}  (not connected)", current))
-            if self._combo_items.get(name) != wanted:
-                combo.blockSignals(True)
-                combo.clear()
-                combo.addItem(NOT_CHOSEN, None)
-                for text, device_id in wanted:
-                    combo.addItem(text, device_id)
-                index = combo.findData(current)
-                combo.setCurrentIndex(index if index >= 0 else 0)
-                combo.blockSignals(False)
-                self._combo_items[name] = wanted
-            device = next((d for d in devices if d["id"] == binding.get(name)), None)
-            if name in preflight and preflight[name] != "ok":
-                text, colour = f"pre-flight: {preflight[name]}", theme.BAD
-            elif device:
-                text, colour = device_health(device)
-            elif binding.get(name) is not None:
-                text, colour = "not connected", theme.BAD
-            else:
-                text, colour = "", theme.MUTED
-            item = self.table.item(row, 2)
-            item.setText(text)
-            item.setToolTip(text)
-            item.setForeground(QColor(colour))
+        for row, (port, number) in enumerate(self.rows[0]):
+            self._fill_row(row, port, number, preflight)
 
-        bound = set(binding.values())
-        others = [device_label(d) for d in devices if d["id"] not in bound]
+        roles = self._roles()
+        if roles:
+            self.hint.setText("Every FED3 plugged in is listed. Its ID is its place in the "
+                              "protocol: " + ", ".join(f"{fed_name(n)} plays {r}"
+                                                      for n, r in enumerate(roles, start=1))
+                              + ". Choose an ID to renumber a FED3. Lights shows which is which.")
+        else:
+            self.hint.setText("Every FED3 plugged in is listed. Choose an ID to renumber a "
+                              "FED3. Lights shows which is which.")
+        have = {d["id"] for d in connected}
+        missing = [f"{fed_name(n)} ({r})" for n, r in enumerate(roles, start=1) if n not in have]
+        if missing and connected:
+            self.missing.setText(f"Not plugged in or not numbered yet: {', '.join(missing)}")
+            self.missing.setStyleSheet(f"color: {theme.WARN};")
+        else:
+            self.missing.setText("")
         old = [p["message"] + f" ({p['device']})" for p in self.snapshot.get("problems", [])
                if p["kind"] in ("firmware", "duplicate_id")]
         text = []
-        if others:
-            text.append("Also connected: " + ", ".join(others))
         if old:
             text.append("⚠ " + "; ".join(old))
-        if not devices:
+        if not connected:
             text.append("No FED3 found yet. Plug one in; it appears here within a few seconds.")
         self.others.setText("\n".join(text))
 
-        ready, why = self._ready(binding, devices)
+        ready, why = self._ready(connected)
         self.start.setEnabled(ready)
         if not ready:
             self.start_note.setText(why)
@@ -357,16 +408,14 @@ class SetupView(QWidget):
         elif not preflight:
             self.start_note.setText("Start checks every device, then starts them together.")
 
-    def _ready(self, binding, devices):
+    def _ready(self, devices):
         if not self.compiled:
             return False, "Choose a protocol that passes its checks."
-        names = self._logical_devices()
-        if len(binding) < len(names):
-            return False, "Choose a FED3 for every protocol device."
-        if len(set(binding.values())) < len(binding):
-            return False, "Each protocol device needs its own FED3."
-        connected = {d["id"] for d in devices}
-        missing = [n for n, i in binding.items() if i not in connected]
+        have = [d["id"] for d in devices]
+        missing = [f"{fed_name(n)} ({r})" for n, r in enumerate(self._roles(), start=1)
+                   if n not in have]
         if missing:
-            return False, f"Not connected: {', '.join(missing)}"
+            return False, f"Needs {', '.join(missing)}: give a FED3 that ID"
+        if len(set(have)) < len(have):
+            return False, "Two FED3s have the same ID; give one another."
         return True, ""

@@ -90,18 +90,31 @@ def main(make=None):
     print("--- boot ---")
     device = MAKE(device_id=3, now=at(20, 9))
     out = device.take()
-    check("a boot announces itself", out[0].startswith("BOOT,fw=3.0,reset=power,clock=ok"))
+    check("a boot announces itself", out[0].startswith("BOOT,fw=3.1,reset=power,clock=ok"))
     check("and is logged", out[1].startswith("ROW,") and ",boot," in out[1])
     check("a blank card logs to IDLE.CSV with a header",
           device.card.files["IDLE.CSV"].startswith(dev.HEADER + "\n"))
     check("PING answers with id and protocol",
-          device.command("PING") == ["PONG,id=3,fw=3.0,proto=3"])
+          device.command("PING") == ["PONG,id=3,fw=3.1,proto=3"])
     check("a blank card runs FR1 on the left",
           sch.summarize(device.rule()) == "FR1 · left")
     check("ID renumbers and is kept", device.command("ID:12") == ["ID,id=12"]
           and MAKE(card=device.card, now=at(20, 9)).command("PING")[-1].startswith("PONG,id=12,"))
     check("unknown commands are refused", device.command("MODE:FR1")[0].startswith("ERR,UNKNOWN"))
     check("over-long commands are refused", device.command("X" * 200)[0].startswith("ERR,TOO_LONG"))
+
+    print("\n--- lights for finding a device ---")
+    check("the lights start off", status(device)["lights"] == "0")
+    check("LIGHTS:on turns them on", device.command("LIGHTS:on") == ["LIGHTS,on=1"]
+          and status(device)["lights"] == "1")
+    check("a cue plays over them and leaves them on",
+          device.command("TEST:flash:bar:0:0:30:0:500") == ["OK"] and status(device)["lights"] == "1")
+    check("LIGHTS:off turns them off", device.command("LIGHTS:off") == ["LIGHTS,on=0"]
+          and status(device)["lights"] == "0")
+    check("anything else is refused", device.command("LIGHTS:blue")[0].startswith("ERR,BAD_LIGHTS"))
+    device.command("LIGHTS:on")
+    device.reboot("power")
+    check("a reboot turns them off", status(device)["lights"] == "0")
 
     print("\n--- uploading and starting ---")
     compiled = compile_one("""\
@@ -117,11 +130,13 @@ def main(make=None):
     check("every line is accepted", all(r == "OK" for r in replies))
     check("outside a run the schedule waits", commit.endswith("slot=next"))
     check("and is not yet in force", sch.summarize(device.rule()) == "FR1 · left")
+    device.command("LIGHTS:on")
     check("a start with the wrong crc is refused",
           device.command(f"RUN:BEGIN,RUN1,{dev.iso(at(20, 9))},deadbeef")[0]
           .startswith("ERR,RUN_SCHED"))
     reply = device.command(f"RUN:BEGIN,RUN1,{dev.iso(at(20, 9))},{schedule.crc():08x}")[-1]
     check("the right crc starts the run", reply == "RUN,run=RUN1,file=RUN1.CSV,phase=0")
+    check("and turns the lights off: a run never starts lit", status(device)["lights"] == "0")
     check("and the uploaded schedule is now in force",
           sch.summarize(device.rule()) == "FR3 · left")
     first = rows(device)
@@ -330,6 +345,14 @@ def main(make=None):
           rows(device)[-1]["event"] == "dispense" and rows(device)[-1]["detail"] == "retry")
     check("manual FEED with a pellet in the well says so",
           device.command("FEED") == ["FEED,result=pellet_in_well"])
+    device.retrieve()
+    device.advance(1)
+    device.jams_pending = 1
+    device.command("FEED")
+    device.advance(dev.JAM_RETRY_SECONDS * 2)
+    check("a pellet fed by hand that jams is logged, and not retried",
+          rows(device)[-1]["event"] == "jam" and rows(device)[-1]["detail"] == "manual"
+          and status(device)["jam"] == "0")
 
     print("\n--- phases on the clock ---")
     rotating = compile_one("""\

@@ -227,6 +227,11 @@ def format_seconds(seconds):
     return "".join(out)
 
 
+def plural(count, noun):
+    """``1 phase``, ``3 phases``."""
+    return f"{count} {noun}{'' if count == 1 else 's'}"
+
+
 def standard_timezone():
     """The PC's local standard time: its UTC offset with daylight saving ignored.
 

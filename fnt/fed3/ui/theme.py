@@ -9,6 +9,8 @@ ACCENT = "#0078d4"
 GOOD = "#4caf50"
 WARN = "#e0a030"
 BAD = "#e05050"
+LOG_PHASE = "#4fc3f7"           # phase changes in the log
+LOG_MANUAL = "#ce93d8"          # things a person did
 
 # One colour per device in plots and cards, in binding order.
 SERIES = ["#4fc3f7", "#ffb74d", "#81c784", "#e57373", "#ba68c8", "#fff176",
@@ -28,6 +30,7 @@ QPushButton[quiet="true"] {{ background-color: {PANEL}; color: {TEXT};
                              border: 1px solid {BORDER}; font-weight: normal; }}
 QPushButton[quiet="true"]:hover {{ background-color: {BORDER}; }}
 QPushButton[danger="true"] {{ background-color: #a33; }}
+QPushButton::menu-indicator {{ image: none; width: 0; }}   /* the label carries its own ▾ */
 QLineEdit, QPlainTextEdit, QComboBox, QSpinBox, QListWidget, QTableWidget {{
     background-color: {PANEL}; border: 1px solid {BORDER}; border-radius: 3px; padding: 3px; }}
 QPlainTextEdit {{ font-family: Consolas, "DejaVu Sans Mono", monospace; }}
@@ -38,6 +41,19 @@ QFrame#card[problem="true"] {{ border: 2px solid {BAD}; }}
 QFrame#card QLabel {{ background: transparent; }}
 QLabel#title {{ font-size: 14pt; font-weight: bold; }}
 QLabel#muted {{ color: {MUTED}; }}
+QWidget#stagebar {{ background-color: {PANEL}; border-bottom: 1px solid {BORDER}; }}
+QWidget#stagebar QLabel {{ background: transparent; }}
+QWidget#logheader {{ background-color: {PANEL}; border-top: 1px solid {BORDER}; }}
+QWidget#logheader QLabel {{ background: transparent; }}
+QPushButton#logtoggle {{ background: transparent; color: {TEXT}; padding: 3px 6px;
+                         text-align: left; }}
+QPushButton#logtoggle:hover {{ background-color: {BORDER}; }}
+QPlainTextEdit#log {{ border: none; border-radius: 0; }}
+QPushButton[small="true"] {{ padding: 3px 9px; font-size: 9pt; }}
+QPushButton[small="true"]:checked {{ background-color: #f1c40f; color: black; border-color: #f1c40f; }}
+QSplitter::handle {{ background-color: {BORDER}; }}
+QSplitter::handle:vertical {{ height: 3px; }}
+QSplitter::handle:horizontal {{ width: 3px; }}
 QToolTip {{ background-color: {PANEL}; color: {TEXT}; border: 1px solid {BORDER}; }}
 """
 
@@ -50,4 +66,11 @@ def quiet(button):
 
 def danger(button):
     button.setProperty("danger", True)
+    return button
+
+
+def small(button):
+    """A compact quiet button, for actions inside a card."""
+    button.setProperty("quiet", True)
+    button.setProperty("small", True)
     return button

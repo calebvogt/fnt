@@ -92,20 +92,22 @@ class DataCopy:
 
     Rows are written strictly in ``seq`` order. One that arrives early waits
     for the gap before it to be filled by a ``READ``.
+
+    The copy doesn't end at ``run_end``: after Stop the device keeps running
+    its last phase and writing rows to the same file until it starts another
+    run, and the copy follows it.
     """
 
     def __init__(self, path):
         self.path = path
         self.next_seq = 1
         self.pending = {}
-        self.closed = False
         self.read_requested = -1e9
         if os.path.exists(path):
             with open(path, encoding="ascii", newline="") as handle:
                 lines = handle.read().splitlines()
             if len(lines) > 1:
                 self.next_seq = int(lines[-1].split(",")[2]) + 1
-                self.closed = lines[-1].split(",")[4] == "run_end"
         else:
             with open(path, "w", encoding="ascii", newline="") as handle:
                 handle.write(HEADER + "\n")
@@ -116,8 +118,6 @@ class DataCopy:
 
     def add(self, row_text):
         """Take one row (without ``ROW,``). Returns the rows written."""
-        if self.closed:
-            return []
         seq = int(row_text.split(",", 3)[2])
         if seq < self.next_seq or seq in self.pending:
             return []
@@ -129,10 +129,6 @@ class DataCopy:
                 handle.write(text + "\n")
                 written.append(text)
                 self.next_seq += 1
-                if text.split(",", 5)[4] == "run_end":
-                    self.closed = True
-                    self.pending.clear()
-                    break
         return written
 
 
@@ -171,6 +167,10 @@ class Run:
         self.fnt_changes = []
         self.copies = {}
         self.started = {}                     # logical -> device confirmed RUN
+        self.stopped_at = None                # when Stop was pressed (UTC iso)
+        # logical -> the device's own run_end row: where its data after Stop
+        # begins. Later than stopped_at for a device that was unplugged then.
+        self.ended = {}
         for logical, device_id in self.binding.items():
             self.copies[logical] = DataCopy(os.path.join(folder, f"{logical}_FED{device_id:03d}.csv"))
 
@@ -184,7 +184,7 @@ class Run:
                 return logical
         return None
 
-    def save(self, stopped_at=None):
+    def save(self):
         data = {
             "format": RUN_FORMAT,
             "run_id": self.run_id,
@@ -200,8 +200,10 @@ class Run:
             "fnt_phase_changes": self.fnt_changes,
             "schedules": {name: f"{crc:08x}" for name, crc in self.crcs.items()},
         }
-        if stopped_at:
-            data["stopped_at"] = stopped_at
+        if self.stopped_at:
+            data["stopped_at"] = self.stopped_at
+        if self.ended:
+            data["ended"] = self.ended
         path = os.path.join(self.folder, RUN_FILE)
         with open(path + ".tmp", "w", encoding="utf-8") as handle:
             json.dump(data, handle, indent=2)
@@ -228,7 +230,10 @@ class Engine:
         self.problems = {}                # key -> Problem
         self.run = None
         self.state = SETUP
+        self.stopped = {}                 # run id -> a stopped Run its devices still write to
+        self._searched = set()            # run ids already looked for in runs_root
         self.events = deque(maxlen=300)   # (utc time, device, text) for the UI
+        self.event_count = 0              # events ever added, so the UI adds only new ones
         self.preflight = {}               # logical -> "ok" or why not
         self.commands = queue.Queue()
         self.lock = threading.Lock()
@@ -274,12 +279,15 @@ class Engine:
                     self._disconnect(device, str(exc))
         if self.run and self.state == RUNNING:
             self._run_step()
+        for run in self._stopped_runs():
+            self._stopped_step(run)
         self._check_problems()
         self._flush_log()
         self._publish()
 
     def _event(self, device, text):
         self.events.append((self.now(), device, text))
+        self.event_count += 1
 
     def _log(self, device, action, detail="", result="ok", quiet=False):
         """Record an action in log.csv; ``quiet`` keeps routine ones off the screen."""
@@ -418,11 +426,9 @@ class Engine:
             device.drift = (moment - self.now()).total_seconds() if moment else None
         else:
             device.drift = None
-        if status.get("run") and self.run and status["run"] == self.run.run_id:
-            device.run = self.run.run_id
-        elif status.get("run") not in (None, "-") and (
-                not self.run or status["run"] != self.run.run_id):
+        if status.get("run") not in (None, "-"):
             device.run = status["run"]
+            self._find_stopped(device.run)
         name = self._name(device)
         if status.get("clock") == "unset" or (
                 device.drift is not None and abs(device.drift) > DRIFT_TOLERANCE):
@@ -483,10 +489,7 @@ class Engine:
         if reading_run:
             # A replayed row: it belongs in the copy, but it isn't news. Only
             # live rows say what the device is doing now.
-            if self.run and target == self.run.run_id and device.id is not None:
-                logical = self.run.logical_for(device.id)
-                if logical:
-                    self.run.copies[logical].add(text)
+            self._copy_row(device, target, text)
             return
         device.rows.append(row)
         device.last_row = row
@@ -499,11 +502,24 @@ class Engine:
             self._problem(name, "jam", name, "jammed: retrying every 10 minutes")
         elif row["event"] == "phase":
             self._event(name, f"phase {row['phase']}: {row['detail']}")
-        target = device.run
-        if self.run and target == self.run.run_id and device.id is not None:
-            logical = self.run.logical_for(device.id)
+        self._copy_row(device, device.run, text)
+
+    def _copy_row(self, device, run_id, text):
+        run = self._run_by_id(run_id)
+        if run and device.id is not None:
+            logical = run.logical_for(device.id)
             if logical:
-                self.run.copies[logical].add(text)
+                for written in run.copies[logical].add(text):
+                    self._note_end(run, logical, parse_row(written))
+
+    def _note_end(self, run, logical, row):
+        """Record in run.json where a device's run ended in its data, so rows
+        recorded after Stop can be told apart: every row after it in seq."""
+        if row["event"] != "run_end" or logical in run.ended:
+            return
+        run.ended[logical] = {"time": row["time"] or None, "seq": int(row["seq"]),
+                              "detail": row["detail"]}
+        run.save()
 
     # ------------------------------------------------------------------
     # Problems
@@ -659,7 +675,7 @@ class Engine:
             device.run = self.run.run_id
             self.run.started[logical] = True
             self._read_status(device)
-            self._fill_gaps(logical, device, force=True)
+            self._fill_gaps(self.run, logical, device, force=True)
             return True
         self._problem(logical, "not_started", logical, f"couldn't start: {reply}")
         return False
@@ -670,7 +686,15 @@ class Engine:
             if device is None:
                 continue
             try:
-                if device.status.get("run") != self.run.run_id or device.status.get("ended") == "1":
+                if device.status.get("run") == self.run.run_id and device.status.get("ended") == "1":
+                    # RUN:END reached it but the run wasn't marked stopped (FNT
+                    # was closed mid-Stop). A RUN:BEGIN now would start the
+                    # run's file on the card over, so leave it be.
+                    self._problem(logical, "ended", logical,
+                                  "its run was already ended on the device; press Stop run")
+                    self._fill_gaps(self.run, logical, device)
+                    continue
+                if device.status.get("run") != self.run.run_id:
                     if device.status:      # a known other state: join the run
                         if self._begin(logical, device):
                             self._clear(logical, "not_started")
@@ -679,29 +703,27 @@ class Engine:
                 expected = f"{self.run.crcs[logical]:08x}"
                 if device.status.get("sched") not in (None, expected):
                     self._reupload(logical, device)
-                self._fill_gaps(logical, device)
+                self._fill_gaps(self.run, logical, device)
             except LinkError as exc:
                 self._disconnect(device, str(exc))
         self._fnt_conditions()
 
-    def _fill_gaps(self, logical, device, force=False):
-        copy = self.run.copies[logical]
-        if copy.closed:
-            return
+    def _fill_gaps(self, run, logical, device, force=False):
+        copy = run.copies[logical]
         try:
             seq = int(device.status.get("seq", 0))
         except ValueError:
             seq = 0
-        behind = copy.gap or (device.run == self.run.run_id and seq >= copy.next_seq
-                              and device.status.get("run") == self.run.run_id)
+        behind = copy.gap or (device.run == run.run_id and seq >= copy.next_seq
+                              and device.status.get("run") == run.run_id)
         if not (force or behind):
             return
         if self.monotonic() - copy.read_requested < READ_RETRY and not force:
             return
         copy.read_requested = self.monotonic()
-        device.link.on_line = lambda line, d=device: self._on_line(d, line, self.run.run_id)
+        device.link.on_line = lambda line, d=device: self._on_line(d, line, run.run_id)
         try:
-            self._call(device, f"READ:{self.run.run_id},{copy.next_seq}", timeout=30)
+            self._call(device, f"READ:{run.run_id},{copy.next_seq}", timeout=30)
         finally:
             device.link.on_line = lambda line, d=device: self._on_line(d, line)
 
@@ -797,18 +819,22 @@ class Engine:
             try:
                 self._call(device, "RUN:END")
                 self._read_status(device)
-                self._fill_gaps(logical, device, force=True)
+                self._fill_gaps(self.run, logical, device, force=True)
             except LinkError as exc:
                 self._log(logical, "not stopped", str(exc), "failed")
         self.run.state = STOPPED
         self.state = STOPPED
-        self.run.save(stopped_at=iso(self.now()))
-        self._log("", "run stopped")
+        self.run.stopped_at = iso(self.now())
+        self.run.save()
+        self._clear_kind("ended")
+        self._log("", "run stopped", "the devices keep their last phase, and their rows "
+                                     "are still copied until they start another run")
         self._flush_log()
 
     def cmd_close(self):
-        """Back to Setup after a stopped run."""
+        """Back to Setup after a stopped run. Its rows are still copied."""
         if self.state == STOPPED:
+            self.stopped[self.run.run_id] = self.run
             self.run = None
             self.state = SETUP
             self.problems = {k: p for k, p in self.problems.items() if p.kind == "firmware"}
@@ -867,6 +893,19 @@ class Engine:
         if target:
             self._log(self._name(target), "feed by hand", self._call(target, "FEED"))
 
+    def cmd_lights(self, device, on):
+        """A FED3's lights on or off, steady, to find it on the bench. The
+        device turns them off itself at RUN:BEGIN and on boot (firmware 3.1)."""
+        target = self._device_for(device)
+        if not target:
+            return
+        reply = self._call(target, f"LIGHTS:{'on' if on else 'off'}")
+        if reply.startswith("LIGHTS,"):
+            target.status["lights"] = fields(reply).get("on", "0")
+            self._log(self._name(target), "lights", "on" if on else "off", quiet=True)
+        else:
+            self._log(self._name(target), "lights", f"need firmware 3.1 ({reply})", "failed")
+
     def cmd_test_cue(self, device, cue):
         target = self._device_for(device)
         if target:
@@ -901,19 +940,91 @@ class Engine:
             if data.get("format") != RUN_FORMAT or data.get("state") != RUNNING:
                 continue
             folder = os.path.dirname(path)
-            latest = data["protocol_versions"][-1]
-            with open(os.path.join(folder, latest), encoding="utf-8") as handle:
-                text = handle.read()
-            compiled = proto.compile_protocol(proto.load(text), seed=data["seed"])
-            t0 = parse_iso(data["t0"])
-            self.run = Run(folder, text, compiled, data["binding"], data["run_id"], t0,
-                           data["seed"])
-            self.run.edits = data.get("edits", [])
-            self.run.fnt_changes = data.get("fnt_phase_changes", [])
+            self.run = self._load_run(folder, data)
             self.state = RUNNING
             self._log("", "run resumed", f"{data['name']} ({data['run_id']})")
             return folder
         return None
+
+    @staticmethod
+    def _load_run(folder, data):
+        latest = data["protocol_versions"][-1]
+        with open(os.path.join(folder, latest), encoding="utf-8") as handle:
+            text = handle.read()
+        compiled = proto.compile_protocol(proto.load(text), seed=data["seed"])
+        run = Run(folder, text, compiled, data["binding"], data["run_id"],
+                  parse_iso(data["t0"]), data["seed"])
+        run.state = data.get("state", RUNNING)
+        run.edits = data.get("edits", [])
+        run.fnt_changes = data.get("fnt_phase_changes", [])
+        run.stopped_at = data.get("stopped_at")
+        run.ended = data.get("ended", {})
+        return run
+
+    # --- stopped runs ------------------------------------------------------
+    #
+    # After Stop a device keeps running its last phase and writing rows to the
+    # same file until it starts another run. The animals are still eating, so
+    # the copy in the run folder keeps following the card: in the Stopped
+    # view, after New run, and after FNT restarts.
+
+    def _run_by_id(self, run_id):
+        if self.run and run_id == self.run.run_id:
+            return self.run
+        return self.stopped.get(run_id)
+
+    def _stopped_runs(self):
+        runs = list(self.stopped.values())
+        if self.run and self.state == STOPPED:
+            runs.append(self.run)
+        return runs
+
+    def _find_stopped(self, run_id):
+        """A device reports a run FNT doesn't hold: if it's a stopped run in
+        runs_root, keep copying its rows there."""
+        if self._run_by_id(run_id) or run_id in self._searched:
+            return
+        self._searched.add(run_id)
+        try:
+            names = os.listdir(self.runs_root)
+        except OSError:
+            return
+        for name in names:
+            path = os.path.join(self.runs_root, name, RUN_FILE)
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    data = json.load(handle)
+            except (OSError, ValueError):
+                continue
+            if (data.get("format") != RUN_FORMAT or data.get("run_id") != run_id
+                    or data.get("state") != STOPPED):
+                continue
+            try:
+                self.stopped[run_id] = self._load_run(os.path.dirname(path), data)
+            except (OSError, KeyError, proto.ProtocolError):
+                return
+            self._log("", "copying a stopped run", f"{data.get('name')} ({run_id})", quiet=True)
+            return
+
+    def _stopped_step(self, run):
+        for logical, device_id in run.binding.items():
+            device = self.device_by_id(device_id)
+            if device is None or device.status.get("run") != run.run_id:
+                continue
+            try:
+                if device.status.get("ended") == "0":
+                    # Stop didn't reach it (it was unplugged): end it now.
+                    reply = self._call(device, "RUN:END")
+                    self._log(logical, "run ended", f"it was offline at Stop: {reply}")
+                    self._read_status(device)
+                self._fill_gaps(run, logical, device)
+            except LinkError as exc:
+                self._disconnect(device, str(exc))
+
+    def _clear_kind(self, kind):
+        for problem in list(self.problems.values()):
+            if problem.kind == kind:
+                self._clear(problem.device, kind)
 
     # ------------------------------------------------------------------
     # For the UI
@@ -929,6 +1040,7 @@ class Engine:
                 "status": dict(device.status), "drift": device.drift,
                 "name": self._name(device), "rows": list(device.rows)[-50:],
                 "last_row": dict(device.last_row),
+                "lights": device.status.get("lights") == "1",
             })
         run = None
         if self.run:
@@ -943,12 +1055,14 @@ class Engine:
                 "copies": {l: c.path for l, c in self.run.copies.items()},
                 "rules": {l: [sch.summarize(p.rule) for p in s.phases]
                           for l, s in self.run.compiled.schedules.items()},
+                "actives": {l: [p.rule["active"] for p in s.phases]
+                            for l, s in self.run.compiled.schedules.items()},
             }
         snapshot = {
             "state": self.state, "now": self.now(), "zone": self.zone,
             "devices": devices, "run": run, "preflight": dict(self.preflight),
             "problems": [vars(p).copy() for p in self.problems.values()],
-            "events": list(self.events)[-100:],
+            "events": list(self.events)[-100:], "event_count": self.event_count,
         }
         with self.lock:
             self._snapshot = snapshot

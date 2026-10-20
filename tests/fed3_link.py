@@ -89,7 +89,7 @@ def main():
 
     print("--- commands and replies ---")
     check("PING answers, though it arrives 7 bytes at a time",
-          link.call("PING") == "PONG,id=5,fw=3.0,proto=3")
+          link.call("PING") == "PONG,id=5,fw=3.1,proto=3")
     status = fields(link.call("STATUS"))
     check("STATUS parses into fields", status.get("id") == "5" and status.get("clock") == "ok")
 

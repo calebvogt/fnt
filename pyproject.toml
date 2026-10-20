@@ -101,4 +101,4 @@ Issues = "https://github.com/calebvogt/fnt/issues"
 include = ["fnt*"]
 
 [tool.setuptools.package-data]
-fnt = ["../icons/*.ico", "../icons/*.png"]
+fnt = ["../icons/*.ico", "../icons/*.png", "fed3/ui/*.svg"]

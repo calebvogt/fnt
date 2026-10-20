@@ -103,7 +103,9 @@ same thing wherever it is in the schedule.
 - A dispense takes about a second, until the pellet breaks the well beam,
   which writes a `dispense` row. Taking it writes a `retrieve` row.
 - If the motor can't deliver a pellet, a `jam` row is written and the same
-  dispense is retried every 10 minutes until it succeeds. At most one
+  dispense is retried every 10 minutes until it succeeds. A pellet fed by hand
+  (`FEED`) isn't retried: nobody is owed it, and on the bench a retry would run
+  the motor every 10 minutes on an empty hopper. At most one
   dispense is ever owed, so rewards earned while jammed don't pile up.
 
 **A blank or corrupt card** boots into a one-phase schedule of the defaults:
@@ -322,6 +324,7 @@ These are newline-terminated ASCII lines at 115200 baud.
 | `READ:<run_id>,<from_seq>` | `ROW,…` lines, then `READ_END,run=<id>,last=<seq>` | Re-send rows from `from_seq` onward. These interleave safely with live rows. |
 | `FEED` | `FEED,result=<started\|pellet_in_well\|jam>` | Dispense once by hand. The outcome follows as a `dispense` (`detail=manual`) or `jam` row. Counts as a pellet but not a reward. |
 | `TEST:<cue>` | `OK` | Play a cue with the same syntax as `cue.*`. |
+| `LIGHTS:on`, `LIGHTS:off` | `LIGHTS,on=<0\|1>` | The bar and both pokes white and steady, to find a device on the bench (firmware 3.1). Cues flash over them. Off at boot and at `RUN:BEGIN`, so a run never starts lit. |
 | `REBOOT` | (the device restarts) | Remote recovery; a `BOOT` line follows. |
 
 **`SCHED:COMMIT`**
@@ -354,7 +357,7 @@ Run ids are 8 characters, so file names stay valid on any FAT card.
 | --- | --- |
 | `ROW,<SD row>` | Every row written to the card, the moment it is written, and again in reply to `READ`. |
 | `BOOT,fw=…,reset=<power\|watchdog\|software\|external>,clock=<ok\|unset>,sched=<crc\|default>,run=<id\|->` | At startup. |
-| `STATUS,id=,fw=,time=,clock=ok\|unset,sd=ok\|err,run=,ended=0\|1,sched=,next_sched=,phase=,phase_name=,phase_start=,next=,file=,seq=,l=,r=,pellets=,phase_rewards=,phase_left=,phase_right=,depleted=0\|1,well=0\|1,jam=0\|1,uptime=,batt=,temp=,hum=` | In reply to `STATUS`. `sched` and `next_sched` are crcs (`-` if none). `next` describes the soonest `UNTIL`, for example `at=2026-10-20T19:00-07:00` or `rewards=37/100`. |
+| `STATUS,id=,fw=,time=,clock=ok\|unset,sd=ok\|err,run=,ended=0\|1,sched=,next_sched=,phase=,phase_name=,phase_start=,next=,file=,seq=,l=,r=,pellets=,phase_rewards=,phase_left=,phase_right=,depleted=0\|1,well=0\|1,jam=0\|1,uptime=,batt=,temp=,hum=,lights=0\|1` | In reply to `STATUS`. `sched` and `next_sched` are crcs (`-` if none). `next` describes the soonest `UNTIL`, for example `at=2026-10-20T19:00-07:00` or `rewards=37/100`. |
 | `ERR,<code>,<detail>` | Bad command or bad value, or an SD write failure (`ERR,SD,…`). |
 
 `crc` is CRC-32 (the `zlib.crc32` polynomial) of the schedule's lines, each
@@ -637,7 +640,20 @@ records when it took effect.
 
 **Stop**
 - FNT sends `RUN:END`, pulls the remaining rows and writes a summary.
-- The devices keep running their current phase until the next run.
+- The devices keep running their current phase until the next run, and keep
+  writing rows to the same file. FNT keeps copying them, after the `run_end`
+  row, until the device starts another run: in the Stopped view, after New
+  run, and after FNT restarts (a device reporting a stopped run that's in the
+  runs folder is picked back up).
+- A device that missed `RUN:END` (it was unplugged) is sent it when it's back.
+- `run.json` keeps `stopped_at` (when Stop was pressed, UTC) and `ended`: for
+  each device, the `time`, `seq` and `detail` of its `run_end` row, so the rows
+  recorded after Stop can be told apart even when a device ended late or had no
+  clock.
+- FNT never sends `RUN:BEGIN` for a run a device reports as ended: the device
+  would start that run's file over. A run left running in `run.json` whose
+  devices already ended it (FNT closed mid-Stop) is flagged, and Stop finishes
+  it.
 
 **Crash recovery:** if FNT finds an unfinished run at launch, it resumes it:
 - it rebinds the devices;
@@ -681,7 +697,8 @@ an overnight jam is still visible at the morning check.
 ```
 
 FNT writes each device's copy in `seq` order, holding rows that arrive early
-until `READ` fills the gap. The live view uses rows as they arrive.
+until `READ` fills the gap. The live view uses rows as they arrive. The copy
+follows the device's file past `run_end` (see Stop).
 
 ---
 
@@ -701,7 +718,7 @@ fnt/fed3/
   run.py          # devices, runs, data copies, FNT conditions, problems (no Qt)
   demo.py         # simulated devices for trying the window without hardware
   cli.py          # fnt-fed check | compile | preview
-  ui/             # window, setup and running views, editor, plot
+  ui/             # window, setup and running views, editor, plot, log, the FED3 drawing
 ```
 
 - **`run.py` has no widgets and no threads of its own.** Everything happens in
@@ -718,22 +735,26 @@ fnt/fed3/
 ### Setup
 
 ```
-┌ FED ─ Setup ───────────────────────────────────────────────────────────────────┐
-│ Protocol: four-patch.yaml  [Open] [New] [Edit]     ✓ checks pass · 17 phases  │
-│ ┌ Timeline ────────────────────────────────────────────────────────────────┐   │
-│ │ Habituation ▸ day 3 19:00 │ Training ▸ 100 rewards (all) or 4d │ Comp…   │   │
-│ └──────────────────────────────────────────────────────────────────────────┘   │
-│ Devices          FED            status                         bench          │
-│  P1   [FED003 ▾] ● connected · clock ok · SD ok · fw 3.0   [Feed] [Test cue] │
-│  P2   [FED007 ▾] ● connected · clock ok · SD ok · fw 3.0   [Feed] [Test cue] │
-│  P3   [FED002 ▾] ▲ SD error                                 [Feed] [Test cue] │
-│  P4   [FED011 ▾] ● connected · clock ok · SD ok · fw 3.0   [Feed] [Test cue] │
-│ Save to: ~/FED3_Runs                                         [ Start run ▶ ]   │
-└────────────────────────────────────────────────────────────────────────────────┘
+┌ ✓ Setup › 2 Running › 3 Stopped ──────────────────────────────────────────────┐
+├ Protocol ───────────────────────┬ FED3s ────────────────────────────────────────┤
+│ four-patch.yaml [Open][New][Edit]│ Port ID           Status           Tests     │
+│ ✓ 17 phases · 4 devices          │ COM3 [FED001 (P1)▾] plays P1 · SD ok  [L][T][F]│
+│ ┌ Timeline ────────────────────┐ │ COM4 [FED002 (P2)▾] plays P2 · SD ok  [L][T][F]│
+│ │ 0 Habituation                │ │ COM5 [FED003 (P3)▾] plays P3 · SD err [L][T][F]│
+│ │   ends at 19:00 on day 3     │ │ COM6 [FED004 (P4)▾] plays P4 · SD ok  [L][T][F]│
+│ │ 1 Training [needs FNT] …     │ │                                              │
+│ └──────────────────────────────┘ │                                              │
+├──────────────────────────────────┴──────────────────────────────────────────────┤
+│ Runs are saved in ~/FED3_Runs                [Change folder] [ Start run ▶ ]    │
+└─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- Unbound FEDs appear in the drop-downs automatically. A FED can be renumbered
-  from its entry (`ID:`).
+- Every FED3 plugged in has a row. Its number is its place in the protocol:
+  FED00*n* plays the *n*th entry of `devices`. There is no separate binding
+  to keep, and the data file names match.
+- The ID list renumbers a FED3 (`ID:`); a number another FED3 has swaps them.
+- **Lights** sends `LIGHTS:on`/`off` (firmware 3.1), and the button follows the
+  device's `lights` status.
 - **Start** runs pre-flight and reports per row, so a failure is shown on the
   row that caused it.
 
@@ -746,11 +767,18 @@ The file is the protocol, so the editor edits the file:
   `fnt-fed check`, and clicking a problem jumps to its line.
 - **The timeline** below it: when each phase starts and ends, each device's
   rule, and which phases need FNT.
-- **New from template:** FR1 on both pokes with a cue; stepping the ratio up by
-  rewards; timed feeding; a four-patch competition.
-- **Add phase…:** a form for the common settings (end condition, active poke,
-  ratio, timeout, quota, free feeding, reward tone and flash). It writes the
-  YAML for you, so a new phase never needs typing.
+- **New from template:** each classic FED3 mode (and FNT's FRTO and RR) as a
+  one-phase protocol, as in "What replaces the old modes"; and examples: FR1 on
+  both pokes with a cue, stepping the ratio up by rewards, a four-patch
+  competition.
+- **Add phase…:** a form for the common settings (where it goes, end condition,
+  active poke, ratio, timeout, quota, free feeding, pellet or none, reward tone,
+  flash and BNC train, clicks). It writes the YAML for you, so a new phase
+  never needs typing.
+- **Edit phase / Remove phase:** the same form, filled from a phase's YAML, or
+  deleting its lines. A phase the form can't show in full (named rules,
+  rotation, windows, per-device rules) is edited in the text instead; the form
+  never drops what it can't show.
 - **During a run** the editor opens on the running protocol and **Apply to
   running devices** sends it. The engine refuses an edit that changes a
   finished phase or moves a device's current phase.
@@ -763,34 +791,36 @@ same file. Nothing else would change.
 
 ```
 ┌ Four-patch competition ── ● RUNNING  6d 03:12 ── 3 problems ── [Edit] [Stop] ┐
-│ Training ▸ Competition 3/14 ▸ Recovery     next: Competition 4 at 19:00 (2h47m) │
-├───────────────────────────────┬────────────────────────────────────────────────┤
-│ P1 FED003  ● Competition 3    │ cumulative rewards, per device                 │
-│  rich · FR1 · quota 12/30 /h  │ (standard time; dark phase shaded)             │
-│  L 912  R 340  rewards 801    │                                                │
-│  last: retrieve 40 s ago      │                                                │
-│ P3 FED002  ▲ jam 02:14 [ack]  │                                                │
-│  poor · FR5 · depleted        │                                                │
-│ …                             │                                                │
-├───────────────────────────────┴────────────────────────────────────────────────┤
-│ 19:00 all → Competition 3 · 02:14 P3 jam · 08:02 you: Feed P3 · 08:03 ack jam  │
+│ Phase 5 of 17: Competition 3 · next phase Tue 19:00 (in 2h 47m)                 │
+├────────────────────────────────────────────────┬───────────────────────────────┤
+│ P1 ● FED003       [Feed] [Test cue] [Set clock] │ cumulative pellets, per      │
+│  ╭──────────────╮  Competition 3 · phase 5/17   │ device (standard time; phase │
+│  │ (912)▭801(340)│  FR1 · both · Q30/1h          │ changes dotted, Stop dashed) │
+│  ╰──────────────╯  12 rewards this phase        │                              │
+│                    last: retrieve, 40 s ago     │                              │
+│ P3 ● FED002  …  ⚠ jammed · Tue 02:14 [Acknowledge]                             │
+├────────────────────────────────────────────────┴───────────────────────────────┤
+│ ▼ Log                                                                           │
+│ Tue 19:00:00  P1  phase 5: Competition 3                                        │
+│ Tue 02:14:09  P3  problem: jammed: retrying every 10 minutes                    │
+│ Tue 08:02:31  P3  feed by hand: FEED,result=started                             │
 └────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 - **Header:** state, elapsed time since t0, open problems, **Edit** and
   **Stop**. **Advance phase** appears only when the current phase has a manual
   condition.
-- **Device cards:**
-  - the current phase;
-  - a summary of the rule generated from its keys;
-  - counts since t0;
-  - the last event;
-  - problems with an **Acknowledge** button.
-
-  **Feed** and **Test cue** are in each card's menu.
-- **Plot:** cumulative pellets per device against standard time, with phase
-  changes marked.
-- **Log:** phase changes, problems, uploads and manual actions.
+- **Device cards**, below the plot, in as many columns as fit:
+  - the FED3 drawn with left pokes, pellets and right pokes since t0 on it;
+  - the current phase, a summary of its rule, rewards this phase and when the
+    phase ends;
+  - the last event, and the port, battery and temperature;
+  - problems with an **Acknowledge** button;
+  - **Feed**, **Test cue…** and **Set clock**.
+- **Plot**, across the top at full width: cumulative pellets per device against standard
+  time, with phase changes and Stop marked.
+- **Log**, along the bottom of the window in every state: phase changes,
+  problems, uploads and manual actions, coloured by kind, and collapsible.
 
 **Stopped** shows when the run stopped, pellets per device, **Open folder** and
 **New run**.

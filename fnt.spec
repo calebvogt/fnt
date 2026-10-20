@@ -14,6 +14,7 @@ hiddenimports += collect_submodules('fnt.fed3')
 
 datas = []
 datas += [('icons', 'icons')]
+datas += [('fnt/fed3/ui/fed3.svg', 'fnt/fed3/ui')]
 datas += collect_data_files('ultralytics')
 datas += collect_data_files('sam2')
 datas += collect_data_files('segmentation_models_pytorch')

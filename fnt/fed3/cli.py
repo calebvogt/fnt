@@ -49,8 +49,8 @@ def cmd_check(args):
     if _report(args.file, problems):
         return 1
     fnt_phases = [p.name for p in compiled.phases if p.fnt]
-    print(f"{args.file}: ok · {len(compiled.phases)} phases · "
-          f"{len(compiled.protocol.devices)} devices")
+    print(f"{args.file}: ok · {sch.plural(len(compiled.phases), 'phase')} · "
+          f"{sch.plural(len(compiled.protocol.devices), 'device')}")
     if fnt_phases:
         print(f"phases that need FNT running to end: {', '.join(fnt_phases)}")
     return 0
