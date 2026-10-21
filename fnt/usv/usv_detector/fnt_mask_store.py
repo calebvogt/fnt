@@ -633,6 +633,34 @@ PRED_SPEC_GROUP = "pred_specs"
 PRED_RIDGE_GROUP = "pred_ridge"
 
 
+#: Whether MAD computes brightness ridges at all: the project setting ``ridge`` (on by default),
+#: applied by the GUI when a project opens and by ``mad infer --no-ridge``. Off, every write
+#: still drops a stale ridge but stores no new one, and the backfills do nothing.
+_RIDGE_ON = True
+
+
+def set_ridge_enabled(on: bool) -> None:
+    """Turn ridge computation on or off for this process (see :data:`_RIDGE_ON`)."""
+    global _RIDGE_ON
+    _RIDGE_ON = bool(on)
+
+
+def ridge_enabled() -> bool:
+    return _RIDGE_ON
+
+
+#: Root attr: the :data:`mad_ridge.RIDGE_VERSION` this file's ridges were completed under, set
+#: once every detection with a spectrogram and every label has its ridge (as far as the file
+#: allows: no grid, no spectrogram or no pixels inside a label's bounds leave none). A file
+#: without it is checked, filled and stamped by :func:`fill_ridges`.
+RIDGE_VERSION_ATTR = "ridge_version"
+
+
+def _unstamp(f) -> None:
+    if RIDGE_VERSION_ATTR in f.attrs:
+        del f.attrs[RIDGE_VERSION_ATTR]
+
+
 def _ridge_units(f):
     """(kHz per bin, ms per frame) from a file's grid attrs, or None."""
     try:
@@ -655,6 +683,9 @@ def _store_ridge(f, key: str, ds, m: np.ndarray, spec, units) -> None:
     for k in RIDGE_ATTRS:
         if k in ds.attrs:
             del ds.attrs[k]
+    if not _RIDGE_ON:
+        _unstamp(f)                            # a later fill must look at this crop again
+        return
     if spec is None or units is None or np.asarray(spec).shape != m.shape:
         return
     res = ridge_measures(np.asarray(spec), m > 0, units[0], units[1],
@@ -725,6 +756,9 @@ def store_example_ridge(g, spec=None, mask=None, meta=None) -> Optional[Dict]:
         for k in RIDGE_ATTRS + ("ridge_t_off",):
             if k in g.attrs:
                 del g.attrs[k]
+        if not _RIDGE_ON:
+            _unstamp(g.file)
+            return None
         if spec is None:
             spec = g["spec"][()]
         if mask is None:
@@ -744,12 +778,24 @@ def store_example_ridge(g, spec=None, mask=None, meta=None) -> Optional[Dict]:
         return None
 
 
-def add_example_ridges(h5_path: str, overwrite: bool = False) -> int:
+def _stale_pieces(f, mask) -> bool:
+    """True for a mask in several pieces whose ridge may predate per-piece ridges (the file
+    is not stamped with the current :data:`RIDGE_VERSION_ATTR`)."""
+    from .mad_ridge import RIDGE_VERSION, mask_pieces
+    if int(f.attrs.get(RIDGE_VERSION_ATTR, 0)) >= RIDGE_VERSION:
+        return False
+    return len(mask_pieces(np.asarray(mask) > 0)) > 1
+
+
+def add_example_ridges(h5_path: str, overwrite: bool = False,
+                       redo_pieces: bool = False) -> int:
     """Store the brightness ridge of every training example that has none yet
     (all of them with ``overwrite``), in a recording's .mad or a project's
-    training store. No audio needed. Returns the number stored."""
+    training store. No audio needed. ``redo_pieces`` also recomputes a
+    multi-piece mask whose ridge may predate per-piece ridges (in a file not
+    yet stamped; it reads every mask). Returns the number stored."""
     _require_h5()
-    if not os.path.isfile(h5_path):
+    if not _RIDGE_ON or not os.path.isfile(h5_path):
         return 0
     n = 0
     with h5py.File(h5_path, "a") as f:
@@ -758,7 +804,8 @@ def add_example_ridges(h5_path: str, overwrite: bool = False) -> int:
             return 0
         for key in list(ex.keys()):
             g = ex[key]
-            if not overwrite and "ridge_turns" in g.attrs:
+            if (not overwrite and "ridge_turns" in g.attrs
+                    and not (redo_pieces and _stale_pieces(f, g["mask"][()]))):
                 continue
             n += store_example_ridge(g) is not None
     return n
@@ -1113,12 +1160,14 @@ def has_pred_masks(h5_path: str) -> bool:
 
 
 @_reporting_write
-def add_pred_ridges(h5_path: str, overwrite: bool = False) -> int:
+def add_pred_ridges(h5_path: str, overwrite: bool = False,
+                    redo_pieces: bool = False) -> int:
     """Store the brightness ridge of every prediction that has its spectrogram
     (/pred_specs) but no ridge yet (all of them with ``overwrite``). No audio
-    needed. Returns the number computed."""
+    needed. ``redo_pieces`` as in :func:`add_example_ridges`. Returns the
+    number computed."""
     _require_h5()
-    if not os.path.isfile(h5_path):
+    if not _RIDGE_ON or not os.path.isfile(h5_path):
         return 0
     n = 0
     with h5py.File(h5_path, "a") as f:
@@ -1128,11 +1177,54 @@ def add_pred_ridges(h5_path: str, overwrite: bool = False) -> int:
             return 0
         for key in list(grp.keys()):
             ds = grp[key]
-            if key not in sgrp or (not overwrite and "ridge_turns" in ds.attrs):
+            if key not in sgrp:
                 continue
-            _store_ridge(f, key, ds, ds[()], sgrp[key][()], units)
+            done = not overwrite and "ridge_turns" in ds.attrs
+            if done and not redo_pieces:
+                continue
+            m = ds[()]
+            if done and not _stale_pieces(f, m):
+                continue
+            _store_ridge(f, key, ds, m, sgrp[key][()], units)
             n += "ridge_turns" in ds.attrs
     return n
+
+
+def ridge_status(h5_path: str) -> Dict:
+    """What a recording's .mad still lacks for ridges, read-only.
+
+    ``{needed, pred, pred_no_spec, examples}``: ``needed`` is False for a file stamped with the
+    current :data:`RIDGE_VERSION_ATTR` (one attribute read) or with nothing to measure;
+    otherwise ``pred`` counts detections without a ridge, ``pred_no_spec`` those of them
+    without their spectrogram (they need the audio), ``examples`` labels without one."""
+    from .mad_ridge import RIDGE_VERSION
+    _require_h5()
+    out = {"needed": False, "pred": 0, "pred_no_spec": 0, "examples": 0}
+    if not os.path.isfile(h5_path):
+        return out
+    with h5py.File(h5_path, "r") as f:
+        if int(f.attrs.get(RIDGE_VERSION_ATTR, 0)) >= RIDGE_VERSION:
+            return out
+        grp, sgrp, ex = f.get(PRED_GROUP), f.get(PRED_SPEC_GROUP), f.get("examples")
+        if not (grp is not None and len(grp)) and not (ex is not None and len(ex)):
+            return out
+        out["needed"] = True                   # unstamped: multi-piece ridges may be stale
+        for key in (grp or {}):
+            if "ridge_turns" not in grp[key].attrs:
+                out["pred"] += 1
+                out["pred_no_spec"] += sgrp is None or key not in sgrp
+        for key in (ex or {}):
+            out["examples"] += "ridge_turns" not in ex[key].attrs
+    return out
+
+
+@_reporting_write
+def mark_ridges_complete(h5_path: str) -> None:
+    """Stamp the file with the current ridge version (see :data:`RIDGE_VERSION_ATTR`)."""
+    from .mad_ridge import RIDGE_VERSION
+    _require_h5()
+    with h5py.File(h5_path, "a") as f:
+        f.attrs[RIDGE_VERSION_ATTR] = int(RIDGE_VERSION)
 
 
 @_reporting_write

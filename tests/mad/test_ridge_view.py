@@ -39,7 +39,21 @@ def _trill(n=120, f_mid=40, amp=24, period=24):
     return level, mask, rows
 
 
-def _window():
+def _strip(h5):
+    """Remove detection 1's ridge and the file's ridge stamp."""
+    import h5py
+    with h5py.File(h5, 'a') as f:
+        del f[MS.PRED_RIDGE_GROUP]
+        for k in ('ridge_turns', 'ridge_rate_hz', 'ridge_depth_khz', 'ridge_trill'):
+            del f[MS.PRED_GROUP]['1'].attrs[k]
+        if MS.RIDGE_VERSION_ATTR in f.attrs:
+            del f.attrs[MS.RIDGE_VERSION_ATTR]
+
+
+def _window(crop=None, strip=False):
+    """A main window with one recording and one detection: the trill, or
+    ``crop`` = (level, mask). ``strip`` removes its ridge and the file's ridge
+    stamp before the recording opens, as in a file written before ridges."""
     global _APP
     _APP = QApplication.instance() or QApplication([])
     root = tempfile.mkdtemp(prefix="mad_ridge_view_")
@@ -61,9 +75,13 @@ def _window():
                       n_freq_bins=w.spectrogram.n_freq_bins,
                       n_time_frames=w.spectrogram.n_time_frames)
     level, mask, rows = _trill()
+    if crop is not None:
+        level, mask = crop
     MS.write_pred_masks(h5, [{'blob_id': 1, 'mask': mask, 'spec': level,
                               'f_off': F_OFF, 't_off': T_OFF, 'score': 0.9,
                               'class': 'USV'}])
+    if strip:
+        _strip(h5)
     w._loaded_wav_path = None
     w.audio_data = None
     w.current_file_idx = 0
@@ -123,6 +141,68 @@ def test_an_edited_mask_hides_its_ridge():
     assert _ridge_pixels(_show_call(w), col) > 50
     a['mask'] = a['mask'].copy()            # what an edit does: a new mask
     assert _ridge_pixels(_show_call(w), col) == 0
+
+
+def test_pieces_sounding_together_draw_a_line_each():
+    level = np.full((60, 80), 30, np.uint8)
+    mask = np.zeros((60, 80), np.uint8)
+    for row in (10, 45):                      # a harmonic over its fundamental
+        level[row, :] = 250
+        mask[row - 2:row + 3, :] = 1
+    w, _ = _window(crop=(level, mask))
+    a = next(a for a in w.spectrogram.annotations if a.get('status') == 'prediction')
+    assert np.shape(a['ridge_bins']) == (2, 80)
+    col = M.overlay_palette(getattr(w.spectrogram, 'colormap_name', None))['ridge']
+    w.chk_ridges.setChecked(True)
+    assert _ridge_pixels(_show_call(w), col) > 50
+
+
+def test_opening_a_recording_fills_its_missing_ridges():
+    w, rows = _window(strip=True)
+    a = next(a for a in w.spectrogram.annotations if a.get('status') == 'prediction')
+    assert np.max(np.abs(a['ridge_bins'] - (F_OFF + rows))) <= 1.01
+    h5 = MS.masks_sibling_path(w._active_wav_path())
+    assert not MS.ridge_status(h5)['needed']                 # and stamped
+
+
+def test_the_ridge_checkbox_is_the_projects_setting():
+    w, _ = _window(strip=True)
+    try:
+        assert w.chk_infer_ridge.isChecked() and w._project.ridge
+        w.chk_infer_ridge.setChecked(False)
+        assert not MS.ridge_enabled()
+        assert MADProjectConfig.load(w._project.project_dir).ridge is False
+        assert w._infer_perf_kwargs()['ridge'] is False
+    finally:
+        w.chk_infer_ridge.setChecked(True)
+    assert MS.ridge_enabled() and w._project.ridge
+
+
+def test_a_run_with_nothing_to_infer_still_fills_the_ridges(monkeypatch):
+    import time
+    import fnt.usv.usv_detector.mad_inference as MI
+    w, _ = _window()
+    wav = w._active_wav_path()
+    _strip(MS.masks_sibling_path(wav))            # as written before ridges
+    monkeypatch.setattr(MI, "load_model", lambda *a, **k: (None, {}, "cpu"))
+    lines, shown = [], []
+    monkeypatch.setattr(w, "_log", lambda msg, *a, **k: lines.append(str(msg)))
+    monkeypatch.setattr(w, "_show_inference_summary_dialog",
+                        lambda results, cfg=None, ridge_line=None: shown.append((results, ridge_line)))
+    cfg = MI.MADInferenceConfig(model_path="m.pt", **w._infer_perf_kwargs())
+    w._ridge_checked = set()
+    w._start_inference(cfg, [], reporter=w.infer_panel, skip_scope_prompt=True,
+                       ridge_fill=[wav])
+    t0 = time.time()
+    while getattr(w, '_infer_worker', None) is not None and time.time() - t0 < 60:
+        _APP.processEvents()
+        time.sleep(0.01)
+    assert not MS.ridge_status(MS.masks_sibling_path(wav))['needed']
+    assert any("ridges rec.wav: 1 detection(s)" in s for s in lines)
+    assert any(s.startswith("Ridges of the 1 already-analysed file(s): 1 filled")
+               for s in lines)
+    assert not w._is_infer_locked(wav)
+    assert shown == [([], lines[-1])]              # the summary names the ridge pass
 
 
 if __name__ == "__main__":

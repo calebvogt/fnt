@@ -110,6 +110,11 @@ class MADProjectConfig:
 
     # Inference.
     mask_threshold: float = 0.5
+    # Store each detection's and label's brightness ridge (frequency contour,
+    # turns, trill; mad_ridge), and fill in the ridges older .mad files lack:
+    # a resumed run fills its skipped recordings, opening a recording fills
+    # what its stored spectrograms allow. On by default.
+    ridge: bool = True
 
     # Call-type classes the user has confirmed (metadata on each saved
     # training example; the segmentation model itself stays binary). The

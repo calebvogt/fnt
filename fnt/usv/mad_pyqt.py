@@ -2006,15 +2006,18 @@ class MADSpectrogramWidget(SpectrogramWidget):
         if bins is None or ann.get('_ridge_mask') is not ann.get('mask'):
             return
         t0 = ann['t0']
-        runs, cur = [], []
-        for j, b in enumerate(bins):
-            if np.isfinite(b):
-                cur.append(QPointF(tpx_to_x(t0 + j), fpx_to_y(b)))
-            elif cur:
+        runs = []
+        # One row per piece where a mask's pieces share columns (mad_ridge).
+        for row in np.atleast_2d(bins):
+            cur = []
+            for j, b in enumerate(row):
+                if np.isfinite(b):
+                    cur.append(QPointF(tpx_to_x(t0 + j), fpx_to_y(b)))
+                elif cur:
+                    runs.append(cur)
+                    cur = []
+            if cur:
                 runs.append(cur)
-                cur = []
-        if cur:
-            runs.append(cur)
         painter.setBrush(Qt.NoBrush)
         # 2 px: at the outline's 1 px the halo swallows the hue.
         for col, w in ((pal['halo'], RIDGE_W + 2), (pal['ridge'], RIDGE_W)):
@@ -2925,11 +2928,16 @@ class MADInferenceWorker(QThread):
     device_signal = pyqtSignal(str)      # resolved compute device
     file_done_signal = pyqtSignal(dict)  # per-file summary (incl. timing)
     retry_signal = pyqtSignal(int)       # n files about to be re-attempted
+    ridge_done_signal = pyqtSignal(dict)  # one ridge-filled recording
 
-    def __init__(self, cfg, wav_paths: List[str], parent=None):
+    def __init__(self, cfg, wav_paths: List[str], parent=None,
+                 ridge_fill: Optional[List[str]] = None):
         super().__init__(parent)
         self.cfg = cfg
         self.wav_paths = wav_paths
+        # Recordings already analysed by this model, whose missing ridges are
+        # filled after the inference (mad_inference.fill_ridges_for_run).
+        self.ridge_fill = list(ridge_fill or [])
         self._stop = False
         import threading
         # Event is *set* when running, *cleared* when paused.
@@ -2968,6 +2976,8 @@ class MADInferenceWorker(QThread):
                 on_device=lambda d: self.device_signal.emit(d),
                 on_file_done=lambda s: self.file_done_signal.emit(s),
                 on_retry_start=lambda k: self.retry_signal.emit(k),
+                ridge_fill=self.ridge_fill,
+                on_ridge_done=lambda r: self.ridge_done_signal.emit(r),
             )
             self.finished_signal.emit(results)
         except Exception as e:
@@ -7412,12 +7422,32 @@ class MADMainWindow(QMainWindow):
         layout.addWidget(group)
 
     def _infer_perf_kwargs(self) -> dict:
-        """Performance-only inference settings, shared by every place that
-        builds a MADInferenceConfig so the two paths can't drift apart."""
+        """Performance settings, and the project's ridge setting, shared by
+        every place that builds a MADInferenceConfig so the paths can't drift
+        apart."""
         return {
             'batch_size': self.spin_infer_batch.value(),
             'amp': self.chk_infer_amp.isChecked(),
+            'ridge': self._ridge_on(),
         }
+
+    def _ridge_on(self) -> bool:
+        """The project's ridge setting (on without a project)."""
+        return bool(getattr(self._project, 'ridge', True)
+                    if getattr(self, '_project', None) is not None else True)
+
+    def _set_ridge_setting(self, on: bool) -> None:
+        """Brightness ridges on/off for this project (saved with it) and for
+        every store write in this process."""
+        from fnt.usv.usv_detector.fnt_mask_store import set_ridge_enabled
+        set_ridge_enabled(on)
+        if getattr(self, '_project', None) is not None and                 bool(getattr(self._project, 'ridge', True)) != bool(on):
+            self._project.ridge = bool(on)
+            try:
+                self._project.save()
+            except Exception as e:
+                self._log(f"Could not save the ridge setting: {e}")
+        self._ridge_checked = set()
 
     def _overlay_palette(self) -> dict:
         """Review colors for the loaded spectrogram colormap. Shared by the
@@ -7999,6 +8029,20 @@ class MADMainWindow(QMainWindow):
         self.chk_infer_harmonics.setToolTip(HARMONIC_TOGGLE_TIP)
         iform.addRow("", self.chk_infer_harmonics)
 
+        self.chk_infer_ridge = QCheckBox("Brightness ridges")
+        self.chk_infer_ridge.setChecked(True)
+        self.chk_infer_ridge.setToolTip(
+            "<b>Brightness ridge</b> of every detection and label: the "
+            "brightest continuous line through the pixels under its mask "
+            "(its frequency contour), with its turns, turn rate, depth and "
+            "whether it is a trill. One ridge per piece of a mask, so two "
+            "pieces merged into one call never get a jump between them.<br><br>"
+            "On, a run also fills in the ridges of recordings it skips as "
+            "already analysed, and opening a recording fills what its stored "
+            "spectrograms allow. A project setting, for every run.")
+        self.chk_infer_ridge.toggled.connect(self._set_ridge_setting)
+        iform.addRow("", self.chk_infer_ridge)
+
         self.combo_infer_device = QComboBox()
         self._fill_device_combo(self.combo_infer_device)
         self.combo_infer_device.setToolTip(
@@ -8159,21 +8203,28 @@ class MADMainWindow(QMainWindow):
             else:
                 w.valueChanged.connect(fn)
 
-    def _show_inference_summary_dialog(self, results, cfg=None):
+    def _show_inference_summary_dialog(self, results, cfg=None,
+                                       ridge_line=None):
         """Report what a manual inference run found, and acknowledge it.
 
         Finding nothing is a result, not a silent no-op: it usually means the
         threshold or the minimum blob size excluded everything, so the dialog
         names both rather than leaving the user to guess why the file came
-        back empty.
+        back empty. ``ridge_line`` reports the run's ridge pass; a run that
+        had nothing to infer reports only that.
         """
         results = list(results or [])
         ok = [r for r in results if 'error' not in r]
         errs = [r for r in results if 'error' in r]
         total = sum(int(r.get('n_blobs') or 0) for r in ok)
 
+        ridge_only = bool(ridge_line) and not results
         lines = []
-        if total:
+        if ridge_only:
+            lines.append("Every recording was already analysed by this model "
+                         "at these settings.")
+            cfg = None                      # no threshold advice: nothing ran
+        elif total:
             lines.append(f"{total} detection(s) across {len(ok)} file(s), "
                          "pending review.")
         else:
@@ -8199,8 +8250,11 @@ class MADMainWindow(QMainWindow):
         # owned by a hidden window never appears: MAD sat on an invisible
         # summary all night. Unowned and brought forward instead.
         window_only = getattr(self, '_window_only', False)
+        if ridge_line:
+            lines.append(ridge_line)
         dlg = MADRunSummaryTable(
             self, "Inference complete",
+            "Ridges complete." if ridge_only else
             "Inference complete." if total else
             "Inference complete — nothing detected.",
             lines, results)
@@ -11267,6 +11321,10 @@ class MADMainWindow(QMainWindow):
                 and not self._has_rejected_examples(wav)):
             return
 
+        # The ridges this file's stored spectrograms allow, filled before the
+        # crops are read so they draw on this very load.
+        self._fill_open_ridges(wav)
+
         # Per-blob crops (few MB). Migrate a legacy prob file once, carving
         # crops from the CSV's blob boxes when a CSV is present so blob_ids and
         # accept/reject status stay joined.
@@ -11744,7 +11802,8 @@ class MADMainWindow(QMainWindow):
         self._log(f"Launched inference with {os.path.basename(os.path.dirname(path))}: "
                   f"{len(done)} of {len(wavs)} recording(s) already analysed "
                   f"at these settings, {len(todo)} to run")
-        if not todo:
+        ridge_fill = done if cfg.ridge else []
+        if not todo and not ridge_fill:
             QMessageBox.information(
                 self, "Nothing to analyse",
                 f"All {len(wavs)} recording(s) are already analysed by this "
@@ -11757,7 +11816,7 @@ class MADMainWindow(QMainWindow):
         self.btn_infer_run.setEnabled(False)
         self.infer_panel.start_run()
         self._start_inference(cfg, todo, reporter=self.infer_panel,
-                              skip_scope_prompt=True)
+                              skip_scope_prompt=True, ridge_fill=ridge_fill)
         return len(todo)
 
     def launch_training(self, overrides=None, infer_after: bool = False):
@@ -13220,6 +13279,33 @@ class MADMainWindow(QMainWindow):
             else:
                 a += 1
         return (a, p, r)
+
+    def _fill_open_ridges(self, wav: str) -> None:
+        """Fill the brightness ridges a recording's .mad lacks, from what it
+        stores (``fill_ridges`` without the audio: detections analysed before
+        MAD kept their spectrogram wait for a run's ridge pass). Never while a
+        run holds the file, not with ridges off. A stamped file costs one
+        attribute read; one the fill could not complete is not retried this
+        session (each try reads every mask)."""
+        from fnt.usv.usv_detector.fnt_mask_store import ridge_enabled
+        key = self._path_key(wav)
+        checked = getattr(self, '_ridge_checked', None)
+        if checked is None:
+            checked = self._ridge_checked = set()
+        if key in checked or not ridge_enabled() or self._is_infer_locked(wav):
+            return
+        try:
+            from fnt.usv.usv_detector.mad_inference import fill_ridges
+            r = fill_ridges(wav, use_audio=False)
+        except Exception as e:
+            checked.add(key)
+            self._log(f"Ridges of {os.path.basename(wav)} not filled: {e}")
+            return
+        if r.get('needed') and not r.get('stamped'):
+            checked.add(key)
+        if r.get('pred') or r.get('examples'):
+            self._log(f"Ridges filled in {os.path.basename(wav)}: "
+                      f"{r['pred']} detection(s), {r['examples']} label(s)")
 
     @staticmethod
     def _path_key(fp) -> str:
@@ -14792,6 +14878,13 @@ class MADMainWindow(QMainWindow):
 
     def _activate_project(self, cfg: MADProjectConfig):
         self._project = cfg
+        self._ridge_checked = set()
+        if hasattr(self, 'chk_infer_ridge'):
+            self.chk_infer_ridge.blockSignals(True)
+            self.chk_infer_ridge.setChecked(bool(getattr(cfg, 'ridge', True)))
+            self.chk_infer_ridge.blockSignals(False)
+        from fnt.usv.usv_detector.fnt_mask_store import set_ridge_enabled
+        set_ridge_enabled(bool(getattr(cfg, 'ridge', True)))
         # training_data/ moved out of models/ on 2026-09-08 — it is an input to
         # models, not one of them. Contents are a cache rebuilt from the .mad
         # sidecars each run, so a failed move costs a rebuild and nothing more.
@@ -20315,17 +20408,28 @@ class MADMainWindow(QMainWindow):
         if done:
             self._log(f"Resuming: skipping {len(done):,} already-analyzed "
                       f"file(s)")
+            self._scope_ridge_fill = list(done)
             return todo
         return wav_paths
 
     def _start_inference(self, cfg, wav_paths: List[str], reporter=None,
-                         skip_scope_prompt: bool = False):
+                         skip_scope_prompt: bool = False,
+                         ridge_fill: Optional[List[str]] = None):
         # A run chained after training must not stop to ask anything: the
         # user pressed one button and walked away. Everything that needs an
         # answer is asked in _on_inline_train, before the run starts.
+        #
+        # ``ridge_fill``: recordings this model analysed before, skipped by a
+        # resume; their missing brightness ridges are filled after the
+        # inference. The scope prompt supplies them when it resumes.
+        ridge_fill = list(ridge_fill or [])
         if not skip_scope_prompt:
+            self._scope_ridge_fill = []
             wav_paths = self._confirm_run_scope(cfg, wav_paths)
-        if not wav_paths:
+            ridge_fill = list(self._scope_ridge_fill)
+        if not getattr(cfg, 'ridge', True):
+            ridge_fill = []
+        if not wav_paths and not ridge_fill:
             self.status_bar.showMessage("Nothing to analyze")
             self._update_infer_run_enabled()
             return
@@ -20344,7 +20448,13 @@ class MADMainWindow(QMainWindow):
         # its own "Inference complete" box beside the "Run complete" one.
         is_chained_tail = bool(getattr(self, '_post_train_infer_wavs', None))
         progress = reporter or MADRunProgressDialog(self, "MAD Inference")
-        progress.set_stage(f"Running inference on {len(wav_paths)} file(s)…")
+        progress.set_stage(f"Running inference on {len(wav_paths)} file(s)…"
+                           if wav_paths else
+                           f"Checking the ridges of {len(ridge_fill)} "
+                           f"analysed file(s)…")
+        if ridge_fill:
+            progress.append(f"Then: missing brightness ridges of "
+                            f"{len(ridge_fill)} already-analysed file(s)")
         progress.append(f"Model: {cfg.model_path}")
         progress.append(f"Threshold: {cfg.threshold}  "
                         f"Min blob: {cfg.min_blob_pixels}px")
@@ -20380,7 +20490,8 @@ class MADMainWindow(QMainWindow):
                 self._log(f"Could not open run manifest: {e}")
                 self._manifest = None
 
-        worker = MADInferenceWorker(cfg, wav_paths, parent=self)
+        worker = MADInferenceWorker(cfg, wav_paths, parent=self,
+                                    ridge_fill=ridge_fill)
         self._infer_worker = worker
         if hasattr(self, 'btn_infer_pause'):
             self.btn_infer_pause.setText("Pause")
@@ -20400,8 +20511,13 @@ class MADMainWindow(QMainWindow):
         # Per-run, so re-running a recording regroups it rather than being
         # skipped as already done.
         self._harmonics_grouped = set()
-        self._infer_locked = {self._path_key(w) for w in wav_paths}
+        # The ridge pass writes to the skipped recordings too: locked until
+        # it has passed them.
+        self._infer_locked = {self._path_key(w)
+                              for w in list(wav_paths) + ridge_fill}
         self._refresh_file_list_locks()
+        ridge_log = {'pred': 0, 'examples': 0, 'specs': 0, 'files': 0,
+                     'errors': [], 'freed': 0}
 
         # Human-readable stage labels so the X/Y is obviously *tiles* scanned by
         # the model (not detections — those are counted at the end).
@@ -20415,6 +20531,18 @@ class MADMainWindow(QMainWindow):
         scan = {'fi': None, 't0': 0.0, 'i0': 0}
 
         def on_progress(file_i, file_n, wav_name, stage, si, sn):
+            if stage == 'ridge':
+                progress.set_stage(f"Ridges {file_i + 1}/{file_n}: {wav_name}")
+                progress.set_main(file_i, file_n)
+                progress.set_sub(0, 1)
+                # Unlock what the pass is done with, in batches: a lock
+                # refresh walks the whole Audio list.
+                if file_i - ridge_log['freed'] >= 25:
+                    for w in ridge_fill[ridge_log['freed']:file_i]:
+                        self._infer_locked.discard(self._path_key(w))
+                    ridge_log['freed'] = file_i
+                    self._refresh_file_list_locks()
+                return
             label = stage_labels.get(stage, stage)
             if stage == 'infer':
                 now = _t.time()
@@ -20533,7 +20661,20 @@ class MADMainWindow(QMainWindow):
                     progress.append(
                         f"  {Path(r['wav_path']).name}: {r['n_blobs']} blob(s)"
                     )
-            progress.mark_done(ok=(len(errors) == 0))
+            ridge_line = None
+            if ridge_fill:
+                line = ridge_line = (f"Ridges of the {len(ridge_fill)} already-analysed "
+                        f"file(s): {ridge_log['files']} filled, "
+                        f"{ridge_log['pred']} detection(s), "
+                        f"{ridge_log['examples']} label(s)"
+                        + (f", {ridge_log['specs']} spectrogram(s) from the "
+                           f"audio" if ridge_log['specs'] else "")
+                        + (f", {len(ridge_log['errors'])} failed"
+                           if ridge_log['errors'] else "") + ".")
+                progress.append(line)
+                self._log(line)
+            progress.mark_done(ok=(len(errors) == 0
+                                   and not ridge_log['errors']))
             self.status_bar.showMessage(
                 f"Inference complete — {len(results)} file(s), {total} blob(s)"
             )
@@ -20544,7 +20685,8 @@ class MADMainWindow(QMainWindow):
                 # Nothing but this run is on screen: show its summary, then
                 # quit. The Audio-list refresh and the auto-opened file are
                 # for a main window that is not there.
-                self._show_inference_summary_dialog(results, cfg)
+                self._show_inference_summary_dialog(results, cfg,
+                                                    ridge_line=ridge_line)
                 QTimer.singleShot(0, QApplication.instance().quit)
                 return
             self._scan_all_file_counts()
@@ -20564,7 +20706,8 @@ class MADMainWindow(QMainWindow):
             # A chained training run reports both halves in its own summary;
             # a second dialog here would be the same news twice.
             if not is_chained_tail:
-                self._show_inference_summary_dialog(results, cfg)
+                self._show_inference_summary_dialog(results, cfg,
+                                                    ridge_line=ridge_line)
                 self.infer_panel.reset_idle()
 
         def on_error(msg: str):
@@ -20645,6 +20788,24 @@ class MADMainWindow(QMainWindow):
             progress.append(line)
             self._log(line)
 
+        def on_ridge_done(r):
+            name = os.path.basename(str(r.get('wav_path', '')))
+            if r.get('error'):
+                ridge_log['errors'].append(name)
+                line = f"  ✖ ridges {name}: FAILED — {r['error']}"
+            elif r.get('pred') or r.get('examples') or r.get('specs'):
+                for k in ('pred', 'examples', 'specs'):
+                    ridge_log[k] += int(r.get(k) or 0)
+                ridge_log['files'] += 1
+                line = (f"  ridges {name}: {r.get('pred', 0)} detection(s), "
+                        f"{r.get('examples', 0)} label(s)"
+                        + (f" ({r['specs']} spectrogram(s) from the audio)"
+                           if r.get('specs') else ""))
+            else:
+                return
+            progress.append(line)
+            self._log(line)
+
         def on_retry(n):
             line = (f"\nRetrying {n} failed file(s) — every per-file grid has "
                     f"been released, so this pass has headroom the first did "
@@ -20655,6 +20816,7 @@ class MADMainWindow(QMainWindow):
         worker.device_signal.connect(on_device)
         worker.retry_signal.connect(on_retry)
         worker.file_done_signal.connect(on_file_done)
+        worker.ridge_done_signal.connect(on_ridge_done)
         worker.progress_signal.connect(on_progress)
         worker.finished_signal.connect(on_finished)
         worker.error_signal.connect(on_error)
