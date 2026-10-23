@@ -750,6 +750,22 @@ class VideoProcessorWorker(QThread):
                 except Exception:
                     pass
     
+    def _encoder_args(self):
+        """The encoder part of the FFmpeg command: the chosen codec and its quality.
+
+        CPU codecs (libx265/libx264) take the speed preset and CRF. The NVIDIA GPU
+        encoders (*_nvenc) have neither: they run constant-quality VBR at the
+        balanced preset p4, with CQ = CRF + 8. On VT-P001 resource-zone IR video
+        (720p HEVC sources, 2026-10-23) CQ 28 matched x265 ultrafast CRF 20 in
+        SSIM against the source (0.945 vs 0.942) at about 1.5x the size.
+        """
+        if self.codec.endswith("_nvenc"):
+            return ["-c:v", self.codec, "-preset", "p4", "-rc", "vbr",
+                    "-cq", str(min(51, int(self.crf_quality) + 8)), "-b:v", "0"]
+        return ["-vcodec", self.codec,                 # libx265 or libx264
+                "-preset", self.preset,                # speed preset
+                "-crf", str(self.crf_quality)]         # quality (0-51): lower is better
+
     def build_ffmpeg_command(self, input_file, output_file):
         """Build the FFmpeg command based on user settings with SLEAP-compatible frame handling"""
         
@@ -765,9 +781,7 @@ class VideoProcessorWorker(QThread):
             "-hwaccel", "none",
             "-threads", "4",
             "-i", input_file,
-            "-vcodec", self.codec,               # User-selected codec (libx265 or libx264)
-            "-preset", self.preset,              # User-selected speed preset
-            "-crf", str(self.crf_quality),       # Quality (0-51): lower is better
+        ] + self._encoder_args() + [
             "-pix_fmt", "yuv420p",
         ]
         
@@ -1477,9 +1491,13 @@ class VideoProcessingGUI(QMainWindow):
         # Video Codec option
         advanced_layout.addWidget(QLabel("Video Codec:"), 0, 0)
         self.codec_combo = QComboBox()
-        self.codec_combo.addItems(["libx265 (H.265/HEVC)", "libx264 (H.264/AVC)"])
+        self.codec_combo.addItems(["libx265 (H.265/HEVC)", "libx264 (H.264/AVC)",
+                                   "hevc_nvenc (H.265, NVIDIA GPU)", "h264_nvenc (H.264, NVIDIA GPU)"])
         self.codec_combo.setCurrentText("libx265 (H.265/HEVC)")
-        self.codec_combo.setToolTip("Video codec: H.265 offers better compression but slower encoding; H.264 is more compatible")
+        self.codec_combo.setToolTip(
+            "Video codec: H.265 offers better compression but slower encoding; H.264 is more compatible.\n"
+            "The NVIDIA GPU encoders (nvenc) take the encoding off the CPU. They ignore the speed preset and\n"
+            "use quality CQ = CRF + 8, which matched CRF 20 x265 quality on VoleTerra IR footage at ~1.5x the size.")
         advanced_layout.addWidget(self.codec_combo, 0, 1)
         
         # Speed Preset option
@@ -1868,7 +1886,14 @@ class VideoProcessingGUI(QMainWindow):
             if os.path.exists(expected_output) and os.path.getsize(expected_output) > 0:
                 already_processed_count += 1
 
-        if already_processed_count > 0:
+        if already_processed_count > 0 and getattr(self, '_auto_skip_existing', False):
+            # --skip-existing: an unattended launch answers "Skip Already
+            # Processed" itself instead of waiting on the dialog.
+            skip_already_processed = True
+            self.log_message(
+                f"Skipping videos already processed ({already_processed_count} of "
+                f"{total_video_count} have output in proc/) -- --skip-existing")
+        elif already_processed_count > 0:
             msg_box = QMessageBox(self)
             msg_box.setWindowTitle("Already Processed Videos Detected")
             msg_box.setText(
@@ -2156,11 +2181,26 @@ def _launch_parser():
     p.add_argument("--start", action="store_true",
                    help="Start processing the --input-dir folders at once, "
                         "with the default settings.")
+    p.add_argument("--codec", default=None, metavar="CODEC",
+                   help="Video codec to select: libx265, libx264, hevc_nvenc or "
+                        "h264_nvenc (the last two encode on an NVIDIA GPU).")
+    p.add_argument("--skip-existing", action="store_true",
+                   help="Skip videos that already have an output in proc/ without "
+                        "asking (to resume an unattended run).")
     return p
 
 
 def apply_launch_args(window, args) -> None:
-    """Preselect ``args.input_dir`` in ``window``; start if ``args.start``."""
+    """Preselect ``args.input_dir`` in ``window`` and the ``args.codec``;
+    start if ``args.start``."""
+    if getattr(args, 'codec', None):
+        items = [window.codec_combo.itemText(i) for i in range(window.codec_combo.count())]
+        match = [t for t in items if t.split()[0] == args.codec]
+        if not match:
+            raise SystemExit(f"--codec {args.codec}: not one of "
+                             + ", ".join(t.split()[0] for t in items))
+        window.codec_combo.setCurrentText(match[0])
+    window._auto_skip_existing = bool(getattr(args, 'skip_existing', False))
     for d in args.input_dir:
         d = os.path.abspath(d)
         if os.path.isdir(d) and d not in window.selected_dirs:
