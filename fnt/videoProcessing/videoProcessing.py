@@ -757,7 +757,10 @@ class VideoProcessorWorker(QThread):
         encoders (*_nvenc) have neither: they run constant-quality VBR at the
         balanced preset p4, with CQ = CRF + 8. On VT-P001 resource-zone IR video
         (720p HEVC sources, 2026-10-23) CQ 28 matched x265 ultrafast CRF 20 in
-        SSIM against the source (0.945 vs 0.942) at about 1.5x the size.
+        SSIM against the source (0.945 vs 0.942) at about 1.5x the size at 720p,
+        but upscaled to 1080p the files came out ~3.7x x265's (500 vs 136 kbps)
+        at the same speed (decode + scale on the CPU set the pace). Use them to
+        keep encoding off an unstable CPU, not as the standard settings.
         """
         if self.codec.endswith("_nvenc"):
             return ["-c:v", self.codec, "-preset", "p4", "-rc", "vbr",
@@ -1497,7 +1500,8 @@ class VideoProcessingGUI(QMainWindow):
         self.codec_combo.setToolTip(
             "Video codec: H.265 offers better compression but slower encoding; H.264 is more compatible.\n"
             "The NVIDIA GPU encoders (nvenc) take the encoding off the CPU. They ignore the speed preset and\n"
-            "use quality CQ = CRF + 8, which matched CRF 20 x265 quality on VoleTerra IR footage at ~1.5x the size.")
+            "use quality CQ = CRF + 8. Their files are much larger than x265's (~3.7x for 720p video upscaled\n"
+            "to 1080p), so x265 stays the standard.")
         advanced_layout.addWidget(self.codec_combo, 0, 1)
         
         # Speed Preset option
