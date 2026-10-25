@@ -142,16 +142,61 @@ def test_no_video_says_why():
         MV.read_clip(wav, 300.0, 301.0, "CAM16", cfg)
 
 
+def _rfid_csvs(root):
+    """Reads and bouts of two mice at zone 4 (antenna 16) of T004, on the RFID
+    clock: recording t = 0 is 2021-10-25 02:53:33."""
+    import pandas as pd
+    t0 = (datetime(2021, 10, 25, 2, 53, 33) - datetime(1970, 1, 1)).total_seconds()
+    reads = pd.DataFrame({"trial": "T004", "code": ["ATL", "ATL", "GWN", "DNA"],
+                          "antenna": [16, 16, 16, 1], "read_tag": 0.0,
+                          "field_time": [t0 + 1.5, t0 + 2.5, t0 + 9.0, t0 + 2.0], "noon_day": 4})
+    bouts = pd.DataFrame({"animal": ["T004 ATL", "T004 GWN"], "trial": "T004", "code": ["ATL", "GWN"],
+                          "genotype": "WD", "sex": ["M", "F"], "bout": 1, "antenna": 16, "zone": 4,
+                          "noon_day": 4, "start": [t0 - 100, t0 + 8.0], "stop": [t0 + 5.0, t0 + 50.0]})
+    rp, bp = os.path.join(root, "reads.csv"), os.path.join(root, "bouts.csv")
+    reads.to_csv(rp, index=False)
+    bouts.to_csv(bp, index=False)
+    return {"reads": [rp], "bouts": [bp], "channel_zones": {"ch1": 4},
+            "zone_antennas": {"4": [16], "1": [1]}}
+
+
+def test_the_rfid_at_the_microphones_zone_comes_on_the_recordings_clock():
+    root, wav, d = _dataset()
+    d["rfid"] = _rfid_csvs(root)
+    cfg = MV.VideoQCConfig.from_dict(d)
+    z = MV.zone_rfid(wav, 0.0, 4.0, cfg)
+    assert z.zone == 4 and z.antennas == [16]
+    assert sorted(z.reads["t_s"].round(2)) == [1.5, 2.5]          # zone 1's read is left out
+    assert list(z.bouts["code"]) == ["ATL"]                        # GWN's bout starts at 8 s
+    assert abs(float(z.bouts["t1_s"].iloc[0]) - 5.0) < 1e-6
+
+
+def test_the_mice_are_outlined_every_kth_frame(monkeypatch):
+    _, wav, d = _dataset()
+    cfg = MV.VideoQCConfig.from_dict(d)
+    clip = MV.read_clip(wav, 1.0, 2.0, "CAM16", cfg)
+    square = np.zeros(clip.frames[0].shape[:2], bool)
+    square[10:20, 10:30] = True
+    monkeypatch.setattr(MV, "_detector", lambda model, device: (lambda fr: [(square, 0.9)]))
+    masks = MV.segment_clip(clip, "model", every=3)
+    assert sorted(masks) == list(range(0, len(clip.frames), 3))
+    cnt, score = masks[0][0]
+    assert score == 0.9 and cnt[:, 0].min() == 10 and cnt[:, 1].max() == 19
+    assert MV.masks_at(masks, 2, 3) is masks[0] and MV.masks_at(masks, 3, 3) is masks[3]
+
+
 # ----------------------------------------------------------------------
 # MAD's button and window
 # ----------------------------------------------------------------------
-def _window(with_video=True):
+def _window(with_video=True, with_rfid=False):
     global _APP
     from PyQt5.QtWidgets import QApplication
     import fnt.usv.mad_pyqt as M
     from fnt.usv.usv_detector.mad_project import MADProjectConfig, create_mad_project
     _APP = QApplication.instance() or QApplication([])
     root, wav, d = _dataset()
+    if with_rfid:
+        d["rfid"] = _rfid_csvs(root)
     proj = os.path.join(root, "p")
     create_mad_project(proj)
     if with_video:
@@ -173,6 +218,19 @@ def _wait_loaded(dlg, timeout=30):
         _APP.processEvents()
         time.sleep(0.01)
     return dlg._clip
+
+
+def test_the_window_lists_who_the_reader_saw_in_the_zone():
+    w = _window(with_rfid=True)
+    sg = w.spectrogram
+    sg.view_start, sg.view_end = 1.0, 3.0                 # clip 0-4 s
+    w._show_video_qc()
+    dlg = w._video_qc_window()
+    _wait_loaded(dlg)
+    assert "zone 4 (antenna 16)" in dlg.lbl_rfid.text()
+    assert "ATL (M): 2 reads" in dlg.lbl_rfid.text()
+    assert dlg.rfid_strip._rows == ["ATL"]
+    assert w.btn_video_qc.text() == "Fusion QC"
 
 
 def test_the_button_is_off_without_a_video_source():

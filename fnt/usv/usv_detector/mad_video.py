@@ -25,7 +25,16 @@ The file says how to get from a recording to its video::
       "video_file": "{camera}_*.mp4",          # a camera's files in it
       "video_start": {"regex": "_(\\d{4}-\\d{2}-\\d{2}_\\d{2}_\\d{2}_\\d{2}_\\d{3})\\.mp4$",
                       "format": "%Y-%m-%d_%H_%M_%S_%f"},
-      "offsets_s": {"T006": 0.0}               # per trial: video clock minus audio clock
+      "offsets_s": {"T006": 0.0},              # per trial: video clock minus audio clock
+      "mask_models": {"CAM13": "Z:/.../MTT_.../models/<run>"},   # Mask Tracker run per camera
+      "mask_every": 3,                         # segment every 3rd frame of a clip (CPU)
+      "rfid": {                                # who the reader saw in the microphone's zone
+        "reads": ["<csv: trial, code, antenna, field_time (s since 1970, wall clock)>"],
+        "bouts": ["<csv: trial, animal, code, sex, zone, start, stop>"],
+        "channel_zones": {"ch1": 4, "ch2": 3, "ch3": 1, "ch4": 2},
+        "zone_antennas": {"1": [1], "2": [4], "3": [13], "4": [16]},
+        "offsets_s": {}                        # per trial: RFID clock minus audio clock
+      }
     }
 
 A moment ``t`` seconds into a recording is the wall-clock time ``start + t``,
@@ -63,6 +72,10 @@ class VideoQCConfig:
     video_file: str = "{camera}_*.mp4"
     video_start: Dict = field(default_factory=dict)
     offsets_s: Dict[str, float] = field(default_factory=dict)
+    mask_models: Dict[str, str] = field(default_factory=dict)
+    mask_every: int = 3
+    mask_device: str = "cpu"
+    rfid: Dict = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: Dict) -> 'VideoQCConfig':
@@ -341,3 +354,115 @@ def read_clip(wav: str, t0_s: float, t1_s: float, camera: str, cfg: VideoQCConfi
     if not frames:
         raise VideoQCError(f"Could not decode {camera}'s frames ({os.path.basename(spans[0].path)}).")
     return VideoClip(camera, np.asarray(times), frames, spans, start, offset)
+
+
+# ----------------------------------------------------------------------
+# Masks: the camera's Mask Tracker model on the clip's frames
+# ----------------------------------------------------------------------
+@lru_cache(maxsize=4)
+def _detector(model_dir: str, device: str):
+    """Mask Tracker's own frame detector (behavior_features.yolo_detector): the
+    same filtering as its batch inference. Loaded once per model."""
+    from fnt.videoTracking.behavior_features import yolo_detector
+    return yolo_detector(model_dir, device=device)
+
+
+def segment_clip(clip: VideoClip, model_dir: str, every: int = 3, device: str = "cpu",
+                 progress: Optional[Callable[[int, int], None]] = None,
+                 cancelled: Optional[Callable[[], bool]] = None) -> Dict[int, List[Tuple[np.ndarray, float]]]:
+    """Mouse outlines on every ``every``-th frame of a clip: {frame index:
+    [(contour as an (n, 2) array of frame pixels, score)]}. A frame between two
+    segmented ones shows the earlier one's (see :func:`masks_at`)."""
+    import cv2
+    detect = _detector(model_dir, device)
+    idx = list(range(0, len(clip.frames), max(1, int(every))))
+    out: Dict[int, List[Tuple[np.ndarray, float]]] = {}
+    for n, i in enumerate(idx):
+        if cancelled is not None and cancelled():
+            break
+        fr = clip.frames[i]
+        rgb = cv2.cvtColor(fr, cv2.COLOR_GRAY2BGR) if fr.ndim == 2 else fr
+        dets = []
+        for mask, score in detect(rgb):
+            cs, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for c in cs:
+                if len(c) >= 3:
+                    dets.append((c.reshape(-1, 2), score))
+        out[i] = dets
+        if progress is not None:
+            progress(n + 1, len(idx))
+    return out
+
+
+def masks_at(masks: Dict[int, List], i: int, every: int) -> Optional[List]:
+    """The outlines to show on frame ``i``: its own, or the last segmented
+    frame's within ``every`` frames."""
+    for j in range(i, max(-1, i - max(1, every)), -1):
+        if j in masks:
+            return masks[j]
+    return None
+
+
+# ----------------------------------------------------------------------
+# RFID: who the reader saw at the microphone's zone
+# ----------------------------------------------------------------------
+_RFID_CACHE: Dict[Tuple[str, str], object] = {}
+
+
+def _rfid_table(paths: Tuple[str, ...], trial: str, kind: str):
+    """One trial's rows of the RFID CSVs (read once per session per trial)."""
+    import pandas as pd
+    key = (kind + "|" + "|".join(paths), trial)
+    cols = (["trial", "code", "antenna", "field_time"] if kind == "reads" else
+            ["trial", "animal", "code", "sex", "zone", "start", "stop"])
+    if key not in _RFID_CACHE:
+        parts = []
+        for p in paths:
+            if not os.path.isfile(p):
+                continue
+            d = pd.read_csv(p, dtype={"trial": str, "code": str},
+                            usecols=lambda c: c in cols)
+            parts.append(d[d["trial"] == trial])
+        _RFID_CACHE[key] = (pd.concat(parts, ignore_index=True) if parts else pd.DataFrame())
+    return _RFID_CACHE[key]
+
+
+@dataclass
+class ZoneRFID:
+    """The reads at a zone's antennas over a stretch of a recording, and the
+    visit bouts that overlap it, on the recording's clock (seconds)."""
+    zone: Optional[int]
+    antennas: List[int]
+    reads: object                 # DataFrame: t_s, code, antenna
+    bouts: object                 # DataFrame: animal, code, sex, t0_s, t1_s
+    offset_s: float = 0.0
+
+
+def zone_rfid(wav: str, t0_s: float, t1_s: float, cfg: VideoQCConfig) -> Optional[ZoneRFID]:
+    """The RFID reads and bouts at the recording's zone between ``t0_s`` and
+    ``t1_s`` (None if the project names no RFID data)."""
+    import pandas as pd
+    r = cfg.rfid or {}
+    if not r:
+        return None
+    trial, channel = recording_ids(wav, cfg)
+    start = recording_start(wav, cfg)
+    if trial is None or start is None:
+        return None
+    zone = (r.get("channel_zones") or {}).get(channel)
+    ants = [int(a) for a in (r.get("zone_antennas") or {}).get(str(zone), [])]
+    offset = float((r.get("offsets_s") or {}).get(trial, 0.0))
+    s0 = (start - datetime(1970, 1, 1)).total_seconds() + offset   # recording t=0 on the RFID clock
+    reads = _rfid_table(tuple(r.get("reads", [])), trial, "reads")
+    if len(reads):
+        reads = reads[reads["antenna"].isin(ants) &
+                      (reads["field_time"] >= s0 + t0_s) & (reads["field_time"] <= s0 + t1_s)]
+        reads = pd.DataFrame({"t_s": reads["field_time"] - s0, "code": reads["code"],
+                              "antenna": reads["antenna"]})
+    bouts = _rfid_table(tuple(r.get("bouts", [])), trial, "bouts")
+    if len(bouts):
+        bouts = bouts[(bouts["zone"] == zone) & (bouts["stop"] >= s0 + t0_s) & (bouts["start"] <= s0 + t1_s)]
+        bouts = pd.DataFrame({"animal": bouts.get("animal"), "code": bouts["code"],
+                              "sex": bouts.get("sex"), "t0_s": bouts["start"] - s0,
+                              "t1_s": bouts["stop"] - s0})
+    return ZoneRFID(zone, ants, reads, bouts, offset)

@@ -6439,21 +6439,26 @@ class MADMainWindow(QMainWindow):
 
     _COPY_VIEW_LABEL = "Copy View"
     _VIDEO_QC_OFF_TIP = (
-        "Video QC: the video filmed alongside the view — the microphone's own "
-        "camera, synced to the playhead.\n"
+        "Fusion QC: what was happening at the microphone over the view — its "
+        "camera, the mice in it and the RFID reads at its zone, synced to the "
+        "playhead.\n"
         "\n"
         "Off: this project names no video. Put a video_qc.json in the project "
         "folder saying where the video is, how to read the recordings' and the "
         "videos' start times, and which camera watched each channel (see "
         "fnt/usv/usv_detector/mad_video.py), then reopen the project.")
     _VIDEO_QC_ON_TIP = (
-        "Video QC: open the video filmed alongside the view (plus 1 s either "
+        "Fusion QC: open the video filmed alongside the view (plus 1 s either "
         "side) — the microphone's own camera by default, any other camera of "
         "the project on request.\n"
         "\n"
         "It follows the playhead: Play the audio and the frame keeps pace; drag "
         "the video's slider or play it silently and the playhead line moves on "
         "the spectrogram. Frames during the selected call get a red border.\n"
+        "\n"
+        "With a Mask Tracker model named for the camera, the mice it finds are "
+        "outlined; with RFID data named, the reads at the microphone's zone run "
+        "under the video.\n"
         "\n"
         "The two clocks come from the file names (or the Avisoft log), so check "
         "the time the camera burns into each frame against the one shown above "
@@ -7092,7 +7097,7 @@ class MADMainWindow(QMainWindow):
             lambda _checked=False: self.render_spectrogram_clip())
         controls_layout.addWidget(self.btn_render_clip)
 
-        self.btn_video_qc = QPushButton("Video QC")
+        self.btn_video_qc = QPushButton("Fusion QC")
         self.btn_video_qc.setFixedWidth(84)
         self.btn_video_qc.setFocusPolicy(Qt.NoFocus)
         self.btn_video_qc.setEnabled(False)
