@@ -189,6 +189,36 @@ Where to spend labeling time: sort the Detections list by **Score** and work the
 middle — calls near the decision threshold are where a label changes the model
 most. Confidently right and confidently wrong calls teach it little.
 
+### When the spectrogram can't decide: Fusion QC
+
+A running wheel, a mouse chewing or scrabbling in bedding, and a faint call can
+look alike in a spectrogram. If the arena was filmed, **Fusion QC** (right end of
+the controls bar) shows what was happening at the microphone over the view (plus
+1 s either side):
+
+- the camera that watched the microphone, synced to the playhead both ways —
+  Play the audio and the frame keeps pace; drag the video's slider, or play it
+  silently, and the playhead line moves on the spectrogram;
+- the mice that camera's Mask Tracker model finds, outlined (every few frames;
+  colours tell mice apart within a frame, they are not identities);
+- the RFID reads and visit bouts at the microphone's zone, one row per mouse,
+  under the video;
+- **Layout ▸ Arena**: every camera at once, laid out as the arena is, each zone
+  camera labelled with the mice RFID places in it at that moment — calls carry
+  between zones, so a call on one microphone can come from the next zone;
+- frames during the selected detection get a red border.
+
+It needs a `video_qc.json` in the project folder: how to read each recording's
+trial, channel and start time (from its file name or the Avisoft log), which
+camera watched each channel, where each camera's files are and how to read their
+start times, and optionally the Mask Tracker model per camera, the RFID tables,
+the arena layout and per-trial clock offsets. The fields are documented at the
+top of `fnt/usv/usv_detector/mad_video.py`. Without the file the button stays off.
+
+Clocks: each sensor kept its own clock, so check the time a camera burns into its
+frames against the one Fusion QC prints above it, and set `offsets_s` (video) and
+`rfid.offsets_s` per trial once you know them.
+
 ---
 
 ## 7. Evaluate before you scale
