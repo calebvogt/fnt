@@ -10,6 +10,12 @@ its video. ``--focus-out`` writes the frame names as a list for
 The CSV needs columns ``video`` (path) and ``frame`` (0-based index). Frames
 already in ``training_frames/`` are kept, not rewritten. Run it while the
 project is not open in the GUI: both write ``project_config.json``.
+
+``pack-session --project P --focus LIST --out DIR`` copies a focus list's frames
+and labels into a portable session folder that opens as a project on any
+machine with FNT; ``unpack-session --session S`` merges the labels made there
+back into the project (see :mod:`fnt.videoTracking.mtt_portable`). Unpack while
+the project is not open in the GUI: both write ``annotations.json``.
 """
 from __future__ import annotations
 
@@ -182,6 +188,22 @@ def _parser():
                         help="Rebuild windows' candidate bouts with the current rules from their saved "
                              "tracks and pairs CSVs (no detection).")
     r_.add_argument("--bouts", nargs="+", required=True, help="*_bouts.csv files to rewrite.")
+    k_ = sub.add_parser("pack-session",
+                        help="Copy a focus list's frames and labels into a portable session folder "
+                             "(e.g. on OneDrive) that opens as a project on any machine with FNT.")
+    k_.add_argument("--project", required=True, help="Project folder or its project_config.json.")
+    k_.add_argument("--focus", required=True, help="Focus list: frame names, one per line.")
+    k_.add_argument("--out", required=True, help="Folder the session folder goes into.")
+    k_.add_argument("--name", default=None, help="Session folder name (default: project + time).")
+    k_.add_argument("--note", default="", help="A line for the README (what to do).")
+    u_ = sub.add_parser("unpack-session",
+                        help="Merge a session's labels back into its project, frame by frame.")
+    u_.add_argument("--session", required=True, help="The session folder.")
+    u_.add_argument("--project", default=None,
+                    help="Merge into this project instead of the one it was packed from.")
+    u_.add_argument("--force", action="store_true",
+                    help="Overwrite frames whose labels changed in the project since packing.")
+    u_.add_argument("--dry-run", action="store_true", help="Report what would merge; write nothing.")
     return p
 
 
@@ -237,6 +259,22 @@ def main(argv=None) -> int:
         from .behavior_features import rebuild_bouts
         for p in args.bouts:
             print(f"{rebuild_bouts(p)} bouts: {os.path.basename(p)}", flush=True)
+        return 0
+    if args.cmd == "pack-session":
+        from .mtt_portable import pack_session, read_focus
+        path = pack_session(args.project, read_focus(args.focus), args.out, args.name, args.note)
+        print(f"session: {path}")
+        return 0
+    if args.cmd == "unpack-session":
+        from .mtt_portable import unpack_session
+        try:
+            res = unpack_session(args.session, args.project, args.force, args.dry_run)
+        except RuntimeError as e:
+            print(str(e), file=sys.stderr)
+            return 1
+        print(f"{'would merge' if args.dry_run else 'merged'} {res['frames']} frame(s)"
+              f"{'; overwrote ' + str(len(res['conflicts'])) + ' changed frame(s)' if res['conflicts'] else ''}"
+              f"{'; backup ' + res['backup'] if res['backup'] else ''}")
         return 0
     return 2
 
