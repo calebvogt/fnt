@@ -1,9 +1,9 @@
 """MAD's review view draws each detection's brightness ridge through its mask.
 
 The ridge (mad_ridge, stored in /pred_ridge) is read with the prediction crops
-when a recording opens, converted to spectrogram bins, and drawn as a line in
-every view mode. The "Ridges" toggle above the spectrogram hides it, and a mask
-replaced by an edit hides its ridge, which no longer fits it.
+when a recording opens, converted to spectrogram bins, and drawn as a line with
+the masks. "Spec only" (V) and the "Ridges" toggle above the spectrogram hide
+it, and a mask replaced by an edit hides its ridge, which no longer fits it.
 
 Runs under pytest, or directly.
 """
@@ -123,13 +123,26 @@ def test_the_ridge_loads_with_the_detection_in_bins():
 def test_the_ridge_is_drawn_and_the_toggle_hides_it():
     w, _ = _window()
     col = M.overlay_palette(getattr(w.spectrogram, 'colormap_name', None))['ridge']
-    for mode in ('overlay', 'spec'):
-        w.spectrogram.view_mode = mode
-        w.chk_ridges.setChecked(True)
-        assert _ridge_pixels(_show_call(w), col) > 50, mode
-        w.chk_ridges.setChecked(False)
-        assert _ridge_pixels(_show_call(w), col) == 0, mode
+    w._set_view_mode('overlay')
     w.chk_ridges.setChecked(True)
+    assert _ridge_pixels(_show_call(w), col) > 50
+    w.chk_ridges.setChecked(False)
+    assert _ridge_pixels(_show_call(w), col) == 0
+    w.chk_ridges.setChecked(True)
+
+
+def test_spec_only_hides_the_ridge():
+    w, _ = _window()
+    col = M.overlay_palette(getattr(w.spectrogram, 'colormap_name', None))['ridge']
+    w.chk_ridges.setChecked(True)
+    w._set_view_mode('overlay')
+    assert _ridge_pixels(_show_call(w), col) > 50
+    w._shortcut_cycle_view()                      # V: Spec + Mask -> Spec only
+    assert w.spectrogram.view_mode == 'spec'
+    assert _ridge_pixels(_show_call(w), col) == 0
+    w._shortcut_cycle_view()                      # V again: the ridge is back
+    assert w.spectrogram.view_mode == 'overlay'
+    assert _ridge_pixels(_show_call(w), col) > 50
 
 
 def test_an_edited_mask_hides_its_ridge():

@@ -2344,9 +2344,10 @@ class MADSpectrogramWidget(SpectrogramWidget):
                     painter.restore()
                     self._note_hits.append((mr.adjusted(-2, -2, 2, 2), ai))
 
-        # Brightness ridges, in every view mode: over the bare spectrogram is
-        # where you judge whether the line follows the call.
-        if self.show_ridges and overlays_visible and self.annotations:
+        # Brightness ridges, with the masks: "Spec only" (V) shows the bare
+        # spectrogram, so it hides them like every other overlay.
+        if (self.show_ridges and self.view_mode != 'spec' and overlays_visible
+                and self.annotations):
             painter.save()
             painter.setClipRect(spec_rect)
             for ai, ann in enumerate(self.annotations):
