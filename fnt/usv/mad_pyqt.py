@@ -6438,6 +6438,26 @@ class MADMainWindow(QMainWindow):
     BASE_TITLE = "FNT Mask Audio Detector"
 
     _COPY_VIEW_LABEL = "Copy View"
+    _VIDEO_QC_OFF_TIP = (
+        "Video QC: the video filmed alongside the view — the microphone's own "
+        "camera, synced to the playhead.\n"
+        "\n"
+        "Off: this project names no video. Put a video_qc.json in the project "
+        "folder saying where the video is, how to read the recordings' and the "
+        "videos' start times, and which camera watched each channel (see "
+        "fnt/usv/usv_detector/mad_video.py), then reopen the project.")
+    _VIDEO_QC_ON_TIP = (
+        "Video QC: open the video filmed alongside the view (plus 1 s either "
+        "side) — the microphone's own camera by default, any other camera of "
+        "the project on request.\n"
+        "\n"
+        "It follows the playhead: Play the audio and the frame keeps pace; drag "
+        "the video's slider or play it silently and the playhead line moves on "
+        "the spectrogram. Frames during the selected call get a red border.\n"
+        "\n"
+        "The two clocks come from the file names (or the Avisoft log), so check "
+        "the time the camera burns into each frame against the one shown above "
+        "it.")
     #: Copy-out resolution. Fixed at 600 — safe for a printed figure panel
     #: and comfortably above the 300 journal minimum. It was a picker, but
     #: every real use wanted the highest setting and the control cost a slot
@@ -7071,6 +7091,14 @@ class MADMainWindow(QMainWindow):
         self.btn_render_clip.clicked.connect(
             lambda _checked=False: self.render_spectrogram_clip())
         controls_layout.addWidget(self.btn_render_clip)
+
+        self.btn_video_qc = QPushButton("Video QC")
+        self.btn_video_qc.setFixedWidth(84)
+        self.btn_video_qc.setFocusPolicy(Qt.NoFocus)
+        self.btn_video_qc.setEnabled(False)
+        self.btn_video_qc.setToolTip(self._VIDEO_QC_OFF_TIP)
+        self.btn_video_qc.clicked.connect(lambda _checked=False: self._show_video_qc())
+        controls_layout.addWidget(self.btn_video_qc)
 
         # The controls row is one non-wrapping run of fixed-width widgets, so
         # its layout minimum (1120px at the default font) propagated up as the
@@ -11118,6 +11146,121 @@ class MADMainWindow(QMainWindow):
             chk.setChecked(visible)
             chk.blockSignals(False)
 
+    # ------------------------------------------------------------------
+    # Video QC: the camera that watched the microphone (mad_video_qc)
+    # ------------------------------------------------------------------
+    def _load_video_qc_config(self):
+        """Read the project's video_qc.json (None if it has none) and set the
+        button. A broken file is reported, not raised: video is optional."""
+        from fnt.usv.usv_detector.mad_video import VideoQCConfig
+        self._video_qc_cfg = None
+        proj = getattr(self, '_project', None)
+        try:
+            self._video_qc_cfg = VideoQCConfig.load(
+                getattr(proj, 'project_dir', None))
+        except Exception as e:
+            self._log(f"video_qc.json could not be read: {e}")
+        on = self._video_qc_cfg is not None
+        if hasattr(self, 'btn_video_qc'):
+            self.btn_video_qc.setEnabled(on)
+            self.btn_video_qc.setToolTip(
+                self._VIDEO_QC_ON_TIP if on else self._VIDEO_QC_OFF_TIP)
+
+    def _video_qc_window(self, create: bool = False):
+        dlg = getattr(self, '_video_qc_dialog', None)
+        if dlg is not None:
+            try:
+                import sip
+                if sip.isdeleted(dlg):
+                    dlg = None
+            except Exception:
+                pass
+        if dlg is None and create:
+            from fnt.usv.mad_video_qc import MADVideoQCWindow
+            dlg = MADVideoQCWindow(self)
+            dlg.position_changed.connect(self._on_video_qc_position)
+            dlg.visibility_changed.connect(self._on_video_qc_visibility)
+        self._video_qc_dialog = dlg
+        return dlg
+
+    def _show_video_qc(self):
+        """Open (or refresh) the Video QC window on the view: the stretch on
+        screen plus 1 s either side, from the channel's own camera."""
+        from fnt.usv.usv_detector.mad_video import VideoQCConfig
+        wav = self._active_wav_path()
+        if not wav or self.audio_data is None:
+            self.status_bar.showMessage("Load a recording first")
+            return
+        # Re-read the file each time, so an edit to it applies without reopening.
+        try:
+            cfg = VideoQCConfig.load(getattr(self._project, 'project_dir', None))
+        except Exception as e:
+            QMessageBox.warning(self, "Video QC",
+                                f"video_qc.json could not be read:\n\n{e}")
+            return
+        if cfg is None:
+            QMessageBox.information(self, "Video QC", self._VIDEO_QC_OFF_TIP)
+            return
+        self._video_qc_cfg = cfg
+        sg = self.spectrogram
+        total = float(getattr(sg, 'total_duration', 0.0) or 0.0)
+        t0 = max(0.0, float(sg.view_start) - 1.0)
+        t1 = float(sg.view_end) + 1.0
+        if total > 0:
+            t1 = min(total, t1)
+        dlg = self._video_qc_window(create=True)
+        dlg.request(wav, t0, t1, cfg)
+        self._update_video_qc_mark()
+        self.present_window(dlg)
+
+    def _on_video_qc_position(self, t_s: float):
+        """The video's slider or its own player moved: draw the playhead line
+        there (MAD's own playback, when running, owns the line)."""
+        if getattr(self, 'is_playing', False):
+            return
+        self.spectrogram.playback_position = float(t_s)
+        self.spectrogram.update()
+
+    def _on_video_qc_visibility(self, visible: bool):
+        if not visible and not getattr(self, 'is_playing', False):
+            self.spectrogram.playback_position = None
+            self.spectrogram.update()
+
+    def _notify_video_qc_playback(self, event: str, pos: float = 0.0):
+        dlg = self._video_qc_window()
+        if dlg is None:
+            return
+        try:
+            if not dlg.isVisible():
+                return
+            if event == 'start':
+                dlg.playback_started(self._playback_start_s, self._playback_end_s)
+            elif event == 'tick':
+                dlg.playback_tick(pos)
+            else:
+                dlg.playback_stopped()
+        except RuntimeError:
+            self._video_qc_dialog = None       # C++ side already gone
+
+    def _update_video_qc_mark(self):
+        """Give the Video QC window the selected call's time, for its red border."""
+        dlg = self._video_qc_window()
+        if dlg is None:
+            return
+        try:
+            if not dlg.isVisible():
+                return
+            sg = self.spectrogram
+            i = getattr(sg, '_selected_ann_idx', None)
+            anns = getattr(sg, 'annotations', None) or []
+            if i is None or not (0 <= i < len(anns)):
+                dlg.set_call_mark(None, None)
+                return
+            s_per_px = sg.hop / float(sg.sample_rate)
+            dlg.set_call_mark(anns[i]['t0'] * s_per_px, anns[i]['t1'] * s_per_px)
+        except (RuntimeError, KeyError, AttributeError, TypeError):
+            pass
+
     def _show_trajectory_window(self):
         """Open (or raise) the 3D call-trajectory view.
 
@@ -11145,8 +11288,10 @@ class MADMainWindow(QMainWindow):
         self.present_window(dlg)
 
     def _notify_trajectory_playback(self, event: str, pos: float = 0.0):
-        """Drive the 3D view's player from the spectrogram's playhead:
-        'start' | 'tick' (every playhead update) | 'stop'."""
+        """Drive the 3D view's player — and the Video QC window — from the
+        spectrogram's playhead: 'start' | 'tick' (every playhead update) |
+        'stop'."""
+        self._notify_video_qc_playback(event, pos)
         dlg = getattr(self, '_trajectory_dialog', None)
         if dlg is None:
             return
@@ -11167,6 +11312,7 @@ class MADMainWindow(QMainWindow):
                                 view_changed: bool = False):
         """Tell an open 3D view that the calls, the view or the selection
         changed. Cheap when the window is closed — which is almost always."""
+        self._update_video_qc_mark()
         dlg = getattr(self, '_trajectory_dialog', None)
         if dlg is None:
             return
@@ -14880,6 +15026,7 @@ class MADMainWindow(QMainWindow):
     def _activate_project(self, cfg: MADProjectConfig):
         self._project = cfg
         self._ridge_checked = set()
+        self._load_video_qc_config()
         if hasattr(self, 'chk_infer_ridge'):
             self.chk_infer_ridge.blockSignals(True)
             self.chk_infer_ridge.setChecked(bool(getattr(cfg, 'ridge', True)))
