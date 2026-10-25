@@ -133,6 +133,18 @@ def test_a_clock_offset_shifts_the_frames():
     assert clip.frame_info(clip.index_at(1.0))[1] == 90
 
 
+def test_a_drifting_clock_is_interpolated_between_its_points():
+    pts = [["2021-10-25 00:00", 0.0], ["2021-10-26 00:00", 4.0]]
+    assert MV.offset_at(pts, datetime(2021, 10, 25, 12, 0)) == 2.0
+    assert MV.offset_at(pts, datetime(2021, 10, 24)) == 0.0          # held before the first
+    assert MV.offset_at(pts, datetime(2021, 10, 27)) == 4.0          # and after the last
+    assert MV.offset_at(1.5, datetime(2021, 10, 25)) == 1.5 and MV.offset_at(None, datetime.now()) == 0.0
+    _, wav, d = _dataset()
+    d["offsets_s"] = {"T004": [["2021-10-25 02:53:33", 2.0], ["2021-10-25 03:53:33", 2.0]]}
+    clip = MV.read_clip(wav, 1.0, 2.0, "CAM16", MV.VideoQCConfig.from_dict(d))
+    assert clip.frame_info(clip.index_at(1.0))[1] == 90
+
+
 def test_no_video_says_why():
     _, wav, d = _dataset()
     cfg = MV.VideoQCConfig.from_dict(d)

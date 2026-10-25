@@ -25,7 +25,9 @@ The file says how to get from a recording to its video::
       "video_file": "{camera}_*.mp4",          # a camera's files in it
       "video_start": {"regex": "_(\\d{4}-\\d{2}-\\d{2}_\\d{2}_\\d{2}_\\d{2}_\\d{3})\\.mp4$",
                       "format": "%Y-%m-%d_%H_%M_%S_%f"},
-      "offsets_s": {"T006": 0.0},              # per trial: video clock minus audio clock
+      "offsets_s": {"T006": 0.0,               # per trial: video clock minus audio clock; or,
+                    "T002": [["2021-10-08 12:00", 0.5],   # for a clock that drifts, [time, offset]
+                             ["2021-10-12 12:00", 4.0]]}, # points, interpolated (held past the ends)
       "mask_models": {"CAM13": "Z:/.../MTT_.../models/<run>"},   # Mask Tracker run per camera
       "mask_every": 3,                         # segment every 3rd frame of a clip (CPU)
       "rfid": {                                # who the reader saw in the microphone's zone
@@ -33,7 +35,7 @@ The file says how to get from a recording to its video::
         "bouts": ["<csv: trial, animal, code, sex, zone, start, stop>"],
         "channel_zones": {"ch1": 4, "ch2": 3, "ch3": 1, "ch4": 2},
         "zone_antennas": {"1": [1], "2": [4], "3": [13], "4": [16]},
-        "offsets_s": {}                        # per trial: RFID clock minus audio clock
+        "offsets_s": {}                        # per trial: RFID clock minus audio clock (as above)
       }
     }
 
@@ -71,7 +73,7 @@ class VideoQCConfig:
     trial_folder: str = "{trial}_*"
     video_file: str = "{camera}_*.mp4"
     video_start: Dict = field(default_factory=dict)
-    offsets_s: Dict[str, float] = field(default_factory=dict)
+    offsets_s: Dict[str, object] = field(default_factory=dict)
     mask_models: Dict[str, str] = field(default_factory=dict)
     mask_every: int = 3
     mask_device: str = "cpu"
@@ -123,6 +125,25 @@ class VideoQCConfig:
             if camera in s.get('cameras', []):
                 return s.get('root')
         return None
+
+
+def offset_at(spec, when: datetime) -> float:
+    """A clock offset at ``when``: ``spec`` is seconds, or [[time, seconds], ...]
+    points (a drifting clock), interpolated in time and held past the ends."""
+    if spec is None:
+        return 0.0
+    if isinstance(spec, (int, float)):
+        return float(spec)
+    pts = sorted((datetime.fromisoformat(str(t)), float(v)) for t, v in spec)
+    if not pts:
+        return 0.0
+    if when <= pts[0][0]:
+        return pts[0][1]
+    for (ta, va), (tb, vb) in zip(pts, pts[1:]):
+        if when <= tb:
+            f = (when - ta).total_seconds() / max(1e-9, (tb - ta).total_seconds())
+            return va + f * (vb - va)
+    return pts[-1][1]
 
 
 def _slash(path: str) -> str:
@@ -297,7 +318,7 @@ def locate(wav: str, t0_s: float, t1_s: float, camera: str,
     if start is None:
         raise VideoQCError(f"No start time for {os.path.basename(wav)}: not in its "
                            "name, and no Avisoft log entry for it.")
-    offset = float(cfg.offsets_s.get(trial, 0.0))
+    offset = offset_at(cfg.offsets_s.get(trial), start + timedelta(seconds=t0_s))
     files = video_files(trial, camera, cfg)
     if not files:
         raise VideoQCError(f"No {camera} video for {trial} under "
@@ -469,7 +490,7 @@ def zone_rfid(wav: str, t0_s: float, t1_s: float, cfg: VideoQCConfig,
     if zone is None:
         zone = (r.get("channel_zones") or {}).get(channel)
     ants = [int(a) for a in (r.get("zone_antennas") or {}).get(str(zone), [])]
-    offset = float((r.get("offsets_s") or {}).get(trial, 0.0))
+    offset = offset_at((r.get("offsets_s") or {}).get(trial), start + timedelta(seconds=t0_s))
     s0 = (start - datetime(1970, 1, 1)).total_seconds() + offset   # recording t=0 on the RFID clock
     reads = _rfid_table(tuple(r.get("reads", [])), trial, "reads")
     if len(reads):
