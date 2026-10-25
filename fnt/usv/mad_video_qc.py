@@ -38,15 +38,47 @@ class _ClipWorker(QThread):
     its mice (each sent as soon as it is ready)."""
     done = pyqtSignal(object)
     rfid_done = pyqtSignal(object)
+    arena_done = pyqtSignal(object)
+    arena_rfid_done = pyqtSignal(object)
     masks_done = pyqtSignal(object)
     failed = pyqtSignal(str)
     progress = pyqtSignal(str)
 
-    def __init__(self, wav, t0, t1, camera, cfg, want_masks, parent=None):
+    def __init__(self, wav, t0, t1, camera, cfg, want_masks, arena=False, parent=None):
         super().__init__(parent)
         self._args = (wav, t0, t1, camera, cfg)
         self._want_masks = want_masks
+        self._arena = arena
         self._cancel = False
+
+    def _load_arena(self):
+        """Every other camera of the arena view, decoded in parallel at a
+        smaller size: {camera: VideoClip or the reason there is none}."""
+        from concurrent.futures import ThreadPoolExecutor
+        wav, t0, t1, camera, cfg = self._args
+        cams = [c for c in cfg.arena_cells() if c != camera]
+
+        def one(cam):
+            try:
+                return cam, read_clip(wav, t0, t1, cam, cfg, width=480, max_frames=450,
+                                      cancelled=lambda: self._cancel)
+            except VideoQCError as e:
+                return cam, str(e)
+            except Exception as e:
+                return cam, f"{type(e).__name__}: {e}"
+        self.progress.emit(f"Decoding {len(cams)} more camera(s)…")
+        with ThreadPoolExecutor(4) as ex:
+            out = dict(ex.map(one, cams))
+        self.arena_done.emit(out)
+        rf = {}
+        for cam in cfg.arena_cells():
+            z = (cfg.zone_of_camera or {}).get(cam)
+            if z is not None:
+                try:
+                    rf[cam] = zone_rfid(wav, t0, t1, cfg, zone=z)
+                except Exception:
+                    rf[cam] = None
+        self.arena_rfid_done.emit(rf)
 
     def cancel(self):
         self._cancel = True
@@ -69,6 +101,8 @@ class _ClipWorker(QThread):
             self.rfid_done.emit(zone_rfid(wav, t0, t1, cfg))
         except Exception as e:
             self.progress.emit(f"RFID could not be read: {type(e).__name__}: {e}")
+        if self._arena and not self._cancel:
+            self._load_arena()
         if model and not self._cancel:
             try:
                 every = max(1, int(cfg.mask_every or 1))
@@ -212,6 +246,18 @@ class MADVideoQCWindow(QDialog):
             "within a frame only; they are not identities.")
         self.chk_masks.toggled.connect(lambda _on: self._render())
         top.addWidget(self.chk_masks)
+        top.addWidget(QLabel("Layout:"))
+        self.combo_layout = QComboBox()
+        self.combo_layout.addItem("Mic camera", "single")
+        self.combo_layout.addItem("Arena (all cameras)", "arena")
+        self.combo_layout.setToolTip(
+            "Mic camera: the chosen camera, large.\n"
+            "Arena: every camera at once, laid out as the arena is (video_qc.json "
+            "arena_layout), the chosen camera outlined, each zone camera with the "
+            "mice RFID places in its zone at that moment. Calls carry between "
+            "zones, so a call on one mic can come from a mouse in the next zone.")
+        self.combo_layout.activated.connect(lambda _i: self._reload())
+        top.addWidget(self.combo_layout)
         top.addStretch(1)
         top.addWidget(QLabel("Speed:"))
         self.combo_speed = QComboBox()
@@ -306,6 +352,7 @@ class MADVideoQCWindow(QDialog):
             self._worker = None
         self._clip = None
         self._masks, self._rfid = {}, None
+        self._arena, self._arena_rfid = {}, {}
         self._index = -1
         self.slider.setEnabled(False)
         self.lbl_rfid.setText("")
@@ -313,7 +360,10 @@ class MADVideoQCWindow(QDialog):
         self.setWindowTitle(f"Fusion QC — {camera} — {os.path.basename(wav)}")
         self._show_message(f"Loading {camera}, {t0:.2f}–{t1:.2f} s of "
                            f"{os.path.basename(wav)}…")
-        w = _ClipWorker(wav, t0, t1, camera, cfg, self.chk_masks.isChecked(), parent=self)
+        w = _ClipWorker(wav, t0, t1, camera, cfg, self.chk_masks.isChecked(),
+                        arena=self.combo_layout.currentData() == "arena", parent=self)
+        w.arena_done.connect(lambda a, w=w: self._on_arena(w, a))
+        w.arena_rfid_done.connect(lambda a, w=w: self._on_arena_rfid(w, a))
         w.done.connect(lambda clip, w=w: self._on_loaded(w, clip))
         w.rfid_done.connect(lambda r, w=w: self._on_rfid(w, r))
         w.masks_done.connect(lambda m, w=w: self._on_masks(w, m))
@@ -379,6 +429,18 @@ class MADVideoQCWindow(QDialog):
                 "Bluetooth push; offset to be estimated)")
         return f"RFID, zone {rfid.zone} (antenna {ants}), this stretch: {who}{sync}"
 
+    def _on_arena(self, w, arena):
+        if w is not self._worker:
+            return
+        self._arena = arena
+        self._render()
+
+    def _on_arena_rfid(self, w, rf):
+        if w is not self._worker:
+            return
+        self._arena_rfid = rf
+        self._render()
+
     def _on_masks(self, w, payload):
         if w is not self._worker:
             return
@@ -413,45 +475,117 @@ class MADVideoQCWindow(QDialog):
         self.rfid_strip.set_now(float(self._clip.times_s[i]))
         self._render()
 
+    def _draw_frame(self, p: QPainter, rect: QRectF, clip: VideoClip, i: int,
+                    dets: Optional[List]) -> QRectF:
+        """Draw frame ``i`` of ``clip`` fitted into ``rect`` (aspect kept), with
+        the mouse outlines ``dets``; returns where it landed."""
+        fr = np.ascontiguousarray(clip.frames[i])
+        h, w = fr.shape[:2]
+        img = QImage(fr.data, w, h, w, QImage.Format_Grayscale8)
+        s = min(rect.width() / w, rect.height() / h)
+        tw, th = w * s, h * s
+        target = QRectF(rect.x() + (rect.width() - tw) / 2, rect.y() + (rect.height() - th) / 2, tw, th)
+        p.drawImage(target, img)
+        if dets and self.chk_masks.isChecked():
+            for j, (cnt, score) in enumerate(dets):
+                poly = QPolygonF([QPointF(target.x() + x * s, target.y() + y * s) for x, y in cnt])
+                p.setPen(QPen(QColor(*MASK_COLORS[j % len(MASK_COLORS)]), 2))
+                p.drawPolygon(poly)
+        return target
+
+    @staticmethod
+    def _text(p: QPainter, rect: QRectF, text: str, color=(255, 230, 90)):
+        p.setPen(QColor(0, 0, 0))
+        p.drawText(rect.translated(1, 1), Qt.AlignLeft | Qt.AlignTop, text)
+        p.setPen(QColor(*color))
+        p.drawText(rect, Qt.AlignLeft | Qt.AlignTop, text)
+
+    def _rfid_now(self, cam: str, t: float) -> str:
+        """The mice RFID places in ``cam``'s zone at ``t`` (bouts covering it);
+        a mouse read within 2 s gets a dot."""
+        z = (self._arena_rfid or {}).get(cam)
+        if z is None:
+            return ""
+        b, rd = z.bouts, z.reads
+        codes = []
+        if b is not None and len(b):
+            codes = sorted(set(b.loc[(b["t0_s"] <= t) & (b["t1_s"] >= t), "code"]))
+        near = set()
+        if rd is not None and len(rd):
+            near = set(rd.loc[(rd["t_s"] - t).abs() <= 2.0, "code"])
+        codes = sorted(set(codes) | near)
+        if not codes:
+            return f"zone {z.zone}: nobody (RFID)"
+        return f"zone {z.zone}: " + ", ".join(f"{c}{'•' if c in near else ''}" for c in codes)
+
     def _render(self):
         clip = self._clip
         if clip is None or self._index < 0:
             return
-        fr = np.ascontiguousarray(clip.frames[self._index])
-        h, w = fr.shape[:2]
-        img = QImage(fr.data, w, h, w, QImage.Format_Grayscale8).copy()
-        pm = QPixmap.fromImage(img).scaled(
-            self.lbl_frame.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
         t = float(clip.times_s[self._index])
         name, k, when = clip.frame_info(self._index)
         dets = masks_at(self._masks, self._index, self._mask_every) if self._masks else None
-        p = QPainter(pm)
+        size = self.lbl_frame.size()
+        arena = self.combo_layout.currentData() == "arena" and self._request is not None
+        canvas = QPixmap(size)
+        canvas.fill(QColor(17, 17, 17))
+        p = QPainter(canvas)
         try:
             p.setRenderHint(QPainter.Antialiasing)
-            if dets and self.chk_masks.isChecked():
-                sc = pm.width() / float(w)
-                for j, (cnt, score) in enumerate(dets):
-                    poly = QPolygonF([QPointF(x * sc, y * sc) for x, y in cnt])
-                    p.setPen(QPen(QColor(*MASK_COLORS[j % len(MASK_COLORS)]), 2))
-                    p.drawPolygon(poly)
-            if self._mark and self._mark[0] - 0.034 <= t <= self._mark[1] + 0.034:
-                p.setPen(QPen(QColor(230, 40, 40), 6))
-                p.drawRect(QRectF(3, 3, pm.width() - 6, pm.height() - 6))
             f = QFont()
             f.setPointSize(9)
             f.setBold(True)
             p.setFont(f)
             mice = "" if dets is None else f"  ·  mice seen: {len(dets)}"
-            text = (f"{clip.camera}  ·  t = {t:.2f} s  ·  {when:%Y-%m-%d %H:%M:%S}."
+            head = (f"{clip.camera}  ·  t = {t:.2f} s  ·  {when:%Y-%m-%d %H:%M:%S}."
                     f"{when.microsecond // 1000:03d}  ·  {name} frame {k}{mice}")
-            p.setPen(QColor(0, 0, 0))
-            p.drawText(QRectF(9, 7, pm.width() - 14, 20), Qt.AlignLeft, text)
-            p.setPen(QColor(255, 230, 90))
-            p.drawText(QRectF(8, 6, pm.width() - 14, 20), Qt.AlignLeft, text)
+            if arena:
+                cells = self._request[3].arena_cells()
+                if clip.camera not in cells:
+                    cells = dict(cells)
+                    cells[clip.camera] = (0, max(c + cs for _, c, _, cs in cells.values()), 1, 1)
+                nr = max(r + rs for r, _, rs, _ in cells.values())
+                nc = max(c + cs for _, c, _, cs in cells.values())
+                top = 22.0
+                cw, chh = size.width() / nc, (size.height() - top) / nr
+                self._text(p, QRectF(8, 3, size.width() - 16, 18), head)
+                small = QFont(f)
+                small.setPointSize(8)
+                for cam, (r, c, rs, cs) in cells.items():
+                    rect = QRectF(c * cw, top + r * chh, cs * cw, rs * chh).adjusted(2, 2, -2, -2)
+                    if cam == clip.camera:
+                        cclip, i, d = clip, self._index, dets
+                    else:
+                        o = self._arena.get(cam)
+                        cclip = o if isinstance(o, VideoClip) else None
+                        i, d = (cclip.index_at(t) if cclip is not None else -1), None
+                    p.setFont(small)
+                    if cclip is None:
+                        why = self._arena.get(cam)
+                        msg = ("loading…" if why is None and self._worker is not None
+                               else (why if isinstance(why, str) else "no video"))
+                        self._text(p, rect.adjusted(6, 22, -6, -6), msg, (170, 170, 170))
+                        target = rect
+                    else:
+                        target = self._draw_frame(p, rect, cclip, i, d)
+                    lab = cam + ("" if not self._rfid_now(cam, t) else "  ·  " + self._rfid_now(cam, t))
+                    self._text(p, QRectF(target.x() + 4, target.y() + 2, target.width() - 8, 16), lab,
+                               (120, 220, 255) if cam != clip.camera else (255, 230, 90))
+                    if cam == clip.camera:
+                        p.setPen(QPen(QColor(255, 230, 90), 2))
+                        p.drawRect(target)
+                    p.setFont(f)
+            else:
+                target = self._draw_frame(p, QRectF(0, 0, size.width(), size.height()), clip,
+                                          self._index, dets)
+                self._text(p, QRectF(target.x() + 8, target.y() + 6, target.width() - 14, 20), head)
+            if self._mark and self._mark[0] - 0.034 <= t <= self._mark[1] + 0.034:
+                p.setPen(QPen(QColor(230, 40, 40), 6))
+                p.drawRect(QRectF(3, 3, size.width() - 6, size.height() - 6))
         finally:
             p.end()
         self.lbl_frame.setText("")
-        self.lbl_frame.setPixmap(pm)
+        self.lbl_frame.setPixmap(canvas)
         if self._worker is None:
             off = f"; clock offset {clip.offset_s:+.2f} s" if clip.offset_s else ""
             step = (len(clip.frames) > 1 and float(np.median(np.diff(clip.times_s))) or 0.0)

@@ -233,6 +233,26 @@ def test_the_window_lists_who_the_reader_saw_in_the_zone():
     assert w.btn_video_qc.text() == "Fusion QC"
 
 
+def test_the_arena_layout_loads_every_camera_and_says_which_have_no_video():
+    w = _window(with_rfid=True)
+    cfg = w._video_qc_cfg
+    cfg.arena_layout = {"CAM13": [0, 0], "CAM16": [0, 1]}
+    cfg.zone_of_camera = {"CAM13": 1, "CAM16": 4}
+    assert cfg.arena_cells() == {"CAM13": (0, 0, 1, 1), "CAM16": (0, 1, 1, 1)}
+    from fnt.usv.mad_video_qc import MADVideoQCWindow
+    dlg = MADVideoQCWindow(w)
+    dlg.combo_layout.setCurrentIndex(1)                   # Arena
+    wav = w._active_wav_path()
+    dlg.request(wav, 0.0, 4.0, cfg)
+    _wait_loaded(dlg)
+    assert "No CAM13 video for T004" in dlg._arena["CAM13"]       # the synthetic trial has CAM16 only
+    assert set(dlg._arena_rfid) == {"CAM13", "CAM16"}
+    assert dlg._rfid_now("CAM16", 2.5).startswith("zone 4: ATL")    # ATL's bout covers 2.5 s, read at 2.5 s
+    assert dlg._rfid_now("CAM13", 2.5) == "zone 1: DNA•"       # DNA read at zone 1 at 2.0 s
+    dlg.show_time(2.5)                                    # draws without error
+    _WINDOWS.append(dlg)
+
+
 def test_the_button_is_off_without_a_video_source():
     w = _window(with_video=False)
     assert not w.btn_video_qc.isEnabled()

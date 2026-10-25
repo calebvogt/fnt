@@ -76,6 +76,12 @@ class VideoQCConfig:
     mask_every: int = 3
     mask_device: str = "cpu"
     rfid: Dict = field(default_factory=dict)
+    # Where each camera sits in the arena view: [row, col] or [row, col,
+    # rowspan, colspan] of a grid (e.g. the overhead in the middle, spanning
+    # two rows, and the zone cameras at the corners they film). Cameras not
+    # listed are not shown there; empty = every camera in a row.
+    arena_layout: Dict[str, List[int]] = field(default_factory=dict)
+    zone_of_camera: Dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: Dict) -> 'VideoQCConfig':
@@ -101,6 +107,16 @@ class VideoQCConfig:
                 if c not in out:
                     out.append(c)
         return out
+
+    def arena_cells(self) -> Dict[str, Tuple[int, int, int, int]]:
+        """(row, col, rowspan, colspan) of each camera in the arena view."""
+        if self.arena_layout:
+            out = {}
+            for cam, cell in self.arena_layout.items():
+                c = list(cell) + [1, 1]
+                out[cam] = (int(c[0]), int(c[1]), int(c[2]), int(c[3]))
+            return out
+        return {cam: (0, i, 1, 1) for i, cam in enumerate(self.all_cameras())}
 
     def root_of(self, camera: str) -> Optional[str]:
         for s in self.sources:
@@ -438,9 +454,10 @@ class ZoneRFID:
     offset_s: float = 0.0
 
 
-def zone_rfid(wav: str, t0_s: float, t1_s: float, cfg: VideoQCConfig) -> Optional[ZoneRFID]:
-    """The RFID reads and bouts at the recording's zone between ``t0_s`` and
-    ``t1_s`` (None if the project names no RFID data)."""
+def zone_rfid(wav: str, t0_s: float, t1_s: float, cfg: VideoQCConfig,
+              zone: Optional[int] = None) -> Optional[ZoneRFID]:
+    """The RFID reads and bouts at the recording's zone (or at ``zone``)
+    between ``t0_s`` and ``t1_s`` (None if the project names no RFID data)."""
     import pandas as pd
     r = cfg.rfid or {}
     if not r:
@@ -449,7 +466,8 @@ def zone_rfid(wav: str, t0_s: float, t1_s: float, cfg: VideoQCConfig) -> Optiona
     start = recording_start(wav, cfg)
     if trial is None or start is None:
         return None
-    zone = (r.get("channel_zones") or {}).get(channel)
+    if zone is None:
+        zone = (r.get("channel_zones") or {}).get(channel)
     ants = [int(a) for a in (r.get("zone_antennas") or {}).get(str(zone), [])]
     offset = float((r.get("offsets_s") or {}).get(trial, 0.0))
     s0 = (start - datetime(1970, 1, 1)).total_seconds() + offset   # recording t=0 on the RFID clock
