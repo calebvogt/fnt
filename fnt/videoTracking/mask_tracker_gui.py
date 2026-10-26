@@ -7571,7 +7571,7 @@ class MaskTrackerWindow(QMainWindow):
         if hasattr(self, "btn_roi"):
             self.btn_roi.setText("ROI" if roi is not None else "ROI (none)")
             self.btn_roi.setToolTip(
-                "Region of interest: the crop the model sees and the areas it ignores.\n"
+                "Region of interest: the area the model sees, and holes in it it ignores.\n"
                 + (f"This project: {roi.describe()}" + (
                     f" (drawn on {roi.frame_size[0]}x{roi.frame_size[1]} frames)"
                     if roi.frame_size else "") if roi is not None else "This project has none.")

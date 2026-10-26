@@ -1,6 +1,7 @@
-"""A project's region of interest (mtt_roi): frames are cut to its crop and its
-excluded areas filled grey for training and for every prediction, masks come
-back in full-frame coordinates, and detections centred outside it are dropped.
+"""A project's region of interest (mtt_roi): frames are cut to the box around
+its included area and everything outside that area (and in its excluded holes)
+filled grey, for training and for every prediction; masks come back in
+full-frame coordinates, and detections centred outside the area are dropped.
 
 Runs under pytest, or directly.
 """
@@ -16,12 +17,13 @@ import pytest  # noqa: E402
 
 from fnt.videoTracking.mtt_roi import FILL, ROI, model_roi, project_roi  # noqa: E402
 
-# A 200 x 100 frame: crop x 20-180, y 10-90; a box lid excluded at x 140-180, y 10-50.
+# A 200 x 100 frame: the arena x 20-179, y 10-89; a box lid excluded at x 140-180, y 10-50.
+ARENA = [(20, 10), (179, 10), (179, 89), (20, 89)]
 LID = [(140, 10), (180, 10), (180, 50), (140, 50)]
 
 
 def _roi():
-    return ROI(crop=(20, 10, 180, 90), exclude=[LID], frame_size=(200, 100))
+    return ROI(include=[ARENA], exclude=[LID], frame_size=(200, 100))
 
 
 def _box_mask(h, w, x0, y0, x1, y1):
@@ -33,10 +35,23 @@ def _box_mask(h, w, x0, y0, x1, y1):
 def test_round_trip_and_scaling():
     r = _roi()
     back = ROI.from_dict(json.loads(json.dumps(r.to_dict())))
-    assert back.crop == r.crop and back.exclude == r.exclude and back.frame_size == (200, 100)
+    assert back.include == r.include and back.exclude == r.exclude
+    assert back.frame_size == (200, 100)
     assert ROI.from_dict({}) is None and ROI.from_dict({"exclude": [[[0, 0], [1, 1]]]}) is None
+    assert r.box(200, 100) == (20, 10, 180, 90)
     big = r.for_size(400, 200)                       # the same camera at twice the size
-    assert big.crop == (40, 20, 360, 180) and big.exclude[0][0] == (280, 20)
+    assert big.include[0][1] == (358, 20) and big.exclude[0][0] == (280, 20)
+    assert r.box(400, 200) == (40, 20, 359, 179)
+    old = ROI.from_dict({"crop": [20, 10, 180, 90], "frame_size": [200, 100]})   # first version
+    assert old.box(200, 100) == (20, 10, 180, 90)
+
+
+def test_an_outline_not_a_box():
+    tri = ROI(include=[[(0, 0), (199, 0), (0, 99)]], frame_size=(200, 100))
+    out, origin = tri.apply(np.full((100, 200, 3), 255, np.uint8))
+    assert origin == (0, 0) and out.shape == (100, 200, 3)
+    assert (out[5, 5] == 255).all() and (out[95, 190] == FILL).all()
+    assert tri.allows(10, 10, 100, 200) and not tri.allows(190, 95, 100, 200)
 
 
 def test_apply_cuts_and_fills():
@@ -172,19 +187,72 @@ def test_batch_sidecar_in_full_frame_coordinates(tmp_path):
     infer_video(m, video, "fake", 1, 0.25, 640, roi=_roi())
     with h5py.File(str(tmp_path / "v_masks.h5")) as f:
         cx, cy = f["det/cx"][:], f["det/cy"][:]
-        assert json.loads(f.attrs["roi"])["crop"] == [20, 10, 180, 90]
+        assert len(json.loads(f.attrs["roi"])["include"]) == 1
     assert len(cx) == 3 and np.allclose(cx, 49.5, atol=1) and np.allclose(cy, 69.5, atol=1)
 
 
 def test_model_and_project_roi_files(tmp_path):
     (tmp_path / "project_config.json").write_text(json.dumps({"roi": _roi().to_dict()}))
-    assert project_roi(str(tmp_path)).crop == (20, 10, 180, 90)
+    assert project_roi(str(tmp_path)).box(200, 100) == (20, 10, 180, 90)
     run = tmp_path / "models" / "r1"
     run.mkdir(parents=True)
     (run / "training_config.json").write_text(json.dumps({"imgsz": 640, "roi": None}))
     assert model_roi(str(run)) is None
     (run / "training_config.json").write_text(json.dumps({"roi": _roi().to_dict()}))
     assert model_roi(str(run / "weights_best.pt")).exclude == [LID]
+
+
+def _click(canvas, x, y, button=None, double=False):
+    from PyQt5.QtCore import QEvent, QPointF, Qt
+    from PyQt5.QtGui import QMouseEvent
+    wx, wy = canvas.to_widget(x, y)
+    b = button or Qt.LeftButton
+    kinds = (QEvent.MouseButtonDblClick,) if double else (QEvent.MouseButtonPress,
+                                                          QEvent.MouseButtonRelease)
+    for kind in kinds:
+        ev = QMouseEvent(kind, QPointF(wx, wy), b, b, Qt.NoModifier)
+        {QEvent.MouseButtonPress: canvas.mousePressEvent,
+         QEvent.MouseButtonRelease: canvas.mouseReleaseEvent,
+         QEvent.MouseButtonDblClick: canvas.mouseDoubleClickEvent}[kind](ev)
+
+
+def test_the_editor_draws_outlines_and_moves_corners():
+    from PyQt5.QtCore import QEvent, QPointF, Qt
+    from PyQt5.QtGui import QMouseEvent
+    from PyQt5.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    from fnt.videoTracking.mtt_roi_editor import ROIEditorDialog
+    dlg = ROIEditorDialog(_frame())
+    c = dlg.canvas
+    c.resize(800, 400)
+    for x, y in ARENA:                                # include: four corners, then the first again
+        _click(c, x, y)
+    _click(c, *ARENA[0])
+    assert len(c.areas["include"]) == 1 and not c._points
+    dlg.rb_exclude.setChecked(True)
+    for x, y in LID[:3]:
+        _click(c, x, y)
+    _click(c, *LID[3])
+    _click(c, *LID[3], double=True)                   # double-click closes
+    assert len(c.areas["exclude"]) == 1 and len(c.areas["exclude"][0]) == 4
+    assert dlg.list_areas.count() == 2
+    # drag the arena's bottom-right corner
+    wx, wy = c.to_widget(179, 89)
+    tx, ty = c.to_widget(170, 80)
+    c.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, QPointF(wx, wy), Qt.LeftButton,
+                                  Qt.LeftButton, Qt.NoModifier))
+    c.mouseMoveEvent(QMouseEvent(QEvent.MouseMove, QPointF(tx, ty), Qt.NoButton,
+                                 Qt.LeftButton, Qt.NoModifier))
+    c.mouseReleaseEvent(QMouseEvent(QEvent.MouseButtonRelease, QPointF(tx, ty), Qt.LeftButton,
+                                    Qt.NoButton, Qt.NoModifier))
+    x, y = c.areas["include"][0][2]
+    assert abs(x - 170) < 1 and abs(y - 80) < 1 and not c._points
+    dlg.chk_model_view.setChecked(True)
+    dlg.grab()                                        # paints both views without error
+    dlg.chk_model_view.setChecked(False)
+    dlg.grab()
+    r = dlg.roi()
+    assert r.frame_size == (200, 100) and len(r.include) == 1 and len(r.exclude) == 1
 
 
 def test_mask_tracker_draws_and_saves_the_roi(monkeypatch):
@@ -205,17 +273,17 @@ def test_mask_tracker_draws_and_saves_the_roi(monkeypatch):
 
     def drawn(dlg):
         c = dlg.canvas
-        c.crop = (20, 10, 180, 90)
-        c.mode = "exclude"
+        c.areas["include"].append(list(ARENA))
+        c.set_mode("exclude")
         c._points = list(LID)
-        c.close_area()
+        c.close_outline()
         dlg.grab()                                   # paints without error
         return QDialog.Accepted
     monkeypatch.setattr(E.ROIEditorDialog, "exec_", drawn)
     w._edit_roi()
     with open(os.path.join(d, "project_config.json")) as fh:
         saved = json.load(fh)["roi"]
-    assert saved["crop"] == [20, 10, 180, 90] and len(saved["exclude"]) == 1
+    assert len(saved["include"]) == 1 and len(saved["exclude"]) == 1
     assert saved["frame_size"] == [200, 100]
     assert w.btn_roi.text() == "ROI" and w.preview.roi is not None
     w.preview.resize(400, 200)

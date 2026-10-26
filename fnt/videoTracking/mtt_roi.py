@@ -4,10 +4,12 @@ A stationary camera sees more than the animals' space: the room around an
 arena, the lids of boxes the animals sit under. The ROI, drawn once per
 project, says where the model may look:
 
-    crop     [x0, y0, x1, y1]: frames are cut to this box before the model
-             sees them (more pixels per mouse at the same input size)
-    exclude  polygons [[x, y], ...]: areas filled with flat grey, so nothing
-             there is learned or detected (a mouse seen through a box lid)
+    include  polygons [[x, y], ...]: the area the model sees (none: the whole
+             frame). Frames are cut to the box around it before the model
+             sees them (more pixels per mouse at the same input size), and
+             everything outside it is filled flat grey.
+    exclude  polygons: holes in that area, filled grey too, so nothing there
+             is learned or detected (a mouse seen through a box lid)
 
 It lives in ``project_config.json`` under ``"roi"`` with the frame size it
 was drawn on (``"frame_size": [w, h]``; other sizes are scaled to it), and is
@@ -15,7 +17,7 @@ copied into each model's ``training_config.json``: training exports frames
 cut and filled, and every way of running that model (post-training
 prediction, Predict, batch sidecars, behaviour and Fusion QC detectors)
 prepares frames the same way, maps the masks back to full-frame coordinates
-and drops detections centred in excluded or cut-away areas.
+and drops detections centred outside the area.
 """
 from __future__ import annotations
 
@@ -32,11 +34,17 @@ ROI_KEY = "roi"
 #: like the padding the model already ignores.
 FILL = 114
 
+Polygon = List[Tuple[float, float]]
+
+
+def _polys(raw) -> List[Polygon]:
+    return [[(float(x), float(y)) for x, y in p] for p in raw or [] if len(p) >= 3]
+
 
 @dataclass
 class ROI:
-    crop: Optional[Tuple[int, int, int, int]] = None
-    exclude: List[List[Tuple[float, float]]] = field(default_factory=list)
+    include: List[Polygon] = field(default_factory=list)
+    exclude: List[Polygon] = field(default_factory=list)
     frame_size: Optional[Tuple[int, int]] = None      # (w, h) it was drawn on
     fill: int = FILL
 
@@ -45,20 +53,21 @@ class ROI:
     def from_dict(cls, d: Optional[Dict]) -> Optional["ROI"]:
         if not d:
             return None
-        crop = d.get("crop")
-        roi = cls(crop=tuple(int(round(v)) for v in crop) if crop else None,
-                  exclude=[[(float(x), float(y)) for x, y in poly]
-                           for poly in d.get("exclude", []) if len(poly) >= 3],
+        include = _polys(d.get("include"))
+        if d.get("crop"):                   # the first version's box (x1, y1 exclusive)
+            x0, y0, x1, y1 = (float(v) for v in d["crop"])
+            include.append([(x0, y0), (x1 - 1, y0), (x1 - 1, y1 - 1), (x0, y1 - 1)])
+        roi = cls(include=include, exclude=_polys(d.get("exclude")),
                   frame_size=tuple(int(v) for v in d["frame_size"]) if d.get("frame_size") else None,
                   fill=int(d.get("fill", FILL)))
         return None if roi.is_empty() else roi
 
     def to_dict(self) -> Dict:
         d: Dict = {}
-        if self.crop:
-            d["crop"] = [int(v) for v in self.crop]
-        if self.exclude:
-            d["exclude"] = [[[round(x, 1), round(y, 1)] for x, y in poly] for poly in self.exclude]
+        for key in ("include", "exclude"):
+            polys = getattr(self, key)
+            if polys:
+                d[key] = [[[round(x, 1), round(y, 1)] for x, y in p] for p in polys]
         if self.frame_size:
             d["frame_size"] = [int(v) for v in self.frame_size]
         if self.fill != FILL:
@@ -66,39 +75,32 @@ class ROI:
         return d
 
     def is_empty(self) -> bool:
-        return not self.crop and not self.exclude
+        return not self.include and not self.exclude
 
     def describe(self) -> str:
         parts = []
-        if self.crop:
-            x0, y0, x1, y1 = self.crop
-            parts.append(f"crop {x1 - x0}x{y1 - y0} at ({x0}, {y0})")
+        if self.include:
+            w, h = self.frame_size or (0, 0)
+            if w and h:
+                x0, y0, x1, y1 = self.box(w, h)
+                parts.append(f"area {x1 - x0}x{y1 - y0} at ({x0}, {y0})")
+            else:
+                parts.append(f"{len(self.include)} included area(s)")
         if self.exclude:
             parts.append(f"{len(self.exclude)} excluded area(s)")
         return ", ".join(parts) or "none"
 
     # -------------------------------------------------------------- geometry
     def for_size(self, w: int, h: int) -> "ROI":
-        """This ROI on a ``w`` x ``h`` frame (scaled from the size it was drawn
-        on, and the crop kept inside the frame)."""
+        """This ROI on a ``w`` x ``h`` frame (scaled from the size it was drawn on)."""
         sx = sy = 1.0
         if self.frame_size and tuple(self.frame_size) != (w, h):
             sx, sy = w / self.frame_size[0], h / self.frame_size[1]
-        crop = None
-        if self.crop:
-            x0, y0, x1, y1 = self.crop
-            x0, x1 = sorted((int(round(x0 * sx)), int(round(x1 * sx))))
-            y0, y1 = sorted((int(round(y0 * sy)), int(round(y1 * sy))))
-            x0, y0 = max(0, x0), max(0, y0)
-            x1, y1 = min(w, x1), min(h, y1)
-            if x1 - x0 >= 8 and y1 - y0 >= 8:
-                crop = (x0, y0, x1, y1)
-        exclude = [[(x * sx, y * sy) for x, y in poly] for poly in self.exclude]
-        return ROI(crop=crop, exclude=exclude, frame_size=(w, h), fill=self.fill)
 
-    def box(self, w: int, h: int) -> Tuple[int, int, int, int]:
-        """The crop on a ``w`` x ``h`` frame (the whole frame without one)."""
-        return self.for_size(w, h).crop or (0, 0, w, h)
+        def scale(polys):
+            return [[(x * sx, y * sy) for x, y in p] for p in polys]
+        return ROI(include=scale(self.include), exclude=scale(self.exclude),
+                   frame_size=(w, h), fill=self.fill)
 
     def keep_mask(self, h: int, w: int) -> np.ndarray:
         """True where the model may look on an ``h`` x ``w`` frame."""
@@ -106,13 +108,26 @@ class ROI:
         cache = self.__dict__.setdefault("_keep_cache", {})
         if key not in cache:
             r = self.for_size(w, h)
-            m = np.zeros((h, w), np.uint8)
-            x0, y0, x1, y1 = r.crop or (0, 0, w, h)
-            m[y0:y1, x0:x1] = 1
-            for poly in r.exclude:
-                cv2.fillPoly(m, [np.round(np.asarray(poly)).astype(np.int32)], 0)
+            if r.include:
+                m = np.zeros((h, w), np.uint8)
+                for p in r.include:
+                    cv2.fillPoly(m, [np.round(np.asarray(p)).astype(np.int32)], 1)
+            else:
+                m = np.ones((h, w), np.uint8)
+            for p in r.exclude:
+                cv2.fillPoly(m, [np.round(np.asarray(p)).astype(np.int32)], 0)
             cache[key] = m.astype(bool)
         return cache[key]
+
+    def box(self, w: int, h: int) -> Tuple[int, int, int, int]:
+        """The box frames are cut to on a ``w`` x ``h`` frame: around the area
+        the model may look at (the whole frame if that is empty)."""
+        cache = self.__dict__.setdefault("_box_cache", {})
+        if (w, h) not in cache:
+            ys, xs = np.nonzero(self.keep_mask(h, w))
+            cache[(w, h)] = ((int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+                             if ys.size else (0, 0, w, h))
+        return cache[(w, h)]
 
     def allows(self, x: float, y: float, h: int, w: int) -> bool:
         keep = self.keep_mask(h, w)
@@ -121,8 +136,8 @@ class ROI:
 
     # ------------------------------------------------------------ the frames
     def apply(self, img: np.ndarray) -> Tuple[np.ndarray, Tuple[int, int]]:
-        """The frame the model sees: cut to the crop, excluded areas filled
-        grey. Returns it and its origin (x0, y0) in the full frame."""
+        """The frame the model sees: cut to the box, everything outside the
+        area filled grey. Returns it and its origin (x0, y0) in the full frame."""
         h, w = img.shape[:2]
         x0, y0, x1, y1 = self.box(w, h)
         keep = self.keep_mask(h, w)[y0:y1, x0:x1]
@@ -131,10 +146,10 @@ class ROI:
         return out, (x0, y0)
 
     def to_frame(self, masks: np.ndarray, h: int, w: int) -> Tuple[np.ndarray, List[int]]:
-        """Masks predicted on the prepared frame ([N, crop h, crop w]) back on
+        """Masks predicted on the prepared frame ([N, box h, box w]) back on
         the full ``h`` x ``w`` frame, cut to the area the model may look at.
-        Returns them and the indices of those kept: a mask centred in an
-        excluded or cut-away area, or with nothing left, is dropped."""
+        Returns them and the indices of those kept: a mask centred outside the
+        area, or with nothing left, is dropped."""
         x0, y0, x1, y1 = self.box(w, h)
         n = len(masks)
         full = np.zeros((n, h, w), bool)
