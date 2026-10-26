@@ -139,6 +139,13 @@ not offered again on that frame.
 `--predict <model folder>` (or **File ▸ Predict Unreviewed Frames with a Model…**) runs any
 trained model over the queue's unreviewed frames.
 
+The same without the window, e.g. on the CPU while another job has the GPU:
+
+```bash
+python -m fnt.videoTracking.mask_tracker_cli predict-frames --project <project> \
+    --model <model folder> --focus <list.txt> --device cpu
+```
+
 The next frames worth labelling are the ones the model gets wrong: low-scored
 masks, animals it missed, counts that jump. Pick them from videos and trials the
 model has not seen.
