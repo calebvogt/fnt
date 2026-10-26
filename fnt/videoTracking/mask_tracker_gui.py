@@ -438,6 +438,9 @@ class AnnotationPreviewWidget(QWidget):
         self._pixmap: Optional[QPixmap] = None
         self._img_w = 0
         self._img_h = 0
+        # The project's region of interest (mtt_roi.ROI): what the model will
+        # not see is shaded, with the masks (V hides both).
+        self.roi = None
 
         self._zoom = 1.0
         self._pan_x = 0.0
@@ -1540,6 +1543,9 @@ class AnnotationPreviewWidget(QWidget):
             int(self._img_w * s), int(self._img_h * s),
             self._pixmap,
         )
+        if self.roi is not None and self.show_masks:
+            from .mtt_roi_editor import paint_roi
+            paint_roi(painter, self.roi, self._img_w, self._img_h, self._img_to_widget)
 
         pr = self._point_radius()
         cat_counters: Dict[str, int] = {}
@@ -7015,6 +7021,12 @@ class MaskTrackerWindow(QMainWindow):
         from fnt.labeling_guide import GuideButton
         self.btn_guide = GuideButton()
         self._tools_view_row.addWidget(self.btn_guide)
+        # The camera's region of interest: drawn once per project, applied
+        # to training frames and to every prediction of models trained here.
+        self.btn_roi = QPushButton("ROI")
+        self.btn_roi.setFocusPolicy(Qt.NoFocus)
+        self.btn_roi.clicked.connect(self._edit_roi)
+        self._tools_view_row.addWidget(self.btn_roi)
         self.lbl_class_keys = QLabel("")
         self.lbl_class_keys.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.lbl_class_keys.setStyleSheet("color: #aaaaaa; font-size: 10px;")
@@ -7185,6 +7197,8 @@ class MaskTrackerWindow(QMainWindow):
         self._project_dir = d
         if hasattr(self, "btn_guide"):
             self.btn_guide.set_project(d)
+        self._project_config = {}
+        self._refresh_roi()
         self._cls_data_loaded = False
         os.makedirs(os.path.join(d, "training_frames"), exist_ok=True)
         os.makedirs(os.path.join(d, "annotations"), exist_ok=True)
@@ -7456,6 +7470,7 @@ class MaskTrackerWindow(QMainWindow):
         self._migrate_model_folder_names()
         self._cls_data_loaded = False
         self._project_config = cfg
+        self._refresh_roi()
 
         # Keep missing videos in the list (shown in red) instead of silently
         # dropping them — the user can relink after moving data or drives.
@@ -7546,6 +7561,48 @@ class MaskTrackerWindow(QMainWindow):
         if self._coco.annotations:
             self._coco.export(ann_path)
         self.status_bar.showMessage(f"Project saved: {self._project_dir}")
+
+    def _refresh_roi(self):
+        """Show the project's ROI on the preview and the ROI button."""
+        from .mtt_roi import ROI
+        roi = ROI.from_dict(self._project_config.get("roi"))
+        self.preview.roi = roi
+        self.preview.update()
+        if hasattr(self, "btn_roi"):
+            self.btn_roi.setText("ROI" if roi is not None else "ROI (none)")
+            self.btn_roi.setToolTip(
+                "Region of interest: the crop the model sees and the areas it ignores.\n"
+                + (f"This project: {roi.describe()}" + (
+                    f" (drawn on {roi.frame_size[0]}x{roi.frame_size[1]} frames)"
+                    if roi.frame_size else "") if roi is not None else "This project has none.")
+                + "\nApplied to training frames and to every prediction of models trained\n"
+                "with it; models trained before it was drawn are unaffected.\n"
+                "Click to draw it on the frame on screen.")
+
+    def _edit_roi(self):
+        if self._project_dir is None:
+            QMessageBox.information(self, "Region of interest", "Open a project first.")
+            return
+        frame = self.preview._image_rgb
+        if frame is None:
+            QMessageBox.information(self, "Region of interest",
+                                    "Show a frame first: the ROI is drawn on it.")
+            return
+        from .mtt_roi import ROI
+        from .mtt_roi_editor import ROIEditorDialog
+        dlg = ROIEditorDialog(frame, ROI.from_dict(self._project_config.get("roi")), self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        roi = dlg.roi()
+        if roi is None:
+            self._project_config.pop("roi", None)
+        else:
+            self._project_config["roi"] = roi.to_dict()
+        self._save_project_config()
+        self._refresh_roi()
+        self.status_bar.showMessage(
+            f"ROI saved: {roi.describe()}. Models trained from now on use it."
+            if roi is not None else "ROI removed: models trained from now on see whole frames.")
 
     def _save_project_config(self):
         if self._project_dir is None:
@@ -10192,6 +10249,8 @@ class MaskTrackerWindow(QMainWindow):
                 "aug_scale": aug_scale,
                 "aug_hsv_v": aug_hsv_v,
                 "aug_hsv_s": aug_hsv_s,
+                # The project's ROI travels with the model (mtt_roi).
+                "roi": self._project_config.get("roi") or None,
                 "_architecture": "yolo",
             }
         else:
@@ -10320,6 +10379,10 @@ class MaskTrackerWindow(QMainWindow):
                 )
             else:
                 self._seg_log_text.append("[Segmentation] Augmentation: disabled")
+            from .mtt_roi import ROI
+            roi = ROI.from_dict(config_dict.get("roi"))
+            self._seg_log_text.append(
+                f"[Segmentation] ROI: {roi.describe() if roi is not None else 'none (whole frames)'}")
 
         self._seg_log_text.append("")
 

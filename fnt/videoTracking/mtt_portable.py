@@ -117,10 +117,12 @@ def pack_session(project: str, frames: List[str], out_root: str, name: Optional[
            "annotations": [a for a in coco["annotations"] if a.get("image_id") in keep_ids],
            "categories": coco["categories"]}
     _write_json(os.path.join(sdir, "annotations", "annotations.json"), sub)
-    _write_json(os.path.join(sdir, "project_config.json"), {
-        "project_dir": ".", "video_paths": [], "source_videos": [],
-        "categories": cfg.get("categories", [c["name"] for c in coco["categories"]]),
-        "sam2_model_path": None})
+    scfg = {"project_dir": ".", "video_paths": [], "source_videos": [],
+            "categories": cfg.get("categories", [c["name"] for c in coco["categories"]]),
+            "sam2_model_path": None}
+    if cfg.get("roi"):
+        scfg["roi"] = cfg["roi"]                 # shaded while labelling there too
+    _write_json(os.path.join(sdir, "project_config.json"), scfg)
     with open(os.path.join(sdir, "focus.txt"), "w", encoding="utf-8") as fh:
         fh.write("\n".join(frames) + "\n")
     from fnt.labeling_guide import GUIDE_FILENAME
