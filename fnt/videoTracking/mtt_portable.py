@@ -123,6 +123,9 @@ def pack_session(project: str, frames: List[str], out_root: str, name: Optional[
         "sam2_model_path": None})
     with open(os.path.join(sdir, "focus.txt"), "w", encoding="utf-8") as fh:
         fh.write("\n".join(frames) + "\n")
+    from fnt.labeling_guide import GUIDE_FILENAME
+    if os.path.isfile(os.path.join(pdir, GUIDE_FILENAME)):        # the rules travel with the frames
+        shutil.copy2(os.path.join(pdir, GUIDE_FILENAME), os.path.join(sdir, GUIDE_FILENAME))
     _write_json(os.path.join(sdir, SESSION_FILE), {
         "kind": "mask_tracker",
         "status": "packed",

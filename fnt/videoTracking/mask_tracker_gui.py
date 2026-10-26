@@ -6985,6 +6985,11 @@ class MaskTrackerWindow(QMainWindow):
         self.btn_view_masks.setFocusPolicy(Qt.NoFocus)
         self._tools_view_row.addWidget(self.btn_view_masks)
         self._tools_view_row.addStretch()
+        # The project's labelling rules (LABELING_GUIDE.md): hover to read,
+        # click to open or edit.
+        from fnt.labeling_guide import GuideButton
+        self.btn_guide = GuideButton()
+        self._tools_view_row.addWidget(self.btn_guide)
         self.lbl_class_keys = QLabel("")
         self.lbl_class_keys.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.lbl_class_keys.setStyleSheet("color: #aaaaaa; font-size: 10px;")
@@ -7153,6 +7158,8 @@ class MaskTrackerWindow(QMainWindow):
             return
         os.makedirs(d, exist_ok=True)
         self._project_dir = d
+        if hasattr(self, "btn_guide"):
+            self.btn_guide.set_project(d)
         self._cls_data_loaded = False
         os.makedirs(os.path.join(d, "training_frames"), exist_ok=True)
         os.makedirs(os.path.join(d, "annotations"), exist_ok=True)
@@ -7418,6 +7425,8 @@ class MaskTrackerWindow(QMainWindow):
         with open(config_path) as f:
             cfg = json.load(f)
         self._project_dir = os.path.dirname(config_path)
+        if hasattr(self, "btn_guide"):
+            self.btn_guide.set_project(self._project_dir)
         self._migrate_classifier_dir()
         self._migrate_model_folder_names()
         self._cls_data_loaded = False

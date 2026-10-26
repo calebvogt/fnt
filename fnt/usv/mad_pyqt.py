@@ -7438,6 +7438,11 @@ class MADMainWindow(QMainWindow):
         self.btn_view_cycle.clicked.connect(self._shortcut_cycle_view)
         view_row.addWidget(self.btn_view_cycle)
         view_row.addStretch()
+        # The project's labelling rules (LABELING_GUIDE.md): hover to read,
+        # click to open or edit.
+        from fnt.labeling_guide import GuideButton
+        self.btn_guide = GuideButton()
+        view_row.addWidget(self.btn_guide)
         vbox.addLayout(view_row)
 
         # Legend. Colors are colormap-dependent (see _OVERLAY_PALETTES), so the
@@ -15032,6 +15037,8 @@ class MADMainWindow(QMainWindow):
         self._project = cfg
         self._ridge_checked = set()
         self._load_video_qc_config()
+        if hasattr(self, 'btn_guide'):
+            self.btn_guide.set_project(cfg.project_dir)
         if hasattr(self, 'chk_infer_ridge'):
             self.chk_infer_ridge.blockSignals(True)
             self.chk_infer_ridge.setChecked(bool(getattr(cfg, 'ridge', True)))
