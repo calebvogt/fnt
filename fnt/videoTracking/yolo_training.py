@@ -327,6 +327,26 @@ def _resolve_device(pref: str) -> str:
     return "cpu"
 
 
+def _named_losses(loss, names) -> dict:
+    """{name: value} from a trainer's epoch loss.
+
+    Older Ultralytics gives one tensor of the parts in ``loss_names`` order;
+    8.4 gives a dict of named tensors (and adds ``sem_loss``), which
+    ``float()`` choked on: the first epoch of every training run died with
+    "float() argument must be ... not 'dict'" (lab PC, Ultralytics 8.4.115).
+    """
+    if loss is None:
+        return {}
+    if isinstance(loss, dict):
+        return {str(k): float(v) for k, v in loss.items()}
+    items = loss.detach().cpu().numpy() if hasattr(loss, "cpu") else loss
+    try:
+        items = list(items)
+    except TypeError:                       # a single number
+        return {"loss": float(items)}
+    return {(names[i] if i < len(names) else f"loss_{i}"): float(v) for i, v in enumerate(items)}
+
+
 def train_yolo_seg(
     cfg: YOLOTrainingConfig,
     progress: Optional[Callable] = None,
@@ -408,10 +428,13 @@ def train_yolo_seg(
         """Capture training loss and sub-losses (available before validation)."""
         # Use tloss (epoch-averaged) instead of loss (last batch only).
         # With small batch sizes, last-batch loss is extremely noisy.
-        if hasattr(trainer, "tloss") and trainer.tloss is not None:
-            loss_val = float(trainer.tloss.mean()) if hasattr(trainer.tloss, "mean") else float(trainer.tloss)
-        elif hasattr(trainer, "loss"):
-            loss_val = float(trainer.loss)
+        names = getattr(trainer, "loss_names", None) or []
+        sub = (_named_losses(getattr(trainer, "tloss", None), names)
+               or _named_losses(getattr(trainer, "loss_items", None), names))
+        if sub:
+            loss_val = sum(sub.values()) / len(sub)     # the mean of the parts, as tloss.mean() was
+        elif getattr(trainer, "loss", None) is not None:
+            loss_val = float(trainer.loss.sum()) if hasattr(trainer.loss, "sum") else float(trainer.loss)
         else:
             loss_val = 0.0
         if loss_val < best_loss[0]:
@@ -420,19 +443,6 @@ def train_yolo_seg(
         iteration_count[0] = trainer.epoch + 1
         _epoch_cache["loss"] = loss_val
         _epoch_cache["lr"] = trainer.optimizer.param_groups[0]["lr"]
-        sub = {}
-        if hasattr(trainer, "tloss") and trainer.tloss is not None:
-            names = trainer.loss_names if hasattr(trainer, "loss_names") else []
-            items = trainer.tloss.cpu().numpy() if hasattr(trainer.tloss, "cpu") else trainer.tloss
-            for i, v in enumerate(items):
-                key = names[i] if i < len(names) else f"loss_{i}"
-                sub[key] = float(v)
-        elif hasattr(trainer, "loss_items") and trainer.loss_items is not None:
-            names = trainer.loss_names if hasattr(trainer, "loss_names") else []
-            items = trainer.loss_items.cpu().numpy() if hasattr(trainer.loss_items, "cpu") else trainer.loss_items
-            for i, v in enumerate(items):
-                key = names[i] if i < len(names) else f"loss_{i}"
-                sub[key] = float(v)
         _epoch_cache["sub"] = sub
 
     def on_fit_epoch_end(trainer):
