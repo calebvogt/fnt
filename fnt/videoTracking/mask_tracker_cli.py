@@ -164,6 +164,17 @@ def _parser():
                         "start, so a stopped run is an even sample; name: alphabetical.")
     b.add_argument("--no-window", action="store_true",
                    help="Run without the progress window (log to the console).")
+    q = sub.add_parser("predict-frames",
+                       help="Predict a project's unreviewed frames with a trained model and save the "
+                            "masks as pending predictions for review (the window's Predict, headless).")
+    q.add_argument("--project", required=True, help="Project folder or its project_config.json.")
+    q.add_argument("--model", required=True, help="Model run folder.")
+    q.add_argument("--focus", default=None,
+                   help="Only these frames (a focus list, one name per line); default all.")
+    q.add_argument("--conf", type=float, default=0.25, help="Confidence threshold (default 0.25).")
+    q.add_argument("--max-det", type=int, default=100, help="At most this many masks per frame.")
+    q.add_argument("--device", default="auto",
+                   help="auto (default), cpu (leaves the GPU to another job) or cuda.")
     w = sub.add_parser("behavior-window",
                        help="Masks on every frame of a stretch of video, tracks, mask-first pose and "
                             "candidate behaviour bouts (tracks.h5, tracks/pairs/bouts CSVs).")
@@ -233,6 +244,15 @@ def main(argv=None) -> int:
             return 0 if res["done"] == res["videos"] else 1
         from .mask_tracker_batch_window import run_with_window
         return run_with_window(args.model, videos, args.step, args.conf, args.imgsz, args.device)
+    if args.cmd == "predict-frames":
+        from .mtt_portable import read_focus
+        from .mtt_predict import predict_frames
+        if args.device == "cpu":
+            os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+        project = os.path.dirname(args.project) if args.project.endswith(".json") else args.project
+        predict_frames(project, args.model, read_focus(args.focus) if args.focus else None,
+                       args.conf, args.max_det, args.device)
+        return 0
     if args.cmd == "behavior-window":
         import cv2
         from .behavior_features import run_window, yolo_detector

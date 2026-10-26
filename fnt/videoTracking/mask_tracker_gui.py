@@ -2274,32 +2274,10 @@ class TrainWorker(QThread):
                 os.close(_null_fd)
 
 
-def drop_fragments(mask: np.ndarray, min_frac: float = 0.03) -> np.ndarray:
-    """A predicted mask without its specks: pieces under ``min_frac`` of the
-    mask's area are dropped (a detached tail is kept; the zone model's stray
-    slivers, accepted with the mouse, were not)."""
-    n, lbl, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
-    if n <= 2:
-        return mask
-    areas = stats[1:, cv2.CC_STAT_AREA]
-    keep = [i + 1 for i, a in enumerate(areas) if a >= min_frac * areas.sum()]
-    return np.isin(lbl, keep)
-
-
-def _drop_overlapping(detections: list, shape, max_overlap: float = 0.5) -> list:
-    """One mask per animal: drop a predicted mask that is mostly (more than
-    ``max_overlap`` of its area) inside a higher-scoring one. The first zone
-    model stacked masks on masks."""
-    from .mask_tracker_annotator import segmentation_to_mask
-    kept, kept_masks = [], []
-    for d in sorted(detections, key=lambda d: -d.get("score", 0.0)):
-        m = segmentation_to_mask(d["segmentation"], shape[0], shape[1]).astype(bool)
-        area = int(m.sum())
-        if area and any(np.count_nonzero(m & k) > max_overlap * area for k in kept_masks):
-            continue
-        kept.append(d)
-        kept_masks.append(m)
-    return kept
+# Specks off a predicted mask, and one mask per animal: shared with the
+# headless prediction (mask_tracker_cli predict-frames).
+from .mask_tracker_batch import drop_fragments  # noqa: E402
+from .mtt_predict import drop_overlapping as _drop_overlapping  # noqa: E402
 
 
 class PostTrainInferenceWorker(QThread):
@@ -2324,23 +2302,8 @@ class PostTrainInferenceWorker(QThread):
 
     def run(self):
         try:
-            import json as _json
-
-            config_path = os.path.join(self.model_dir, "training_config.json")
-            arch = "maskrcnn"
-            if os.path.exists(config_path):
-                with open(config_path) as f:
-                    cfg = _json.load(f)
-                arch = cfg.get("architecture", "maskrcnn")
-
-            if arch == "yolov11-seg":
-                from .yolo_inference import YOLOInference
-                engine = YOLOInference(self.model_dir, device="auto", use_masks=True)
-            else:
-                from .mask_tracker_inference import MaskRCNNInference
-                engine = MaskRCNNInference(self.model_dir, device="auto")
-
-            engine.load_model()
+            from .mtt_predict import frame_detections, load_engine
+            engine = load_engine(self.model_dir, device="auto")
 
             total = len(self.frame_paths)
             inferred_count = 0
@@ -2355,59 +2318,7 @@ class PostTrainInferenceWorker(QThread):
                     continue
 
                 img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                result = engine.predict(
-                    img_rgb,
-                    confidence_threshold=self.confidence,
-                    max_detections=self.max_det,
-                )
-
-                detections = []
-                n_det = len(result.get("scores", []))
-                for j in range(n_det):
-                    mask = None
-                    if result.get("masks") is not None and j < len(result["masks"]):
-                        mask = result["masks"][j]
-
-                    from .mask_tracker_annotator import (
-                        mask_to_coco_polygons, mask_bbox, mask_to_rle,
-                    )
-                    if mask is not None:
-                        # Store the predicted mask itself — approving one of
-                        # these promotes it to ground truth, so it must not
-                        # arrive already coarsened into a polygon.
-                        if not mask_to_coco_polygons(mask):
-                            continue
-                        mask_bool = drop_fragments(np.asarray(mask).astype(bool))
-                        segmentation = mask_to_rle(mask_bool)
-                        bbox = list(mask_bbox(mask_bool))
-                        area = int(mask_bool.sum())
-                    else:
-                        # Box-only model: rectangle mask covering the box.
-                        box = result["boxes"][j]
-                        x1, y1, x2, y2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
-                        h_img, w_img = img_rgb.shape[:2]
-                        rect = np.zeros((h_img, w_img), dtype=bool)
-                        rect[
-                            max(0, int(round(y1))):max(0, int(round(y2))),
-                            max(0, int(round(x1))):max(0, int(round(x2))),
-                        ] = True
-                        if not rect.any():
-                            continue
-                        segmentation = mask_to_rle(rect)
-                        bbox = [x1, y1, x2 - x1, y2 - y1]
-                        area = int(rect.sum())
-
-                    label = int(result["labels"][j])
-                    score = float(result["scores"][j])
-                    detections.append({
-                        "segmentation": segmentation,
-                        "bbox": bbox,
-                        "area": area,
-                        "category_id": label,
-                        "score": score,
-                    })
-
-                detections = _drop_overlapping(detections, img_rgb.shape[:2])
+                detections = frame_detections(engine, img_rgb, self.confidence, self.max_det)
                 if detections:
                     filename = os.path.basename(path)
                     self.frame_result.emit(filename, detections)
@@ -10560,35 +10471,19 @@ class MaskTrackerWindow(QMainWindow):
             self.lbl_train_status.setText("No extracted frames for post-training inference.")
             return
 
-        # Collect frames without manual (non-inferred) annotations
-        unlabeled_paths = []
-        for _, _, fp in self._extracted_frames:
-            filename = os.path.basename(fp)
-            if filename in self._coco._image_id_map:
-                img_id = self._coco._image_id_map[filename]
-                n_manual = self._coco.count_annotations_for_image(
-                    img_id, exclude_inferred=True,
-                )
-                if n_manual > 0 or self._coco.is_image_empty(filename):
-                    continue  # reviewed (masks or marked empty) — skip
-            unlabeled_paths.append(fp)
+        # Frames not yet reviewed (no accepted mask, not marked empty); their
+        # earlier predictions are replaced.
+        from .mtt_predict import clear_predictions, unreviewed_frames
+        paths = {os.path.basename(fp): fp for _, _, fp in self._extracted_frames}
+        todo = unreviewed_frames(self._coco, list(paths))
+        unlabeled_paths = [paths[n] for n in todo]
 
         if not unlabeled_paths:
             self.lbl_train_status.setText(
                 "All frames already have annotations — no inference needed."
             )
             return
-
-        # Remove any existing inferred annotations from these frames
-        # (in case of a previous inference run)
-        for fp in unlabeled_paths:
-            filename = os.path.basename(fp)
-            if filename in self._coco._image_id_map:
-                img_id = self._coco._image_id_map[filename]
-                existing = self._coco.get_annotations_for_image(img_id)
-                for ann in existing:
-                    if ann.get("inferred", False) and not ann.get("rejected"):
-                        self._coco.remove_annotation(ann["id"])
+        clear_predictions(self._coco, todo)
 
         max_det = self.spin_post_infer_max.value() or 100
 
@@ -10638,50 +10533,8 @@ class MaskTrackerWindow(QMainWindow):
         if img is None:
             return
         h, w = img.shape[:2]
-
-        img_id = self._coco.get_or_add_image(filename, w, h)
-        # A prediction on a spot the reviewer already rejected is not offered
-        # again (mostly the same mask: IoU > 0.5).
-        from .mask_tracker_annotator import segmentation_to_mask
-        rejected = [segmentation_to_mask(a["segmentation"], h, w).astype(bool)
-                    for a in self._coco.get_annotations_for_image(img_id) if a.get("rejected")]
-        if rejected:
-            kept = []
-            for det in detections:
-                m = segmentation_to_mask(det["segmentation"], h, w).astype(bool)
-                if not any(np.count_nonzero(m & r) > 0.5 * np.count_nonzero(m | r)
-                           for r in rejected):
-                    kept.append(det)
-            detections = kept
-
-        max_score = 0.0
-        for det in detections:
-            label = det["category_id"]
-            cat_id = None
-            coco_cats_by_idx = {}
-            for ci, cat in enumerate(self._coco.categories):
-                coco_cats_by_idx[ci + 1] = cat["id"]
-            cat_id = coco_cats_by_idx.get(label)
-            if cat_id is None and self._coco.categories:
-                cat_id = self._coco.categories[0]["id"]
-            if cat_id is None:
-                continue
-
-            score = det.get("score", 0.0)
-            if score > max_score:
-                max_score = score
-
-            self._coco.add_annotation_from_segmentation(
-                image_id=img_id,
-                category_id=cat_id,
-                segmentation=det["segmentation"],
-                bbox=det["bbox"],
-                area=det["area"],
-                inferred=True,
-                score=score,
-            )
-
-        self._frame_confidence[filename] = max_score
+        from .mtt_predict import add_predictions
+        self._frame_confidence[filename] = add_predictions(self._coco, filename, w, h, detections)
 
     def _on_post_infer_finished(self, count: int):
         self.train_progress.setVisible(False)
