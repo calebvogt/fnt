@@ -98,6 +98,10 @@ class MADInferenceConfig:
     # Build the inference spectrogram on the GPU (CUDA only) when it
     # reproduces the CPU one -- 14.5 s -> 1.2 s per 10-minute recording.
     gpu_spectrogram: bool = True
+    # Store each detection's brightness ridge (mad_ridge) with it, and fill in
+    # the ridges a resumed run's already-analysed recordings lack. The
+    # project's ``ridge`` setting; on by default.
+    ridge: bool = True
     # Optional per-wav processing parameters — filled from model checkpoint
     # when not specified.
     nperseg: Optional[int] = None
@@ -1502,12 +1506,13 @@ def _spec_params(cfg: MADInferenceConfig, ckpt: Dict):
 
 def backfill_pred_specs(wav_path: str, db_min: float = -100.0,
                         db_max: float = -20.0, db_norm: str = 'fixed',
-                        overwrite: bool = False) -> int:
+                        overwrite: bool = False, ridges: bool = True) -> int:
     """Add the spectrogram image under each stored prediction crop of a
     recording analysed before MAD saved them (/pred_specs), recomputed from
     the audio on the grid recorded in its .mad file. ``db_*`` must be the
     model's (MAD's defaults: fixed, -100 to -20 dB). Crops that already have
-    one are left alone unless ``overwrite``. Returns the number filled."""
+    one are left alone unless ``overwrite``. With ``ridges`` the new images'
+    ridges are stored too. Returns the number filled."""
     from .fnt_mask_store import (masks_sibling_path, get_grid_attrs,
                                  read_all_pred_masks, spec_crop,
                                  PRED_SPEC_GROUP)
@@ -1542,9 +1547,94 @@ def backfill_pred_specs(wav_path: str, db_min: float = -100.0,
                                                     c['mask'].shape),
                                 compression='gzip', compression_opts=4)
     # The images make the brightness ridge measurable (no audio needed).
-    from .fnt_mask_store import add_pred_ridges
-    add_pred_ridges(h5, overwrite=overwrite)
+    if ridges:
+        from .fnt_mask_store import add_pred_ridges
+        add_pred_ridges(h5, overwrite=overwrite)
     return len(todo)
+
+
+def fill_ridges(wav_path: str, db_min: float = -100.0, db_max: float = -20.0,
+                db_norm: str = 'fixed', use_audio: bool = True) -> Dict:
+    """Complete the brightness ridges of one recording's .mad, and stamp it.
+
+    Detections without a ridge get one from their stored spectrogram, or, with
+    ``use_audio``, from the audio first (as :func:`backfill_pred_specs`; the
+    ``db_*`` must be those of the model that made them). Labels without one get
+    theirs from their own patch. A file not yet stamped with the current ridge
+    version also has its multi-piece masks recomputed, one ridge per piece.
+    Without the audio, detections lacking a spectrogram keep no ridge and
+    nothing is recomputed; the file stays unstamped, so a later fill looks
+    again.
+
+    Returns ``{needed, pred, examples, specs, stamped}`` (whether the file
+    lacked anything, ridges stored, spectrograms added). Does nothing when ridges are off (fnt_mask_store.set_ridge_enabled)
+    or the file is stamped already. Never run on a file another process is
+    writing."""
+    from .fnt_mask_store import (add_example_ridges, add_pred_ridges,
+                                 mark_ridges_complete, masks_sibling_path,
+                                 ridge_enabled, ridge_status)
+    out = {'needed': False, 'pred': 0, 'examples': 0, 'specs': 0,
+           'stamped': False}
+    if not ridge_enabled():
+        return out
+    h5 = masks_sibling_path(wav_path)
+    st = ridge_status(h5)
+    if not st['needed']:
+        return out
+    out['needed'] = True
+    complete = use_audio or not st['pred_no_spec']
+    if st['pred_no_spec'] and use_audio:
+        out['specs'] = backfill_pred_specs(wav_path, db_min=db_min,
+                                           db_max=db_max, db_norm=db_norm,
+                                           ridges=False)
+    out['pred'] = add_pred_ridges(h5, redo_pieces=complete)
+    out['examples'] = add_example_ridges(h5, redo_pieces=complete)
+    if complete:
+        mark_ridges_complete(h5)
+        out['stamped'] = True
+    return out
+
+
+def fill_ridges_for_run(wav_paths: List[str], cfg: MADInferenceConfig,
+                        ckpt: Optional[Dict] = None,
+                        progress: Optional[Callable] = None,
+                        should_stop: Optional[Callable[[], bool]] = None,
+                        wait_if_paused: Optional[Callable[[], None]] = None,
+                        on_done: Optional[Callable[[Dict], None]] = None
+                        ) -> List[Dict]:
+    """:func:`fill_ridges` over recordings this run's model analysed earlier,
+    with that model's spectrogram settings (from ``ckpt``, else read from
+    ``cfg.model_path``). ``progress`` as in :func:`run_inference_on_files`,
+    with stage ``'ridge'``; ``on_done`` gets each file's result with its
+    ``wav_path`` (and ``error`` when the fill failed)."""
+    if not getattr(cfg, 'ridge', True) or not wav_paths:
+        return []
+    if ckpt is None:
+        import torch
+        ckpt = torch.load(cfg.model_path, map_location='cpu',
+                          weights_only=False)
+    _, _, _, db_min, db_max, db_norm = _spec_params(cfg, ckpt)
+    out: List[Dict] = []
+    m = len(wav_paths)
+    for j, wav in enumerate(wav_paths):
+        if wait_if_paused is not None:
+            wait_if_paused()
+        if should_stop and should_stop():
+            break
+        if progress:
+            progress(j, m, Path(wav).name, 'ridge', 0, 1)
+        try:
+            r = fill_ridges(wav, db_min=db_min, db_max=db_max, db_norm=db_norm)
+        except Exception as e:
+            r = {'error': str(e)}
+        r['wav_path'] = wav
+        out.append(r)
+        if on_done is not None:
+            try:
+                on_done(r)
+            except Exception:
+                pass
+    return out
 
 
 def prepare_file(wav_path: str, cfg: MADInferenceConfig, ckpt: Dict,
@@ -1926,6 +2016,12 @@ def run_inference_on_file(
             last_infer_merge=1.0 if cfg.merge_consecutive else 0.0,
             last_infer_n=float(len(blobs)),
         )
+        # The detections just got their ridges (each new one keeps its image);
+        # complete the labels' and stamp the file, so no later fill reopens it.
+        try:
+            fill_ridges(wav_path, use_audio=False)
+        except Exception:
+            pass
         # Reclaim disk from any legacy full-grid prob map for this file.
         delete_prob(h5_path)
     except Exception:
@@ -2189,6 +2285,8 @@ def run_inference_on_files(
     on_device: Optional[Callable[[str], None]] = None,
     on_file_done: Optional[Callable[[Dict], None]] = None,
     on_retry_start: Optional[Callable[[int], None]] = None,
+    ridge_fill: Optional[List[str]] = None,
+    on_ridge_done: Optional[Callable[[Dict], None]] = None,
 ) -> List[Dict]:
     """Run inference on a batch of wavs. Loads the model once.
 
@@ -2200,6 +2298,12 @@ def run_inference_on_files(
     the GUI log device + per-file speed live. ``on_retry_start(n)`` fires once
     before the retry pass, with the number of files it will re-attempt.
 
+    ``ridge_fill``: recordings this model analysed before (a resumed run's
+    skipped ones). Their missing brightness ridges are filled after the
+    inference (:func:`fill_ridges_for_run`, stage ``'ridge'``), each result
+    going to ``on_ridge_done`` rather than into the returned list. With
+    ``cfg.ridge`` off the run stores no ridges at all.
+
     Every summary carries a ``mem`` dict (see :func:`_mem_snapshot`), on the
     error path too — the memory reading at the moment of a failure is the one
     most worth having.
@@ -2209,6 +2313,22 @@ def run_inference_on_files(
     returned list, so callers counting ``'error'`` keys see the true final
     state; its summary is marked ``retry: True``.
     """
+    from .fnt_mask_store import ridge_enabled, set_ridge_enabled
+    ridge_was = ridge_enabled()
+    set_ridge_enabled(getattr(cfg, 'ridge', True))
+    try:
+        return _run_inference_on_files(
+            wav_paths, cfg, progress, should_stop, wait_if_paused, on_device,
+            on_file_done, on_retry_start, ridge_fill, on_ridge_done)
+    finally:
+        set_ridge_enabled(ridge_was)
+
+
+def _run_inference_on_files(wav_paths, cfg, progress, should_stop,
+                            wait_if_paused, on_device, on_file_done,
+                            on_retry_start, ridge_fill,
+                            on_ridge_done) -> List[Dict]:
+    """The body of :func:`run_inference_on_files`, with its ridge switch set."""
     model, ckpt, device = load_model(cfg.model_path, cfg.device)
     if on_device is not None:
         try:
@@ -2331,4 +2451,9 @@ def run_inference_on_files(
                 if not s.get('error'):
                     results[i] = s
                 _emit(s)
+    if ridge_fill and not (should_stop and should_stop()):
+        fill_ridges_for_run(ridge_fill, cfg, ckpt=ckpt, progress=progress,
+                            should_stop=should_stop,
+                            wait_if_paused=wait_if_paused,
+                            on_done=on_ridge_done)
     return results

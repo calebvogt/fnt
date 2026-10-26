@@ -155,6 +155,19 @@ def _group_harmonics_for(wav_path: str) -> None:
               f"{os.path.basename(wav_path)}: {e}", file=sys.stderr, flush=True)
 
 
+def _print_ridge_fill(r: dict) -> None:
+    """One line per recording a ridge fill changed (or failed on); silent for
+    files that had nothing to fill."""
+    wav = os.path.basename(r.get('wav_path', '?'))
+    if 'error' in r:
+        print(f"  [FAIL] ridges {wav}: {r['error']}", file=sys.stderr, flush=True)
+    elif r.get('pred') or r.get('examples') or r.get('specs'):
+        print(f"  [ridge] {wav}: {r.get('pred', 0)} detection(s), "
+              f"{r.get('examples', 0)} label(s)"
+              + (f" ({r['specs']} spectrogram(s) from the audio)"
+                 if r.get('specs') else ""), flush=True)
+
+
 def _cmd_analyze(args: argparse.Namespace) -> int:
     from .mad_inference import MADInferenceConfig, run_inference_on_files
 
@@ -188,6 +201,8 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
             args.log_root = proj.project_dir
         if not args.training_data_dir:
             args.training_data_dir = proj.training_data_dir
+        if not getattr(proj, 'ridge', True):
+            args.no_ridge = True
     if not wavs:
         print("No .wav files found in the given input(s).", file=sys.stderr, flush=True)
         return 2
@@ -208,6 +223,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         amp=not args.no_amp,
         prefetch_next=not args.no_prefetch,
         gpu_spectrogram=not args.cpu_spectrogram,
+        ridge=not getattr(args, 'no_ridge', False),
     )
 
     from .mad_batch import (
@@ -232,6 +248,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
     #     set the silent files are the overwhelming majority, so without this
     #     a resume re-does most of the work it was supposed to skip.
     # "Re-detect from scratch" means redo everything, so it disables resume.
+    done: list = []
     if not args.no_resume and not args.no_preserve_labels:
         manifest_done = completed_by_settings(read_roots, settings)
         todo, done = partition_done(wavs, settings, manifest_done)
@@ -240,7 +257,15 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
                   f"these settings, {len(todo)} to go.", flush=True)
         wavs = todo
         if not wavs:
-            print("Nothing to do — every file is already analyzed.", flush=True)
+            print("Nothing to infer — every file is already analyzed.", flush=True)
+            if done and cfg.ridge:
+                from .fnt_mask_store import set_ridge_enabled
+                from .mad_inference import fill_ridges_for_run
+                set_ridge_enabled(True)
+                print(f"  Checking the ridges of {len(done)} analyzed file(s)…",
+                      flush=True)
+                res = fill_ridges_for_run(done, cfg, on_done=_print_ridge_fill)
+                return 1 if any('error' in r for r in res) else 0
             return 0
 
     run_dir = args.run_dir or new_run_dir(log_root)
@@ -276,9 +301,14 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         print(f"  [ok]   {wav}: {summary.get('n_blobs', 0)} detection(s) "
               f"in {t.get('t_total', '?')}s ({t.get('device', '?')})")
 
+    if done and cfg.ridge:
+        print(f"  After them: the ridges of {len(done)} analyzed file(s).",
+              flush=True)
     try:
         results = run_inference_on_files(cfg=cfg, wav_paths=wavs,
-                                         on_file_done=_on_done)
+                                         on_file_done=_on_done,
+                                         ridge_fill=done if cfg.ridge else None,
+                                         on_ridge_done=_print_ridge_fill)
     finally:
         manifest.close()
 
@@ -626,6 +656,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Skip grouping each recording's harmonics into calls "
                          "after its detections are written (on by default, "
                          "matching the GUI).")
+    pa.add_argument('--no-ridge', action='store_true',
+                    help="Store no brightness ridges (on by default, or as the "
+                         "--project's ridge setting says). With ridges on, a "
+                         "resumed run also fills the ridges its skipped, "
+                         "already-analysed recordings lack.")
     pa.add_argument('--threshold', type=float, default=0.5,
                     help="Probability threshold (default 0.5).")
     pa.add_argument('--min-blob-pixels', type=int, default=8,
@@ -724,6 +759,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="The model's dB ceiling, for missing spectrograms (default -20).")
     pr.add_argument('--db-norm', default='fixed',
                     help="The model's dB normalisation (default fixed).")
+    pr.add_argument('--model', default='',
+                    help="The model that made the detections (weights.pt or its "
+                         "folder): its spectrogram settings replace the --db-* "
+                         "values for missing spectrograms.")
     pr.add_argument('--overwrite', action='store_true',
                     help="Recompute ridges that are already stored.")
     pr.set_defaults(func=_cmd_add_ridge)
@@ -759,10 +798,23 @@ def _cmd_add_ridge(args) -> int:
     """Store the brightness ridge (mad_ridge) of every detection and every labelled
     call in the given recordings' .mad files, and of every example in any training
     store (.h5) given directly. Detections recorded before MAD kept their spectrogram
-    get it from the audio first (as add-specs). Never run on files MAD is writing."""
+    get it from the audio first (as add-specs). A recording already complete (stamped
+    with the current ridge version) is passed over unless --overwrite. Never run on
+    files MAD is writing."""
     from .fnt_mask_store import (add_example_ridges, add_pred_ridges, has_pred_masks,
-                                 masks_sibling_path, read_all_pred_masks, td_count)
-    from .mad_inference import backfill_pred_specs
+                                 mark_ridges_complete, masks_sibling_path,
+                                 read_all_pred_masks, td_count)
+    from .mad_inference import backfill_pred_specs, fill_ridges
+    if args.model:
+        from .mad_inference import MADInferenceConfig, _spec_params
+        import torch
+        path = (os.path.join(args.model, 'weights.pt') if os.path.isdir(args.model)
+                else args.model)
+        ckpt = torch.load(path, map_location='cpu', weights_only=False)
+        _, _, _, args.db_min, args.db_max, args.db_norm = _spec_params(
+            MADInferenceConfig(model_path=path), ckpt)
+        print(f"Spectrogram settings of {os.path.basename(os.path.dirname(path))}: "
+              f"{args.db_norm}, {args.db_min:g} to {args.db_max:g} dB", flush=True)
     stores = [p for p in args.input if os.path.isfile(p)
               and p.lower().endswith(('.h5', '.mad'))]
     wavs = [w for w in _expand_inputs([p for p in args.input if p not in stores])
@@ -772,14 +824,21 @@ def _cmd_add_ridge(args) -> int:
         h5 = masks_sibling_path(w)
         k = e = 0
         try:
-            if has_pred_masks(h5):
-                crops = read_all_pred_masks(h5, include_spec=True)
-                if any('spec' not in c for c in crops.values()):
-                    backfill_pred_specs(w, db_min=args.db_min, db_max=args.db_max,
-                                        db_norm=args.db_norm)
-                k = add_pred_ridges(h5, overwrite=args.overwrite)
-            if td_count(h5):
-                e = add_example_ridges(h5, overwrite=args.overwrite)
+            if not args.overwrite:
+                r = fill_ridges(w, db_min=args.db_min, db_max=args.db_max,
+                                db_norm=args.db_norm)
+                k, e = r['pred'], r['examples']
+            else:
+                if has_pred_masks(h5):
+                    crops = read_all_pred_masks(h5, include_spec=True)
+                    if any('spec' not in c for c in crops.values()):
+                        backfill_pred_specs(w, db_min=args.db_min, db_max=args.db_max,
+                                            db_norm=args.db_norm)
+                    k = add_pred_ridges(h5, overwrite=True)
+                if td_count(h5):
+                    e = add_example_ridges(h5, overwrite=True)
+                if k or e:
+                    mark_ridges_complete(h5)
         except Exception as ex:
             print(f"[{i}/{len(wavs)}] {os.path.basename(w)}: failed ({ex})", flush=True)
             continue

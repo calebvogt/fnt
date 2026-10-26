@@ -61,11 +61,13 @@ Detector = Callable[[np.ndarray], List[Tuple[np.ndarray, float]]]
 def yolo_detector(model_dir: str, conf: float = 0.25, imgsz: Optional[int] = None,
                   device: str = "") -> Detector:
     """Frame -> [(full-frame bool mask, score)], filtered as batch inference filters
-    (specks dropped, one mask per animal)."""
+    (specks dropped, one mask per animal, the model's ROI applied)."""
     from ultralytics import YOLO
     from .mask_tracker_batch import drop_fragments, one_per_animal, resolve_weights
+    from .mtt_roi import model_roi
 
     model = YOLO(resolve_weights(model_dir))
+    roi = model_roi(model_dir)
     if imgsz is None:
         try:
             import json
@@ -76,16 +78,21 @@ def yolo_detector(model_dir: str, conf: float = 0.25, imgsz: Optional[int] = Non
 
     def detect(frame):
         h, w = frame.shape[:2]
-        r = model.predict(frame, imgsz=imgsz, conf=conf, retina_masks=True,
+        img = frame if roi is None else roi.apply(frame)[0]
+        r = model.predict(img, imgsz=imgsz, conf=conf, retina_masks=True,
                           device=device or None, verbose=False)[0]
         if r.masks is None or not len(r.masks):
             return []
         raw = r.masks.data.cpu().numpy() > 0.5
-        if raw.shape[1:] != (h, w):
-            raw = np.stack([cv2.resize(m.astype(np.uint8), (w, h),
-                                       interpolation=cv2.INTER_NEAREST) > 0 for m in raw])
-        masks = [drop_fragments(m) for m in raw]
         scores = r.boxes.conf.cpu().numpy().astype(np.float32)
+        ih, iw = img.shape[:2]
+        if raw.shape[1:] != (ih, iw):
+            raw = np.stack([cv2.resize(m.astype(np.uint8), (iw, ih),
+                                       interpolation=cv2.INTER_NEAREST) > 0 for m in raw])
+        if roi is not None:
+            raw, kept = roi.to_frame(raw, h, w)
+            raw, scores = raw[kept], scores[kept]
+        masks = [drop_fragments(m) for m in raw]
         keep = one_per_animal(masks, scores)
         return [(masks[k], float(scores[k])) for k in keep if masks[k].any()]
 

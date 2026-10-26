@@ -438,6 +438,9 @@ class AnnotationPreviewWidget(QWidget):
         self._pixmap: Optional[QPixmap] = None
         self._img_w = 0
         self._img_h = 0
+        # The project's region of interest (mtt_roi.ROI): what the model will
+        # not see is shaded, with the masks (V hides both).
+        self.roi = None
 
         self._zoom = 1.0
         self._pan_x = 0.0
@@ -1540,6 +1543,9 @@ class AnnotationPreviewWidget(QWidget):
             int(self._img_w * s), int(self._img_h * s),
             self._pixmap,
         )
+        if self.roi is not None and self.show_masks:
+            from .mtt_roi_editor import paint_roi
+            paint_roi(painter, self.roi, self._img_w, self._img_h, self._img_to_widget)
 
         pr = self._point_radius()
         cat_counters: Dict[str, int] = {}
@@ -1705,11 +1711,14 @@ class FrameScrubber(QWidget):
     One tick per Training Frames Queue entry cut from this video, coloured by
     its labeling state with the same palette as the queue list: grey = queued
     and unlabeled, yellow = model prediction awaiting review, green = has an
-    accepted mask. The white playhead is the frame on screen.
+    accepted mask. The playhead is the frame on screen, coloured by its state
+    (white queued, yellow predicted, green labeled; blue: a frame not in the
+    queue), drawn on a SLEAP-style track.
 
-    The widget only reports seeks; the window decides what a seek means
-    (video mode at that frame). Keyboard focus is refused so the arrow keys
-    keep scrubbing through the preview widget after a click here.
+    The widget only reports seeks; the window decides what a seek means (a
+    queue frame opens with its masks, any other frame in video mode).
+    Keyboard focus is refused so the arrow keys keep scrubbing through the
+    preview widget after a click here.
     """
 
     seek_requested = pyqtSignal(int)
@@ -1722,6 +1731,10 @@ class FrameScrubber(QWidget):
     # Draw order when several ticks share a pixel: the most advanced state is
     # painted last, so a labeled frame is never hidden behind a queued one.
     STATE_RANK = {"queued": 0, "predicted": 1, "labeled": 2}
+    #: Playhead on a frame that is not in the queue (plain video). On a queue
+    #: frame it takes the frame's state: white = queued, yellow = predicted,
+    #: green = labeled.
+    PLAYHEAD_COLOR = QColor("#4d8fe0")
 
     _PAD = 6             # groove inset from each edge, px
     _SNAP_PX = 4         # a click this close to a tick lands on the tick
@@ -1784,6 +1797,14 @@ class FrameScrubber(QWidget):
 
     def has_marks(self) -> bool:
         return bool(self._sorted_marks)
+
+    def playhead_color(self) -> QColor:
+        """The playhead's colour: the state of the frame on screen (white
+        queued, yellow predicted, green labeled), or blue off the queue."""
+        here = self._marks.get(self._position)
+        if here == "queued":
+            return QColor("#ffffff")
+        return self.STATE_COLORS.get(here, self.PLAYHEAD_COLOR)
 
     def next_mark(self, after: int) -> Optional[int]:
         """First tick strictly after ``after``, wrapping to the first tick."""
@@ -1906,25 +1927,29 @@ class FrameScrubber(QWidget):
                 p.drawText(self.rect(), Qt.AlignCenter, self._empty_text)
             return
 
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor("#3c3c3c"))
-        p.drawRoundedRect(groove, 3, 3)
+        # The track, as in SLEAP's seekbar: a framed box with a line through
+        # the middle; ticks for the queue frames cut from this video, coloured
+        # by state; the playhead takes the state of the frame on screen.
+        track = QRectF(x0, 3.0, x1 - x0, h - 6.0)
+        p.setPen(QPen(QColor("#5a5a5a"), 1.0))
+        p.setBrush(QColor("#262626"))
+        p.drawRect(track)
+        p.setPen(QPen(QColor("#6e6e6e"), 1.0))
+        p.drawLine(QPointF(x0, h / 2), QPointF(x1, h / 2))
         px = self._frame_to_x(self._position)
-        if px > x0:
-            p.setBrush(QColor("#25497a"))
-            p.drawRoundedRect(QRectF(x0, gy, px - x0, gh), 3, 3)
 
         for state in sorted(self.STATE_COLORS, key=self.STATE_RANK.get):
             color = self.STATE_COLORS[state]
             for f in self._by_state.get(state, ()):
                 x = self._frame_to_x(f)
-                p.fillRect(QRectF(x - 1.0, 2.0, 2.0, h - 4.0), color)
+                p.fillRect(QRectF(x - 1.0, 4.0, 2.0, h - 8.0), color)
 
-        pen = QPen(QColor("#1e1e1e"))
+        head = self.playhead_color()
+        pen = QPen(QColor("#111111"))
         pen.setWidthF(1.0)
         p.setPen(pen)
-        p.setBrush(QColor("#ffffff"))
-        p.drawRoundedRect(QRectF(px - 1.5, 1.0, 3.0, h - 2.0), 1.5, 1.5)
+        p.setBrush(head)
+        p.drawRoundedRect(QRectF(px - 3.0, 0.5, 6.0, h - 1.0), 2.0, 2.0)
 
 
 class SAM2LoadWorker(QThread):
@@ -4512,6 +4537,12 @@ class MaskTrackerWindow(QMainWindow):
         scrub_layout = QHBoxLayout(self._scrubber_row)
         scrub_layout.setContentsMargins(5, 0, 5, 0)
         scrub_layout.setSpacing(8)
+        # Which video the timeline is: a focus session's queue jumps between
+        # clips (each frame was cut from its own), so the clip is named here.
+        self._lbl_scrub_video = QLabel("")
+        self._lbl_scrub_video.setStyleSheet("color: #bbbbbb; font-size: 10px;")
+        self._lbl_scrub_video.setMaximumWidth(330)
+        scrub_layout.addWidget(self._lbl_scrub_video)
         self._scrubber = FrameScrubber()
         self._scrubber.seek_requested.connect(self._on_scrubber_seek)
         scrub_layout.addWidget(self._scrubber, 1)
@@ -6985,6 +7016,17 @@ class MaskTrackerWindow(QMainWindow):
         self.btn_view_masks.setFocusPolicy(Qt.NoFocus)
         self._tools_view_row.addWidget(self.btn_view_masks)
         self._tools_view_row.addStretch()
+        # The project's labelling rules (LABELING_GUIDE.md): hover to read,
+        # click to open or edit.
+        from fnt.labeling_guide import GuideButton
+        self.btn_guide = GuideButton()
+        self._tools_view_row.addWidget(self.btn_guide)
+        # The camera's region of interest: drawn once per project, applied
+        # to training frames and to every prediction of models trained here.
+        self.btn_roi = QPushButton("ROI")
+        self.btn_roi.setFocusPolicy(Qt.NoFocus)
+        self.btn_roi.clicked.connect(self._edit_roi)
+        self._tools_view_row.addWidget(self.btn_roi)
         self.lbl_class_keys = QLabel("")
         self.lbl_class_keys.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.lbl_class_keys.setStyleSheet("color: #aaaaaa; font-size: 10px;")
@@ -7153,6 +7195,10 @@ class MaskTrackerWindow(QMainWindow):
             return
         os.makedirs(d, exist_ok=True)
         self._project_dir = d
+        if hasattr(self, "btn_guide"):
+            self.btn_guide.set_project(d)
+        self._project_config = {}
+        self._refresh_roi()
         self._cls_data_loaded = False
         os.makedirs(os.path.join(d, "training_frames"), exist_ok=True)
         os.makedirs(os.path.join(d, "annotations"), exist_ok=True)
@@ -7418,10 +7464,13 @@ class MaskTrackerWindow(QMainWindow):
         with open(config_path) as f:
             cfg = json.load(f)
         self._project_dir = os.path.dirname(config_path)
+        if hasattr(self, "btn_guide"):
+            self.btn_guide.set_project(self._project_dir)
         self._migrate_classifier_dir()
         self._migrate_model_folder_names()
         self._cls_data_loaded = False
         self._project_config = cfg
+        self._refresh_roi()
 
         # Keep missing videos in the list (shown in red) instead of silently
         # dropping them — the user can relink after moving data or drives.
@@ -7512,6 +7561,48 @@ class MaskTrackerWindow(QMainWindow):
         if self._coco.annotations:
             self._coco.export(ann_path)
         self.status_bar.showMessage(f"Project saved: {self._project_dir}")
+
+    def _refresh_roi(self):
+        """Show the project's ROI on the preview and the ROI button."""
+        from .mtt_roi import ROI
+        roi = ROI.from_dict(self._project_config.get("roi"))
+        self.preview.roi = roi
+        self.preview.update()
+        if hasattr(self, "btn_roi"):
+            self.btn_roi.setText("ROI" if roi is not None else "ROI (none)")
+            self.btn_roi.setToolTip(
+                "Region of interest: the area the model sees, and holes in it it ignores.\n"
+                + (f"This project: {roi.describe()}" + (
+                    f" (drawn on {roi.frame_size[0]}x{roi.frame_size[1]} frames)"
+                    if roi.frame_size else "") if roi is not None else "This project has none.")
+                + "\nApplied to training frames and to every prediction of models trained\n"
+                "with it; models trained before it was drawn are unaffected.\n"
+                "Click to draw it on the frame on screen.")
+
+    def _edit_roi(self):
+        if self._project_dir is None:
+            QMessageBox.information(self, "Region of interest", "Open a project first.")
+            return
+        frame = self.preview._image_rgb
+        if frame is None:
+            QMessageBox.information(self, "Region of interest",
+                                    "Show a frame first: the ROI is drawn on it.")
+            return
+        from .mtt_roi import ROI
+        from .mtt_roi_editor import ROIEditorDialog
+        dlg = ROIEditorDialog(frame, ROI.from_dict(self._project_config.get("roi")), self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        roi = dlg.roi()
+        if roi is None:
+            self._project_config.pop("roi", None)
+        else:
+            self._project_config["roi"] = roi.to_dict()
+        self._save_project_config()
+        self._refresh_roi()
+        self.status_bar.showMessage(
+            f"ROI saved: {roi.describe()}. Models trained from now on use it."
+            if roi is not None else "ROI removed: models trained from now on see whole frames.")
 
     def _save_project_config(self):
         if self._project_dir is None:
@@ -7975,6 +8066,8 @@ class MaskTrackerWindow(QMainWindow):
                 "No source video linked to this frame" if showing_frame else ""
             )
             self._lbl_scrub_time.setText("")
+            self._lbl_scrub_video.setText("")
+            self._lbl_scrub_video.setToolTip("")
             return
         vpath, pos = src
         # Keep the video playhead on the frame being labeled, so selecting
@@ -7988,6 +8081,15 @@ class MaskTrackerWindow(QMainWindow):
         self._lbl_scrub_time.setText(
             f"frame {pos:,} · {FrameScrubber.format_timecode(pos, self._video_fps)}"
         )
+        n_here = len(self._scrubber_rows)
+        name = f"{os.path.basename(os.path.dirname(vpath))}/{os.path.splitext(os.path.basename(vpath))[0]}"
+        text = f"{name} · {n_here} in queue"
+        fm = QFontMetrics(self._lbl_scrub_video.font())
+        self._lbl_scrub_video.setText(fm.elidedText(text, Qt.ElideMiddle, 330))
+        self._lbl_scrub_video.setToolTip(
+            f"Timeline: {vpath}\n{n_here} frame(s) of the queue were cut from this video "
+            f"(the ticks). A focus session's queue moves between videos, so the timeline "
+            f"follows the frame on screen.")
 
     def _rebuild_scrubber_marks(self):
         """Recompute the tick for every queue frame cut from the timeline's video."""
@@ -8036,11 +8138,42 @@ class MaskTrackerWindow(QMainWindow):
         self._scrubber_vpath = None  # force the ticks to be recomputed
         self._sync_scrubber()
 
+    def _queue_row_at(self, vpath: str, fidx: int) -> Optional[int]:
+        """The queue row of frame ``fidx`` of ``vpath``, if that frame is in
+        the Training Frames Queue."""
+        if vpath == self._scrubber_vpath and fidx in self._scrubber_rows:
+            return self._scrubber_rows[fidx]
+        for row, (v, f, _) in enumerate(self._extracted_frames):
+            if v == vpath and f == fidx:
+                return row
+        return None
+
+    def _go_to_source_frame(self, vpath: str, fidx: int):
+        """Show frame ``fidx`` of the source video: a frame that is in the queue
+        opens as the queue frame, with its masks and predictions (stepping onto
+        a labeled frame with the arrows used to show it bare); any other frame
+        opens in video mode."""
+        row = self._queue_row_at(vpath, fidx)
+        if row is not None:
+            cur = self.frame_list.currentItem()
+            if cur is not None and cur.data(0, Qt.UserRole) == row:
+                # Still the list's current item after a trip into the video:
+                # selecting it again would not signal, so load it directly.
+                self._on_frame_item_changed(cur, None)
+            else:
+                self._select_frame_row(row)
+        elif self._annot_in_video_mode and vpath == self._video_cap_path:
+            self._show_video_frame(fidx)
+        else:
+            # From a queue frame, the arrows step out into the video it was
+            # cut from.
+            self._enter_video_mode_at(vpath, fidx)
+
     def _on_scrubber_seek(self, frame_idx: int):
         src = self._scrubber_source()
         if src is None:
             return
-        self._enter_video_mode_at(src[0], frame_idx)
+        self._go_to_source_frame(src[0], frame_idx)
         self.preview.setFocus()
 
     def _on_timeline_advance(self, direction: int):
@@ -10116,6 +10249,8 @@ class MaskTrackerWindow(QMainWindow):
                 "aug_scale": aug_scale,
                 "aug_hsv_v": aug_hsv_v,
                 "aug_hsv_s": aug_hsv_s,
+                # The project's ROI travels with the model (mtt_roi).
+                "roi": self._project_config.get("roi") or None,
                 "_architecture": "yolo",
             }
         else:
@@ -10244,6 +10379,10 @@ class MaskTrackerWindow(QMainWindow):
                 )
             else:
                 self._seg_log_text.append("[Segmentation] Augmentation: disabled")
+            from .mtt_roi import ROI
+            roi = ROI.from_dict(config_dict.get("roi"))
+            self._seg_log_text.append(
+                f"[Segmentation] ROI: {roi.describe() if roi is not None else 'none (whole frames)'}")
 
         self._seg_log_text.append("")
 
@@ -11207,12 +11346,7 @@ class MaskTrackerWindow(QMainWindow):
                     if key == Qt.Key_Left:
                         step = -step
                     vpath, pos = src
-                    if self._annot_in_video_mode:
-                        self._show_video_frame(pos + step)
-                    else:
-                        # From a queue frame, the arrows step out into the
-                        # video it was cut from.
-                        self._enter_video_mode_at(vpath, pos + step)
+                    self._go_to_source_frame(vpath, pos + step)
                     return
             elif key == Qt.Key_E:
                 if self._annot_in_video_mode and self._video_cap is not None:

@@ -17,7 +17,8 @@ from typing import Callable, Dict, List, Optional
 import cv2
 import numpy as np
 
-from .mask_tracker_annotator import segmentation_to_polygons
+from .mask_tracker_annotator import (mask_to_coco_polygons, segmentation_to_mask,
+                                     segmentation_to_polygons)
 
 
 @dataclass
@@ -47,6 +48,10 @@ class YOLOTrainingConfig:
     # Copy-paste: animals cut from one training image pasted into another (by
     # their masks). Strong for instance segmentation with few labeled frames.
     aug_copy_paste: float = 0.3
+    # The project's region of interest (mtt_roi.ROI.to_dict()): frames are cut
+    # to its crop and its excluded areas filled grey. Saved with the model, so
+    # every prediction prepares frames the same way.
+    roi: Optional[Dict] = None
 
     def resolve_run_dir(self) -> str:
         name = self.run_name or datetime.now().strftime("yolo_%Y%m%d_%H%M%S")
@@ -74,6 +79,7 @@ def convert_coco_to_yolo(
     images_dir: str,
     output_dir: str,
     val_fraction: float = 0.2,
+    roi: Optional[Dict] = None,
 ) -> str:
     """Convert COCO JSON annotations to YOLO segmentation format.
 
@@ -83,8 +89,15 @@ def convert_coco_to_yolo(
             labels/train/  labels/val/
             data.yaml
 
+    With a ``roi`` (mtt_roi.ROI.to_dict()), frames are written cut to its
+    crop with its excluded areas grey, and labels are cut to match: a label
+    centred in an excluded or cut-away area is dropped.
+
     Returns the path to data.yaml.
     """
+    from .mtt_roi import ROI
+    roi_obj = ROI.from_dict(roi)
+    n_dropped = 0
     with open(coco_json) as f:
         coco = json.load(f)
 
@@ -118,7 +131,16 @@ def convert_coco_to_yolo(
 
         src = os.path.join(images_dir, fname)
         dst = os.path.join(output_dir, "images", split, fname)
-        if os.path.exists(src) and not os.path.exists(dst):
+        origin, out_w, out_h = (0, 0), w, h
+        if roi_obj is not None:
+            img = cv2.imdecode(np.fromfile(src, np.uint8), cv2.IMREAD_COLOR) \
+                if os.path.exists(src) else None
+            if img is not None:
+                h, w = img.shape[:2]
+                cut, origin = roi_obj.apply(img)
+                out_h, out_w = cut.shape[:2]
+                cv2.imencode(Path(fname).suffix or ".png", cut)[1].tofile(dst)
+        elif os.path.exists(src) and not os.path.exists(dst):
             shutil.copy2(src, dst)
 
         label_name = Path(fname).stem + ".txt"
@@ -129,11 +151,24 @@ def convert_coco_to_yolo(
             cls_idx = cat_id_to_idx.get(ann["category_id"])
             if cls_idx is None:
                 continue
-            # YOLO wants normalised polygons, so RLE ground truth is traced
-            # back to outlines here. The stored mask stays lossless; only this
-            # throwaway training copy is polygonised.
-            polys = [p for p in segmentation_to_polygons(ann["segmentation"], h, w)
-                     if len(p) >= 6]
+            if roi_obj is not None:
+                # The label as the cut frame shows it: off the excluded areas,
+                # in the crop's coordinates.
+                m = roi_obj.clip(segmentation_to_mask(ann["segmentation"], h, w))
+                if m is None:
+                    n_dropped += 1
+                    continue
+                x0, y0 = origin
+                polys = [p for p in mask_to_coco_polygons(m[y0:y0 + out_h, x0:x0 + out_w])
+                         if len(p) >= 6]
+            else:
+                # YOLO wants normalised polygons, so RLE ground truth is traced
+                # back to outlines here. The stored mask stays lossless; only this
+                # throwaway training copy is polygonised.
+                polys = [p for p in segmentation_to_polygons(ann["segmentation"], h, w)
+                         if len(p) >= 6]
+            if not polys:
+                continue
             if len(polys) > 1:
                 # Specks (< 3% of the mask) are dropped, not bridged to the
                 # body: a stray sliver joined by a long thin line is no mouse.
@@ -149,8 +184,8 @@ def convert_coco_to_yolo(
             for seg in polys:
                 coords = []
                 for j in range(0, len(seg), 2):
-                    nx = seg[j] / w
-                    ny = seg[j + 1] / h
+                    nx = seg[j] / out_w
+                    ny = seg[j + 1] / out_h
                     coords.append(f"{nx:.6f}")
                     coords.append(f"{ny:.6f}")
                 lines.append(f"{cls_idx} " + " ".join(coords))
@@ -171,6 +206,9 @@ def convert_coco_to_yolo(
         f.write(yaml_content)
 
     print(f"[YOLO Convert] {len(train_ids)} train, {len(val_ids)} val images")
+    if roi_obj is not None:
+        print(f"[YOLO Convert] ROI: {roi_obj.describe()}; "
+              f"{n_dropped} label(s) outside it dropped")
     print(f"[YOLO Convert] {len(cat_names)} classes: {cat_names}")
     print(f"[YOLO Convert] data.yaml: {data_yaml_path}")
     return data_yaml_path
@@ -318,7 +356,7 @@ def train_yolo_seg(
 
     yolo_data_dir = os.path.join(run_dir, "yolo_dataset")
     data_yaml = convert_coco_to_yolo(
-        cfg.coco_json_path, cfg.images_dir, yolo_data_dir, cfg.val_fraction,
+        cfg.coco_json_path, cfg.images_dir, yolo_data_dir, cfg.val_fraction, roi=cfg.roi,
     )
 
     device = _resolve_device(cfg.device)

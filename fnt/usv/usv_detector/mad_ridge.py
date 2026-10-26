@@ -10,6 +10,12 @@ Turns are reversals of the ridge by at least ``h_khz`` (zigzag pivots); the rate
 / duration (Hz) and the depth the median kHz between successive pivots. A trill is at least
 :data:`TRILL_TURNS` turns at :data:`TRILL_HZ` or faster.
 
+A mask in several pieces (8-connected), as when two detections are merged into one call, gets
+one ridge per piece: the path never jumps the gap between pieces, which would count a frequency
+step that is not in the call. Turns add up over the pieces, depths pool the pivot steps within
+each piece, and the duration leaves out the empty columns between pieces. A one-piece mask gives
+exactly what it did before pieces were handled.
+
 This is the same algorithm, with the same constants and tie-breaking, as ``ridge_of`` and
 ``zigzag`` in the 2021_8x8_Mus analysis (R/09_usv.R), so measures from either agree. Input
 levels are MAD's uint8 0-255 spectrogram (the /pred_specs crops, or a training example's
@@ -17,7 +23,7 @@ patch); arrays are frequency x time, as MAD stores them.
 """
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -26,6 +32,11 @@ RIDGE_H_KHZ = 3.0        # a turn needs this excursion
 TRILL_TURNS = 4
 TRILL_HZ = 20.0
 RIDGE_ATTRS = ("ridge_turns", "ridge_rate_hz", "ridge_depth_khz", "ridge_trill")
+#: The ridge rule a file's ridges were completed under (its ``ridge_version`` root attr, see
+#: fnt_mask_store.mark_ridges_complete). 2: one ridge per piece of a mask (2026-10-21); a file
+#: without the attr was written before it, and its multi-piece masks are recomputed.
+RIDGE_VERSION = 2
+_EIGHT = np.ones((3, 3), dtype=int)
 
 
 def ridge_path(level: np.ndarray, mask: np.ndarray, lam: float = RIDGE_LAMBDA) -> Tuple[np.ndarray, np.ndarray]:
@@ -86,29 +97,60 @@ def zigzag(x, h: float) -> np.ndarray:
     return np.asarray(piv)
 
 
+def mask_pieces(mask: np.ndarray) -> List[np.ndarray]:
+    """The 8-connected pieces of ``mask`` (frequency x time), each a bool mask of the same
+    shape, in time order (first column, then lowest bin). One piece: the mask itself."""
+    m = np.asarray(mask, bool)
+    from scipy import ndimage
+    lab, n = ndimage.label(m, structure=_EIGHT)
+    if n <= 1:
+        return [m] if n else []
+    pieces = [lab == k for k in range(1, n + 1)]
+    first = [(int(np.flatnonzero(p.any(axis=0))[0]), int(np.flatnonzero(p.any(axis=1))[0]))
+             for p in pieces]
+    return [pieces[i] for i in sorted(range(n), key=first.__getitem__)]
+
+
 def ridge_measures(level: np.ndarray, mask: np.ndarray, df_khz: float, dt_ms: float,
                    f_off: int = 0, lam: float = RIDGE_LAMBDA,
                    h_khz: float = RIDGE_H_KHZ) -> Optional[Dict]:
     """Ridge, turns, rate, depth and trill call of one crop.
 
     ``f_off`` is the crop's first frequency bin on the full grid (bin b is b x df_khz).
-    Duration is the crop's width in time frames x dt_ms. Returns None for an empty mask.
-    The ``khz`` entry is the ridge per time column of the crop (NaN where the mask is
-    empty there)."""
-    frames, bins = ridge_path(level, mask, lam)
-    if not len(frames):
+    Duration is the crop's width in time frames x dt_ms, less any empty columns between the
+    mask's pieces. Returns None for an empty mask. The ``khz`` entry is the ridge per time
+    column of the crop (NaN where the mask is empty there); when two pieces share a column (a
+    merged harmonic, say) it is one row per piece instead (pieces x columns). ``pieces`` is the
+    number of pieces."""
+    pieces = mask_pieces(mask)
+    if not pieces:
         return None
-    khz_on = (bins + int(f_off)) * df_khz
-    piv = zigzag(khz_on, h_khz)
-    turns = int(len(piv))
-    dur_s = np.asarray(mask).shape[1] * dt_ms / 1000.0
+    width = np.asarray(mask).shape[1]
+    rows, turns, steps = [], 0, []
+    covered = np.zeros(width, bool)
+    for p in pieces:
+        frames, bins = ridge_path(level, p, lam)
+        khz_on = (bins + int(f_off)) * df_khz
+        piv = zigzag(khz_on, h_khz)
+        turns += int(len(piv))
+        if len(piv) >= 2:
+            steps.extend(np.abs(np.diff(piv)))
+        row = np.full(width, np.nan, dtype=np.float32)
+        row[frames] = khz_on
+        rows.append(row)
+        covered[frames[0]:frames[-1] + 1] = True       # a piece spans whole columns
+    on = np.flatnonzero(covered)
+    gaps = int((~covered[on[0]:on[-1] + 1]).sum())
+    dur_s = (width - gaps) * dt_ms / 1000.0
     rate = turns / 2.0 / dur_s if dur_s > 0 else 0.0
-    depth = float(np.median(np.abs(np.diff(piv)))) if turns >= 2 else float("nan")
-    khz = np.full(np.asarray(mask).shape[1], np.nan, dtype=np.float32)
-    khz[frames] = khz_on
-    return {"khz": khz, "ridge_turns": turns, "ridge_rate_hz": float(rate),
+    depth = float(np.median(steps)) if steps else float("nan")
+    k = np.stack(rows)
+    if (np.isfinite(k).sum(axis=0) <= 1).all():
+        k = np.fmax.reduce(k, axis=0)                  # one row while pieces don't overlap
+    return {"khz": k, "ridge_turns": turns, "ridge_rate_hz": float(rate),
             "ridge_depth_khz": depth,
-            "ridge_trill": int(turns >= TRILL_TURNS and rate >= TRILL_HZ)}
+            "ridge_trill": int(turns >= TRILL_TURNS and rate >= TRILL_HZ),
+            "pieces": len(pieces)}
 
 
 def grid_units(sample_rate: float, nperseg: int, noverlap: int, nfft: int) -> Tuple[float, float]:

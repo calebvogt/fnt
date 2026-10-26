@@ -137,10 +137,11 @@ def order_coarse_to_fine(videos: Sequence[str]) -> List[str]:
 def infer_video(model, video: str, name: str, step: int, conf: float, imgsz: int,
                 device: str = "", iou: float = 0.5,
                 on_frame: Optional[Callable] = None,
-                should_stop: Optional[Callable[[], bool]] = None) -> dict:
+                should_stop: Optional[Callable[[], bool]] = None, roi=None) -> dict:
     """Segment every ``step``-th frame of ``video`` with the loaded YOLO ``model`` and write
     the sidecar. ``on_frame(sample_i, n_samples, frame_bgr, masks)`` is called per sample;
-    ``should_stop()`` ends the video early (the sidecar is then left incomplete)."""
+    ``should_stop()`` ends the video early (the sidecar is then left incomplete). ``roi``
+    (mtt_roi.ROI, the model's) prepares each frame as the model was trained on it."""
     import h5py
     cap = cv2.VideoCapture(video)
     if not cap.isOpened():
@@ -161,16 +162,21 @@ def infer_video(model, video: str, name: str, step: int, conf: float, imgsz: int
         ok, frame = cap.read()
         if not ok:
             continue
-        r = model.predict(frame, imgsz=imgsz, conf=conf, iou=iou, retina_masks=True,
+        img = frame if roi is None else roi.apply(frame)[0]
+        r = model.predict(img, imgsz=imgsz, conf=conf, iou=iou, retina_masks=True,
                           device=device or None, verbose=False)[0]
         masks, scores = [], np.zeros(0, np.float32)
         if r.masks is not None and len(r.masks):
             raw = r.masks.data.cpu().numpy() > 0.5
-            if raw.shape[1:] != (height, width):
-                raw = np.stack([cv2.resize(m.astype(np.uint8), (width, height),
-                                           interpolation=cv2.INTER_NEAREST) > 0 for m in raw])
-            masks = [drop_fragments(m) for m in raw]
             scores = r.boxes.conf.cpu().numpy().astype(np.float32)
+            ih, iw = img.shape[:2]
+            if raw.shape[1:] != (ih, iw):
+                raw = np.stack([cv2.resize(m.astype(np.uint8), (iw, ih),
+                                           interpolation=cv2.INTER_NEAREST) > 0 for m in raw])
+            if roi is not None:
+                raw, kept = roi.to_frame(raw, height, width)
+                raw, scores = raw[kept], scores[kept]
+            masks = [drop_fragments(m) for m in raw]
             keep = one_per_animal(masks, scores)
             masks = [masks[k] for k in keep]
             scores = scores[keep]
@@ -206,6 +212,9 @@ def infer_video(model, video: str, name: str, step: int, conf: float, imgsz: int
         a["height"] = height
         a["created"] = datetime.now().isoformat(timespec="seconds")
         a["complete"] = complete
+        if roi is not None:
+            import json
+            a["roi"] = json.dumps(roi.to_dict())
         g = f.create_group("frames")
         g.create_dataset("frame_idx", data=np.asarray(f_idx, np.int32))
         g.create_dataset("time_s", data=np.asarray(f_idx, np.float64) / (fps or 1.0))
@@ -262,9 +271,12 @@ def run_batch(model_dir: str, videos: Sequence[str], step: int = 250, conf: floa
             import json
             imgsz = int(json.load(open(cfg)).get("imgsz", imgsz))
     model = YOLO(weights)
+    from .mtt_roi import model_roi
+    roi = model_roi(weights)
     todo = [v for v in videos if not sidecar_done(v, name, step, conf, imgsz)]
     log(f"[batch] {name}: {len(videos)} video(s), {len(videos) - len(todo)} already done, "
-        f"{len(todo)} to go; every {step} frames, conf {conf}, imgsz {imgsz}")
+        f"{len(todo)} to go; every {step} frames, conf {conf}, imgsz {imgsz}"
+        + (f"; ROI: {roi.describe()}" if roi is not None else ""))
     t0 = time.time()
     done = 0
     for k, v in enumerate(todo):
@@ -276,7 +288,7 @@ def run_batch(model_dir: str, videos: Sequence[str], step: int = 250, conf: floa
             on_video(k, len(todo), v)
         try:
             s = infer_video(model, v, name, step, conf, imgsz, device,
-                            on_frame=on_frame, should_stop=should_stop)
+                            on_frame=on_frame, should_stop=should_stop, roi=roi)
             done += int(s["complete"])
             log(f"[batch] {k + 1}/{len(todo)} {os.path.basename(v)}: {s['samples']} frames, "
                 f"{s['detections']} masks ({time.time() - t0:.0f} s)")
