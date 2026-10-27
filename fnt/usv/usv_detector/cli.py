@@ -7,6 +7,7 @@ be scripted into batch and HPC workflows without the GUI. Installed as the
     mad analyze    --model weights.pt --input recordings/
     mad train      --project my_project/ --split-mode file
     mad embeddings --model weights.pt --input recordings/ --out emb.npz
+    mad export     --input recordings/ --out tables/
 
 Heavy deps (torch, segmentation-models-pytorch) are imported lazily by the
 underlying pipeline, so ``mad --help`` stays fast.
@@ -767,7 +768,114 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Recompute ridges that are already stored.")
     pr.set_defaults(func=_cmd_add_ridge)
 
+    # export
+    px = sub.add_parser('export',
+                        help="Write folder-wide CSV tables from the .mad files: one "
+                             "row per recording, per detection and per labelled call.")
+    px.add_argument('--input', nargs='+', default=[],
+                    help="Folders (walked to the bottom) and/or wav files whose .mad "
+                         "files to export.")
+    px.add_argument('--project', default='',
+                    help="Export the recordings registered in this MAD project "
+                         "(with or instead of --input).")
+    px.add_argument('--out', default='',
+                    help="Folder for the tables (created if needed). Exporting again "
+                         "into it reads only new and changed .mad files.")
+    px.add_argument('--detections', action='store_true',
+                    help="mad_recordings.csv and mad_detections.csv (the default when "
+                         "no table is named).")
+    px.add_argument('--labels', action='store_true',
+                    help="mad_labelled_calls.csv: every accepted call, with MAD's call "
+                         "metrics recomputed from the audio.")
+    px.add_argument('--images', action='store_true',
+                    help="A spectrogram PNG per labelled call in mad_call_images/ "
+                         "(implies --labels).")
+    px.add_argument('--model', default='',
+                    help="Only recordings whose last inference was this model (its "
+                         "run folder name, or a unique start of it). Default: the "
+                         "most common.")
+    px.add_argument('--list-models', action='store_true',
+                    help="List the models the input's .mad files were last analysed "
+                         "with, and how many of each, then stop.")
+    px.add_argument('--harmonics', action='store_true',
+                    help="Include harmonics (harmonic_n > 1). Default: fundamentals "
+                         "only.")
+    px.add_argument('--full', action='store_true',
+                    help="Read every .mad again, instead of copying the rows of "
+                         "recordings unchanged since the last export.")
+    px.add_argument('--settle-minutes', type=float, default=10.0,
+                    help="Leave out .mad files written in the last N minutes, which "
+                         "MAD may still be writing (default 10; 0 keeps all).")
+    px.set_defaults(func=_cmd_export)
+
     return p
+
+
+def _cmd_export(args) -> int:
+    """Folder-wide tables from the .mad files (mad_export), with a line per step
+    and a progress line every 500 recordings."""
+    import time
+    from .mad_export import (ExportOptions, export, find_stores, model_counts,
+                             scan_models)
+    wavs = []
+    if args.project:
+        from .mad_project import MADProjectConfig
+        try:
+            wavs = [e.path for e in MADProjectConfig.load(args.project).audio_entries()]
+        except Exception as e:
+            print(f"Could not open project {args.project}: {e}",
+                  file=sys.stderr, flush=True)
+            return 2
+    folders = [p for p in args.input if os.path.isdir(p)]
+    wavs += [p for p in args.input if os.path.isfile(p)]
+    missing = [p for p in args.input if not os.path.exists(p)]
+    if missing:
+        print(f"Not found: {', '.join(missing)}", file=sys.stderr, flush=True)
+        return 2
+    if not folders and not wavs:
+        print("Name the recordings to export: --input and/or --project.",
+              file=sys.stderr, flush=True)
+        return 2
+
+    last = {'t': 0.0}
+
+    def _progress(stage, i, n, name):
+        # A line every 500 recordings or 10 s, and at the end of each stage:
+        # one per file would be 40,000 lines for a full run.
+        now = time.time()
+        if i == n or i % 500 == 0 or now - last['t'] > 10:
+            last['t'] = now
+            label = {'scan': 'models read', 'detections': 'recordings',
+                     'labels': 'recordings (labels)'}.get(stage, stage)
+            print(f"  [{i:,}/{n:,}] {label}" + (f"  {name}" if name else ""),
+                  flush=True)
+
+    if args.list_models:
+        stores = find_stores(folders, wavs)
+        counts = model_counts(scan_models(stores, progress=_progress))
+        print(f"{len(stores):,} recording(s) with a .mad file", flush=True)
+        for m, n in counts.most_common():
+            print(f"  {n:7,}  {m}", flush=True)
+        if not counts:
+            print("  none has been through inference", flush=True)
+        return 0
+    if not args.out:
+        print("Name the folder for the tables: --out.", file=sys.stderr, flush=True)
+        return 2
+    opts = ExportOptions(
+        out_dir=args.out, folders=folders, wavs=wavs,
+        detections=args.detections or not (args.labels or args.images),
+        labels=args.labels or args.images, images=args.images,
+        model=args.model or None, harmonics=args.harmonics,
+        incremental=not args.full, settle_s=max(0.0, args.settle_minutes) * 60.0)
+    try:
+        rep = export(opts, progress=_progress,
+                     log=lambda m: print(m, flush=True))
+    except ValueError as e:
+        print(str(e), file=sys.stderr, flush=True)
+        return 2
+    print(f"Done: tables in {os.path.abspath(args.out)}", flush=True)
+    return 1 if rep.get('stopped') or rep.get('error') else 0
 
 
 def _cmd_add_specs(args) -> int:

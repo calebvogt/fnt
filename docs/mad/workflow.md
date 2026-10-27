@@ -317,9 +317,14 @@ is the record; nothing else is written during a run.
 **File ▸ Export Annotations to CSV…** turns it into one standalone
 `<recording>_FNT_MAD_annotations.csv` per wav — the same per-file profile SLEAP
 and DLC use. Export when you are done reviewing, not before: the CSV is a
-snapshot, and re-exporting after more review simply overwrites it. There is
-deliberately no aggregate table; concatenate what you need in your analysis
-code.
+snapshot, and re-exporting after more review simply overwrites it.
+
+**File ▸ Export…** (or `mad export`) writes the whole run as a few tables in
+one folder instead: one row per recording, one per detection and one per
+labelled call, with optional spectrogram images of the labelled calls.
+Exporting again into the same folder reads only the recordings that changed, so
+it can be re-run while a batch is still going. See
+[Exporting tables](export.md).
 
 Every row is one call: onset/offset, frequency box and contour metrics (peak,
 bandwidth, slope, excursion, sinuosity), spectral shape (centroid, entropy,

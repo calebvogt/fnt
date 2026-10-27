@@ -70,6 +70,7 @@ nav:
   - MAD:
       - Overview: mad/overview.md
       - Workflow (step by step): mad/workflow.md
+      - Exporting tables: mad/export.md
   - Mask Tracker: tools/mask-tracker.md
   - About:
       - Citing and license: about.md

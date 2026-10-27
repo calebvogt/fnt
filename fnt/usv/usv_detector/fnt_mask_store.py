@@ -398,22 +398,26 @@ def set_infer_run_attrs(h5_path: str, **params) -> None:
                 f.attrs[k] = round(float(v), 6)
 
 
+def _run_attrs(f) -> Dict:
+    out: Dict = {}
+    for k in _RUN_KEYS:
+        if k in f.attrs:
+            v = f.attrs[k]
+            out[k] = (v.decode() if isinstance(v, bytes)
+                      else v.item() if hasattr(v, "item") else v)
+    return out
+
+
 def get_infer_run_attrs(h5_path: str) -> Dict:
     """The last run's settings, or {} when inference has never been run."""
     _require_h5()
     if not os.path.isfile(h5_path):
         return {}
-    out: Dict = {}
     try:
         with h5py.File(h5_path, "r") as f:
-            for k in _RUN_KEYS:
-                if k in f.attrs:
-                    v = f.attrs[k]
-                    out[k] = (v.decode() if isinstance(v, bytes)
-                              else v.item() if hasattr(v, "item") else v)
+            return _run_attrs(f)
     except Exception:
         return {}
-    return out
 
 
 def was_inferred(h5_path: str) -> bool:
@@ -499,18 +503,44 @@ def review_complete_at(h5_path: str) -> str:
         return ""
 
 
+def _grid_attrs(f) -> Dict:
+    out: Dict = {}
+    for k in _GRID_KEYS:
+        if k in f.attrs:
+            out[k] = int(f.attrs[k])
+    if "schema_version" in f.attrs:
+        out["schema_version"] = int(f.attrs["schema_version"])
+    return out
+
+
 def get_grid_attrs(h5_path: str) -> Dict:
     """Return the recorded grid params, or {} if the file/attrs are absent."""
     _require_h5()
     if not os.path.isfile(h5_path):
         return {}
-    out: Dict = {}
     with h5py.File(h5_path, "r") as f:
-        for k in _GRID_KEYS:
-            if k in f.attrs:
-                out[k] = int(f.attrs[k])
-        if "schema_version" in f.attrs:
-            out["schema_version"] = int(f.attrs["schema_version"])
+        return _grid_attrs(f)
+
+
+def read_store_summary(h5_path: str, preds: bool = False,
+                       example_meta: bool = False) -> Dict:
+    """What a reader of many recordings needs from one store, in ONE open.
+
+    ``{grid, run}`` (as :func:`get_grid_attrs` and :func:`get_infer_run_attrs`),
+    plus ``preds`` (as :func:`read_all_pred_masks`) and ``example_meta`` (as
+    :func:`td_iter_meta`, a list) when asked. Each of those opens the file on
+    its own, and on a network share an open costs ~9 ms before anything is
+    read -- six minutes of opening alone for a 40,000-recording run read four
+    times over (mad_export). Raises OSError when the file cannot be opened,
+    e.g. while MAD is writing it.
+    """
+    _require_h5()
+    with h5py.File(h5_path, "r") as f:
+        out = {"grid": _grid_attrs(f), "run": _run_attrs(f)}
+        if preds:
+            out["preds"] = _pred_records(f)
+        if example_meta:
+            out["example_meta"] = list(_iter_meta(f))
     return out
 
 
@@ -926,32 +956,37 @@ def read_all_pred_masks(h5_path: str, include_spec: bool = False,
     (ridge_turns, ridge_rate_hz, ridge_depth_khz, ridge_trill) come back
     whenever stored."""
     _require_h5()
-    out: Dict[str, Dict] = {}
     if not os.path.isfile(h5_path):
-        return out
+        return {}
     with h5py.File(h5_path, "r") as f:
-        grp = f.get(PRED_GROUP)
-        if grp is None:
-            return out
-        sgrp = f.get(PRED_SPEC_GROUP) if include_spec else None
-        rgrp = f.get(PRED_RIDGE_GROUP) if include_ridge else None
-        for key in grp:
-            ds = grp[key]
-            rec = {
-                "mask": ds[()].astype(bool),
-                "f_off": int(ds.attrs.get("f_off", 0)),
-                "t_off": int(ds.attrs.get("t_off", 0)),
-            }
-            if sgrp is not None and key in sgrp:
-                rec["spec"] = sgrp[key][()]
-            if rgrp is not None and key in rgrp:
-                rec["ridge_khz"] = rgrp[key][()]
-            for k in PRED_ATTRS + _RIDGE_ATTRS:
-                if k in ds.attrs:
-                    v = ds.attrs[k]
-                    rec[k] = (v.decode() if isinstance(v, bytes)
-                              else v.item() if hasattr(v, "item") else v)
-            out[key] = rec
+        return _pred_records(f, include_spec, include_ridge)
+
+
+def _pred_records(f, include_spec: bool = False,
+                  include_ridge: bool = False) -> Dict[str, Dict]:
+    out: Dict[str, Dict] = {}
+    grp = f.get(PRED_GROUP)
+    if grp is None:
+        return out
+    sgrp = f.get(PRED_SPEC_GROUP) if include_spec else None
+    rgrp = f.get(PRED_RIDGE_GROUP) if include_ridge else None
+    for key in grp:
+        ds = grp[key]
+        rec = {
+            "mask": ds[()].astype(bool),
+            "f_off": int(ds.attrs.get("f_off", 0)),
+            "t_off": int(ds.attrs.get("t_off", 0)),
+        }
+        if sgrp is not None and key in sgrp:
+            rec["spec"] = sgrp[key][()]
+        if rgrp is not None and key in rgrp:
+            rec["ridge_khz"] = rgrp[key][()]
+        for k in PRED_ATTRS + _RIDGE_ATTRS:
+            if k in ds.attrs:
+                v = ds.attrs[k]
+                rec[k] = (v.decode() if isinstance(v, bytes)
+                          else v.item() if hasattr(v, "item") else v)
+        out[key] = rec
     return out
 
 
@@ -1697,16 +1732,20 @@ def td_iter_meta(h5_path: str) -> Iterator[Dict]:
         return
     try:
         with h5py.File(h5_path, "r") as f:
-            ex = f.get("examples")
-            if ex is None:
-                return
-            for key in ex:
-                try:
-                    yield json.loads(ex[key].attrs.get("meta_json", "{}"))
-                except Exception:
-                    continue
+            yield from _iter_meta(f)
     except Exception:
         return
+
+
+def _iter_meta(f) -> Iterator[Dict]:
+    ex = f.get("examples")
+    if ex is None:
+        return
+    for key in ex:
+        try:
+            yield json.loads(ex[key].attrs.get("meta_json", "{}"))
+        except Exception:
+            continue
 
 
 def td_count(h5_path: str, kind: Optional[str] = None) -> int:

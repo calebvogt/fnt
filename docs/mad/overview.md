@@ -16,7 +16,7 @@ Launch from the FNT main GUI **Audio** tab → **Mask Audio Detector (MAD)**.
 
 ## Project structure
 
-MAD follows SLEAP's project model: a project **points at** recordings where they already live, the way a SLEAP project points at videos. The project folder holds those path references, the training-data store, and trained model checkpoints — never copies of your audio, which for 250 kHz recordings would run to hundreds of MB per file. Detections are saved as a sibling CSV next to each recording, cross-readable with the Classic Audio Detector (CAD) output.
+MAD follows SLEAP's project model: a project **points at** recordings where they already live, the way a SLEAP project points at videos. The project folder holds those path references, the training-data store, and trained model checkpoints — never copies of your audio, which for 250 kHz recordings would run to hundreds of MB per file. Detections are saved in a `.mad` file next to each recording.
 
 There is a single **Audio** list: every recording the project knows about. Anything you confirm in it trains the model — there is no separate training set to curate. Large production runs stay outside the list via the **Folder** inference target, so recordings you are not curating never join the training set.
 
@@ -26,7 +26,7 @@ Because recordings are referenced rather than copied, a recording that moves is 
 
 ## Detection output
 
-Every recording gets its own standalone `<wav>_FNT_MAD_annotations.csv` sibling holding that file's complete detection table — the same per-file profile SLEAP and DeepLabCut use for video. There is no aggregate run-level table and no interchange export: MAD is deliberately self-contained for both analysis and review, and third-party formats (Raven, Audacity) are upkeep the project does not carry. If a downstream tool is ever needed, compatibility gets built then.
+Each recording's masks, detections and review status live in its `<recording>_FNT.mad` file beside the wav. **File ▸ Export Annotations to CSV…** turns that into a standalone `<recording>_FNT_MAD_annotations.csv` per recording — the same per-file profile SLEAP and DeepLabCut use for video. For analysis across a run, **File ▸ Export…** (or `mad export`) writes folder-wide tables instead: one row per recording, one per detection and one per labelled call, with optional spectrogram images of the labelled calls. See [Exporting tables](export.md). There is no interchange export: third-party formats (Raven, Audacity) are upkeep the project does not carry. If a downstream tool is ever needed, compatibility gets built then.
 
 ## Consecutive-detection merging
 
@@ -53,6 +53,13 @@ mad train --project my_project/ --epochs 30 --device cuda
 
 # Export per-detection embeddings for clustering / similarity analysis
 mad embeddings --model weights.pt --input recordings/ --out embeddings.npz
+
+# Folder-wide tables of recordings and detections (see Exporting tables)
+mad export --input recordings/ --out tables/
+
+# Add stored spectrograms, then brightness ridges, to existing .mad files
+mad add-specs --input recordings/
+mad add-ridge --input recordings/ --model <project>/models/<run>
 ```
 
 Run `mad <command> --help` for the full option list.
