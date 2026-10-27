@@ -6,62 +6,87 @@ site_author: Caleb C. Vogt
 site_url: https://calebvogt.github.io/fnt/
 repo_url: https://github.com/calebvogt/fnt
 repo_name: calebvogt/fnt
+edit_uri: edit/dev/docs/
 copyright: Copyright &copy; Caleb C. Vogt, Samuel Garmany and contributors
 
 theme:
   name: material
+  logo: assets/fnt-logo-white.png
+  favicon: assets/favicon.png
   icon:
     repo: fontawesome/brands/github
+    edit: material/pencil
   features:
+    - navigation.tabs
+    - navigation.tabs.sticky
     - navigation.instant
     - navigation.tracking
     - navigation.sections
     - navigation.top
     - navigation.footer
     - content.code.copy
+    - content.action.edit
     - toc.follow
     - search.suggest
     - search.highlight
   palette:
     - media: "(prefers-color-scheme: light)"
       scheme: default
-      primary: teal
-      accent: teal
+      primary: custom
+      accent: custom
       toggle:
         icon: material/brightness-7
         name: Switch to dark mode
     - media: "(prefers-color-scheme: dark)"
       scheme: slate
-      primary: teal
-      accent: teal
+      primary: custom
+      accent: custom
       toggle:
         icon: material/brightness-4
         name: Switch to light mode
 
+extra_css:
+  - stylesheets/extra.css
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/calebvogt/fnt
+      name: FNT on GitHub
+    - icon: fontawesome/brands/youtube
+      link: https://youtube.com/playlist?list=PLY8yLegR_viXsARZr460L3ZHRp3HZsOOC
+      name: Video tutorials
+
 nav:
   - Home: index.md
-  - Getting Started:
-      - Installation: installation.md
+  - Installation: installation.md
   - Tools:
       - Audio / USV: tools/audio.md
       - Video Processing: tools/video-processing.md
       - Video Tracking: tools/video-tracking.md
-      - Mask Tracker: tools/mask-tracker.md
       - UWB Tracking: tools/uwb.md
       - RFID Tracking: tools/rfid.md
       - Imaging: tools/imaging.md
-  - MAD Detector:
+  - MAD:
       - Overview: mad/overview.md
       - Workflow (step by step): mad/workflow.md
+  - Mask Tracker: tools/mask-tracker.md
+  - About:
+      - Citing and license: about.md
 
 markdown_extensions:
   - admonition
+  - attr_list
+  - md_in_html
   - pymdownx.details
   - pymdownx.superfences
   - pymdownx.highlight:
       anchor_linenums: true
   - pymdownx.inlinehilite
   - pymdownx.snippets
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
   - tables
   - toc:
       permalink: true

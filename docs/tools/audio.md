@@ -13,8 +13,8 @@ Project-based spectrogram labeling, training, and inference tool. See the [MAD O
 - **Label workflow** — pending → confirmed or rejected annotations
 - **Training** — train a U-Net segmentation model on labeled examples within the GUI
 - **Inference** — run trained models on new recordings; review and correct predictions
-- **Project system** — organizes session audio, training data, and models in a single project folder
-- **Output** — one standalone detections CSV per recording, written beside the wav
+- **Project system** — references recordings where they live; the project folder holds the training data and models
+- **Output** — a `<recording>_FNT.mad` file beside each wav (masks, detections, review status), exported to CSV on request
 
 ## Classic Audio Detector (CAD)
 

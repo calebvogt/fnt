@@ -16,18 +16,25 @@ Interactive GUI for loading, cleaning, and exporting UWB tracking data:
 - **Day/night segmentation** based on a configurable light cycle
 - **Visual preview** of smoothed trajectories per tag
 - **Weather, sunlight and sky** for the site (latitude/longitude you enter or load from a site profile): a weather line, a daylight strip, the moon's phase, and a sky icon (clear, partly cloudy, overcast, fog, light/moderate/heavy rain, snow, thunderstorm) that follows the playhead in the preview and the video. Measured data win: rain comes from the weather station's gauge wherever it has a record and daytime cloud from measured sunlight; the Open-Meteo model fills only gaps and what nothing measures (night cloud, thunder, fog), and is labelled "model". Exported minute by minute to `{db}_sky.csv` with the evidence behind each minute
-- **Export** cleaned data to CSV with standardized column naming
+- **Regions of interest** — draw regions on the arena (or import the site XML's zones) for visit and occupancy tables
+- **Contact and chases** — contact bouts between every pair of animals within a distance threshold, and directed chase bouts
+- **Export** cleaned data, social and region tables, plots and animations, one trial at a time or as a batch queue
 
-## Proximity Detection
+## Exports
 
-Batch analysis for detecting pairwise proximity events between tracked animals:
+Everything goes to `<database>_FNT_analysis/` beside the database, with the settings in `fnt_config.json`. The tables are in `csvs/`:
 
-- Computes inter-animal distances at each timestamp
-- Detects **proximity bouts** — contiguous periods where two animals are within a configurable distance threshold
-- Configurable gap-bridging to merge bouts separated by brief interruptions
-- Outputs **proximity_bouts** — summarized bouts with start/stop times, duration, mean distance, and observation count
+| File | One row per |
+|------|-------------|
+| `<db>_smoothed.csv` | fix of a configured tag inside its deployment window: raw and smoothed positions (m), local time, animal |
+| `<db>_raw.csv` | the same fixes before smoothing (optional) |
+| `<db>_SocialOverlapBouts.csv` | contact bout of a pair: `animal1`, `animal2`, `Day`, `Date`, `bout_start`, `bout_stop`, `duration_s`, `mean_distance`, `n_reads` |
+| `<db>_behavior_events.csv` | directed chase: `behavior`, `actor`, `target`, sexes, `Day`, `bout_start`, `bout_stop`, `duration_s` |
+| `<db>_ROI_bout_occupancy.csv` | visit to a drawn region: `SexID`, `Day`, `ROI`, `bout_start`, `bout_stop`, `duration_s`, `n_reads` |
+| `<db>_ROI_DailySummary.csv` | animal, region and day: time in the region and its rank among the animals that entered |
+| `<db>_sky.csv` | minute: weather, daylight and sky state, with the evidence for each |
 
-    Bouts are specific to the chosen distance threshold; re-run the analysis with a different threshold to explore other distances. The raw per-timestamp pairwise distances are computed internally but not exported.
+Contact bouts are specific to the distance threshold and the bridging gap chosen at export; export again to try other values. Plots go to `plots/` and tracking or social-network animations to `animation_*/`.
 
 ## Input data format
 
@@ -42,6 +49,5 @@ The tool expects UWB data with at minimum:
 
 Additional columns (e.g., `location_z`, `location_quality`) are preserved during export.
 
-## Output
-
-Exported CSVs include smoothed coordinates (`smoothed_x`, `smoothed_y`), day/night labels, and animal identity metadata — ready for downstream analysis in R or Python.
+!!! tip "Positions for analysis"
+    Use `smoothed_x` and `smoothed_y` from `<db>_smoothed.csv`, at 1 Hz or finer. Tag read rates can differ several-fold between animals, so time spent anywhere is a sum of per-fix durations, never a count of fixes.

@@ -1,3 +1,8 @@
+---
+hide:
+  - navigation
+---
+
 # Mask Tracker
 
 Label animals in video frames with SAM, train a YOLO instance-segmentation model
