@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import tempfile
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
@@ -347,6 +348,17 @@ def _named_losses(loss, names) -> dict:
     return {(names[i] if i < len(names) else f"loss_{i}"): float(v) for i, v in enumerate(items)}
 
 
+def _paths_past_max_path(folder: str, limit: int = 260) -> List[str]:
+    """Files in ``folder`` whose resolved path (the form Ultralytics opens) is
+    too long for Windows without long-path support; empty elsewhere."""
+    if os.name != "nt":
+        return []
+    root = str(Path(folder).resolve())
+    paths = (os.path.join(root, os.path.relpath(os.path.join(d, f), folder))
+             for d, _, files in os.walk(folder) for f in files)
+    return [p for p in paths if len(p) >= limit]
+
+
 def train_yolo_seg(
     cfg: YOLOTrainingConfig,
     progress: Optional[Callable] = None,
@@ -374,10 +386,22 @@ def train_yolo_seg(
     print(f"[YOLO Train] Config: epochs={cfg.num_iterations}, lr={cfg.learning_rate}, "
           f"batch={cfg.batch_size}, imgsz={cfg.imgsz}, model={cfg.model_variant}")
 
-    yolo_data_dir = os.path.join(run_dir, "yolo_dataset")
+    # The YOLO copy of the frames goes in a short local folder, not the run
+    # folder: Ultralytics resolves a mapped drive to its network path (Z: ->
+    # \\server\share), and past 260 characters Windows cannot open a label
+    # file, which Ultralytics then reads as a frame with no animals. In
+    # 2026-10 that silently trained 165 of 177 resource-zone frames as empty.
+    yolo_data_dir = tempfile.mkdtemp(prefix="fnt_yolo_")
     data_yaml = convert_coco_to_yolo(
         cfg.coco_json_path, cfg.images_dir, yolo_data_dir, cfg.val_fraction, roi=cfg.roi,
     )
+    too_long = _paths_past_max_path(yolo_data_dir)
+    if too_long:
+        shutil.rmtree(yolo_data_dir, ignore_errors=True)
+        raise RuntimeError(
+            f"{len(too_long)} training file paths are too long for Windows "
+            f"(260 characters), e.g. {too_long[0]}. Shorten the TEMP folder path "
+            f"or the frame names.")
 
     device = _resolve_device(cfg.device)
     # The training window's live preview: fixed validation frames, re-predicted
@@ -535,33 +559,37 @@ def train_yolo_seg(
         print("[YOLO Train] Augmentation: disabled")
 
     t0 = _time.time()
-    results = model.train(
-        data=data_yaml,
-        epochs=cfg.num_iterations,
-        imgsz=cfg.imgsz,
-        batch=cfg.batch_size,
-        lr0=cfg.learning_rate,
-        patience=cfg.early_stop_patience,
-        device=device,
-        workers=0,
-        project=run_dir,
-        name="train",
-        exist_ok=True,
-        verbose=False,
-        freeze=freeze_layers,
-        optimizer=cfg.optimizer,
-        plots=True,
-        save=True,
-        # Online augmentation
-        fliplr=cfg.aug_fliplr,
-        flipud=cfg.aug_flipud,
-        degrees=cfg.aug_degrees,
-        scale=cfg.aug_scale,
-        hsv_v=cfg.aug_hsv_v,
-        hsv_s=cfg.aug_hsv_s,
-        mosaic=cfg.aug_mosaic,
-        copy_paste=cfg.aug_copy_paste,
-    )
+    try:
+        results = model.train(
+            data=data_yaml,
+            epochs=cfg.num_iterations,
+            imgsz=cfg.imgsz,
+            batch=cfg.batch_size,
+            lr0=cfg.learning_rate,
+            patience=cfg.early_stop_patience,
+            device=device,
+            workers=0,
+            project=run_dir,
+            name="train",
+            exist_ok=True,
+            verbose=False,
+            freeze=freeze_layers,
+            optimizer=cfg.optimizer,
+            plots=True,
+            save=True,
+            # Online augmentation
+            fliplr=cfg.aug_fliplr,
+            flipud=cfg.aug_flipud,
+            degrees=cfg.aug_degrees,
+            scale=cfg.aug_scale,
+            hsv_v=cfg.aug_hsv_v,
+            hsv_s=cfg.aug_hsv_s,
+            mosaic=cfg.aug_mosaic,
+            copy_paste=cfg.aug_copy_paste,
+        )
+    finally:
+        # Remove the temporary YOLO dataset conversion directory
+        shutil.rmtree(yolo_data_dir, ignore_errors=True)
     elapsed = _time.time() - t0
     print()  # newline after the \r-updating status line
 
@@ -575,10 +603,6 @@ def train_yolo_seg(
         shutil.copy2(best_pt, dest_best)
     if os.path.exists(last_pt):
         shutil.copy2(last_pt, dest_last)
-
-    # Remove the temporary YOLO dataset conversion directory
-    if os.path.isdir(yolo_data_dir):
-        shutil.rmtree(yolo_data_dir, ignore_errors=True)
 
     with open(cfg.coco_json_path) as f:
         coco_data = json.load(f)

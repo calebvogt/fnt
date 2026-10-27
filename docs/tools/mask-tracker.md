@@ -127,6 +127,16 @@ python -m fnt.videoTracking.mask_tracker_gui --project <project> --focus <list.t
 - `--post-infer`: when training ends, the model predicts the queue's frames that
   have no approved mask, for review.
 - `--train-only <list>`: train on a subset of the frames.
+- `--optimizer` and `--lr` combine: picking an optimizer resets the learning
+  rate to its default (SGD 0.01, AdamW 0.002) only when `--lr` is not given.
+
+The run's model, plots and summary go in the project's `models/` folder. The
+YOLO copy of the frames that training reads is built in a temporary folder on
+the local disk and removed when the run ends. On Windows, a mapped drive is
+opened by its network path (`Z:` becomes `\\server\share`), and without
+long-path support a label file 260 or more characters deep cannot be opened,
+so YOLO would train that frame as empty; the short local copy avoids that, and
+a run whose paths are still too long stops with an error instead.
 
 ## Reviewing predictions
 
