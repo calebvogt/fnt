@@ -53,6 +53,7 @@ nav:
   - MAD Detector:
       - Overview: mad/overview.md
       - Workflow (step by step): mad/workflow.md
+      - Exporting tables: mad/export.md
 
 markdown_extensions:
   - admonition

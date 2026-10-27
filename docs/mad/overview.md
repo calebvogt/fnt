@@ -26,7 +26,7 @@ Because recordings are referenced rather than copied, a recording that moves is 
 
 ## Detection output
 
-Every recording gets its own standalone `<wav>_FNT_MAD_annotations.csv` sibling holding that file's complete detection table — the same per-file profile SLEAP and DeepLabCut use for video. There is no aggregate run-level table and no interchange export: MAD is deliberately self-contained for both analysis and review, and third-party formats (Raven, Audacity) are upkeep the project does not carry. If a downstream tool is ever needed, compatibility gets built then.
+Every recording gets its own standalone `<wav>_FNT_MAD_annotations.csv` sibling holding that file's complete detection table — the same per-file profile SLEAP and DeepLabCut use for video. For analysis across a run, **File ▸ Export…** (or `mad export`) writes folder-wide tables instead: one row per recording, one per detection and one per labelled call, with optional spectrogram images of the labelled calls. See [Exporting tables](export.md). There is no interchange export: third-party formats (Raven, Audacity) are upkeep the project does not carry. If a downstream tool is ever needed, compatibility gets built then.
 
 ## Consecutive-detection merging
 
@@ -53,6 +53,9 @@ mad train --project my_project/ --epochs 30 --device cuda
 
 # Export per-detection embeddings for clustering / similarity analysis
 mad embeddings --model weights.pt --input recordings/ --out embeddings.npz
+
+# Folder-wide tables of recordings and detections (see Exporting tables)
+mad export --input recordings/ --out tables/
 ```
 
 Run `mad <command> --help` for the full option list.

@@ -13954,6 +13954,16 @@ class MADMainWindow(QMainWindow):
         self.act_run_summary.triggered.connect(self._show_run_summary)
         file_menu.addAction(self.act_run_summary)
 
+        self.act_export_tables = QAction("E&xport…", self)
+        self.act_export_tables.setToolTip(
+            "Folder-wide tables from the .mad files: one row per recording, "
+            "one per detection and one per labelled call (with spectrogram "
+            "images if asked), for analysis in R or pandas.\n\n"
+            "Exporting again into the same folder reads only the recordings "
+            "whose .mad changed.")
+        self.act_export_tables.triggered.connect(self._show_export_dialog)
+        file_menu.addAction(self.act_export_tables)
+
         self.act_export_csv = QAction("&Export Annotations to CSV…", self)
         self.act_export_csv.setToolTip(
             "Write a CSV beside every recording in a folder, generated from "
@@ -14661,6 +14671,33 @@ class MADMainWindow(QMainWindow):
     # ==================================================================
     # Project lifecycle
     # ==================================================================
+    def _show_export_dialog(self):
+        """File ▸ Export…: the folder-wide tables (mad_export), in a window of
+        their own. Offers the project's recordings (the Audio list's with no
+        project open) or folders; one window at a time."""
+        dlg = getattr(self, '_export_dialog', None)
+        try:
+            if dlg is not None and dlg.isVisible():
+                dlg.raise_()
+                dlg.activateWindow()
+                return
+        except RuntimeError:            # closed and deleted
+            pass
+        from fnt.usv.mad_export_dialog import MADExportDialog
+        if self._project is not None:
+            wavs = [e.path for e in self._project.audio_entries()]
+            label = "Project recordings"
+        else:
+            wavs, label = list(self.audio_files), "Audio list"
+        dlg = MADExportDialog(self, wavs=wavs, wavs_label=label,
+                              settings=self._settings,
+                              start_dir=self._default_browse_dir(),
+                              parented=False)
+        dlg.setAttribute(Qt.WA_DeleteOnClose, True)
+        self._keep_window(dlg)
+        self._export_dialog = dlg
+        dlg.show()
+
     def _export_annotations_csv(self):
         """Write a CSV beside every recording under a chosen folder.
 
@@ -14670,7 +14707,7 @@ class MADMainWindow(QMainWindow):
         are measured with today's feature code against the audio, instead of
         being frozen at whatever ran the day each call was confirmed.
         """
-        start = (self._project.root if self._project
+        start = (self._project.project_dir if self._project
                  else self._default_browse_dir())
         folder = QFileDialog.getExistingDirectory(
             self, "Export annotations for every recording under…", start)
