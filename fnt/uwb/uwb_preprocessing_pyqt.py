@@ -16915,6 +16915,24 @@ class UWBQuickVisualizationWindow(QWidget):
             selected_days = list(s['selected_days']) if generate_daily else []
             force_full_render = False
 
+            # A day the Start/Stop trim leaves empty can never have a video, so
+            # it is not a gap in the full video. VC-T006's day 11 (3/2, after
+            # its 3/1 12:52 cut) used to count as missing, which threw away the
+            # ten daily videos and re-rendered the whole span in one 195,000-
+            # frame pass (it died two-fifths of the way through).
+            if trial_days and not anim_data.empty:
+                have = set(pd.Series(anim_data['Timestamp'].dt.normalize().unique())
+                           .dt.strftime('%Y-%m-%d'))
+                empty_days = [d for d in trial_days if d not in have]
+                if empty_days:
+                    self.log_message(
+                        "No tracking data on "
+                        + ", ".join(f"Day {day_numbers.get(d, '?')} ({d})"
+                                    for d in empty_days)
+                        + " after the Start/Stop trim: left out of the full animation.")
+                    trial_days = [d for d in trial_days if d in have]
+                    selected_days = [d for d in selected_days if d in have]
+
             # A full video is meant to be the WHOLE trial. Before rendering
             # anything, check that every day will have a video at THESE
             # settings - the ones already on disk plus the ones about to be
