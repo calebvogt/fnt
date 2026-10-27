@@ -576,20 +576,41 @@ class COCOAnnotationManager:
     # A frame the reviewer marked as holding no object. It is stored as a flag
     # on the COCO image ("empty": true) and trains as a background image. The
     # flag only counts while the frame has no accepted mask, so a mask drawn
-    # later wins without every entry point having to clear it.
+    # later wins without every entry point having to clear it. A frame whose
+    # every prediction was rejected, with nothing accepted, is empty too: the
+    # reviewer saw the model's guesses and found no animal. Unmarking such a
+    # frame (E) stores "empty": false, which keeps it out of the empties.
     def _image_entry(self, image_id: int) -> Optional[Dict]:
         for img in self.images:
             if img["id"] == image_id:
                 return img
         return None
 
+    @staticmethod
+    def _empty_rule(flag, anns: List[Dict]) -> bool:
+        """Is a frame with this "empty" flag and these annotations empty?"""
+        if flag is False or any(not a.get("inferred", False) for a in anns):
+            return False
+        return bool(flag) or (bool(anns) and all(a.get("rejected") for a in anns))
+
     def is_image_empty(self, filename: str) -> bool:
         img_id = self._image_id_map.get(filename)
-        if img_id is None:
-            return False
-        img = self._image_entry(img_id)
-        return bool(img and img.get("empty")) and not self.count_annotations_for_image(
-            img_id, exclude_inferred=True)
+        img = self._image_entry(img_id) if img_id is not None else None
+        return bool(img) and self._empty_rule(img.get("empty"), self.get_annotations_for_image(img_id))
+
+    def _empty_image_ids(self) -> set:
+        """Ids of every empty frame, in one pass over the annotations."""
+        by_image: Dict[int, List[Dict]] = {}
+        for a in self.annotations:
+            by_image.setdefault(a["image_id"], []).append(a)
+        return {img["id"] for img in self.images
+                if self._empty_rule(img.get("empty"), by_image.get(img["id"], []))}
+
+    def rejected_count(self, filename: str) -> int:
+        """Predictions rejected on the frame."""
+        img_id = self._image_id_map.get(filename)
+        return 0 if img_id is None else sum(
+            1 for a in self.annotations if a["image_id"] == img_id and a.get("rejected"))
 
     def set_image_empty(self, filename: str, width: int, height: int, empty: bool = True) -> int:
         """Mark (or unmark) a frame as empty. Marking drops the frame's pending
@@ -605,8 +626,10 @@ class COCOAnnotationManager:
             self.annotations = [a for a in self.annotations
                                 if a["image_id"] != img_id or a.get("rejected")]
             img["empty"] = True
-        else:
-            img.pop("empty", None)
+        elif img.get("empty"):
+            img.pop("empty")
+        elif self.is_image_empty(filename):
+            img["empty"] = False        # every prediction rejected, yet not empty
         self._auto_save()
         return img_id
 
@@ -627,7 +650,7 @@ class COCOAnnotationManager:
         """Times the frame was skipped, or 0 once it is finished."""
         img_id = self._image_id_map.get(filename)
         img = self._image_entry(img_id) if img_id is not None else None
-        if not img or not img.get("skipped") or img.get("empty") or any(
+        if not img or not img.get("skipped") or self.is_image_empty(filename) or any(
                 a["image_id"] == img_id and not a.get("inferred") and not a.get("rejected")
                 for a in self.annotations):
             return 0
@@ -638,7 +661,7 @@ class COCOAnnotationManager:
         return [img["file_name"] for img in self.images if self.skip_count(img["file_name"])]
 
     def count_empty_images(self) -> int:
-        return sum(1 for img in self.images if self.is_image_empty(img["file_name"]))
+        return len(self._empty_image_ids())
 
     def export(self, output_path: str, exclude_inferred: bool = False,
                only: Optional[set] = None):
@@ -660,7 +683,7 @@ class COCOAnnotationManager:
         if exclude_inferred:
             anns = [a for a in self.annotations if not a.get("inferred", False)]
             keep = {a["image_id"] for a in anns}
-            keep |= {img["id"] for img in self.images if img.get("empty")}
+            keep |= self._empty_image_ids()
             images = [img for img in self.images if img["id"] in keep]
         else:
             anns = self.annotations

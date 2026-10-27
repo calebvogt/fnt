@@ -647,5 +647,55 @@ def test_skip_is_recorded_until_the_frame_is_finished():
     w.close()
 
 
+def test_a_frame_with_every_prediction_rejected_is_empty(tmp_path):
+    """Rejecting the model's guesses and labelling nothing means "no animal here":
+    the frame counts as empty and trains as background, unless E unmarks it."""
+    c, cat = manager()
+    img = c.get_or_add_image("f.png", 64, 48)
+    a = c.add_annotation_from_mask(img, cat, square_mask(), inferred=True, score=0.5)
+    b = c.add_annotation_from_mask(img, cat, square_mask(), inferred=True, score=0.3)
+    c.reject_annotation(a)
+    assert not c.is_image_empty("f.png")                    # one still pending
+    c.reject_annotation(b)
+    assert c.is_image_empty("f.png") and c.count_empty_images() == 1
+    assert c.rejected_count("f.png") == 2
+    out = tmp_path / "train.json"
+    c.export(str(out), exclude_inferred=True)
+    d = json.load(open(out))
+    assert [i["file_name"] for i in d["images"]] == ["f.png"] and d["annotations"] == []
+    c.reject_annotation(b, False)                           # undo: pending again
+    assert not c.is_image_empty("f.png")
+    c.reject_annotation(b)
+    c.set_image_empty("f.png", 64, 48, empty=False)         # E unmarks it
+    assert not c.is_image_empty("f.png") and c.count_empty_images() == 0
+    c.set_image_empty("f.png", 64, 48)                      # and E marks it again
+    assert c.is_image_empty("f.png")
+    c.add_annotation_from_mask(img, cat, square_mask())     # a mask drawn later wins
+    assert not c.is_image_empty("f.png")
+
+
+def test_rejections_show_in_the_queue_and_skip_moves_on_from_an_empty_frame():
+    from PyQt5.QtCore import Qt
+    w = window()
+    w.chk_review_auto.setChecked(False)
+    cat = w._coco.categories[0]["id"]
+    img = w._coco.get_or_add_image(FRAMES[0], 64, 48)
+    for s in (0.6, 0.4):
+        w._coco.add_annotation_from_mask(img, cat, square_mask(), inferred=True, score=s)
+    w._select_frame_row(0)
+    key(w.preview, Qt.Key_R, "r")
+    item = w.frame_list.topLevelItem(0)
+    assert item.text(1) == "1 pending · 1 ✗"
+    key(w.preview, Qt.Key_R, "r")
+    assert item.text(1) == "empty ✓ · 2 ✗"
+    assert w.btn_empty_frame.isChecked()
+    w._skip_frame()
+    assert "skipped" not in w._coco._image_entry(img)       # done, not skipped
+    w._select_frame_row(0)
+    w._toggle_empty_frame()                                 # E: not empty after all
+    assert item.text(1) == "2 ✗" and not w._coco.is_image_empty(FRAMES[0])
+    w.close()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

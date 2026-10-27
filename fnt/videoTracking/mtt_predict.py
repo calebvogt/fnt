@@ -97,7 +97,8 @@ def frame_detections(engine, img_rgb: np.ndarray, confidence: float, max_det: in
 
 
 def unreviewed_frames(coco, names: Iterable[str]) -> List[str]:
-    """The frames (file names) with no accepted mask and not marked empty."""
+    """The frames (file names) with no accepted mask and not empty (marked
+    empty, or every prediction on it rejected)."""
     out = []
     for name in names:
         img_id = coco._image_id_map.get(name)

@@ -8141,18 +8141,27 @@ class MaskTrackerWindow(QMainWindow):
         ones the model got too wrong to fix by hand."""
         self.preview._clear_drawing()
         before = self.current_frame_idx
+        done = ""
         if not self._annot_in_video_mode and 0 <= before < len(self._extracted_frames):
             fp = self._extracted_frames[before][2]
             filename = os.path.basename(fp)
-            w = h = 0
-            if filename not in self._coco._image_id_map:
-                img = cv2.imread(fp, cv2.IMREAD_UNCHANGED)
-                h, w = (img.shape[:2] if img is not None else (0, 0))
-            self._coco.mark_skipped(filename, w, h)
+            n_total, n_inferred = self._count_annotations_for_file(filename)
+            if self._coco.is_image_empty(filename):
+                done = "empty"          # e.g. every prediction rejected: finished, not skipped
+            elif n_total > n_inferred:
+                done = "labelled"
+            else:
+                w = h = 0
+                if filename not in self._coco._image_id_map:
+                    img = cv2.imread(fp, cv2.IMREAD_UNCHANGED)
+                    h, w = (img.shape[:2] if img is not None else (0, 0))
+                self._coco.mark_skipped(filename, w, h)
             self._update_frame_list_item(before)
         self._next_frame()
         if self.current_frame_idx == before:
             self.status_bar.showMessage("Nothing else left to label in the queue", 4000)
+        elif done:
+            self.status_bar.showMessage(f"That frame is done ({done}), not skipped", 2500)
         else:
             self.status_bar.showMessage("Skipped: nothing changed on that frame", 2500)
 
@@ -8396,6 +8405,7 @@ class MaskTrackerWindow(QMainWindow):
         n_approved = n_total - n_inferred
         is_empty = self._coco.is_image_empty(filename)
         n_skipped = self._coco.skip_count(filename)
+        n_rejected = self._coco.rejected_count(filename)
 
         if n_approved > 0 or is_empty:
             name_color = QColor("#4fc456")   # green: has accepted mask(s)
@@ -8439,14 +8449,20 @@ class MaskTrackerWindow(QMainWindow):
             ann_text = f"{n_inferred} pending"
         else:
             ann_text = ""
+        if n_rejected:
+            ann_text = f"{ann_text} · {n_rejected} ✗" if ann_text else f"{n_rejected} ✗"
         if n_skipped:
             ann_text = f"{ann_text} · skipped" if ann_text else "skipped"
         item.setText(1, ann_text)
         item.setData(1, Qt.UserRole, float(n_total))  # numeric sort key
         item.setForeground(1, name_color)
-        tip = ("Marked empty: no object; trains as a background image" if is_empty
+        tip = ("Empty: no object; trains as a background image" if is_empty
                else f"{n_approved} accepted, {n_inferred} pending ({n_total} total)"
                if n_total else "No annotations yet")
+        if n_rejected:
+            tip += f"\n{n_rejected} prediction(s) rejected"
+            if is_empty and not n_total:
+                tip += " and nothing labelled, so the frame counts as empty (E unmarks it)"
         if n_skipped:
             tip += f"\nSkipped {n_skipped} time(s) (S)"
         item.setToolTip(1, tip)
@@ -9727,10 +9743,19 @@ class MaskTrackerWindow(QMainWindow):
         self._recalc_current_frame_confidence()
         pv.update()
         if pv.current_prediction() is None:
+            path = self._current_frame_path()
             if not any(not a.inferred for a in pv.annotations):
-                self.status_bar.showMessage(
-                    "No accepted masks on this frame: draw the mice, or press E if it holds "
-                    "none (rejected masks are kept as a record).")
+                if path and self._coco.is_image_empty(os.path.basename(path)):
+                    self._update_ann_stats()
+                    self.status_bar.showMessage(
+                        "Every prediction rejected: the frame counts as empty. Draw any mice it "
+                        "does hold, or press E to unmark it.", 6000)
+                    if self.chk_review_auto.isChecked():
+                        self._next_review_frame()
+                else:
+                    self.status_bar.showMessage(
+                        "No accepted masks on this frame: draw the mice, or press E if it holds "
+                        "none (rejected masks are kept as a record).")
             elif self.chk_review_auto.isChecked():
                 self._next_review_frame()
         self._update_review_label()

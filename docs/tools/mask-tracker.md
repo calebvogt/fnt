@@ -105,7 +105,7 @@ Models trained before the ROI keep seeing whole frames.
 ## Training
 
 **Train Model** (bottom of the Mask tab) trains on the approved frames: those
-with labelled masks or marked empty. Pending predictions and skipped frames are
+with labelled masks or empty. Pending predictions and skipped frames are
 left out. The run opens a training window with the loss, validation mAP and
 live predictions on a few validation frames.
 
@@ -134,7 +134,9 @@ Predictions appear yellow. **A** accepts the bold one (click another to pick it)
 **R** rejects it, Shift+A accepts all on the frame; a SAM click on a prediction
 replaces it with SAM's mask, and Paint / Eraser fix it before you accept.
 **Next to Review** jumps to the next frame with predictions. A rejected spot is
-not offered again on that frame.
+not offered again on that frame. A frame whose every prediction you rejected,
+with nothing labelled, counts as empty (it trains as background); **E** unmarks
+it. The queue's Annotations column counts rejections as ✗.
 
 `--predict <model folder>` (or **File ▸ Predict Unreviewed Frames with a Model…**) runs any
 trained model over the queue's unreviewed frames.

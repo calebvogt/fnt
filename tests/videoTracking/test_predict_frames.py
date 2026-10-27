@@ -45,14 +45,16 @@ def project(tmp_path):
     d = tmp_path / "p"
     (d / "training_frames").mkdir(parents=True)
     (d / "annotations").mkdir()
-    for k in range(5):
+    for k in range(6):
         cv2.imwrite(str(d / "training_frames" / f"f{k}.png"), np.zeros((H, W, 3), np.uint8))
     (d / "project_config.json").write_text(json.dumps({"project_dir": str(d), "categories": ["mouse"]}))
-    coco = {"images": [{"id": i + 1, "file_name": f"f{i}.png", "width": W, "height": H} for i in range(4)],
+    coco = {"images": [{"id": i + 1, "file_name": f"f{i}.png", "width": W, "height": H} for i in (0, 1, 2, 3, 5)],
             "annotations": [
                 _ann(1, 1, _box(0, 0, 10, 10)),                                # f0: labelled
                 _ann(2, 3, _box(1, 1, 9, 9), inferred=True, score=0.3),        # f2: an old prediction
-                _ann(3, 4, _box(35, 20, 55, 40), inferred=True, rejected=True, score=0.5)],  # f3: rejected
+                _ann(3, 4, _box(35, 20, 55, 40), inferred=True, rejected=True, score=0.5),  # f3: one rejected,
+                _ann(4, 4, _box(0, 30, 10, 40), inferred=True, score=0.2),     # one still pending
+                _ann(5, 6, _box(5, 5, 25, 25), inferred=True, rejected=True, score=0.8)],   # f5: all rejected
             "categories": [{"id": 7, "name": "mouse", "supercategory": ""}]}
     coco["images"][1]["empty"] = True                                         # f1: empty
     (d / "annotations" / "annotations.json").write_text(json.dumps(coco))
@@ -75,6 +77,7 @@ def test_predicts_only_unreviewed_frames(project, monkeypatch):
     f3 = [a for a in by["f3.png"] if not a.get("rejected")]
     assert len(f3) == 1 and f3[0]["score"] == pytest.approx(0.9)              # rejected spot not re-offered
     assert len(by["f4.png"]) == 2                                             # a new frame
+    assert [a["id"] for a in by["f5.png"]] == [5]                             # all rejected = empty: untouched
     assert all(a["category_id"] == 7 for a in c["annotations"])
     assert max(a["area"] for a in by["f4.png"]) == 400                        # the speck dropped
 
