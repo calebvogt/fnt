@@ -14075,6 +14075,11 @@ def apply_training_args(win: "MaskTrackerWindow", args) -> List[str]:
     if getattr(args, "device", None):
         win.combo_device.setCurrentText(DEVICE_CHOICES[args.device])
         applied.append(f"device={args.device}")
+    if getattr(args, "optimizer", None):
+        # Before --lr: switching the optimizer resets the learning rate to its
+        # default, so "--optimizer SGD --lr 0.002" trained at 0.01.
+        win.combo_optimizer.setCurrentText(args.optimizer)
+        applied.append(f"optimizer={args.optimizer}")
     for flag, widget in (("epochs", win.spin_iterations), ("batch", win.spin_batch),
                          ("lr", win.spin_lr), ("patience", win.spin_patience),
                          ("val_frac", win.spin_val_frac),
@@ -14109,9 +14114,6 @@ def apply_training_args(win: "MaskTrackerWindow", args) -> List[str]:
     if getattr(args, "copy_paste", None) is not None:
         win._copy_paste_override = float(args.copy_paste)
         applied.append(f"copy_paste={args.copy_paste}")
-    if getattr(args, "optimizer", None):
-        win.combo_optimizer.setCurrentText(args.optimizer)
-        applied.append(f"optimizer={args.optimizer}")
     if getattr(args, "imgsz", None):
         win._imgsz_override = int(args.imgsz)
         applied.append(f"imgsz={args.imgsz}")

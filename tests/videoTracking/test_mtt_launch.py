@@ -188,6 +188,17 @@ def test_training_defaults_and_predict_flag():
     w.close()
 
 
+def test_lr_flag_survives_the_optimizer_flag():
+    """Switching the optimizer resets the learning rate to its default, and the
+    optimizer used to be applied last: "--optimizer SGD --lr 0.002" trained at 0.01."""
+    w = window()
+    args = G._launch_parser().parse_args(["--project", "p", "--optimizer", "SGD", "--lr", "0.002"])
+    G.apply_training_args(w, args)
+    assert w.combo_optimizer.currentText() == "SGD"
+    assert abs(w.spin_lr.value() - 0.002) < 1e-9
+    w.close()
+
+
 def test_augment_turns_the_transforms_on():
     """--augment used to tick only the master checkbox; every transform under it
     stayed off, so the run trained with no augmentation."""
