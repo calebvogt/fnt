@@ -6,7 +6,7 @@ site_author: Caleb C. Vogt
 site_url: https://calebvogt.github.io/fnt/
 repo_url: https://github.com/calebvogt/fnt
 repo_name: calebvogt/fnt
-copyright: Copyright &copy; Caleb C. Vogt and contributors
+copyright: Copyright &copy; Caleb C. Vogt, Samuel Garmany and contributors
 
 theme:
   name: material

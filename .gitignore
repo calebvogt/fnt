@@ -238,14 +238,15 @@ build/
 
 # Editor/tool settings (local only)
 .vscode/
-.claude/
+.claude/*
+!.claude/CLAUDE.md
 
 # Local test data (not for distribution)
 LocalTestData/
 LocalData/
 
-# Claude Code instructions (keep private)
-CLAUDE.md
+# Claude Code instructions (keep private; .claude/CLAUDE.md, the pointer to AGENTS.md, is shared)
+/CLAUDE.md
 sam_models_local/
 
 # R history

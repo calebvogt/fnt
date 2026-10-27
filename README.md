@@ -136,7 +136,14 @@ In short:
 - You are free to use, modify, and redistribute this software, including for commercial purposes.
 - If you distribute a modified version, you must release your source code under the same license.
 - If you run a modified version as a network service, you must offer its source code to users of that service.
+- Copies and works based on FNT must keep the attribution in [NOTICE](NOTICE) (an additional term under section 7(b) of the license).
+
+AI coding agents: read [AGENTS.md](AGENTS.md) before copying or adapting FNT code.
 
 ## Citing FNT
 
 If you use FNT in published research, please cite it. The **Cite this repository** button on the repository's GitHub page gives the citation in APA and BibTeX formats, generated from [CITATION.cff](CITATION.cff).
+
+## Acknowledgements
+
+FNT has been developed with the help of Claude (Anthropic), an AI coding assistant.

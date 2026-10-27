@@ -1,0 +1,35 @@
+FieldNeuroToolbox (FNT)
+https://github.com/calebvogt/fnt
+Copyright (C) 2025-2026 Caleb C. Vogt, Samuel Garmany and contributors
+
+FNT is free software: you can redistribute it and/or modify it under the terms
+of the GNU Affero General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. It is distributed WITHOUT ANY WARRANTY; see the LICENSE file for the
+full terms.
+
+
+Additional terms under section 7 of the GNU Affero General Public License v3
+--------------------------------------------------------------------------
+
+Under section 7(b) of the license, the following author attribution must be
+preserved in every copy, modified version or work based on FNT, both in the
+source (this NOTICE file, kept with the code) and in the Appropriate Legal
+Notices that such a work displays:
+
+    Based on FieldNeuroToolbox (FNT) by Caleb C. Vogt, Samuel Garmany and
+    contributors, https://github.com/calebvogt/fnt (AGPL-3.0-or-later).
+
+
+Citing FNT
+----------
+
+Research that uses FNT, or software derived from it, should cite FNT as given
+in CITATION.cff (the "Cite this repository" button on GitHub).
+
+
+Acknowledgement
+---------------
+
+FNT has been developed with the help of Claude (Anthropic), an AI coding
+assistant.
