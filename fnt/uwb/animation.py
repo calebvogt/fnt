@@ -68,20 +68,6 @@ def prepare_animation_data(data, tag_identities=None):
     return data
 
 
-def downsample_to_hz(data, hz):
-    """Keep the first fix per 1/hz-second bin, per tag (resolution-safe floor).
-
-    Returns ``data`` unchanged if ``hz`` is falsy or the frame is empty.
-    """
-    if not hz or data.empty:
-        return data
-    d = data.copy()
-    d['_bin'] = d['Timestamp'].dt.floor(pd.Timedelta(seconds=1.0 / hz))
-    id_col = 'shortid' if 'shortid' in d.columns else 'ID'
-    d = d.groupby([id_col, '_bin'], as_index=False).first().drop(columns='_bin')
-    return d
-
-
 _NEUTRAL_COLOR = 'blue'
 
 

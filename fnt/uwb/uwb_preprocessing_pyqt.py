@@ -58,6 +58,9 @@ from fnt.uwb.identities import (
     tag_label, hex_label, identity_field_problems, describe_problems,
     OFF_INTERVALS, off_intervals, merge_intervals, inside_intervals)
 from fnt.uwb import uwb_roi
+from fnt.uwb.downsampling import (
+    DOWNSAMPLING_NONE, DOWNSAMPLING_RANDOM, DOWNSAMPLING_METHODS,
+    DEFAULT_DOWNSAMPLING_HZ, DEFAULT_DOWNSAMPLING_SEED, downsample_reads)
 
 
 # Columns the processing pipeline actually consumes. Wiser tables carry ~20
@@ -606,6 +609,17 @@ OUTLIER_SIGMA_TOOLTIP = (
 
 VELOCITY_MIN_DT_TOOLTIP = (
     "The shortest interval the velocity threshold is allowed to divide by.\n\nSpeed is distance over time, and this system's reports can arrive a millisecond apart. Dividing a few centimetres of positional noise by a millisecond gives tens of m/s, so an unfloored velocity threshold mostly measures HOW CLOSELY SPACED THE REPORTS WERE rather than how fast the animal moved - it deletes tightly spaced fixes wherever they occur.\n\nOn this project's pilot data the raw interval put 41% of fixes over 1 m/s with a median step of only 9 cm; flooring at 0.5 s brings that to 2%.\n\nSet 0 for the old unfloored behaviour (what configs written before this option restore, so an old trial reproduces exactly).")
+
+DOWNSAMPLING_TOOLTIP = (
+    "Thin each tag's reads to a common rate BEFORE the thresholds and the smoothing.\n\n"
+    "• None (all reads) (default): every read is used.\n"
+    "• Random: each tag's time line is cut into bins of 1 / (reads per second) seconds and ONE read per bin, picked at random, is kept. A tag that already reports at or below that rate is left almost untouched; a faster tag is brought down to it.\n\n"
+    "WHY. Tags flashed with different rate pairs (10/1, 4/1, 1/1) record the same movement with very different numbers of reads. The thresholds compare consecutive reads, and Savitzky-Golay smooths over 31 of them - about 3-4 s of a 10/1 tag's track but 30-40 s of a 1/1 tag's - so distance, speed and chases come out lower for an animal on a slow tag because of the tag, not the animal. Downsampling every tag to the slowest tags' rate gives every animal the same input. Tag Statistics... shows each tag's measured rate.\n\n"
+    "The pick is random but reproducible: it depends only on the tag, the read's time and a fixed seed recorded in fnt_config.json, so re-running the export, or previewing any stretch of it, keeps the same reads.")
+
+DOWNSAMPLING_HZ_TOOLTIP = (
+    "The most reads per second each tag keeps (one read per 1 / this many seconds).\n\n"
+    "Set it to the rate of the slowest tags in the trial, the same value for every trial you will compare: 1 brings 10/1 and 4/1 tags down to a 1/1 tag's ceiling. A 1/1 tag that misses pings delivers less than 1 read/s on average; to match that rate exactly, use its median rate from Tag Statistics...")
 
 
 def hampel_deviation(x, y, window=31, group=None,
@@ -5552,9 +5566,21 @@ class UWBQuickVisualizationWindow(QWidget):
         self.spin_velocity_min_dt.setDecimals(2)
         self.spin_velocity_min_dt.setSingleStep(0.05)
         self.spin_velocity_min_dt.setValue(0.50)
+        # Downsampling, the first step of the pipeline. Hidden like the
+        # thresholds: the visible controls are the preview's.
+        self.combo_downsampling = QComboBox()
+        self.combo_downsampling.addItems(list(DOWNSAMPLING_METHODS))
+        self.spin_downsampling_hz = QDoubleSpinBox()
+        self.spin_downsampling_hz.setRange(0.05, 20.0)
+        self.spin_downsampling_hz.setDecimals(2)
+        self.spin_downsampling_hz.setValue(DEFAULT_DOWNSAMPLING_HZ)
+        # No widget: the seed only needs to be fixed and recorded, and a
+        # config can set it.
+        self.downsampling_seed = DEFAULT_DOWNSAMPLING_SEED
         for _w in (self.chk_outlier_filter, self.spin_outlier_window,
                    self.spin_outlier_sigma, self.spin_velocity_min_dt,
-                   self.chk_adjacency_filter, self.spin_excursion_s):
+                   self.chk_adjacency_filter, self.spin_excursion_s,
+                   self.combo_downsampling, self.spin_downsampling_hz):
             _w.setVisible(False)
 
         # No standalone "Clear Previous Exports" button: clearing is offered by
@@ -8228,6 +8254,33 @@ class UWBQuickVisualizationWindow(QWidget):
         v.addWidget(self.chk_preview_trail_points)
 
 
+        # Downsampling first, because it runs first: the thresholds and the
+        # smoother below only ever see the reads it keeps.
+        pds_row = QHBoxLayout()
+        pds_row.addWidget(QLabel("Downsampling:"))
+        self.combo_preview_downsampling = QComboBox()
+        self.combo_preview_downsampling.addItems(list(DOWNSAMPLING_METHODS))
+        self.combo_preview_downsampling.setToolTip(DOWNSAMPLING_TOOLTIP)
+        self.combo_preview_downsampling.currentTextChanged.connect(
+            self.on_preview_downsampling_changed)
+        pds_row.addWidget(self.combo_preview_downsampling)
+        self.lbl_preview_downsampling_hz = QLabel("to at most")
+        pds_row.addWidget(self.lbl_preview_downsampling_hz)
+        self.spin_preview_downsampling_hz = QDoubleSpinBox()
+        self.spin_preview_downsampling_hz.setRange(0.05, 20.0)
+        self.spin_preview_downsampling_hz.setDecimals(2)
+        self.spin_preview_downsampling_hz.setSingleStep(0.05)
+        self.spin_preview_downsampling_hz.setValue(DEFAULT_DOWNSAMPLING_HZ)
+        self.spin_preview_downsampling_hz.setSuffix(" reads/s")
+        self.spin_preview_downsampling_hz.setFixedWidth(100)
+        self.spin_preview_downsampling_hz.setToolTip(DOWNSAMPLING_HZ_TOOLTIP)
+        self.spin_preview_downsampling_hz.valueChanged.connect(
+            self.invalidate_preview_cache)
+        pds_row.addWidget(self.spin_preview_downsampling_hz)
+        pds_row.addStretch()
+        v.addLayout(pds_row)
+        self._show_downsampling_rate()
+
         # Preview thresholding — independent of the Export thresholds, so you can
         # see the track with/without each applied AND tune the cutoff live. Each
         # toggle carries its own value spinbox (defaults match Export: 2.0).
@@ -10243,6 +10296,15 @@ class UWBQuickVisualizationWindow(QWidget):
             g, _dropped = self._trim_to_tag_window(g, tag, tz)
             if not len(g):
                 continue
+            # Downsample here rather than inside _filter_and_smooth, so the
+            # threshold read-out below describes the reads the thresholds
+            # will actually see. The pick depends only on each read, so this
+            # slice keeps exactly the reads the export keeps.
+            if self.combo_preview_downsampling.currentText() == DOWNSAMPLING_RANDOM:
+                g = downsample_reads(g, self.spin_preview_downsampling_hz.value(),
+                                     seed=self.downsampling_seed)
+                if not len(g):
+                    continue
             # Threshold BOTH velocity and jump on the raw coordinates, then
             # smooth (see _filter_and_smooth: thresholding velocity on the
             # smoothed track was tried and produced a jumpy result).
@@ -10275,7 +10337,8 @@ class UWBQuickVisualizationWindow(QWidget):
                 outlier_sigma=self.spin_preview_outlier_sigma.value(),
                 velocity_min_dt=self.spin_preview_velocity_min_dt.value(),
                 adjacency=self.chk_preview_adjacency.isChecked(),
-                excursion_s=self.spin_preview_excursion.value())
+                excursion_s=self.spin_preview_excursion.value(),
+                downsampling=DOWNSAMPLING_NONE)   # already applied above
             if len(g):
                 # Re-measure on the SURVIVING, SMOOTHED fixes: the marker
                 # readout describes the track actually drawn, whose steps both
@@ -10433,6 +10496,17 @@ class UWBQuickVisualizationWindow(QWidget):
         self.spin_preview_window.setVisible(needs_param)
         self.lbl_preview_window.setVisible(needs_param)
         self.combo_preview_window_units.setVisible(is_rolling)
+        self.invalidate_preview_cache()
+
+    def _show_downsampling_rate(self):
+        """Show the reads-per-second box only when a downsampling is chosen."""
+        on = self.combo_preview_downsampling.currentText() != DOWNSAMPLING_NONE
+        self.lbl_preview_downsampling_hz.setVisible(on)
+        self.spin_preview_downsampling_hz.setVisible(on)
+
+    def on_preview_downsampling_changed(self, *_):
+        """Downsampling changed: show/hide its rate, then reload the chunks."""
+        self._show_downsampling_rate()
         self.invalidate_preview_cache()
 
     def on_preview_trail_changed(self, *_):
@@ -10659,6 +10733,15 @@ class UWBQuickVisualizationWindow(QWidget):
                 if self.combo_color_by.itemText(i).strip().lower() == want:
                     self.combo_color_by.setCurrentIndex(i)
                     break
+        except Exception:
+            pass
+        # Its own block, so a window still being built (the export widgets
+        # exist before the preview's) cannot skip the mirroring above.
+        try:
+            self.combo_downsampling.setCurrentText(
+                self.combo_preview_downsampling.currentText())
+            self.spin_downsampling_hz.setValue(
+                round(self.spin_preview_downsampling_hz.value(), 2))
         except Exception:
             pass
 
@@ -13122,6 +13205,11 @@ class UWBQuickVisualizationWindow(QWidget):
         self.spin_preview_outlier_window.setValue(31)
         self.spin_preview_outlier_sigma.setValue(6.0)
         self.spin_preview_velocity_min_dt.setValue(0.50)
+        self.combo_downsampling.setCurrentText(DOWNSAMPLING_NONE)
+        self.combo_preview_downsampling.setCurrentText(DOWNSAMPLING_NONE)
+        self.spin_downsampling_hz.setValue(DEFAULT_DOWNSAMPLING_HZ)
+        self.spin_preview_downsampling_hz.setValue(DEFAULT_DOWNSAMPLING_HZ)
+        self.downsampling_seed = DEFAULT_DOWNSAMPLING_SEED
         self.chk_export_behavior.setChecked(False)
         self.on_social_network_toggled()
         self.chk_save_plots.setChecked(False)
@@ -15029,14 +15117,38 @@ class UWBQuickVisualizationWindow(QWidget):
                            jump_thresh=None, window=None, units=None,
                            outlier=None, outlier_window=None,
                            outlier_sigma=None, velocity_min_dt=None,
-                           adjacency=None, excursion_s=None):
-        """Threshold, then smooth (the original order).
+                           adjacency=None, excursion_s=None,
+                           downsampling=None, downsampling_hz=None):
+        """Downsample, threshold, then smooth.
+
+        Downsampling runs first, so a fast tag reaches the thresholds and the
+        smoother at the same rate as a slow one (see fnt.uwb.downsampling).
+        ``downsampling``/``downsampling_hz`` override the Export widgets, as
+        the threshold arguments do.
 
         BOTH the velocity and jump thresholds run on the raw coordinates BEFORE
         smoothing, so the noisy/teleport fixes are removed and the smoother gets
         clean input. (Thresholding the velocity on the smoothed track instead
         let the noise into the smoother and produced a jumpy result.)
         """
+        method = (self.combo_downsampling.currentText()
+                  if downsampling is None else downsampling)
+        if method == DOWNSAMPLING_RANDOM and len(data):
+            hz = (self.spin_downsampling_hz.value()
+                  if downsampling_hz is None else downsampling_hz)
+            n_before = len(data)
+            data = downsample_reads(data, hz, seed=self.downsampling_seed)
+            if collect_stats:
+                self.log_message(
+                    f"  Downsampled to at most {hz:g} read/s: kept {len(data):,} "
+                    f"of {n_before:,} reads ({100 * len(data) / n_before:.1f}%)")
+                s = getattr(self, 'filter_stats', None) or {}
+                s['reads_before_downsampling'] = (
+                    s.get('reads_before_downsampling', 0) + n_before)
+                s['removed_downsampling'] = (
+                    s.get('removed_downsampling', 0) + n_before - len(data))
+                self.filter_stats = s
+
         use_vel = self.chk_velocity_filter.isChecked() if velocity is None else velocity
         use_jmp = self.chk_jump_filter.isChecked() if jump is None else jump
         use_out = (self.chk_outlier_filter.isChecked()
@@ -15219,6 +15331,9 @@ class UWBQuickVisualizationWindow(QWidget):
         if collect_stats:
             s = getattr(self, 'filter_stats', None) or {}
             self.filter_stats = {
+                # Anything another step counted (downsampling) is carried
+                # through rather than dropped by the rebuild.
+                **s,
                 'initial_count': s.get('initial_count', 0) + initial_count,
                 'removed_outlier': s.get('removed_outlier', 0) + removed_outlier,
                 'removed_velocity': s.get('removed_velocity', 0) + removed_velocity,
@@ -15297,6 +15412,16 @@ class UWBQuickVisualizationWindow(QWidget):
             'table_name': self.table_name,
             'selected_tags': [tag for tag, cb in self.tag_checkboxes.items() if cb.isChecked()],
             'timezone': self.combo_timezone.currentText(),
+            # First step of the pipeline. The rate and seed are written only
+            # when downsampling is on, so a config never claims a rate its
+            # export did not use.
+            'downsampling': self.combo_downsampling.currentText(),
+            'downsampling_hz': (self.spin_downsampling_hz.value()
+                                if self.combo_downsampling.currentText()
+                                != DOWNSAMPLING_NONE else None),
+            'downsampling_seed': (int(self.downsampling_seed)
+                                  if self.combo_downsampling.currentText()
+                                  != DOWNSAMPLING_NONE else None),
             'velocity_filter': self.chk_velocity_filter.isChecked(),
             'velocity_threshold': self.spin_velocity_threshold.value(),
             'jump_filter': self.chk_jump_filter.isChecked(),
@@ -15413,6 +15538,8 @@ class UWBQuickVisualizationWindow(QWidget):
     # Kind drives how the value is read/written ('text' for combos, 'value' for
     # spinboxes, 'checked' for checkboxes).
     _PREVIEW_CONFIG_WIDGETS = {
+        'downsampling': ('combo_preview_downsampling', 'text'),
+        'downsampling_hz': ('spin_preview_downsampling_hz', 'value'),
         'smoothing': ('combo_preview_smoothing', 'text'),
         'window': ('spin_preview_window', 'value'),
         'window_units': ('combo_preview_window_units', 'text'),
@@ -15767,7 +15894,22 @@ class UWBQuickVisualizationWindow(QWidget):
             _min_dt = float(config.get('velocity_min_dt') or 0.0)
             self.spin_velocity_min_dt.setValue(_min_dt)
             self.spin_preview_velocity_min_dt.setValue(_min_dt)
-            
+            # A config from before downsampling existed used every read, so an
+            # absent key means none, as for the thresholds above.
+            _ds = config.get('downsampling') or DOWNSAMPLING_NONE
+            if _ds not in DOWNSAMPLING_METHODS:
+                self.log_message(f"Unknown downsampling '{_ds}' in the config; "
+                                 f"using every read.")
+                _ds = DOWNSAMPLING_NONE
+            self.combo_downsampling.setCurrentText(_ds)
+            self.combo_preview_downsampling.setCurrentText(_ds)
+            if config.get('downsampling_hz') is not None:
+                self.spin_downsampling_hz.setValue(float(config['downsampling_hz']))
+                self.spin_preview_downsampling_hz.setValue(
+                    float(config['downsampling_hz']))
+            self.downsampling_seed = int(
+                config.get('downsampling_seed') or DEFAULT_DOWNSAMPLING_SEED)
+
             if 'time_gap' in config:
                 self.spin_time_gap.setValue(config['time_gap'])
             
@@ -18848,6 +18990,12 @@ class UWBQuickVisualizationWindow(QWidget):
                 # the run summary would report whatever the last call left
                 # behind (a preview chunk, or a previous export).
                 self.reset_filter_stats()
+                if self.combo_downsampling.currentText() != DOWNSAMPLING_NONE:
+                    self.log_message(
+                        f"Downsampling: {self.combo_downsampling.currentText()}, "
+                        f"at most {self.spin_downsampling_hz.value():g} read/s per "
+                        f"tag (seed {self.downsampling_seed}), before the "
+                        f"thresholds and the smoothing")
 
                 # Stream the smoothed CSV one tag at a time rather than holding
                 # the whole processed dataset in RAM and writing it in one shot
