@@ -606,10 +606,16 @@ class VideoProcessorWorker(QThread):
         local_copy = None
         local_sub_copy = None
         tmp_dir = None
+        partial_file = None
         try:
             # Get filename and build output path
             video_filename = os.path.basename(video_file)
             output_file = os.path.join(out_dir, self._get_output_filename(video_file))
+            # FFmpeg writes here and the file is renamed to output_file only once
+            # it is complete and verified, so a stop, a kill or a crash never
+            # leaves a half-encoded video under the real name (which a later
+            # --skip-existing run would count as done).
+            partial_file = output_file + ".partial"
 
             self.progress_update.emit(f"Processing: {video_filename}")
 
@@ -636,7 +642,7 @@ class VideoProcessorWorker(QThread):
                         shutil.copy2(sub_file, local_sub_copy)
 
             # Build FFmpeg command based on settings
-            cmd = self.build_ffmpeg_command(ffmpeg_input, output_file)
+            cmd = self.build_ffmpeg_command(ffmpeg_input, partial_file)
 
             # When burning subtitles we run ffmpeg from the video's own folder so
             # the .smi can be referenced by basename in the filtergraph (avoids
@@ -696,6 +702,11 @@ class VideoProcessorWorker(QThread):
                         process.wait(timeout=5)
                     except subprocess.TimeoutExpired:
                         process.kill()
+                        process.wait()
+                    # The half-encoded partial is thrown away (finally below);
+                    # the file starts over on the next run.
+                    self.progress_update.emit(
+                        f"⏹ Stopped: {video_filename} (partial output discarded)")
                     return False
 
                 try:
@@ -713,13 +724,7 @@ class VideoProcessorWorker(QThread):
                             process.wait(timeout=5)
                         except subprocess.TimeoutExpired:
                             pass
-                        # Clean up partial output
-                        try:
-                            if os.path.exists(output_file):
-                                os.remove(output_file)
-                        except Exception:
-                            pass
-                        return False
+                        return False  # the partial output is removed in finally
                     continue
 
                 if line is None:
@@ -746,13 +751,7 @@ class VideoProcessorWorker(QThread):
                     for ln in list(recent_lines)[-12:]:
                         self.progress_update.emit(f"    │ {ln}")
                     self.progress_update.emit("    ────────────────────────")
-                # Clean up partial output file
-                try:
-                    if os.path.exists(output_file):
-                        os.remove(output_file)
-                except Exception:
-                    pass
-                return False
+                return False  # the partial output is removed in finally
 
             # --- Post-processing verification: confirm output resolution ---
             if self.resolution == "1080p":
@@ -760,20 +759,17 @@ class VideoProcessorWorker(QThread):
             else:
                 target_w, target_h = 1280, 720
 
-            res = self._get_video_resolution(output_file)
+            res = self._get_video_resolution(partial_file)
             if res is not None:
                 actual_w, actual_h = res
                 if actual_w != target_w or actual_h != target_h:
                     self.progress_update.emit(
                         f"⚠️ Resolution mismatch after processing {video_filename}: "
                         f"got {actual_w}x{actual_h}, expected {target_w}x{target_h}")
-                    # Remove the bad output so it doesn't pollute future skip checks
-                    try:
-                        os.remove(output_file)
-                    except Exception:
-                        pass
-                    return False
+                    return False  # the bad partial is removed in finally
 
+            # Complete: give it the real name (replaces an older output, if any)
+            os.replace(partial_file, output_file)
             self.progress_update.emit(f"✅ Completed: {video_filename}")
             return True
 
@@ -782,6 +778,13 @@ class VideoProcessorWorker(QThread):
             return False
 
         finally:
+            # Whatever stopped the encode (Stop, a failure, a stall, an error),
+            # its half-written output is thrown away.
+            if partial_file and os.path.exists(partial_file):
+                try:
+                    os.remove(partial_file)
+                except Exception:
+                    pass
             if tmp_dir:
                 try:
                     shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -896,7 +899,9 @@ class VideoProcessorWorker(QThread):
                     f"{os.path.basename(input_file)} — processing without timestamps")
 
         video_filter = ",".join(video_filters)
-        cmd.extend(["-vf", video_filter, output_file])
+        # The container is named, not read from the extension: the encode
+        # writes to "<output>.partial" (see process_single_file).
+        cmd.extend(["-vf", video_filter, "-f", self.output_format, output_file])
 
         return cmd
 
