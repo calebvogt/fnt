@@ -797,8 +797,13 @@ def run_inference_on_video(
     frame_callback: Optional[Callable] = None,
     track_callback: Optional[Callable] = None,
     create_tracked_video: bool = True,
+    run_info: Optional[Dict] = None,
 ) -> Dict:
     """Run full inference + tracking pipeline on a video.
+
+    The output folder also gets ``run_settings.json`` (model, settings,
+    ``run_info``, timing, frames without a detection) and ``inference.log``
+    (see ``mtt_runs``).
 
     Args:
         video_path: Path to video file.
@@ -812,7 +817,10 @@ def run_inference_on_video(
     Returns:
         Dict with 'output_dir', 'csv_path', 'num_tracks', 'total_frames'.
     """
-    import platform, time
+    import platform, sys, time
+    from dataclasses import asdict
+    from datetime import datetime
+    from . import mtt_runs
 
     _saved_fd = None
     _null_fd = None
@@ -825,8 +833,23 @@ def run_inference_on_video(
             _saved_fd = None
 
     mask_writer = None
+    tee = mtt_runs.LogTee(sys.stdout)
+    _real_stdout = sys.stdout
+    sys.stdout = tee
+    rec: Dict = {
+        "video": video_path, "model_dir": model_dir, "settings": asdict(config),
+        "create_tracked_video": create_tracked_video,
+        "started": datetime.now().isoformat(timespec="seconds"), "complete": False,
+    }
+    rec.update(run_info or {})
+    output_dir = None
+    stopped = False
+    n_no_det = 0
+    frame_idx = 0
+    t_start = time.time()
     try:
         architecture = _detect_architecture(model_dir)
+        rec["architecture"] = architecture
         if architecture == "yolov11-seg":
             from .yolo_inference import YOLOInference
             inference = YOLOInference(model_dir, device=config.device,
@@ -844,6 +867,7 @@ def run_inference_on_video(
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 
+        rec.update(frames=total_frames, fps=fps, width=w, height=h)
         print(f"[MTT Inference] Video: {os.path.basename(video_path)}")
         print(f"[MTT Inference]   {total_frames} frames, {fps:.1f} fps, {w}x{h}")
         print(f"[MTT Inference]   confidence={config.confidence_threshold}, "
@@ -887,6 +911,7 @@ def run_inference_on_video(
         while True:
             if should_stop and should_stop():
                 print(f"[MTT Inference] Stopped by user at frame {frame_idx}/{total_frames}")
+                stopped = True
                 break
 
             t0 = time.time()
@@ -900,6 +925,8 @@ def run_inference_on_video(
                 frame_rgb, config.confidence_threshold, config.max_detections,
             )
             t2 = time.time()
+            if len(detections["scores"]) == 0:
+                n_no_det += 1
 
             matched = tracker.update(detections, frame_idx, fps, frame_hw=(h, w))
             if mask_writer is not None and matched:
@@ -983,6 +1010,7 @@ def run_inference_on_video(
             print(f"[MTT Inference] {n_tracks} unique tracks written to {output_dir}/")
         if writer:
             print(f"[MTT Inference] Annotated video: {annotated_path}")
+        rec.update(complete=not stopped, tracks=n_tracks)
 
         return {
             "output_dir": output_dir,
@@ -1001,6 +1029,19 @@ def run_inference_on_video(
                 mask_writer.close()
             except Exception:
                 pass
+        sys.stdout = _real_stdout
+        if output_dir and os.path.isdir(output_dir):
+            elapsed = time.time() - t_start
+            rec.update(finished=datetime.now().isoformat(timespec="seconds"),
+                       elapsed_s=round(elapsed, 1), frames_processed=frame_idx,
+                       frames_without_detection=n_no_det,
+                       fps_processed=round(frame_idx / elapsed, 2) if elapsed > 0 else None)
+            if stopped:
+                rec["stopped"] = True
+            try:
+                mtt_runs.write_run_record(output_dir, rec, tee.lines)
+            except Exception as e:
+                print(f"[MTT Inference] Could not write the run record ({e})")
         if _saved_fd is not None:
             os.dup2(_saved_fd, 2)
             os.close(_saved_fd)

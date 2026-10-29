@@ -2278,6 +2278,7 @@ class TrainWorker(QThread):
 # Specks off a predicted mask, and one mask per animal: shared with the
 # headless prediction (mask_tracker_cli predict-frames).
 from .mask_tracker_batch import drop_fragments  # noqa: E402
+from .mask_tracker_parallel_view import InferenceGrid, ParallelInferenceWorker  # noqa: E402
 from .mtt_predict import drop_overlapping as _drop_overlapping  # noqa: E402
 
 
@@ -2372,89 +2373,15 @@ class InferenceWorker(QThread):
         self._pause_flag = False
 
     def _load_classifier(self):
-        """Load the behavior classifier.
-
-        Returns ``(model, class_names, device, scene_cfg)``, where scene_cfg is
-        the stored configuration for a scene-aware checkpoint and None for a
-        legacy single-silhouette one. Returns None outright when nothing
-        loadable is there.
-        """
-        if not self.classifier_dir:
-            return None
-
-        from .behavior_classifier import load_scene_classifier
-        scene = load_scene_classifier(self.classifier_dir)
-        if scene is not None:
-            model, class_names, device, cfg = scene
-            n_soc = cfg.get("n_social_samples")
-            print(f"[Classifier Inference] Loaded scene-aware "
-                  f"{cfg.get('backbone', '?')} ({len(class_names)} classes: "
-                  f"{', '.join(class_names)}) on {device.upper()}"
-                  + (f"; trained with {n_soc} multi-animal samples"
-                     if n_soc is not None else ""))
-            return model, class_names, device, cfg
-
-        import torch
-        from torchvision import models
-        cfg_path = os.path.join(self.classifier_dir, "classifier_config.json")
-        weights_path = os.path.join(self.classifier_dir, "best_classifier.pth")
-        if not os.path.isfile(cfg_path) or not os.path.isfile(weights_path):
-            print(f"[Classifier Inference] Missing config or weights in {self.classifier_dir}")
-            return None
-
-        with open(cfg_path) as f:
-            cfg = json.load(f)
-        class_names = cfg.get("class_names", [])
-        n_classes = cfg.get("n_classes", len(class_names))
-        backbone = cfg.get("backbone", "ResNet-18")
-
-        from torch import nn
-        if backbone == "ResNet-34":
-            model = models.resnet34(weights=None)
-            model.fc = nn.Linear(model.fc.in_features, n_classes)
-        elif backbone == "MobileNetV3":
-            model = models.mobilenet_v3_small(weights=None)
-            model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, n_classes)
-        else:
-            model = models.resnet18(weights=None)
-            model.fc = nn.Linear(model.fc.in_features, n_classes)
-
-        device = "cpu"
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            device = "mps"
-
-        model.load_state_dict(torch.load(weights_path, map_location=device))
-        model = model.to(device)
-        model.eval()
-
-        print(f"[Classifier Inference] Loaded legacy single-silhouette {backbone} "
-              f"({n_classes} classes: {', '.join(class_names)}) on {device.upper()}. "
-              f"Social categories cannot be represented by this checkpoint — "
-              f"retrain to get a scene-aware model.")
-        return model, class_names, device, None
+        """Load the behavior classifier (see mask_tracker_parallel.load_classifier)."""
+        from .mask_tracker_parallel import load_classifier
+        return load_classifier(self.classifier_dir)
 
     @staticmethod
     def _apply_min_bout_filter(rows, min_bout):
-        """Replace behavior bouts shorter than min_bout frames with NC.
-
-        Groups consecutive same-behavior predictions per object. Bouts
-        shorter than min_bout are relabeled NC to suppress flickering.
-        """
-        from itertools import groupby
-
-        per_obj = {}
-        for i, r in enumerate(rows):
-            per_obj.setdefault(r["object_id"], []).append(i)
-
-        for obj_id, indices in per_obj.items():
-            labels = [rows[i]["behavior"] for i in indices]
-            for _, grp in groupby(enumerate(labels), key=lambda x: x[1]):
-                grp_list = list(grp)
-                if len(grp_list) < min_bout and grp_list[0][1] != "NC":
-                    for local_pos, _ in grp_list:
-                        rows[indices[local_pos]]["behavior"] = "NC"
+        """Replace behavior bouts shorter than min_bout frames with NC."""
+        from .mask_tracker_parallel import apply_min_bout_filter
+        apply_min_bout_filter(rows, min_bout)
 
     def run(self):
         import io, sys
@@ -2473,22 +2400,12 @@ class InferenceWorker(QThread):
 
         sys.stdout = _LogCapture(self, _real_stdout)
         try:
-            from .mask_tracker_inference import MaskInferenceConfig, run_inference_on_video
-            from .behavior_classifier import predict_scene
-            from .silhouette_extractor import (
-                generate_composite, generate_scene_composite, pairwise_features,
-                pairwise_vector,
-            )
+            from .mask_tracker_inference import MaskInferenceConfig
+            from .mask_tracker_parallel import infer_one_video
             import time as _pause_time
 
             config = MaskInferenceConfig(**self.config_dict)
-
             cls_info = self._load_classifier()
-            cls_model = cls_class_names = cls_device = cls_scene_cfg = None
-            torch = None
-            if cls_info:
-                cls_model, cls_class_names, cls_device, cls_scene_cfg = cls_info
-                import torch
 
             def _check_stop():
                 while self._pause_flag and not self._stop_flag:
@@ -2502,165 +2419,19 @@ class InferenceWorker(QThread):
             for video_path in self.video_paths:
                 if self._stop_flag:
                     break
-
-                from collections import deque
-                mask_buffers: dict = {}
-                current_labels: dict = {}
-                behavior_rows: list = []
-
-                def _track_cb(matched, frame_idx, fps):
-                    if cls_model is None:
-                        return None
-
-                    # Every known object gets an entry every frame, present or
-                    # not, so the per-object buffers stay aligned in time and a
-                    # neighbour's position can be read at the same index as the
-                    # focal animal's. Appending only for detected objects would
-                    # silently shear the windows apart whenever one is missed.
-                    for obj_id in set(mask_buffers) | set(matched):
-                        if obj_id not in mask_buffers:
-                            mask_buffers[obj_id] = deque(maxlen=self.cls_window)
-                        det = matched.get(obj_id)
-                        entry = None
-                        mask = det.get("mask") if det is not None else None
-                        if mask is not None:
-                            bbox = det["bbox"]
-                            h_f, w_f = mask.shape[:2]
-                            x1 = max(0, int(round(float(bbox[0]))))
-                            y1 = max(0, int(round(float(bbox[1]))))
-                            x2 = min(w_f, int(round(float(bbox[2]))))
-                            y2 = min(h_f, int(round(float(bbox[3]))))
-                            if x2 > x1 and y2 > y1:
-                                entry = {
-                                    "crop": mask[y1:y2, x1:x2],
-                                    "bbox": (x1, y1, x2, y2),
-                                }
-                        mask_buffers[obj_id].append(entry)
-
-                    # Snapshot once rather than per focal animal: the inner
-                    # loop below is quadratic in object count otherwise.
-                    windows = {oid: list(buf) for oid, buf in mask_buffers.items()}
-                    for obj_id, window in windows.items():
-                        if all(e is None for e in window):
-                            # Gone for a whole window. Drop it so a long video
-                            # does not accumulate dead buffers, and so it stops
-                            # counting as a neighbour of anyone.
-                            mask_buffers.pop(obj_id, None)
-                            current_labels.pop(obj_id, None)
-
-                    for obj_id in list(mask_buffers.keys()):
-                        window = windows.get(obj_id) or []
-                        if len(window) < self.cls_window:
-                            continue
-
-                        if cls_scene_cfg is not None:
-                            neighbors = []
-                            for i in range(len(window)):
-                                neighbors.append([
-                                    other[i] for oid, other in windows.items()
-                                    if oid != obj_id and oid in mask_buffers
-                                    and len(other) == len(window)
-                                    and other[i] is not None
-                                ])
-                            scene = generate_scene_composite(
-                                window, neighbors, output_size=(128, 128),
-                            )
-                            vec = pairwise_vector(
-                                pairwise_features(window, neighbors, fps=fps)
-                            )
-                            probs_np = predict_scene(
-                                cls_model, cls_scene_cfg, scene, vec, cls_device,
-                            )
-                            probs = torch.from_numpy(probs_np)
-                        else:
-                            crops = [w["crop"] if w is not None else None for w in window]
-                            boxes = [w["bbox"] if w is not None else None for w in window]
-                            composite = generate_composite(
-                                crops, output_size=(128, 128), bboxes=boxes)
-                            img = composite.astype(np.float32) / 255.0
-                            inp = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(cls_device)
-                            with torch.no_grad():
-                                probs = torch.softmax(cls_model(inp), dim=1)[0].cpu()
-
-                        sorted_probs, sorted_idx = probs.sort(descending=True)
-                        conf = sorted_probs[0].item()
-                        pred_idx = sorted_idx[0].item()
-                        gap = (sorted_probs[0] - sorted_probs[1]).item() if len(sorted_probs) > 1 else conf
-
-                        if conf < self.nc_threshold or gap < self.uncertain_gap:
-                            beh_name = "NC"
-                        else:
-                            beh_name = cls_class_names[pred_idx]
-                        current_labels[obj_id] = (beh_name, conf)
-
-                        behavior_rows.append({
-                            "frame": frame_idx,
-                            "object_id": obj_id,
-                            "behavior": beh_name,
-                            "confidence": round(conf, 4),
-                            "gap": round(gap, 4),
-                        })
-
-                    return current_labels if current_labels else None
-
-                result = run_inference_on_video(
-                    video_path,
-                    self.model_dir,
-                    config,
+                result = infer_one_video(
+                    video_path, self.model_dir, config, cls_info,
+                    cls_window=self.cls_window, nc_threshold=self.nc_threshold,
+                    uncertain_gap=self.uncertain_gap, min_bout=self.min_bout,
+                    create_tracked_video=self.create_tracked_video,
                     progress=lambda f, t: self.progress.emit(f, t),
                     should_stop=_check_stop,
+                    stop_requested=lambda: self._stop_flag,
                     frame_callback=_on_frame,
-                    track_callback=_track_cb if cls_model else None,
-                    create_tracked_video=self.create_tracked_video,
+                    run_info={"classifier": self.classifier_dir},
                 )
-                result["video_path"] = video_path
-
-                if self._stop_flag:
-                    out_dir = result.get("output_dir", "")
-                    if out_dir and os.path.isdir(out_dir):
-                        import shutil
-                        shutil.rmtree(out_dir, ignore_errors=True)
-                        print(f"[MTT Inference] Removed incomplete output: {out_dir}")
+                if result.get("stopped"):
                     break
-
-                if behavior_rows:
-                    per_obj_first = {}
-                    for row in behavior_rows:
-                        oid = row["object_id"]
-                        if oid not in per_obj_first:
-                            per_obj_first[oid] = row
-                    backfill = []
-                    for oid, first_row in per_obj_first.items():
-                        first_frame = first_row["frame"]
-                        for fi in range(first_frame):
-                            backfill.append({
-                                "frame": fi,
-                                "object_id": oid,
-                                "behavior": first_row["behavior"],
-                                "confidence": first_row["confidence"],
-                                "gap": first_row["gap"],
-                            })
-                    if backfill:
-                        behavior_rows = backfill + behavior_rows
-
-                    self._apply_min_bout_filter(behavior_rows, self.min_bout)
-
-                    import csv
-                    out_dir = result.get("output_dir", "")
-                    beh_csv = os.path.join(out_dir, "behavior_predictions.csv")
-                    fieldnames = ["frame", "object_id", "behavior", "confidence", "gap"]
-                    behavior_rows.sort(key=lambda r: (r["object_id"], r["frame"]))
-                    with open(beh_csv, "w", newline="") as f:
-                        w = csv.DictWriter(f, fieldnames=fieldnames)
-                        w.writeheader()
-                        w.writerows(behavior_rows)
-                    result["behavior_csv"] = beh_csv
-                    n_pred = len(behavior_rows)
-                    n_nc = sum(1 for r in behavior_rows if r["behavior"] == "NC")
-                    n_objs = len(set(r["object_id"] for r in behavior_rows))
-                    print(f"[Classifier Inference] Saved {n_pred} predictions "
-                          f"({n_nc} NC) for {n_objs} objects → {beh_csv}")
-
                 self.video_finished.emit(result)
 
             self.all_done.emit()
@@ -4461,6 +4232,12 @@ class MaskTrackerWindow(QMainWindow):
         self.preview.category_hotkey.connect(self._on_category_hotkey)
         self.preview.reassign_annotation_requested.connect(self._on_reassign_annotation)
         right_layout.addWidget(self.preview, 1)
+
+        # Tiles for "Several videos at once": in the preview's place while it runs.
+        self._infer_grid = InferenceGrid()
+        self._infer_grid.setVisible(False)
+        self._infer_grid_on = False
+        right_layout.addWidget(self._infer_grid, 1)
 
         # Source-video timeline directly under the preview (Mask tab only).
         self._scrubber_row = QWidget()
@@ -6564,6 +6341,37 @@ class MaskTrackerWindow(QMainWindow):
             "OFF: skip rendering to the preview window for faster processing."
         )
         ctrl_vbox.addWidget(self.chk_inference_preview)
+
+        row_par = QHBoxLayout()
+        self.chk_parallel_videos = QCheckBox("Several videos at once")
+        self.chk_parallel_videos.setChecked(False)
+        self.chk_parallel_videos.setToolTip(
+            "Track several queued videos at the same time, one worker process\n"
+            "per video. One video at a time leaves the GPU mostly idle: the\n"
+            "work around the model (reading, tracking, drawing, writing) runs\n"
+            "on the CPU one step after another, and separate workers overlap it.\n\n"
+            "The preview pane shows a small tile per running video. Each video's\n"
+            "outputs are the same as when it runs alone."
+        )
+        row_par.addWidget(self.chk_parallel_videos)
+        row_par.addStretch()
+        lbl_par = QLabel("At once:")
+        row_par.addWidget(lbl_par)
+        self.spin_parallel_videos = QSpinBox()
+        self.spin_parallel_videos.setRange(0, 16)
+        self.spin_parallel_videos.setSpecialValueText("Auto")
+        self.spin_parallel_videos.setValue(0)
+        self.spin_parallel_videos.setStyleSheet(self._spin_style)
+        self.spin_parallel_videos.setToolTip(
+            "How many videos run at once.\n\n"
+            "Auto: as many as this machine can take, the smallest of physical\n"
+            "CPU cores / 3, free GPU memory / 1.5 GB, available RAM / 3 GB,\n"
+            "8, and the number of queued videos.\n"
+            "A number: that many (never more than the queue)."
+        )
+        lbl_par.setToolTip(self.spin_parallel_videos.toolTip())
+        row_par.addWidget(self.spin_parallel_videos)
+        ctrl_vbox.addLayout(row_par)
 
         btn_row = QHBoxLayout()
         self.btn_start_tracking = QPushButton("Run Inference")
@@ -13569,6 +13377,12 @@ class MaskTrackerWindow(QMainWindow):
                 )
                 return
 
+        if self.chk_parallel_videos.isChecked() and len(video_paths) > 1:
+            self._start_parallel_tracking(video_paths, model_dir, config_dict,
+                                          classifier_dir)
+            return
+        self._track_parallel = False
+
         self._inference_worker = InferenceWorker(
             video_paths, model_dir, config_dict,
             classifier_dir=classifier_dir,
@@ -13589,6 +13403,239 @@ class MaskTrackerWindow(QMainWindow):
         self._infer_log_text.clear()
         self._infer_log_panel.setVisible(True)
         self._inference_worker.start()
+
+    def _launch_inference(self, args, _waited: float = 0.0):
+        """--infer: fill the Inference tab from the command line and run it.
+
+        Waits for the hardware probe first, since it sets the device and mask
+        defaults; never stops at a dialog (videos with output are left out).
+        """
+        probe = getattr(self, "_sysprofile_worker", None)
+        if probe is not None and probe.isRunning() and _waited < 30:
+            QTimer.singleShot(250, lambda: self._launch_inference(args, _waited + 0.25))
+            return
+        # The tab fills its model list when shown.
+        self.tab_widget.setCurrentIndex(self._inference_tab_idx)
+        self._refresh_model_list()
+        settings = inference_settings(args)
+        model = args.infer_model or settings.get("model_dir")
+        if model:
+            if not self._select_track_model(model):
+                print(f"[MTT] --infer-model is not a trained model folder: {model}", flush=True)
+                return
+        from .mtt_runs import find_track_videos
+        videos = []
+        for item in args.infer:
+            if os.path.exists(item):
+                videos += find_track_videos([item])
+            else:
+                print(f"[MTT] --infer: no such video or folder: {item}", flush=True)
+        todo = [v for v in videos
+                if not os.path.isdir(os.path.join(str(Path(v).parent),
+                                                  f"{Path(v).stem}_MaskTracker"))]
+        if len(todo) < len(videos):
+            print(f"[MTT] --infer: {len(videos) - len(todo)} video(s) already have "
+                  f"output, left out", flush=True)
+        if not todo:
+            print("[MTT] --infer: nothing to track", flush=True)
+            return
+        self.list_track_videos.clear()
+        for v in todo:
+            self.list_track_videos.addItem(os.path.basename(v))
+            self.list_track_videos.item(self.list_track_videos.count() - 1).setData(
+                Qt.UserRole, v)
+        applied = self._apply_inference_settings(settings)
+        if applied:
+            print(f"[MTT] inference settings: {', '.join(applied)}", flush=True)
+        self._quit_when_done = bool(getattr(args, "quit_when_done", False))
+        self.tab_widget.setCurrentIndex(self._inference_tab_idx)
+        self._update_tracking_button_state()
+        print(f"[MTT] --infer: {len(todo)} video(s)", flush=True)
+        self._start_tracking()
+
+    def _select_track_model(self, model_dir: str) -> bool:
+        """Pick this model in the Inference tab, adding it for this session if
+        it is not one of the project's (nothing is saved)."""
+        want = os.path.normcase(os.path.normpath(model_dir))
+        hits = [k for k, d in enumerate(self._track_model_dirs)
+                if d and os.path.normcase(os.path.normpath(d)) == want]
+        if not hits:
+            if not self._is_track_model_dir(model_dir):
+                return False
+            k = max(0, len(self._track_model_dirs) - 1)      # before the Browse entry
+            self.combo_track_model.insertItem(k, self._track_model_label(model_dir, external=True))
+            self._track_model_dirs.insert(k, model_dir)
+            hits = [k]
+        self.combo_track_model.setCurrentIndex(hits[0])
+        return True
+
+    def _apply_inference_settings(self, d: dict) -> List[str]:
+        """Put settings (mask_tracker_cli.inference_settings) into the Inference
+        tab, so the tab shows what the run uses. Returns what was set."""
+        applied = []
+
+        def note(k):
+            applied.append(f"{k}={d[k]}")
+
+        if "max_detections" in d:
+            self.spin_track_max_det.setValue(int(d["max_detections"]))
+            note("max_detections")
+        if "confidence_threshold" in d:
+            self.spin_track_confidence.setValue(float(d["confidence_threshold"]))
+            note("confidence_threshold")
+        if "max_disappeared_frames" in d:
+            text = "Never" if int(d["max_disappeared_frames"]) == 0 else str(int(d["max_disappeared_frames"]))
+            if self.combo_track_disappear.findText(text) < 0:
+                self.combo_track_disappear.addItem(text)
+            self.combo_track_disappear.setCurrentText(text)
+            note("max_disappeared_frames")
+        if "iou_match_threshold" in d:
+            self.spin_track_iou.setValue(float(d["iou_match_threshold"]))
+            note("iou_match_threshold")
+        if "matching_algorithm" in d:
+            for i in range(self.combo_track_matching.count()):
+                if self.combo_track_matching.itemText(i).lower().startswith(d["matching_algorithm"]):
+                    self.combo_track_matching.setCurrentIndex(i)
+            note("matching_algorithm")
+        if "inference_size" in d:
+            size = int(d["inference_size"] or 0)
+            text = None
+            for i in range(self.combo_track_resolution.count()):
+                t = self.combo_track_resolution.itemText(i)
+                if (size == 0 and t.startswith("Trained")) or t == f"{size}px":
+                    text = t
+            if text is None:
+                text = f"{size}px"
+                self.combo_track_resolution.addItem(text)
+            self.combo_track_resolution.setCurrentText(text)
+            note("inference_size")
+        if "device" in d:
+            names = {"auto": "Auto", "cpu": "CPU", "cuda": "CUDA", "mps": "MPS"}
+            want = names.get(str(d["device"]).lower(), "Auto")
+            for i in range(self.combo_track_device.count()):
+                if self.combo_track_device.itemText(i).startswith(want):
+                    self.combo_track_device.setCurrentIndex(i)
+            note("device")
+        for key, box in (("use_masks", self.chk_track_masks),
+                         ("save_masks", self.chk_save_masks),
+                         ("create_tracked_video", self.chk_create_tracked_video),
+                         ("show_preview", self.chk_inference_preview)):
+            if key in d:
+                box.setChecked(bool(d[key]))
+                note(key)
+        if "classifier_dir" in d:
+            cdir = d["classifier_dir"]
+            if not cdir:
+                self.chk_behavior_cls.setChecked(False)
+            else:
+                self._refresh_classifier_model_list()
+                want = os.path.normcase(os.path.normpath(cdir))
+                hits = [k for k, x in enumerate(self._behavior_model_dirs)
+                        if x and os.path.normcase(os.path.normpath(x)) == want]
+                if not hits and self._is_behavior_model_dir(cdir):
+                    k = max(0, len(self._behavior_model_dirs) - 1)
+                    self.combo_behavior_model.insertItem(k, os.path.basename(os.path.normpath(cdir)))
+                    self._behavior_model_dirs.insert(k, cdir)
+                    hits = [k]
+                if hits:
+                    self.chk_behavior_cls.setChecked(True)
+                    self.combo_behavior_model.setCurrentIndex(hits[0])
+                else:
+                    print(f"[MTT] not a behavior classifier folder: {cdir}", flush=True)
+            note("classifier_dir")
+        for key, spin in (("nc_threshold", self.spin_nc_threshold),
+                          ("cls_window", self.spin_cls_window),
+                          ("min_bout", self.spin_min_bout),
+                          ("uncertain_gap", self.spin_uncertain_gap)):
+            if key in d:
+                spin.setValue(type(spin.value())(d[key]))
+                note(key)
+        if "parallel" in d:
+            self.chk_parallel_videos.setChecked(True)
+            self.spin_parallel_videos.setValue(0 if d["parallel"] == "auto" else int(d["parallel"]))
+            note("parallel")
+        return applied
+
+    def _start_parallel_tracking(self, video_paths, model_dir, config_dict,
+                                 classifier_dir):
+        """Track the queue several videos at a time (mask_tracker_parallel),
+        with a tile per running video in the preview pane."""
+        import time as _time
+        from .mask_tracker_parallel import auto_worker_count
+        n = self.spin_parallel_videos.value()
+        if n == 0:
+            n, why = auto_worker_count(len(video_paths), config_dict.get("device", "auto"))
+        else:
+            n = min(n, len(video_paths))
+            why = f"{n} at once (set by hand)"
+        opts = {
+            "classifier_dir": classifier_dir,
+            "nc_threshold": self.spin_nc_threshold.value(),
+            "cls_window": self.spin_cls_window.value(),
+            "min_bout": self.spin_min_bout.value(),
+            "uncertain_gap": self.spin_uncertain_gap.value(),
+            "create_tracked_video": self.chk_create_tracked_video.isChecked(),
+            "show_preview": self.chk_inference_preview.isChecked(),
+            "auto_reason": why,
+        }
+        self._track_parallel = True
+        self._track_parallel_t0 = _time.time()
+        self._track_parallel_frames = 0
+        self._track_parallel_failed = 0
+        w = ParallelInferenceWorker(video_paths, model_dir, config_dict, n, opts)
+        self._inference_worker = w
+        self._infer_grid.set_slots(w.n_workers)
+        self._infer_grid.lbl_summary.setText(f"Tracking {len(video_paths)} videos, {why}")
+        w.video_started.connect(self._infer_grid.video_started)
+        w.video_progress.connect(self._infer_grid.video_progress)
+        w.video_progress.connect(self._on_parallel_progress)
+        w.video_frame.connect(self._on_parallel_frame)
+        w.video_failed.connect(self._on_parallel_failed)
+        w.worker_exited.connect(self._infer_grid.worker_exited)
+        w.video_finished.connect(self._on_video_finished)
+        w.all_done.connect(self._on_all_tracking_done)
+        w.error.connect(self._on_tracking_error)
+        w.log.connect(self._on_infer_log)
+
+        self.track_progress.setVisible(False)
+        self.track_queue_progress.setVisible(True)
+        self.lbl_track_status.setText(f"Tracking {len(video_paths)} videos, {why}")
+        self._show_infer_grid(True)
+        self._infer_log_text.clear()
+        self._infer_log_panel.setVisible(True)
+        print(f"[MTT Parallel] {why}", flush=True)
+        w.start()
+
+    def _show_infer_grid(self, on: bool):
+        """The tile grid in the preview's place (on the Inference tab) or not."""
+        self._infer_grid_on = on
+        here = self.tab_widget.currentIndex() == self._inference_tab_idx
+        self._infer_grid.setVisible(on and here)
+        if here:
+            self.preview.setVisible(not on)
+
+    def _on_parallel_progress(self, slot: int, frame: int, total: int, fps: float):
+        w = self._inference_worker
+        running = len(w.fps) if hasattr(w, "fps") else 0
+        all_fps = w.total_fps() if hasattr(w, "total_fps") else 0.0
+        failed = getattr(self, "_track_parallel_failed", 0)
+        text = (f"{self._track_videos_done} of {self._track_total_videos} done · "
+                f"{running} running · {all_fps:.0f} fps in all")
+        if failed:
+            text += f" · {failed} failed"
+        self.lbl_track_status.setText(text)
+        self.lbl_tracking_info.setText(text)
+
+    def _on_parallel_frame(self, slot: int, rgb, frame: int):
+        if self.tab_widget.currentIndex() == self._inference_tab_idx:
+            self._infer_grid.video_frame(slot, rgb, frame)
+
+    def _on_parallel_failed(self, slot: int, msg: str):
+        self._track_parallel_failed = getattr(self, "_track_parallel_failed", 0) + 1
+        self._infer_grid.video_failed(slot, msg)
+        item = QListWidgetItem(f"FAILED {msg}")
+        item.setForeground(QColor("#ef5350"))
+        self.list_track_results.addItem(item)
 
     def _on_tracking_frame(self, frame_rgb, frame_idx: int):
         """Display an annotated frame in the preview during live inference."""
@@ -13657,7 +13704,11 @@ class MaskTrackerWindow(QMainWindow):
         item.setForeground(QColor("#4fc456"))
         self.list_track_results.addItem(item)
 
-        if self._track_videos_done < self._track_total_videos:
+        if getattr(self, "_track_parallel", False):
+            self._track_parallel_frames += total_frames
+            if "worker" in result:
+                self._infer_grid.video_done(result["worker"], f"finished: {n_tracks} tracks")
+        elif self._track_videos_done < self._track_total_videos:
             next_name = os.path.basename(
                 self._track_video_paths[self._track_videos_done]
             )
@@ -13677,6 +13728,40 @@ class MaskTrackerWindow(QMainWindow):
         self.lbl_track_status.setText(
             f"Done — {self._track_videos_done} video(s) processed"
         )
+        if getattr(self, "_track_parallel", False):
+            import time as _time
+            dt = max(1e-6, _time.time() - self._track_parallel_t0)
+            line = (f"[MTT Parallel] Done: {self._track_videos_done} video(s), "
+                    f"{self._track_parallel_frames} frames in {dt / 60:.1f} min "
+                    f"({self._track_parallel_frames / dt:.1f} fps in all)")
+            if self._track_parallel_failed:
+                line += f", {self._track_parallel_failed} failed"
+            self._on_infer_log(line)
+            print(line, flush=True)
+            self.lbl_track_status.setText(line.replace("[MTT Parallel] ", ""))
+            self._track_parallel = False
+            self._show_infer_grid(False)
+        self._write_run_summaries()
+        if getattr(self, "_quit_when_done", False):
+            QTimer.singleShot(1500, self.close)
+
+    def _write_run_summaries(self):
+        """MaskTracker_summary.csv in each folder this run's videos are in."""
+        from .mtt_runs import write_folder_summary
+        seen = set()
+        for v in getattr(self, "_track_video_paths", []) or []:
+            folder = os.path.dirname(v)
+            if folder in seen:
+                continue
+            seen.add(folder)
+            try:
+                path = write_folder_summary(folder)
+            except Exception as e:
+                path = None
+                self._on_infer_log(f"[MTT] could not write the summary in {folder}: {e}")
+            if path:
+                self._on_infer_log(f"[MTT] summary: {path}")
+                print(f"[MTT] summary: {path}", flush=True)
         self.lbl_tracking_info.setText(
             f"Inference complete — {self._track_videos_done} video(s) processed"
         )
@@ -13712,6 +13797,9 @@ class MaskTrackerWindow(QMainWindow):
             self.lbl_track_status.setText("Stopping tracking...")
 
     def _on_tracking_error(self, msg: str):
+        if getattr(self, "_infer_grid_on", False):
+            self._track_parallel = False
+            self._show_infer_grid(False)
         self.track_progress.setVisible(False)
         self.track_queue_progress.setVisible(False)
         self.btn_start_tracking.setEnabled(True)
@@ -13719,6 +13807,10 @@ class MaskTrackerWindow(QMainWindow):
         self.btn_track_stop.setVisible(False)
         self.preview.setEnabled(True)
         self.lbl_track_status.setText(f"Error: {msg}")
+        print(f"[MTT] tracking error: {msg}", flush=True)
+        if getattr(self, "_quit_when_done", False):
+            QTimer.singleShot(1500, self.close)
+            return
         QMessageBox.critical(self, "Tracking Error", msg)
 
     def _on_result_double_clicked(self, item):
@@ -13874,7 +13966,10 @@ class MaskTrackerWindow(QMainWindow):
         # (Mask training has its own window.) Preview + info row: hidden while
         # the classifier graph is up.
         show_preview = not cls_show_loss and not cls_graph_visible
-        self.preview.setVisible(show_preview)
+        grid_on = is_tracking and getattr(self, "_infer_grid_on", False)
+        self.preview.setVisible(show_preview and not grid_on)
+        if hasattr(self, "_infer_grid"):
+            self._infer_grid.setVisible(grid_on)
         self._scrubber_row.setVisible(is_annotation and show_preview)
         self._info_row.setVisible(show_preview)
 
@@ -14056,6 +14151,9 @@ class MaskTrackerWindow(QMainWindow):
         if worker is not None and worker.isRunning():
             worker.wait(2000)
         self._wait_for_prediction()
+        w = getattr(self, "_inference_worker", None)
+        if isinstance(w, ParallelInferenceWorker) and w.isRunning():
+            w.shutdown()
         event.accept()
 
 
@@ -14111,7 +14209,9 @@ def expand_focus_items(items) -> List[str]:
     return names
 
 
-from .mask_tracker_cli import resolve_project_config  # noqa: E402
+from .mask_tracker_cli import (  # noqa: E402
+    add_inference_settings, inference_settings, project_of_model, resolve_project_config,
+)
 
 
 def apply_training_args(win: "MaskTrackerWindow", args) -> List[str]:
@@ -14242,7 +14342,57 @@ def _launch_parser():
     p.add_argument("--predict", metavar="MODEL_DIR", default=None,
                    help="Once the project is open, predict the queue's unreviewed frames "
                         "with this trained model (as File > Predict Unreviewed Frames).")
+    i = p.add_argument_group(
+        "inference",
+        "Run the Inference tab on videos once the project is open, as Run "
+        "Inference would. Settings not given keep the tab's value.")
+    i.add_argument("--infer", nargs="+", default=None, metavar="VIDEO",
+                   help="Videos, folders (searched recursively) and/or .txt lists to track. "
+                        "Any that already have a <name>_MaskTracker folder are left out "
+                        "(never cleared).")
+    i.add_argument("--infer-model", dest="infer_model", default=None, metavar="MODEL_DIR",
+                   help="The trained model run folder; default: --settings-from's, else the "
+                        "one the tab selects.")
+    add_inference_settings(i)
     return p
+
+
+def track_main(args) -> int:
+    """``mask_tracker_cli track``: open the project in the window and track the
+    videos from the Inference tab (see ``main``'s ``--infer``)."""
+    from .mask_tracker_cli import settings_argv
+    from .mtt_runs import find_track_videos, output_dir_for
+    model = args.model
+    if not model and args.settings_from:
+        model = inference_settings(args).get("model_dir")
+    if not model:
+        print("track: give --model (or --settings-from a run that names one)", file=sys.stderr)
+        return 2
+    project = args.project or project_of_model(model)
+    if not project:
+        print(f"track: {model} is not inside a project's models/ folder; give --project",
+              file=sys.stderr)
+        return 2
+    videos = find_track_videos(args.videos)
+    if not videos:
+        print("track: no videos found", file=sys.stderr)
+        return 1
+    if args.redo:
+        import shutil
+        from datetime import datetime
+        for v in videos:
+            out = output_dir_for(v)
+            if os.path.isdir(out):
+                bin_dir = os.path.join(os.path.dirname(v), "_TO_DELETE_tracking")
+                os.makedirs(bin_dir, exist_ok=True)
+                dest = os.path.join(bin_dir, os.path.basename(out))
+                if os.path.exists(dest):
+                    dest += datetime.now().strftime("_%Y%m%d_%H%M%S")
+                shutil.move(out, dest)
+                print(f"[MTT] moved the old output to {dest}", flush=True)
+    argv = (["--project", project, "--infer", *videos, "--infer-model", model]
+            + settings_argv(args))
+    return main(argv)
 
 
 def read_frame_names(items) -> set:
@@ -14279,8 +14429,12 @@ def main(argv=None) -> int:
     # parse_known_args: Qt has command-line options of its own.
     args, qt_args = parser.parse_known_args(
         sys.argv[1:] if argv is None else argv)
-    if (args.train or args.focus or args.predict) and not args.project:
-        parser.error("--train, --focus and --predict need --project")
+    if (args.train or args.focus or args.predict or args.infer) and not args.project:
+        parser.error("--train, --focus, --predict and --infer need --project")
+    try:
+        inference_settings(args)
+    except (ValueError, OSError) as e:
+        parser.error(str(e))
     if args.training_window_only and not args.train:
         parser.error("--training-window-only needs --train")
     if args.train_only and not args.train:
@@ -14319,6 +14473,8 @@ def main(argv=None) -> int:
             QTimer.singleShot(500, win._start_training)
         elif args.predict:
             QTimer.singleShot(500, lambda: win._predict_queue_with_model(args.predict))
+        elif args.infer:
+            QTimer.singleShot(500, lambda: win._launch_inference(args))
     return app.exec_()
 
 

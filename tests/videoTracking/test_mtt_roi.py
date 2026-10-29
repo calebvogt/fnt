@@ -110,10 +110,13 @@ def test_export_cuts_frames_and_labels(tmp_path):
 
 
 class _T:
-    """Just enough of a torch tensor: .cpu().numpy()."""
+    """Just enough of a torch tensor: .bool().cpu().numpy()."""
 
     def __init__(self, a):
         self.a = np.asarray(a)
+
+    def bool(self):
+        return _T(self.a.astype(bool))
 
     def cpu(self):
         return self

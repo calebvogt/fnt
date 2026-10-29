@@ -11,6 +11,13 @@ The CSV needs columns ``video`` (path) and ``frame`` (0-based index). Frames
 already in ``training_frames/`` are kept, not rewritten. Run it while the
 project is not open in the GUI: both write ``project_config.json``.
 
+``track --videos V... --model M`` tracks every frame of whole videos in the
+Mask Tracker window (the Inference tab, several videos at once with
+``--parallel auto``), with every Inference setting as a flag;
+``--settings-from`` repeats an earlier run's settings from its output folder.
+``track-summary --videos V...`` writes each video folder's
+``MaskTracker_summary.csv`` (see :mod:`fnt.videoTracking.mtt_runs`).
+
 ``pack-session --project P --focus LIST --out DIR`` copies a focus list's frames
 and labels into a portable session folder that opens as a project on any
 machine with FNT; ``unpack-session --session S`` merges the labels made there
@@ -40,6 +47,125 @@ def resolve_project_config(project: str) -> str:
     if not os.path.isfile(path):
         raise FileNotFoundError(f"no Mask Tracker project at {project}")
     return path
+
+
+def project_of_model(model_dir: str) -> str:
+    """The project a model run folder belongs to (``<project>/models/<run>``), or ""."""
+    proj = os.path.dirname(os.path.dirname(os.path.normpath(model_dir)))
+    return proj if os.path.isfile(os.path.join(proj, "project_config.json")) else ""
+
+
+def _on_off(group, name: str, help_on: str, help_off: str) -> None:
+    dest = name.replace("-", "_")
+    group.add_argument(f"--{name}", dest=dest, action="store_true", default=None, help=help_on)
+    group.add_argument(f"--no-{name}", dest=dest, action="store_false", help=help_off)
+
+
+def add_inference_settings(g) -> None:
+    """The Inference tab's settings as flags (shared by ``track`` and the
+    window's ``--infer``). A flag not given keeps the tab's value, or the
+    ``--settings-from`` run's."""
+    g.add_argument("--settings-from", dest="settings_from", default=None, metavar="PATH",
+                   help="Repeat an earlier run: a <video>_MaskTracker folder or its "
+                        "run_settings.json (model and settings; flags given here win).")
+    g.add_argument("--parallel", default=None, metavar="N",
+                   help="Track several videos at once: N of them, or 'auto'.")
+    g.add_argument("--max-objects", dest="max_objects", type=int, default=None,
+                   help="Max objects per frame (0 = unlimited).")
+    g.add_argument("--conf", type=float, default=None, help="Confidence threshold.")
+    g.add_argument("--max-disappear", dest="max_disappear", default=None, metavar="N",
+                   help="Frames a track may go undetected before it ends: 'never' or N.")
+    g.add_argument("--iou", type=float, default=None, help="IoU threshold for matching.")
+    g.add_argument("--matching", choices=["hungarian", "greedy"], default=None)
+    g.add_argument("--resolution", default=None, metavar="PX",
+                   help="Inference size: 'trained' or 256/384/512/640/800.")
+    g.add_argument("--infer-device", dest="infer_device", default=None,
+                   choices=["auto", "cpu", "cuda", "mps"], help="Device for inference.")
+    _on_off(g, "masks", "Predict masks (centroids from the mask).", "Boxes only.")
+    _on_off(g, "tracked-video", "Write the annotated video.", "No annotated video.")
+    _on_off(g, "save-masks", "Save every frame's masks for proofreading.", "Don't.")
+    _on_off(g, "preview", "Show the tracking preview.", "No preview.")
+    g.add_argument("--classifier", default=None, metavar="DIR",
+                   help="Behavior classifier folder ('none' to turn classification off).")
+    g.add_argument("--nc-threshold", dest="nc_threshold", type=float, default=None)
+    g.add_argument("--cls-window", dest="cls_window", type=int, default=None)
+    g.add_argument("--min-bout", dest="min_bout", type=int, default=None)
+    g.add_argument("--uncertain-gap", dest="uncertain_gap", type=float, default=None)
+    g.add_argument("--quit-when-done", dest="quit_when_done", action="store_true",
+                   help="Close the window when the run ends.")
+
+
+#: (flag, dest) of add_inference_settings's value flags, for settings_argv.
+_VALUE_FLAGS = [("--settings-from", "settings_from"), ("--parallel", "parallel"),
+                ("--max-objects", "max_objects"), ("--conf", "conf"),
+                ("--max-disappear", "max_disappear"), ("--iou", "iou"),
+                ("--matching", "matching"), ("--resolution", "resolution"),
+                ("--infer-device", "infer_device"), ("--classifier", "classifier"),
+                ("--nc-threshold", "nc_threshold"), ("--cls-window", "cls_window"),
+                ("--min-bout", "min_bout"), ("--uncertain-gap", "uncertain_gap")]
+_ON_OFF_FLAGS = [("masks", "masks"), ("tracked-video", "tracked_video"),
+                 ("save-masks", "save_masks"), ("preview", "preview")]
+
+
+def settings_argv(args) -> List[str]:
+    """The inference settings given in ``args``, as flags again."""
+    out: List[str] = []
+    for flag, dest in _VALUE_FLAGS:
+        v = getattr(args, dest, None)
+        if v is not None:
+            out += [flag, str(v)]
+    for name, dest in _ON_OFF_FLAGS:
+        v = getattr(args, dest, None)
+        if v is not None:
+            out.append(f"--{name}" if v else f"--no-{name}")
+    if getattr(args, "quit_when_done", False):
+        out.append("--quit-when-done")
+    return out
+
+
+def inference_settings(args) -> Dict:
+    """The settings asked for: ``--settings-from``'s, then the flags given.
+
+    Keys follow MaskInferenceConfig, plus create_tracked_video, show_preview,
+    parallel, classifier_dir (None: off) and its four settings, and model_dir
+    (from --settings-from). Only keys with a value are present.
+    """
+    out: Dict = {}
+    if getattr(args, "settings_from", None):
+        from .mtt_runs import read_run_settings
+        rec = read_run_settings(args.settings_from)
+        out.update(rec.get("settings", {}))
+        out.pop("model_path", None)
+        out["create_tracked_video"] = rec.get("create_tracked_video", True)
+        out["classifier_dir"] = rec.get("classifier")
+        out.update(rec.get("classifier_settings") or {})
+        out["model_dir"] = rec.get("model_dir")
+    flags = {
+        "max_objects": "max_detections", "conf": "confidence_threshold",
+        "iou": "iou_match_threshold", "matching": "matching_algorithm",
+        "infer_device": "device", "masks": "use_masks", "tracked_video": "create_tracked_video",
+        "save_masks": "save_masks", "preview": "show_preview", "nc_threshold": "nc_threshold",
+        "cls_window": "cls_window", "min_bout": "min_bout", "uncertain_gap": "uncertain_gap",
+    }
+    for a, k in flags.items():
+        v = getattr(args, a, None)
+        if v is not None:
+            out[k] = v
+    md = getattr(args, "max_disappear", None)
+    if md is not None:
+        out["max_disappeared_frames"] = 0 if str(md).lower() == "never" else int(md)
+    res = getattr(args, "resolution", None)
+    if res is not None:
+        out["inference_size"] = 0 if str(res).lower() == "trained" else int(str(res).rstrip("px"))
+    cls = getattr(args, "classifier", None)
+    if cls is not None:
+        out["classifier_dir"] = None if cls.lower() == "none" else cls
+    par = getattr(args, "parallel", None)
+    if par is not None:
+        if par != "auto" and not str(par).isdigit():
+            raise ValueError("--parallel takes a number or 'auto'")
+        out["parallel"] = par
+    return out
 
 
 def frame_name(video: str, index: int) -> str:
@@ -229,6 +355,27 @@ def _parser():
     u_.add_argument("--force", action="store_true",
                     help="Overwrite frames whose labels changed in the project since packing.")
     u_.add_argument("--dry-run", action="store_true", help="Report what would merge; write nothing.")
+    t_ = sub.add_parser("track",
+                        help="Track every frame of whole videos in the Mask Tracker window (the "
+                             "Inference tab): trajectories, annotated video, masks; several at "
+                             "once with --parallel auto.")
+    t_.add_argument("--videos", nargs="+", required=True,
+                    help="Video files, folders (searched recursively; output folders are "
+                         "skipped) and/or .txt lists.")
+    t_.add_argument("--model", default=None,
+                    help="Model run folder (default: --settings-from's model).")
+    t_.add_argument("--project", default=None,
+                    help="Project to open (default: the one the model folder is in).")
+    t_.add_argument("--redo", action="store_true",
+                    help="Track videos that already have output too (their output folder is "
+                         "moved to _TO_DELETE_tracking/ first, not deleted).")
+    add_inference_settings(t_.add_argument_group("settings"))
+    ts = sub.add_parser("track-summary",
+                        help="Write MaskTracker_summary.csv in each video folder (one row per "
+                             "tracked video: frames, frames without a detection, tracks, speed, "
+                             "settings) and print it.")
+    ts.add_argument("--videos", nargs="+", required=True,
+                    help="Video folders (searched recursively), files and/or .txt lists.")
     x_ = sub.add_parser("exits",
                         help="Draw each camera's exits (e.g. an entrance tube's mouth) on its "
                              "median frame; saved as exits.json in each video folder.")
@@ -240,8 +387,39 @@ def _parser():
     return p
 
 
+def summary_folders(items) -> List[str]:
+    """Every folder holding videos named by ``items`` (folders searched recursively)."""
+    from .mtt_runs import OUTPUT_SUFFIX, find_track_videos
+    folders = []
+    for it in items:
+        if os.path.isdir(it):
+            for root, dirs, _ in os.walk(it):
+                dirs[:] = [d for d in dirs if not d.endswith(OUTPUT_SUFFIX)]
+                folders.append(root)
+    folders += [os.path.dirname(v) for v in
+                find_track_videos([i for i in items if not os.path.isdir(i)])]
+    seen, out = set(), []
+    for f in folders:
+        k = os.path.normcase(os.path.abspath(f))
+        if k not in seen:
+            seen.add(k)
+            out.append(f)
+    return out
+
+
 def main(argv=None) -> int:
     args = _parser().parse_args(argv)
+    if args.cmd == "track":
+        from .mask_tracker_gui import track_main
+        return track_main(args)
+    if args.cmd == "track-summary":
+        from .mtt_runs import folder_summary, print_summary, write_folder_summary
+        for f in summary_folders(args.videos):
+            path = write_folder_summary(f)
+            if path:
+                print(f"== {path}")
+                print_summary(folder_summary(f))
+        return 0
     if args.cmd == "extract-frames":
         res = extract_frames(args.project, read_frame_list(args.frames), args.workers)
         if args.focus_out:

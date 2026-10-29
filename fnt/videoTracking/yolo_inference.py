@@ -143,7 +143,9 @@ class YOLOInference:
 
         masks = None
         if self._use_masks and r.masks is not None:
-            mask_data = r.masks.data.cpu().numpy()
+            # To bool on the device first: a quarter of the bytes to copy back
+            # than the float masks, for the same nonzero test as astype(bool).
+            mask_data = r.masks.data.bool().cpu().numpy()
             n = mask_data.shape[0]
             if mask_data.shape[1] != img_h or mask_data.shape[2] != img_w:
                 full_masks = np.zeros((n, img_h, img_w), dtype=bool)
