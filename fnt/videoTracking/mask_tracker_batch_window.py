@@ -26,15 +26,15 @@ class BatchWorker(QThread):
     log = pyqtSignal(str)
     finished_run = pyqtSignal(object)
 
-    def __init__(self, model, videos, step, conf, imgsz, device):
+    def __init__(self, model, videos, step, conf, imgsz, device, gate=None):
         super().__init__()
-        self.args = (model, videos, step, conf, imgsz, device)
+        self.args = (model, videos, step, conf, imgsz, device, gate)
         self.stop_flag = False
         self.pause_flag = False
         self._last_preview = 0.0
 
     def run(self):
-        model, videos, step, conf, imgsz, device = self.args
+        model, videos, step, conf, imgsz, device, gate = self.args
 
         def on_frame(si, n, frame, masks):
             now = time.time()
@@ -58,7 +58,7 @@ class BatchWorker(QThread):
             res = run_batch(model, videos, step, conf, imgsz, device,
                             on_video=lambda k, n, v: self.video_started.emit(k, n, v),
                             on_frame=on_frame, should_stop=lambda: self.stop_flag,
-                            is_paused=lambda: self.pause_flag, log=self.log.emit)
+                            is_paused=lambda: self.pause_flag, log=self.log.emit, gate=gate)
         except Exception as e:
             self.log.emit(f"[batch] stopped: {e}")
             res = {"error": str(e)}
@@ -150,9 +150,10 @@ class BatchWindow(QDialog):
         event.accept()
 
 
-def run_with_window(model, videos: List[str], step, conf, imgsz: Optional[int], device) -> int:
+def run_with_window(model, videos: List[str], step, conf, imgsz: Optional[int], device,
+                    gate: Optional[dict] = None) -> int:
     app = QApplication.instance() or QApplication([])
-    worker = BatchWorker(model, videos, step, conf, imgsz, device)
+    worker = BatchWorker(model, videos, step, conf, imgsz, device, gate)
     win = BatchWindow(worker, f"Mask Tracker — Batch Inference ({len(videos)} videos)")
     win.show()
     worker.start()

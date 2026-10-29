@@ -19,6 +19,7 @@ import random
 import re
 import shutil
 import sys
+from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -33,7 +34,7 @@ from PyQt5.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QHeaderView,
     QInputDialog, QStatusBar, QFrame, QMenu, QTabWidget, QTabBar,
     QDoubleSpinBox, QDialogButtonBox, QLineEdit, QCheckBox, QSlider,
-    QTextEdit, QSplitter, QToolTip, QAbstractSpinBox,
+    QTextEdit, QSplitter, QToolTip, QAbstractSpinBox, QAbstractSlider,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPointF, QRectF, QTimer, QSettings
 from PyQt5.QtGui import (
@@ -4063,6 +4064,9 @@ class MaskTrackerWindow(QMainWindow):
         # (-1 = unknown), so sequential stepping can skip the seek.
         self._video_cap_path: Optional[str] = None
         self._video_cap_pos: int = -1
+        # Recently decoded frames of that file (index -> BGR), so stepping
+        # back is not a keyframe seek per press; see _read_video_frame.
+        self._video_frame_cache: "OrderedDict[int, np.ndarray]" = OrderedDict()
 
         # Timeline under the preview: the video its ticks belong to, and the
         # queue row behind each tick so Space can open that frame.
@@ -4141,6 +4145,17 @@ class MaskTrackerWindow(QMainWindow):
                 and not (isinstance(obj, QComboBox) and obj.isEditable())):
             self.preview.setFocus(Qt.OtherFocusReason)
             self.preview.keyPressEvent(event)
+            return True
+        # Left/Right scrub the source video from anywhere on the Mask tab: the frame
+        # list (focused after a click or at startup) used to swallow them.
+        if (event.type() == event.KeyPress and isinstance(obj, QWidget)
+                and obj is not self and obj.window() is self
+                and event.key() in (Qt.Key_Left, Qt.Key_Right)
+                and self.tab_widget.currentIndex() == 0
+                and not isinstance(obj, (QLineEdit, QAbstractSpinBox, QTextEdit,
+                                         QAbstractSlider))
+                and not (isinstance(obj, QComboBox) and obj.isEditable())):
+            self.keyPressEvent(event)
             return True
         return super().eventFilter(obj, event)
 
@@ -4369,6 +4384,10 @@ class MaskTrackerWindow(QMainWindow):
 
         # Left panel: tabs
         self.tab_widget = QTabWidget()
+        # The tab strip never takes keyboard focus: with it focused, Left/Right switch tabs
+        # instead of scrubbing frames (it is the first widget to get focus at startup).
+        self.tab_widget.setFocusPolicy(Qt.NoFocus)
+        self.tab_widget.tabBar().setFocusPolicy(Qt.NoFocus)
         fm = self.fontMetrics()
         min_w = max(300, fm.averageCharWidth() * 44 + 30)
         self.tab_widget.setMinimumWidth(min_w)
@@ -7860,6 +7879,7 @@ class MaskTrackerWindow(QMainWindow):
         self._video_cap = cap
         self._video_cap_path = path
         self._video_cap_pos = 0
+        self._video_frame_cache.clear()
         self._video_frame_idx = 0
         self._video_frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self._video_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -7886,21 +7906,56 @@ class MaskTrackerWindow(QMainWindow):
             self._video_cap = None
         self._video_cap_path = None
         self._video_cap_pos = -1
+        self._video_frame_cache.clear()
         self._video_frame_count = 0
         self._video_frame_idx = 0
+
+    VIDEO_CACHE_BYTES = 512 * 1024 * 1024
+
+    def _read_video_frame(self, frame_idx: int) -> Optional[np.ndarray]:
+        """Frame ``frame_idx`` of the open video (BGR), or None.
+
+        Stepping to the very next frame skips the seek: one decode per arrow
+        press. Stepping back used to seek every press, and a seek decodes
+        forward from the previous keyframe (~1 s per press over the network),
+        so holding Left crawled while Right flew. Decoded frames are now kept
+        (up to VIDEO_CACHE_BYTES), and stepping back past them fetches the
+        block that ends at the target with one seek.
+        """
+        cache = self._video_frame_cache
+        if frame_idx in cache:
+            cache.move_to_end(frame_idx)
+            return cache[frame_idx]
+        cap = self._video_cap
+        start = frame_idx
+        if self._video_cap_pos != frame_idx:
+            if cache:
+                max_frames = max(1, self.VIDEO_CACHE_BYTES // next(iter(cache.values())).nbytes)
+                block = max(1, max_frames // 2)
+                if any(frame_idx < k <= frame_idx + block for k in cache):  # stepping back
+                    start = max(0, frame_idx - block + 1)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+        frame = None
+        for i in range(start, frame_idx + 1):
+            ret, frame = cap.read()
+            if not ret:
+                self._video_cap_pos = -1
+                return None
+            cache[i] = frame
+            cache.move_to_end(i)
+        self._video_cap_pos = frame_idx + 1
+        max_frames = max(1, self.VIDEO_CACHE_BYTES // frame.nbytes)
+        while len(cache) > max_frames:
+            cache.popitem(last=False)
+        return frame
 
     def _show_video_frame(self, frame_idx: int):
         if self._video_cap is None:
             return
         frame_idx = max(0, min(frame_idx, self._video_frame_count - 1))
         self._video_frame_idx = frame_idx
-        # Stepping to the very next frame skips the seek: one decode per
-        # arrow press instead of a keyframe seek plus decode-forward.
-        if self._video_cap_pos != frame_idx:
-            self._video_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        ret, frame = self._video_cap.read()
-        self._video_cap_pos = frame_idx + 1 if ret else -1
-        if ret:
+        frame = self._read_video_frame(frame_idx)
+        if frame is not None:
             if self.preview.annotations:
                 self.preview.annotations.clear()
             self.preview.set_frame(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
@@ -8239,10 +8294,8 @@ class MaskTrackerWindow(QMainWindow):
         if os.path.exists(out_path):
             self.status_bar.showMessage(f"Frame already extracted: {fname}", 3000)
         else:
-            self._video_cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
-            ret, frame = self._video_cap.read()
-            self._video_cap_pos = fidx + 1 if ret else -1
-            if not ret:
+            frame = self._read_video_frame(fidx)
+            if frame is None:
                 self.status_bar.showMessage("Failed to read frame from video", 3000)
                 return
             cv2.imwrite(out_path, frame)

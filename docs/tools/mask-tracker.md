@@ -180,8 +180,37 @@ skips videos already done with the same model and settings; `--order coarse`
 (the default) spreads the work over every folder and camera first, so a stopped
 run is still an even sample.
 
+`--gate` (MP4/MOV, fixed cameras) chooses the frames by activity instead of
+`--step`. A still scene compresses to tiny frames and a moving animal multiplies
+their size, so the frame sizes in each file's index show where something moves
+without decoding the video. The gate then segments every frame of the moving
+seconds (padded by `--gate-pad`, 1 s), `--gate-low-fps` frames a second (2) where
+it is unsure, and only the keyframes elsewhere, where a resting animal can still
+be. On the 2021_8x8 resource-zone cameras the moving seconds are about a fifth
+of the video. `--gate-hi` and `--gate-lo` (2 and 1.3) are the size ratios over
+the camera's still level that mark moving and unsure seconds.
+
 `behavior-window` runs the model on every frame of a stretch of video and links
 the masks into tracks, with candidate behaviour bouts for review.
+
+### Exits
+
+Tracking that keeps a count of the animals needs to know where an animal can
+leave the view (the mouth of an entrance tube):
+
+```bash
+python -m fnt.videoTracking.mask_tracker_cli exits --videos <folders or files> \
+    [--focus <cameras.txt>]
+```
+
+The window lists every folder and camera, unchecked ones first (a `--focus`
+file of `folder/camera` lines puts those at the top), and shows each camera's
+median frame. Click the corners round each exit and close the outline as in the
+ROI editor; corners can be dragged and **Delete** removes an exit. **Space**
+confirms the camera as it is and moves on; **PgUp** / **PgDn** step through the
+list. The exits are saved per camera in `exits.json` in each video folder. A
+fixed outline cannot follow an exit that moves (a tube that slides in its hole
+over a trial), so check those cameras across the trial.
 
 ## Labelling on another machine
 

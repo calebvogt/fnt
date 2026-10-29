@@ -14,6 +14,12 @@ A video whose sidecar is complete for the same model and settings is skipped, so
 run resumes where it stopped. With a 250-frame step on the 15-fps zone cameras every
 sample is a keyframe, which cv2 reaches without decoding the frames between.
 
+With a ``gate`` (see :mod:`frame_activity`) the frames are chosen from the video's
+compressed frame sizes instead of a fixed step: every frame where something moves, a
+few a second where it may, and the keyframes elsewhere. The sidecar then also holds
+``frames/tier`` (0 keyframe, 1 uncertain, 2 moving) and the gate settings (attrs
+``gate``, JSON; ``step`` is 0).
+
 Used by ``python -m fnt.videoTracking.mask_tracker_cli infer-videos``, which shows
 the run in a window (progress, the last frame with its masks, Pause / Stop).
 """
@@ -52,7 +58,13 @@ def model_name(model: str) -> str:
     return os.path.basename(os.path.normpath(model if os.path.isdir(model) else os.path.dirname(model)))
 
 
-def sidecar_done(video: str, name: str, step: int, conf: float, imgsz: int) -> bool:
+def _gate_json(gate: Optional[dict]) -> str:
+    import json
+    return json.dumps(gate, sort_keys=True) if gate else ""
+
+
+def sidecar_done(video: str, name: str, step: int, conf: float, imgsz: int,
+                 gate: Optional[dict] = None) -> bool:
     p = sidecar_path(video)
     if not os.path.exists(p):
         return False
@@ -61,8 +73,10 @@ def sidecar_done(video: str, name: str, step: int, conf: float, imgsz: int) -> b
         with h5py.File(p, "r") as f:
             a = f.attrs
             return (bool(a.get("complete", False)) and str(a.get("model", "")) == name
-                    and int(a.get("step", -1)) == step and abs(float(a.get("conf", -1)) - conf) < 1e-9
-                    and int(a.get("imgsz", -1)) == imgsz)
+                    and int(a.get("step", -1)) == (0 if gate else step)
+                    and abs(float(a.get("conf", -1)) - conf) < 1e-9
+                    and int(a.get("imgsz", -1)) == imgsz
+                    and str(a.get("gate", "")) == _gate_json(gate))
     except Exception:
         return False
 
@@ -134,12 +148,20 @@ def order_coarse_to_fine(videos: Sequence[str]) -> List[str]:
     return [v for _, _, v in sorted(keyed)]
 
 
+#: Read forward (decoding the frames between) to a frame at most this far ahead; seek to
+#: one further away (a seek decodes from the keyframe before it).
+READ_AHEAD = 30
+
+
 def infer_video(model, video: str, name: str, step: int, conf: float, imgsz: int,
                 device: str = "", iou: float = 0.5,
                 on_frame: Optional[Callable] = None,
-                should_stop: Optional[Callable[[], bool]] = None, roi=None) -> dict:
-    """Segment every ``step``-th frame of ``video`` with the loaded YOLO ``model`` and write
-    the sidecar. ``on_frame(sample_i, n_samples, frame_bgr, masks)`` is called per sample;
+                should_stop: Optional[Callable[[], bool]] = None, roi=None,
+                frames: Optional[Sequence[int]] = None, tiers: Optional[Sequence[int]] = None,
+                gate: Optional[dict] = None) -> dict:
+    """Segment every ``step``-th frame of ``video`` (or the given ``frames``, in order, with
+    their gate ``tiers``) with the loaded YOLO ``model`` and write the sidecar.
+    ``on_frame(sample_i, n_samples, frame_bgr, masks)`` is called per sample;
     ``should_stop()`` ends the video early (the sidecar is then left incomplete). ``roi``
     (mtt_roi.ROI, the model's) prepares each frame as the model was trained on it."""
     import h5py
@@ -150,16 +172,27 @@ def infer_video(model, video: str, name: str, step: int, conf: float, imgsz: int
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    targets = list(range(0, n_frames, step))
-    f_idx, f_n = [], []
+    if frames is None:
+        targets = list(range(0, n_frames, step))
+        tier_of = None
+    else:
+        targets = [int(f) for f in frames if 0 <= int(f) < n_frames]
+        tier_of = dict(zip((int(f) for f in frames), (int(t) for t in tiers))) if tiers is not None else None
+    f_idx, f_n, f_tier = [], [], []
     d_frame, d_score, d_bbox, d_area, d_cx, d_cy, d_rle = [], [], [], [], [], [], []
     complete = True
+    pos = -1                                   # the frame the next read() returns, if known
     for si, fi in enumerate(targets):
         if should_stop is not None and should_stop():
             complete = False
             break
-        cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+        if pos < 0 or fi < pos or fi - pos > READ_AHEAD:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+            pos = fi
+        while pos < fi and cap.grab():
+            pos += 1
         ok, frame = cap.read()
+        pos = pos + 1 if ok else -1
         if not ok:
             continue
         img = frame if roi is None else roi.apply(frame)[0]
@@ -182,6 +215,8 @@ def infer_video(model, video: str, name: str, step: int, conf: float, imgsz: int
             scores = scores[keep]
         f_idx.append(fi)
         f_n.append(len(masks))
+        if tier_of is not None:
+            f_tier.append(tier_of.get(fi, -1))
         for m, s in zip(masks, scores):
             ys, xs = np.nonzero(m)
             if ys.size == 0:
@@ -202,7 +237,8 @@ def infer_video(model, video: str, name: str, step: int, conf: float, imgsz: int
         a = f.attrs
         a["video"] = os.path.abspath(video)
         a["model"] = name
-        a["step"] = step
+        a["step"] = 0 if gate else step
+        a["gate"] = _gate_json(gate)
         a["conf"] = conf
         a["iou"] = iou
         a["imgsz"] = imgsz
@@ -219,6 +255,8 @@ def infer_video(model, video: str, name: str, step: int, conf: float, imgsz: int
         g.create_dataset("frame_idx", data=np.asarray(f_idx, np.int32))
         g.create_dataset("time_s", data=np.asarray(f_idx, np.float64) / (fps or 1.0))
         g.create_dataset("n_det", data=np.asarray(f_n, np.int16))
+        if tier_of is not None:
+            g.create_dataset("tier", data=np.asarray(f_tier, np.int8))
         g = f.create_group("det")
         g.create_dataset("frame_idx", data=np.asarray(d_frame, np.int32))
         g.create_dataset("score", data=np.asarray(d_score, np.float32))
@@ -259,8 +297,11 @@ def run_batch(model_dir: str, videos: Sequence[str], step: int = 250, conf: floa
               imgsz: Optional[int] = None, device: str = "",
               on_video: Optional[Callable] = None, on_frame: Optional[Callable] = None,
               should_stop: Optional[Callable[[], bool]] = None,
-              is_paused: Optional[Callable[[], bool]] = None, log=print) -> dict:
-    """Run the model over the videos (skipping those already done the same way)."""
+              is_paused: Optional[Callable[[], bool]] = None, log=print,
+              gate: Optional[dict] = None) -> dict:
+    """Run the model over the videos (skipping those already done the same way). With a
+    ``gate`` (frame_activity settings; missing keys take its defaults) the frames come from
+    each video's activity instead of ``step``."""
     from ultralytics import YOLO
     weights = resolve_weights(model_dir)
     name = model_name(weights)
@@ -273,10 +314,29 @@ def run_batch(model_dir: str, videos: Sequence[str], step: int = 250, conf: floa
     model = YOLO(weights)
     from .mtt_roi import model_roi
     roi = model_roi(weights)
-    todo = [v for v in videos if not sidecar_done(v, name, step, conf, imgsz)]
+    plans = {}
+    if gate is not None:
+        from .frame_activity import DEFAULT_GATE, activity_ratios, plan_frames
+        gate = {**DEFAULT_GATE, **gate}
+    todo = [v for v in videos if not sidecar_done(v, name, step, conf, imgsz, gate)]
+    how = (f"gated (moving > x{gate['hi']:g}, uncertain > x{gate['lo']:g})" if gate
+           else f"every {step} frames")
     log(f"[batch] {name}: {len(videos)} video(s), {len(videos) - len(todo)} already done, "
-        f"{len(todo)} to go; every {step} frames, conf {conf}, imgsz {imgsz}"
+        f"{len(todo)} to go; {how}, conf {conf}, imgsz {imgsz}"
         + (f"; ROI: {roi.describe()}" if roi is not None else ""))
+    if gate is not None and todo:
+        t = time.time()
+        # Each camera's baseline comes from all its clips given, done or not.
+        act = activity_ratios(videos, gate["baseline_s"], gate["quantile"], log=log)
+        planned = total = 0
+        for v in todo:
+            if act.get(v) is not None:
+                fs, ratio = act[v]
+                plans[v] = plan_frames(fs, ratio, **gate)
+                planned += len(plans[v][0])
+                total += len(fs.sizes)
+        log(f"[gate] {len(plans)} video(s) planned in {time.time() - t:.0f} s: "
+            f"{planned:,} of {total:,} frames ({planned / max(total, 1):.0%})")
     t0 = time.time()
     done = 0
     for k, v in enumerate(todo):
@@ -287,8 +347,18 @@ def run_batch(model_dir: str, videos: Sequence[str], step: int = 250, conf: floa
         if on_video is not None:
             on_video(k, len(todo), v)
         try:
+            frames = tiers = None
+            if gate is not None:
+                if v in plans:
+                    frames, tiers = plans[v]
+                else:                       # no readable index: look at every frame
+                    cap = cv2.VideoCapture(v)
+                    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    cap.release()
+                    frames, tiers = np.arange(n), np.full(n, 2, np.int8)
             s = infer_video(model, v, name, step, conf, imgsz, device,
-                            on_frame=on_frame, should_stop=should_stop, roi=roi)
+                            on_frame=on_frame, should_stop=should_stop, roi=roi,
+                            frames=frames, tiers=tiers, gate=gate)
             done += int(s["complete"])
             log(f"[batch] {k + 1}/{len(todo)} {os.path.basename(v)}: {s['samples']} frames, "
                 f"{s['detections']} masks ({time.time() - t0:.0f} s)")

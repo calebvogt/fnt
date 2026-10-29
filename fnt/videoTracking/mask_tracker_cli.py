@@ -164,6 +164,20 @@ def _parser():
                         "start, so a stopped run is an even sample; name: alphabetical.")
     b.add_argument("--no-window", action="store_true",
                    help="Run without the progress window (log to the console).")
+    b.add_argument("--gate", action="store_true",
+                   help="Choose frames by activity instead of --step: every frame where something "
+                        "moves, a few a second where it may, keyframes elsewhere (MP4/MOV; read "
+                        "from each file's frame sizes, see frame_activity).")
+    b.add_argument("--gate-hi", type=float, default=None,
+                   help="Moving: a second's frames this many times the camera's still level (default 2).")
+    b.add_argument("--gate-lo", type=float, default=None,
+                   help="Uncertain above this ratio (default 1.3).")
+    b.add_argument("--gate-pad", type=float, default=None,
+                   help="Seconds added before and after each moving second (default 1).")
+    b.add_argument("--gate-low-fps", type=float, default=None,
+                   help="Frames a second in uncertain seconds (default 2).")
+    b.add_argument("--gate-busy-fps", type=float, default=None,
+                   help="Frames a second in moving seconds (default: every frame).")
     q = sub.add_parser("predict-frames",
                        help="Predict a project's unreviewed frames with a trained model and save the "
                             "masks as pending predictions for review (the window's Predict, headless).")
@@ -215,6 +229,14 @@ def _parser():
     u_.add_argument("--force", action="store_true",
                     help="Overwrite frames whose labels changed in the project since packing.")
     u_.add_argument("--dry-run", action="store_true", help="Report what would merge; write nothing.")
+    x_ = sub.add_parser("exits",
+                        help="Draw each camera's exits (e.g. an entrance tube's mouth) on its "
+                             "median frame; saved as exits.json in each video folder.")
+    x_.add_argument("--videos", nargs="+", required=True,
+                    help="Video files and/or folders (searched recursively).")
+    x_.add_argument("--focus", default=None,
+                    help="Text file of folder/camera names (e.g. T001_PAH/CAM14), one per line, "
+                         "shown first among the unchecked.")
     return p
 
 
@@ -239,11 +261,18 @@ def main(argv=None) -> int:
         if not videos:
             print("no videos found", file=sys.stderr)
             return 1
+        gate = None
+        if args.gate:
+            gate = {k: v for k, v in (("hi", args.gate_hi), ("lo", args.gate_lo),
+                                      ("pad_s", args.gate_pad), ("low_fps", args.gate_low_fps),
+                                      ("busy_fps", args.gate_busy_fps)) if v is not None}
         if args.no_window:
-            res = run_batch(args.model, videos, args.step, args.conf, args.imgsz, args.device)
+            res = run_batch(args.model, videos, args.step, args.conf, args.imgsz, args.device,
+                            gate=gate)
             return 0 if res["done"] == res["videos"] else 1
         from .mask_tracker_batch_window import run_with_window
-        return run_with_window(args.model, videos, args.step, args.conf, args.imgsz, args.device)
+        return run_with_window(args.model, videos, args.step, args.conf, args.imgsz, args.device,
+                               gate)
     if args.cmd == "predict-frames":
         from .mtt_portable import read_focus
         from .mtt_predict import predict_frames
@@ -296,6 +325,22 @@ def main(argv=None) -> int:
               f"{'; overwrote ' + str(len(res['conflicts'])) + ' changed frame(s)' if res['conflicts'] else ''}"
               f"{'; backup ' + res['backup'] if res['backup'] else ''}")
         return 0
+    if args.cmd == "exits":
+        from PyQt5.QtWidgets import QApplication
+        from .mtt_exits import cameras_in
+        from .mtt_exits_editor import ExitsWindow
+        focus = []
+        if args.focus:
+            with open(args.focus, encoding="utf-8") as fh:
+                focus = [ln.strip() for ln in fh if ln.strip()]
+        cams = cameras_in(args.videos)
+        if not cams:
+            print("no videos found", file=sys.stderr)
+            return 1
+        app = QApplication.instance() or QApplication(sys.argv)
+        w = ExitsWindow(cams, focus)
+        w.show()
+        return app.exec_()
     return 2
 
 
