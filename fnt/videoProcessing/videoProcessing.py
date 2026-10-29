@@ -13,6 +13,7 @@ import glob
 import re
 import shutil
 import tempfile
+import zlib
 from pathlib import Path
 
 try:
@@ -174,6 +175,31 @@ def make_output_filename(video_file, output_format, replace_whitespace=False,
     return f"{name}.{output_format}"
 
 
+def in_shard(video_file, shard):
+    """True when *video_file* belongs to ``shard`` = ``(k, n)``, part k of n (1-based).
+
+    The split is by a hash of the file name, not by position in a listing, so it
+    does not depend on how many files a folder holds or the order they are found:
+    n windows started on one folder with shards 1/n .. n/n never take the same file.
+    ``None`` keeps every file.
+    """
+    if not shard:
+        return True
+    k, n = shard
+    return zlib.crc32(os.path.basename(video_file).encode("utf-8")) % n == k - 1
+
+
+def parse_shard(text):
+    """``"2/4"`` -> ``(2, 4)``; raises ValueError unless 1 <= k <= n."""
+    k, sep, n = str(text).partition("/")
+    if not sep:
+        raise ValueError(f"shard {text!r}: expected K/N, e.g. 2/4")
+    k, n = int(k), int(n)
+    if not 1 <= k <= n:
+        raise ValueError(f"shard {text!r}: K must be between 1 and N")
+    return k, n
+
+
 def rgb_to_ass(rgb, alpha=0):
     """Convert an (r, g, b) tuple to an ASS colour string &HAABBGGRR.
 
@@ -240,7 +266,7 @@ class VideoProcessorWorker(QThread):
                  instance_id=1, skip_already_processed=False,
                  burn_subtitles=False, subtitle_style=None,
                  replace_whitespace=False, filename_prefix="", filename_suffix="",
-                 input_extensions=None):
+                 input_extensions=None, shard=None):
         super().__init__()
         self.input_dirs = input_dirs
         self.input_videos = input_videos
@@ -261,6 +287,7 @@ class VideoProcessorWorker(QThread):
         self.filename_prefix = filename_prefix
         self.filename_suffix = filename_suffix
         self.input_extensions = list(input_extensions) if input_extensions else list(DEFAULT_VIDEO_GLOBS)
+        self.shard = shard  # (k, n): only this part of the files (see in_shard)
         self.should_stop = False
         # Retry transient failures (e.g. network drops reading from a mapped
         # network drive cause FFmpeg to crash mid-read). max_retries is the
@@ -449,6 +476,17 @@ class VideoProcessorWorker(QThread):
                 return
 
             self.progress_update.emit(f"Found {total_files} video files...")
+
+            if self.shard:
+                file_list = [(f, d) for f, d in file_list if in_shard(f, self.shard)]
+                self.progress_update.emit(
+                    f"Shard {self.shard[0]}/{self.shard[1]}: {len(file_list)} of "
+                    f"{total_files} files are this window's (the other shards take the rest)")
+                total_files = len(file_list)
+                discovered_total = total_files
+                if total_files == 0:
+                    self.finished.emit(True, "Nothing to do: no files in this shard.")
+                    return
 
             # --- Decide what actually needs doing, once, before starting ---
             file_list, skipped_count = self._plan_work(file_list)
@@ -1972,7 +2010,8 @@ class VideoProcessingGUI(QMainWindow):
             replace_whitespace=replace_whitespace,
             filename_prefix=filename_prefix,
             filename_suffix=filename_suffix,
-            input_extensions=input_extensions
+            input_extensions=input_extensions,
+            shard=getattr(self, '_shard', None)
         )
         self.worker.progress_update.connect(self.log_message)
         self.worker.file_progress.connect(self.update_file_progress)
@@ -2191,12 +2230,22 @@ def _launch_parser():
     p.add_argument("--skip-existing", action="store_true",
                    help="Skip videos that already have an output in proc/ without "
                         "asking (to resume an unattended run).")
+    p.add_argument("--shard", default=None, metavar="K/N",
+                   help="Process only part K of N of the files (split by file name), "
+                        "so N windows started with 1/N .. N/N encode one folder in "
+                        "parallel without taking the same file.")
     return p
 
 
 def apply_launch_args(window, args) -> None:
-    """Preselect ``args.input_dir`` in ``window`` and the ``args.codec``;
-    start if ``args.start``."""
+    """Preselect ``args.input_dir`` in ``window``, the ``args.codec`` and the
+    ``args.shard``; start if ``args.start``."""
+    if getattr(args, 'shard', None):
+        try:
+            window._shard = parse_shard(args.shard)
+        except ValueError as e:
+            raise SystemExit(f"--shard: {e}")
+        window.setWindowTitle(f"{window.windowTitle()} (shard {args.shard})")
     if getattr(args, 'codec', None):
         items = [window.codec_combo.itemText(i) for i in range(window.codec_combo.count())]
         match = [t for t in items if t.split()[0] == args.codec]
