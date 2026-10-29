@@ -198,6 +198,14 @@ def compute_full_spec_image_torch(
     9 of 2,057 pixel-identical and those 9 off by one edge pixel; 14.5 s ->
     1.2 s on an RTX 4070 Ti SUPER. Use through :func:`spec_image_for_device`,
     which checks agreement first and falls back to the CPU.
+
+    Only one chunk's samples are on the device at a time, so the GPU memory
+    it needs does not grow with the recording (~1 GB at the default chunk;
+    the output is byte-identical to the whole-recording upload).
+    Uploading the whole recording first (0.6 GB per 10 min at 250 kHz) put a
+    30-min file at 1.8 GB on top of the scan running beside it; on a 3 GB card
+    the driver moved the overflow into system memory and every later file of
+    the run scanned at half speed (2026-10-29, GTX 1060).
     """
     import torch
     from scipy.signal import get_window
@@ -216,15 +224,15 @@ def compute_full_spec_image_torch(
     out = np.empty((n_freq, n_frames), dtype=np.uint8)
     with torch.no_grad():
         win = torch.from_numpy(wc.real.copy()).to(device)
-        x = torch.from_numpy(audio).to(device)
         for f0 in range(0, n_frames, int(chunk_frames)):
             f1 = min(n_frames, f0 + int(chunk_frames))
-            fr = x[f0 * hop:(f1 - 1) * hop + int(nperseg)].unfold(
-                0, int(nperseg), hop)
+            x = torch.from_numpy(
+                audio[f0 * hop:(f1 - 1) * hop + int(nperseg)]).to(device)
+            fr = x.unfold(0, int(nperseg), hop)
             fr = fr - fr.mean(dim=1, keepdim=True)
             X = torch.fft.rfft(fr * win, n=int(nfft), dim=1)
             p = (X.real * X.real + X.imag * X.imag) * scale
-            del X, fr
+            del X, fr, x
             if int(nfft) % 2 == 0:
                 p[:, 1:-1] *= 2.0       # the Nyquist bin is unpaired
             else:
@@ -234,7 +242,7 @@ def compute_full_spec_image_torch(
             out[:, f0:f1] = (torch.round(p * 255.0).to(torch.uint8)
                              .T.cpu().numpy())
             del p
-        del x, win
+        del win
     return out
 
 

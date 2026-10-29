@@ -56,6 +56,26 @@ def test_chunking_changes_nothing_beyond_rounding():
     assert d.max() <= 1 and np.count_nonzero(d) <= 1e-4 * d.size
 
 
+def test_gpu_memory_does_not_grow_with_the_recording():
+    """Only a chunk's samples go to the device: a recording four times as
+    long peaks at the same GPU memory (a 30-min file once needed 1.8 GB more
+    than a 10-min one and spilled a 3 GB card into system memory)."""
+    import torch
+    dev = _cuda()
+
+    def peak(seconds):
+        x = signal(seconds)
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        D.compute_full_spec_image_torch(x, *ARGS, device=dev, chunk_frames=777)
+        return torch.cuda.max_memory_allocated() - base
+
+    short, long_ = peak(2.0), peak(8.0)
+    assert long_ <= short * 1.05
+    assert long_ - short < 0.1 * (8.0 - 2.0) * SR * 4   # not the extra audio
+
+
 def test_too_short_is_empty_like_the_cpu():
     dev = _cuda()
     out = D.compute_full_spec_image_torch(np.zeros(100, np.float32), *ARGS,
