@@ -663,42 +663,40 @@ class FNTMainWindow(QMainWindow):
             )
 
     def create_wifp_tab(self):
-        """Create the WiFP (Wireless Fiber Photometry) processing tab"""
-        tab, layout = self._make_scrollable_tab("WiFP")
+        """Create the Fiber Photometry tab"""
+        tab, layout = self._make_scrollable_tab("Photometry")
         
         # Description
-        desc = QLabel("Doric Wireless Fiber Photometry (WiFP) analysis tools")
+        desc = QLabel("Fiber photometry: dF/F, z-scores and video alignment")
         desc.setFont(QFont("Arial", 10, QFont.Bold))
         desc.setStyleSheet("color: #cccccc; margin: 10px;")
         layout.addWidget(desc)
         
-        # Doric Processing group
-        doric_group = QGroupBox("Doric WiFP Processing")
-        doric_layout = QGridLayout()
+        fp_group = QGroupBox("Fiber Photometry")
+        fp_layout = QGridLayout()
         
-        doric_buttons = [
-            ("Process .doric Files", "Batch process .doric files: calculate ΔF/F, sync with video, export CSV", self.run_doric_processor),
-            ("Explore .doric Structure", "View the internal HDF5 structure of a .doric file", self.run_doric_explorer),
+        fp_buttons = [
+            ("Fiber Photometry", "Batch dF/F and z-score (Warden lab MATLAB, GuPPy or PhAT methods), aligned to video", self.run_fiber_photometry),
+            ("Explore .doric Structure", "View the internal HDF5 structure of a Doric .doric file", self.run_doric_explorer),
         ]
         
-        self.create_button_grid(doric_layout, doric_buttons)
-        doric_group.setLayout(doric_layout)
-        layout.addWidget(doric_group)
+        self.create_button_grid(fp_layout, fp_buttons)
+        fp_group.setLayout(fp_layout)
+        layout.addWidget(fp_group)
         
         # Info panel
-        info_group = QGroupBox("About WiFP Processing")
+        info_group = QGroupBox("About")
         info_layout = QVBoxLayout()
         
         info_label = QLabel(
             "<b>Workflow:</b><br>"
-            "1. Record behavior video and fiber photometry with Doric WiFP system<br>"
-            "2. Use 'Process .doric Files' to calculate ΔF/F with isosbestic correction<br>"
-            "3. Outputs: CSV (Frame, Time, ΔF/F) + combined video with trace overlay<br><br>"
-            "<b>Supported:</b><br>"
-            "• Auto-detection of 470nm signal and 405/415nm isosbestic channels<br>"
-            "• Video synchronization using timestamps from .doric file<br>"
-            "• Batch processing of entire folders<br>"
-            "• Manual channel selection if auto-detection fails"
+            "1. Record photometry and behaviour video (supported so far: Doric wireless, .doric)<br>"
+            "2. 'Fiber Photometry': pick a pipeline, preview the first recording, process the batch<br>"
+            "3. Outputs: per-sample and per-video-frame CSVs (dF/F, z-score), the video with the traces "
+            "scrolling underneath, and a settings record<br><br>"
+            "<b>Pipelines:</b> Warden lab MATLAB (default), GuPPy (Sherathiya et al. 2021) and PhAT "
+            "(Murphy et al. 2023), with wireless dropouts removed.<br>"
+            "See docs/tools/fiber-photometry.md for the methods and their citations."
         )
         info_label.setTextFormat(Qt.RichText)
         info_label.setStyleSheet("color: #cccccc; background-color: #1e1e1e; padding: 15px; border: 1px solid #3f3f3f; border-radius: 4px;")
@@ -1019,15 +1017,15 @@ class FNTMainWindow(QMainWindow):
         """Launch Data Transfer tool for copying data files to a destination folder"""
         self.tools.launch("github_csv_transfer")
 
-    # Doric WiFP Processing Methods
-    def run_doric_processor(self):
-        """Launch Doric WiFP Fiber Photometry Processor"""
-        self.tools.launch("doric_processor")
+    # Fiber photometry
+    def run_fiber_photometry(self):
+        """Launch the Fiber Photometry tool"""
+        self.tools.launch("fiber_photometry")
     
     def run_doric_explorer(self):
         """Run the .doric file structure explorer"""
         try:
-            from fnt.DoricFP.explore_doric_structure import main as explore_main
+            from fnt.fiberPhotometry.explore_doric_structure import main as explore_main
             import subprocess
             import sys
             
@@ -1042,7 +1040,7 @@ class FNTMainWindow(QMainWindow):
             
             # Run the explorer script in a terminal to see output
             python_exe = sys.executable
-            script_path = Path(__file__).parent / "DoricFP" / "explore_doric_structure.py"
+            script_path = Path(__file__).parent / "fiberPhotometry" / "explore_doric_structure.py"
             
             # Run in new terminal window
             if sys.platform == 'win32':

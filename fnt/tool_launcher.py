@@ -98,8 +98,8 @@ TOOL_REGISTRY = {
         # --- Misc ---
         ToolSpec("github_csv_transfer", "fnt.gitProcessing.github_csv_transfer_pyqt",
                  "GitHubCSVTransferWindow", "GitHub CSV Transfer"),
-        ToolSpec("doric_processor", "fnt.DoricFP.doric_processor_pyqt",
-                 "DoricProcessorWindow", "Doric Processor"),
+        ToolSpec("fiber_photometry", "fnt.fiberPhotometry.fiber_photometry_pyqt",
+                 "FiberPhotometryWindow", "Fiber Photometry"),
     ]
 }
 
