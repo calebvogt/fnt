@@ -16,7 +16,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5.QtCore import QSettings                       # noqa: E402
 from PyQt5.QtCore import Qt                              # noqa: E402
-from PyQt5.QtWidgets import QApplication, QLineEdit, QPushButton    # noqa: E402
+from PyQt5.QtWidgets import QApplication, QLineEdit, QPushButton, QWidget    # noqa: E402
 
 from fnt.fed3 import protocol as proto                   # noqa: E402
 from fnt.fed3.ui import editor as ed                     # noqa: E402
@@ -149,7 +149,36 @@ def run_checks(app, tmp):
           event_style("run stopped: the devices keep their last phase")[0] == theme.GOOD)
     check("anything that failed is red", event_style("edit failed: no run")[0] == theme.BAD)
     check("things people did have their own colour",
-          event_style("feed by hand: FEED,result=started")[0] == theme.LOG_MANUAL)
+          event_style("feed by hand: dispensing a pellet")[0] == theme.LOG_MANUAL)
+    check("a FED3 powered up or flashed restarts quietly",
+          event_style("boot: reset=power")[0] == theme.MUTED)
+    check("a watchdog restart doesn't", event_style("boot: reset=watchdog")[0] == theme.WARN)
+    check("a feed that jams is red", event_style("feed by hand: it's jammed (failed)")[0]
+          == theme.BAD)
+
+    print("\n--- the plot and the cards' layout ---")
+    from datetime import datetime, timedelta, timezone
+    from matplotlib.dates import num2date
+    from fnt.fed3.ui.plot import PelletPlot
+    from fnt.fed3.ui.run_view import CardArea
+    t0 = datetime(2026, 11, 2, 20, 55, tzinfo=timezone.utc)
+    plot = PelletPlot()
+    plot.update_plot({"run_id": "R", "copies": {}, "binding": {"FED001": 1}, "t0": t0},
+                     timezone.utc, t0 + timedelta(hours=3))
+    left, right = (num2date(x) for x in plot.axes.get_xlim())
+    check("a plot with no pellets yet spans the run, not some other day",
+          abs(left - t0) < timedelta(seconds=1)
+          and abs(right - t0 - timedelta(hours=3)) < timedelta(seconds=1), f"{left} to {right}")
+    from fnt.fed3.ui.run_view import pellet_waiting
+    check("a card knows a pellet is waiting from the live rows, before STATUS says",
+          pellet_waiting([{"event": "dispense"}, {"event": "clock"}], {"well": "0"})
+          and not pellet_waiting([{"event": "dispense"}, {"event": "retrieve"}], {"well": "1"})
+          and pellet_waiting([], {"well": "1"}))
+    area = CardArea()
+    area.resize(1400, 400)
+    area.set_cards([QWidget() for _ in range(4)])
+    check("four cards that fit three across go two by two, not three and one",
+          area.columns == 2)
 
     print("\n--- setup ---")
     settings = QSettings(os.path.join(tmp, "settings.ini"), QSettings.IniFormat)
@@ -195,8 +224,11 @@ def run_checks(app, tmp):
           and box(0).text() == "FED007")
     check("FED007 isn't in this protocol, so Start says FED001 is missing",
           wait(app, lambda: status(0).startswith("not in this protocol")
-               and "FED001 isn't plugged in" in setup.missing.text()
+               and "FED001 isn't plugged in" in setup.start_note.text()
                and not setup.start.isEnabled(), 5))
+    check("and FED001 gets a greyed row of its own, so the table is the protocol's list",
+          setup.table.rowCount() == 3 and setup.table.cellWidget(2, 1).text() == "FED001"
+          and status(2).startswith("not plugged in"))
     type_id(0, "FED002")
     check("typing an ID another FED3 has swaps the two, and says so",
           wait(app, lambda: numbers() == {"SIM1": 2, "SIM2": 7}, 10)
@@ -210,10 +242,14 @@ def run_checks(app, tmp):
     type_id(1, "fed 42")
     check("any way of writing it works: 7, 007, FED007, fed 42",
           wait(app, lambda: numbers() == {"SIM1": 2, "SIM2": 42}, 10) and box(1).text() == "FED042")
-    for bad in ("abc", "0", "1000", ""):
+    type_id(1, "")
+    check("a blank ID is put back, saying so",
+          box(1).text() == "FED042" and "can't be blank" in setup.id_note.text())
+    for bad in ("abc", "0", "1000"):
         type_id(1, bad)
-    check("anything that isn't 1-999 puts the ID back and says what an ID is",
-          box(1).text() == "FED042" and "1 to 999" in setup.id_note.text()
+    check("anything that isn't 1-999 is put back, quoting what was typed",
+          box(1).text() == "FED042" and "'1000' isn't an ID" in setup.id_note.text()
+          and "1 to 999" in setup.id_note.text()
           and wait(app, lambda: False, 1) is False and numbers() == {"SIM1": 2, "SIM2": 42})
     type_id(0, "1")
     type_id(1, "2")
@@ -250,6 +286,9 @@ def run_checks(app, tmp):
                                  f"{d._crc_text(d.sched_crc)}"))
     check("its row says it's still in that run",
           wait(app, lambda: "still in run ELSEWHRE" in status(0), 10), status(0))
+    check("and the note under Start says starting ends it",
+          wait(app, lambda: "starting ends run ELSEWHRE on FED001" in setup.start_note.text(), 5),
+          setup.start_note.text())
     shown = []
     QMessageBox.exec_ = lambda box: shown.append(box.text())          # Cancel
     setup.start.click()
@@ -298,6 +337,10 @@ def run_checks(app, tmp):
     editor = ed.ProtocolEditor(run["protocol_text"], running=True, t0=run["t0"],
                                edit_check=lambda text: "it can't" if "Renamed" in text else None)
     editor._set_text(run["protocol_text"].replace("name: Free", "name: Renamed"))
+    check("the editor keeps what each FED3 is sent closed until asked",
+          not editor.sent.isVisibleTo(editor) and editor.sent_toggle.text().startswith("▶"))
+    editor.sent_toggle.click()
+    check("and opens it", editor.sent.isVisibleTo(editor) and "FED001" in editor.sent.toPlainText())
     check("the running editor says at once when the run can't take an edit, and won't apply it",
           not editor.ok.isEnabled() and "can't take this" in editor.verdict.text())
     editor._set_text(run["protocol_text"])
@@ -367,17 +410,24 @@ def run_checks(app, tmp):
     window.show()
     setup = window.setup_view
     setup._set_protocol(PROTOCOL, "")
-    check("both rows show FED001, and Start says to renumber one",
-          wait(app, lambda: setup.table.rowCount() == 2
-               and [setup.table.cellWidget(r, 1).text() for r in range(2)]
-               == ["FED001", "FED001"], 10)
-          and wait(app, lambda: "SIM1 and SIM2 are both FED001" in setup.missing.text(), 5)
+    check("both FED3s show FED001, FED002 has a greyed row, and Start says to renumber one",
+          wait(app, lambda: setup.table.rowCount() == 3
+               and [setup.table.cellWidget(r, 1).text() for r in range(3)]
+               == ["FED001", "FED001", "FED002"], 10)
+          and wait(app, lambda: "SIM1 and SIM2 are both FED001" in setup.id_problems.text(), 5)
           and not setup.start.isEnabled())
     combo = setup.table.cellWidget(1, 1)
     combo.setText("2")
     combo.editingFinished.emit()
     check("giving one of them FED002 is all it takes",
           wait(app, setup.start.isEnabled, 10))
+    setup.start.click()
+    check("and the mix-up from Setup doesn't follow the run onto its cards",
+          wait(app, lambda: window.stack.currentWidget() is window.run_view, 10)
+          and wait(app, lambda: bool(window.run_view.cards), 5)
+          and not any(p["kind"] == "duplicate_id" for p in window.engine.snapshot()["problems"]))
+    window.engine.submit("stop")
+    wait(app, lambda: window.engine.snapshot()["state"] == "stopped", 10)
     window.close()
     wait(app, lambda: not window.thread.is_alive(), 5)
 

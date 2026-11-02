@@ -942,16 +942,27 @@ class ProtocolEditor(QDialog):
         self.problem_list.setMaximumHeight(140)
         self.problem_list.hide()
         side_layout.addWidget(self.problem_list)
-        panes = QSplitter(Qt.Vertical)
-        self.outline = self._pane(panes, "Timeline")
-        self.sent = self._pane(panes, "What each FED3 is sent")
-        panes.setSizes([360, 240])
-        side_layout.addWidget(panes, 1)
+        timeline = QLabel("Timeline")
+        timeline.setObjectName("muted")
+        side_layout.addWidget(timeline)
+        self.outline = self._readonly_text()
+        side_layout.addWidget(self.outline, 1)
+        # The schedule text each FED3 receives: for checking the compiler, so
+        # closed until someone opens it.
+        self.sent = self._readonly_text()
+        self.sent.hide()
+        self.sent_toggle = QPushButton()
+        self.sent_toggle.setObjectName("disclosure")
+        self.sent_toggle.setCheckable(True)
+        self.sent_toggle.toggled.connect(self._show_sent)
+        self._show_sent(False)
+        side_layout.addWidget(self.sent_toggle)
+        side_layout.addWidget(self.sent, 1)
         split.addWidget(side)
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 2)
         split.setSizes([700, 500])
-        layout.addWidget(split)
+        layout.addWidget(split, 1)      # the text and panes take the height, not the toolbar
 
         buttons = QHBoxLayout()
         if not running:
@@ -975,21 +986,16 @@ class ProtocolEditor(QDialog):
         self._check()
 
     @staticmethod
-    def _pane(splitter, title):
-        holder = QWidget()
-        column = QVBoxLayout(holder)
-        column.setContentsMargins(0, 4, 0, 0)
-        column.setSpacing(2)
-        label = QLabel(title)
-        label.setObjectName("muted")
-        column.addWidget(label)
+    def _readonly_text():
         text = QPlainTextEdit()
         text.setReadOnly(True)
         text.setFont(QFont("Consolas", 9))
         text.setLineWrapMode(QPlainTextEdit.NoWrap)
-        column.addWidget(text, 1)
-        splitter.addWidget(holder)
         return text
+
+    def _show_sent(self, opened):
+        self.sent.setVisible(opened)
+        self.sent_toggle.setText(f"{'▼' if opened else '▶'}  What each FED3 is sent")
 
     def text(self):
         return self.editor.toPlainText()

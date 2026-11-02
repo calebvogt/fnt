@@ -283,6 +283,11 @@ def run_checks(root):
     world.engine = world.new_engine()
     resumed = world.engine.resume_latest()
     check("a new engine finds the unfinished run", resumed == folder)
+    world.engine._publish()
+    recent = world.engine.snapshot()["run"]["recent"]["FED003"]
+    last = copy_text(world, "FED003").splitlines()[-1].split(",")
+    check("and its cards start from the run's saved rows, not empty",
+          recent and recent[-1]["seq"] == last[2] and recent[-1]["event"] == last[4])
     feed(world, "COM3", 3)
     world.run_for(120)
     check("and carries on copying without gaps or repeats",

@@ -21,10 +21,14 @@ from ..run import check_edit
 from . import theme
 from .editor import ProtocolEditor, format_delta
 from .fed_graphic import FedGraphic
+from .health import health, readings
 from .plot import PelletPlot, zones
 
 CARD_WIDTH = 370                # cards reflow into as many columns as fit
 TEST_CUE = "tone:4000:200+flash:bar:0:0:30:0:500"
+# What a card's "last:" reports: what the animal and the run did, not housekeeping
+# (clock corrections, hourly status rows, boots).
+CARD_EVENTS = ("poke", "dispense", "retrieve", "jam", "phase", "run_start", "run_end")
 
 
 def ago(moment, now):
@@ -53,24 +57,33 @@ def describe_next(nxt, zone, now):
     return ""
 
 
-def describe_health(device, status):
-    if device is None or not device["connected"]:
-        return "not connected", theme.BAD
-    parts, colour = [f"{device['port']}"], theme.MUTED
-    if status.get("clock") == "unset":
-        parts.append("clock not set")
-        colour = theme.WARN
-    if status.get("sd") == "err":
-        parts.append("SD error")
-        colour = theme.BAD
-    if status.get("jam") == "1":
-        parts.append("jammed")
-        colour = theme.BAD
-    # A FED3 without a temperature sensor (most have none) reports nan.
-    for key, unit in (("batt", "V"), ("temp", "°C"), ("hum", "% RH")):
-        if status.get(key, "nan") not in ("", "nan"):
-            parts.append(f"{status[key]} {unit}")
-    return " · ".join(parts), colour
+def pellet_waiting(rows, status):
+    """Whether a pellet sits in the well: from the latest dispense or retrieve
+    row, which is live, else from STATUS, which is polled every 30 s."""
+    for row in reversed(rows):
+        if row.get("event") in ("dispense", "retrieve"):
+            return row["event"] == "dispense"
+    return status.get("well") == "1"
+
+
+def card_health(device):
+    """A card's last line: the port, the FED3's state and its readings."""
+    parts, colour = health(device)
+    if device and device["connected"]:
+        parts = [device["port"], *parts, *readings(device["status"])]
+    return " · ".join(parts), theme.MUTED if colour == theme.GOOD else colour
+
+
+def card_counts(row):
+    """Left pokes, right pokes and pellets from a data row or a STATUS, or None."""
+    if not row:
+        return None
+    try:
+        return {"left": int(row.get("left", row.get("l", 0))),
+                "right": int(row.get("right", row.get("r", 0))),
+                "pellets": int(row.get("pellets", 0))}
+    except ValueError:
+        return None
 
 
 class DeviceCard(QFrame):
@@ -156,29 +169,25 @@ class DeviceCard(QFrame):
     def update_card(self, device, run, problems, now, zone):
         self.device = device
         connected = bool(device and device["connected"])
-        self.dot.setStyleSheet(f"color: {theme.GOOD if connected else theme.BAD};")
         status = device["status"] if device else {}
-        row = device["last_row"] if device else {}
-        health, colour = describe_health(device, status)
-        self.health.setText(health)
-        self.health.setStyleSheet(f"color: {colour};")
+        rows = run["recent"].get(self.logical, [])     # this run's, kept across restarts
+        latest = (device["last_row"] if device else {}) or (rows[-1] if rows else status)
+        self.dot.setStyleSheet(f"color: {theme.GOOD if connected else theme.BAD};")
         # The card is titled with the FED3's ID; say so only if it's been renumbered since.
         current = f"FED{device['id']:03d}" if device else ""
         self.fed.setText(f"now {current}" if current and current != self.logical else "")
+        health_text, colour = card_health(device)
+        self.health.setText(health_text)
+        self.health.setStyleSheet(f"color: {colour};")
+        self.graphic.set_state(card_counts(latest), connected)
+        self._show_phase(run, status, latest, rows, now, zone)
+        self._show_last(rows, now)
+        self._show_problems([p for p in problems if p["device"] == self.logical], zone)
 
-        source = row or status
-        counts = None
-        if source:
-            try:
-                counts = {"left": int(source.get("left", source.get("l", 0))),
-                          "right": int(source.get("right", source.get("r", 0))),
-                          "pellets": int(source.get("pellets", 0))}
-            except ValueError:
-                counts = None
-        self.graphic.set_state(counts, connected)
-
+    def _show_phase(self, run, status, latest, rows, now, zone):
+        """The phase, its rule, and progress: rewards, the well, the next change."""
         try:
-            index = int(status.get("phase", row.get("phase", 0)))
+            index = int(status.get("phase", latest.get("phase", 0)))
         except ValueError:
             index = 0
         phases = run["phases"]
@@ -186,55 +195,65 @@ class DeviceCard(QFrame):
         self.phase.setText(f"<b>{name}</b> · phase {index + 1} of {len(phases)}")
         rules = run["rules"].get(self.logical, [])
         self.rule.setText(rules[index] if index < len(rules) else "")
-        rewards = (row or status).get("phase_rewards")
         actives = run.get("actives", {}).get(self.logical, [])
-        can_earn = index < len(actives) and actives[index] != "none"
-        progress = [f"{rewards} rewards this phase"] if rewards is not None and can_earn else []
+        rewards = latest.get("phase_rewards")
+        progress = []
+        if rewards is not None and index < len(actives) and actives[index] != "none":
+            progress.append(f"{rewards} rewards this phase")
+        if pellet_waiting(rows, status):
+            progress.append("a pellet is waiting in the well")
         if run["state"] == "running":
             nxt = describe_next(status.get("next"), zone, now)
             if nxt:
                 progress.append(nxt)
         self.progress.setText(" · ".join(progress))
-        if row:
-            when = parse_iso(row.get("time", ""))
-            what = " ".join(w.replace("_", " ") for w in
-                            (row.get("event"), row.get("side"), row.get("outcome")) if w)
-            self.last.setText(f"last: {what}, {ago(when, now)}")
-        else:
-            self.last.setText("last: —")
+        self.progress.setVisible(bool(progress))
 
-        mine = [p for p in problems if p["device"] == self.logical]
+    def _show_last(self, rows, now):
+        event = next((r for r in reversed(rows) if r.get("event") in CARD_EVENTS), None)
+        if not event:
+            self.last.setText("last: —")
+            return
+        what = " ".join(w.replace("_", " ") for w in
+                        (event.get("event"), event.get("side"), event.get("outcome")) if w)
+        self.last.setText(f"last: {what}, {ago(parse_iso(event.get('time', '')), now)}")
+
+    def _show_problems(self, mine, zone):
+        """This FED3's problems, each with Acknowledge until it's been seen."""
         keys = [(p["key"], p["active"], p["message"]) for p in mine]
         if keys != self.problem_keys:
             self.problem_keys = keys
-            while self.problem_box.count():
-                item = self.problem_box.takeAt(0)
-                if item.layout():
-                    while item.layout().count():
-                        sub = item.layout().takeAt(0)
-                        if sub.widget():
-                            sub.widget().deleteLater()
-                elif item.widget():
-                    item.widget().deleteLater()
+            self._clear_problems()
             for problem in mine:
-                line = QHBoxLayout()
-                state = "" if problem["active"] else " (cleared)"
-                label = QLabel(f"⚠ {problem['message']}{state} · "
-                               f"{problem['since'].astimezone(zone):%a %H:%M}")
-                label.setStyleSheet(f"color: {theme.BAD if problem['active'] else theme.WARN};")
-                label.setWordWrap(True)
-                line.addWidget(label, 1)
-                if not problem["acknowledged"]:
-                    ack = theme.small(QPushButton("Acknowledge"))
-                    ack.clicked.connect(lambda _=False, k=problem["key"]:
-                                        self.engine.submit("acknowledge", key=k))
-                    line.addWidget(ack)
-                self.problem_box.addLayout(line)
+                self.problem_box.addLayout(self._problem_line(problem, zone))
         flagged = any(not p["acknowledged"] for p in mine)
         if self.property("problem") != flagged:
             self.setProperty("problem", flagged)
             self.style().unpolish(self)
             self.style().polish(self)
+
+    def _clear_problems(self):
+        while self.problem_box.count():
+            line = self.problem_box.takeAt(0).layout()
+            while line and line.count():
+                widget = line.takeAt(0).widget()
+                if widget:
+                    widget.deleteLater()
+
+    def _problem_line(self, problem, zone):
+        line = QHBoxLayout()
+        state = "" if problem["active"] else " (cleared)"
+        label = QLabel(f"⚠ {problem['message']}{state} · "
+                       f"{problem['since'].astimezone(zone):%a %H:%M}")
+        label.setStyleSheet(f"color: {theme.BAD if problem['active'] else theme.WARN};")
+        label.setWordWrap(True)
+        line.addWidget(label, 1)
+        if not problem["acknowledged"]:
+            ack = theme.small(QPushButton("Acknowledge"))
+            ack.clicked.connect(lambda _=False, k=problem["key"]:
+                                self.engine.submit("acknowledge", key=k))
+            line.addWidget(ack)
+        return line
 
 
 class CardArea(QWidget):
@@ -258,7 +277,11 @@ class CardArea(QWidget):
         self._reflow()
 
     def _reflow(self):
-        columns = max(1, min(len(self.cards) or 1, self.width() // CARD_WIDTH))
+        # As few rows as the width allows, then as even as they can be: 4 cards
+        # that fit 3 across go 2 + 2, not 3 + 1.
+        count = len(self.cards) or 1
+        rows = -(-count // max(1, self.width() // CARD_WIDTH))
+        columns = -(-count // rows)
         if columns == self.columns:
             return
         self.columns = columns
@@ -478,7 +501,7 @@ class RunView(QWidget):
         general = [p for p in problems if not p["device"] and not p["acknowledged"]]
         self.banner.setText("\n".join(f"⚠ {p['message']}" for p in general))
         self.banner.setVisible(bool(general))
-        self.plot.update_plot(run, self._plot_zone(zone, now))
+        self.plot.update_plot(run, self._plot_zone(zone, now), now)
         self._edit_answered(snapshot)
 
     def _build_cards(self, run):

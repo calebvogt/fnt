@@ -45,9 +45,9 @@ QWidget#stagebar {{ background-color: {PANEL}; border-bottom: 1px solid {BORDER}
 QWidget#stagebar QLabel {{ background: transparent; }}
 QWidget#logheader {{ background-color: {PANEL}; border-top: 1px solid {BORDER}; }}
 QWidget#logheader QLabel {{ background: transparent; }}
-QPushButton#logtoggle {{ background: transparent; color: {TEXT}; padding: 3px 6px;
-                         text-align: left; }}
-QPushButton#logtoggle:hover {{ background-color: {BORDER}; }}
+QPushButton#disclosure {{ background: transparent; color: {TEXT}; padding: 3px 6px;
+                          text-align: left; }}
+QPushButton#disclosure:hover {{ background-color: {BORDER}; }}
 QPlainTextEdit#log {{ border: none; border-radius: 0; }}
 QPushButton[small="true"] {{ padding: 3px 9px; font-size: 9pt; }}
 QPushButton[small="true"]:checked {{ background-color: #f1c40f; color: black; border-color: #f1c40f; }}

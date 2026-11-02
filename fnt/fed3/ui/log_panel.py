@@ -20,6 +20,9 @@ KINDS = [
     (theme.BAD, True, ("problem", "engine error", "can't open", "not stopped",
                        "pre-flight failed")),
     (theme.GOOD, True, ("run started", "run stopped", "run resumed", "run ended")),
+    # A FED3 restarting because it was powered up, flashed or reset is routine;
+    # any other restart (its watchdog) falls through to the warning below.
+    (theme.MUTED, False, ("boot: reset=power", "boot: reset=software", "boot: reset=external")),
     (theme.WARN, False, ("disconnected", "boot", "schedule re-sent", "the current phase")),
     (theme.LOG_PHASE, False, ("phase",)),
     (theme.GOOD, False, ("connected", "pre-flight ok")),
@@ -67,7 +70,7 @@ class LogPanel(QWidget):
         row = QHBoxLayout(self.header)
         row.setContentsMargins(6, 2, 6, 2)
         self.toggle = QPushButton()
-        self.toggle.setObjectName("logtoggle")
+        self.toggle.setObjectName("disclosure")
         self.toggle.setCheckable(True)
         self.toggle.setChecked(True)
         self.toggle.setToolTip("Show or hide the log")

@@ -43,9 +43,16 @@ DRIFT_TOLERANCE = 2.0           # seconds of clock error corrected silently
 DRIFT_PROBLEM = 60.0            # seconds of clock error worth flagging
 TIME_JUMP_LIMIT = 600.0         # the firmware refuses bigger jumps mid-run
 READ_RETRY = 20.0
+RECENT_ROWS = 50                # of a run's rows kept for its card: enough to find the last event
 RETRY_OPEN = 15.0
 RUN_FILE = "run.json"
 RUN_FORMAT = "fnt-fed3-run/1"
+# FEED's result -> (what happened, the log's result): what the log says, not the reply.
+FEED_RESULTS = {
+    "started": ("dispensing a pellet", "ok"),
+    "pellet_in_well": ("a pellet is already in the well", "none dispensed"),
+    "jam": ("it's jammed", "failed"),
+}
 
 SETUP, RUNNING, STOPPED = "setup", "running", "stopped"
 
@@ -83,7 +90,6 @@ class Device:
     open_error: str = ""            # the last reason it couldn't be opened, logged once
     not_fed3: bool = False          # answered, but not as a FED3: left alone until unplugged
     run: str = ""                   # the run its live rows belong to
-    rows: deque = field(default_factory=lambda: deque(maxlen=400))
     last_row: dict = field(default_factory=dict)
     last_pellet: datetime | None = None
     drift: float | None = None
@@ -106,11 +112,15 @@ class DataCopy:
         self.pending = {}
         self.read_requested = -1e9
         self.last_pellet = None     # time of the last dispense row copied
+        # The latest rows, parsed. From the file too, so a run picked back up
+        # after FNT restarts shows its history, not just what arrived since.
+        self.recent = deque(maxlen=RECENT_ROWS)
         if os.path.exists(path):
             with open(path, encoding="ascii", newline="") as handle:
                 lines = handle.read().splitlines()
             if len(lines) > 1:
                 self.next_seq = int(lines[-1].split(",")[2]) + 1
+            self.recent.extend(parse_row(line) for line in lines[1:][-RECENT_ROWS:])
             for line in reversed(lines[1:]):
                 if self._note_pellet(line):
                     break
@@ -134,6 +144,7 @@ class DataCopy:
                 text = self.pending.pop(self.next_seq)
                 handle.write(text + "\n")
                 written.append(text)
+                self.recent.append(parse_row(text))
                 self._note_pellet(text)
                 self.next_seq += 1
         return written
@@ -571,7 +582,6 @@ class Engine:
             # live rows say what the device is doing now.
             self._copy_row(device, target, text)
             return
-        device.rows.append(row)
         device.last_row = row
         if row["event"] == "run_start":
             ours = self.run and row["detail"].startswith(f"t0={iso(self.run.t0)};")
@@ -709,6 +719,10 @@ class Engine:
         os.makedirs(folder)
         with open(os.path.join(folder, "protocol.yaml"), "w", encoding="utf-8") as handle:
             handle.write(protocol_text)
+        # Problems from Setup that are already over (two FED3s sharing an ID,
+        # since renumbered) aren't this run's; ones still going are.
+        self.problems = {k: p for k, p in self.problems.items()
+                         if p.active and p.kind != "duplicate_id"}
         self.run = Run(folder, protocol_text, compiled, binding, run_id_now(t0), t0, seed)
         self.run.write_schedules()
         self.run.save()
@@ -1054,7 +1068,9 @@ class Engine:
     def cmd_feed(self, device):
         target = self._device_for(device)
         if target:
-            self._log(self._name(target), "feed by hand", self._call(target, "FEED"))
+            reply = self._call(target, "FEED")
+            detail, result = FEED_RESULTS.get(fields(reply).get("result"), (reply, "failed"))
+            self._log(self._name(target), "feed by hand", detail, result)
 
     def cmd_lights(self, device, on):
         """A FED3's lights on or off, steady, to find it on the bench. The
@@ -1072,7 +1088,9 @@ class Engine:
     def cmd_test_cue(self, device, cue):
         target = self._device_for(device)
         if target:
-            self._log(self._name(target), "test cue", f"{cue}: {self._call(target, f'TEST:{cue}')}")
+            reply = self._call(target, f"TEST:{cue}")
+            self._log(self._name(target), "test cue", cue,
+                      "ok" if reply == "OK" else f"failed: {reply}")
 
     def cmd_set_id(self, port, number):
         """Renumber the FED3 on a port. If another FED3 plugged in has that
@@ -1273,7 +1291,7 @@ class Engine:
                 "connected": device.connected, "id": device.id,
                 "firmware": device.firmware, "compatible": device.compatible,
                 "status": dict(device.status), "drift": device.drift,
-                "name": self._name(device), "rows": list(device.rows)[-50:],
+                "name": self._name(device),
                 "last_row": dict(device.last_row),
                 "lights": device.status.get("lights") == "1",
                 "live_run": self._in_live_run(device),
@@ -1291,6 +1309,7 @@ class Engine:
                            for p in self.run.compiled.phases],
                 "protocol_text": self.run.protocol_text,
                 "copies": {l: c.path for l, c in self.run.copies.items()},
+                "recent": {l: list(c.recent) for l, c in self.run.copies.items()},
                 "rules": {l: [sch.summarize(p.rule) for p in s.phases]
                           for l, s in self.run.compiled.schedules.items()},
                 "actives": {l: [p.rule["active"] for p in s.phases]

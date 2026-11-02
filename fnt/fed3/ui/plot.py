@@ -9,6 +9,7 @@ from datetime import timedelta, timezone, tzinfo
 
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 from matplotlib.dates import DateFormatter
+from matplotlib.ticker import MaxNLocator
 from matplotlib.figure import Figure
 
 from ..device_sim import parse_iso
@@ -101,7 +102,7 @@ class PelletPlot(FigureCanvasQTAgg):
             elif parts[4] == "run_end" and mark_phases and self.stop_mark is None:
                 self.stop_mark = moment
 
-    def update_plot(self, run, zone):
+    def update_plot(self, run, zone, now):
         if run["run_id"] != self.run_id:    # a new run: same device names, new data
             self.run_id = run["run_id"]
             self._reset()
@@ -116,23 +117,39 @@ class PelletPlot(FigureCanvasQTAgg):
         for spine in ax.spines.values():
             spine.set_color(theme.BORDER)
         ax.tick_params(colors=theme.TEXT, labelsize=8)
+        # The axis is the run, t0 to now, whatever the data: with one pellet or
+        # none, matplotlib would otherwise pick a week, or some other day.
+        t0 = run["t0"].astimezone(zone)
+        end = max(now.astimezone(zone), t0 + timedelta(hours=1))
+        ax.set_xlim(t0, end)
+        most = max((len(times) for times in self.series.values()), default=0)
+        ax.set_ylim(0, max(most, 1) * 1.08)       # a little headroom over the top count
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=4, integer=True))
         for n, logical in enumerate(run["binding"]):
             times = [t.astimezone(zone) for t in self.series.get(logical, [])]
             if not times:
                 continue
-            ax.step(times, range(1, len(times) + 1), where="post",
-                    color=theme.SERIES[n % len(theme.SERIES)], label=logical, linewidth=1.5)
+            # From 0 at t0, a step per pellet, then level until now.
+            xs = [t0, *times, max(end, times[-1])]
+            ys = [0, *range(1, len(times) + 1), len(times)]
+            ax.step(xs, ys, where="post", color=theme.SERIES[n % len(theme.SERIES)],
+                    label=logical, linewidth=1.5)
         for mark in self.phase_marks:
             ax.axvline(mark.astimezone(zone), color=theme.MUTED, linewidth=0.8, linestyle=":")
         if self.stop_mark:
             # The devices keep feeding after Stop, so data carries on past it.
             ax.axvline(self.stop_mark.astimezone(zone), color=theme.BAD, linewidth=1,
                        linestyle="--", label="Stop")
+        if not any(self.series.values()):
+            ax.set_yticks([])
+            ax.text(0.5, 0.5, "No pellets yet", transform=ax.transAxes,
+                    ha="center", va="center", color=theme.MUTED)
         ax.set_ylabel("pellets", color=theme.TEXT, fontsize=9)
         ax.xaxis.set_major_formatter(DateFormatter("%a %H:%M", tz=zone))
         if any(self.series.values()) or self.stop_mark:
+            # Beside the plot, not on it: inside, it covers the lines it labels.
             ax.legend(facecolor=theme.PANEL, edgecolor=theme.BORDER, labelcolor=theme.TEXT,
-                      fontsize=8, loc="upper left")
+                      fontsize=8, loc="upper left", bbox_to_anchor=(1.01, 1), borderaxespad=0)
         self.figure.autofmt_xdate()
         self.figure.tight_layout()
         self.draw_idle()

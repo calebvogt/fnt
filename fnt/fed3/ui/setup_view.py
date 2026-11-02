@@ -30,6 +30,7 @@ from .. import protocol as proto
 from .. import schedule as sch
 from . import theme
 from .editor import ProtocolEditor
+from .health import health
 
 TEST_TONE = "tone:4000:200"
 ID_TEXT = re.compile(r"\s*(?:FED)?\s*(\d{1,3})\s*", re.IGNORECASE)   # 7, 007, FED007
@@ -56,32 +57,13 @@ def port_order(port):
 
 
 def device_health(device):
-    """One line: what's ready and what isn't."""
-    if not device["connected"]:
-        return "not connected", theme.BAD
-    status = device["status"]
-    if not status:
-        return "connected · reading its status…", theme.MUTED
-    parts, colour = [], theme.GOOD
-    clock = status.get("clock")
-    if clock == "ok":
-        drift = device.get("drift")
-        parts.append("clock ok" if drift is None or abs(drift) < 5 else f"clock {drift:+.0f}s")
-    else:
-        parts.append("clock not set")
-        colour = theme.WARN
-    if status.get("sd") == "ok":
-        parts.append("SD ok")
-    else:
-        parts.append("SD error")
-        colour = theme.BAD
-    if status.get("jam") == "1":
-        parts.append("jammed")
-        colour = theme.BAD
-    parts.append(f"fw {device['firmware']}")
-    if device.get("live_run"):
-        parts.append(f"still in run {device['run_label']}")
-        colour = theme.BAD if colour == theme.BAD else theme.WARN
+    """A row's status: what's ready, its firmware, and any run it's still in."""
+    parts, colour = health(device)
+    if device["connected"] and device["status"]:
+        parts.append(f"fw {device['firmware']}")
+        if device.get("live_run"):
+            parts.append(f"still in run {device['run_label']}")
+            colour = theme.BAD if colour == theme.BAD else theme.WARN
     return " · ".join(parts), colour
 
 
@@ -94,7 +76,7 @@ class SetupView(QWidget):
         self.protocol_path = settings.value("protocol_path", "") or ""
         self.compiled = None
         self.snapshot = {}
-        self.rows = None            # (ports shown, ID choices, roles) last built
+        self.rows = None            # (ports, absent IDs, the protocol's IDs) last built
         self.pending = {}           # port -> (number chosen, when): not confirmed yet
         self.starting = 0.0         # when Start was pressed, until pre-flight answers
 
@@ -109,16 +91,16 @@ class SetupView(QWidget):
         self.path_label = QLabel("No protocol chosen")
         self.path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         row.addWidget(self.path_label, 1)
-        self.edit_button = None
+        buttons = {}
         for text, tip, slot in (
                 ("Open…", "Open a protocol file", self._open),
                 ("New…", "Write a new protocol, starting from a template", self._new),
                 ("Edit…", "Edit this protocol", self._edit)):
-            button = theme.quiet(QPushButton(text))
+            buttons[text] = button = theme.quiet(QPushButton(text))
             button.setToolTip(tip)
             button.clicked.connect(slot)
             row.addWidget(button)
-            self.edit_button = button
+        self.edit_button = buttons["Edit…"]
         g.addLayout(row)
         self.verdict = QLabel()
         self.verdict.setWordWrap(True)
@@ -159,9 +141,10 @@ class SetupView(QWidget):
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setFocusPolicy(Qt.NoFocus)
         g.addWidget(self.table, 1)
-        self.missing = QLabel()
-        self.missing.setWordWrap(True)
-        g.addWidget(self.missing)
+        self.id_problems = QLabel()
+        self.id_problems.setWordWrap(True)
+        self.id_problems.setStyleSheet(f"color: {theme.WARN};")
+        g.addWidget(self.id_problems)
         self.others = QLabel()
         self.others.setWordWrap(True)
         g.addWidget(self.others)
@@ -206,13 +189,13 @@ class SetupView(QWidget):
         self._show_folder()
         if self.protocol_path and os.path.exists(self.protocol_path):
             with open(self.protocol_path, encoding="utf-8") as handle:
-                self._set_protocol(handle.read(), self.protocol_path, startup=True)
+                self._set_protocol(handle.read(), self.protocol_path)
         else:
-            self._set_protocol("", "", startup=True)
+            self._set_protocol("", "")
 
     # --- protocol --------------------------------------------------------
 
-    def _set_protocol(self, text, path, startup=False):
+    def _set_protocol(self, text, path):
         self.protocol_text = text
         self.protocol_path = path
         self.settings.setValue("protocol_path", path)
@@ -241,7 +224,7 @@ class SetupView(QWidget):
             self.verdict.setStyleSheet(f"color: {theme.GOOD};")
             t0 = datetime.now(sch.standard_timezone()).replace(second=0, microsecond=0)
             self.timeline.setPlainText(proto.preview_text(c, t0))
-        self.rows = None            # rebuild: what each number plays changed
+        self.rows = None            # rebuild: the protocol's IDs may have changed
         self.engine.submit("clear_preflight")
         self.update_view(self.snapshot)
 
@@ -283,8 +266,9 @@ class SetupView(QWidget):
         return {fed_name(n): n for n in self._used_ids()}
 
     def _colour(self, number):
-        roles = self._used_ids()
-        return theme.SERIES[roles.index(number) % len(theme.SERIES)] if number in roles \
+        """The colour this ID has on the cards and plot: its place in the protocol."""
+        ids = self._used_ids()
+        return theme.SERIES[ids.index(number) % len(theme.SERIES)] if number in ids \
             else theme.MUTED
 
     def _connected(self):
@@ -299,13 +283,15 @@ class SetupView(QWidget):
         if not device:
             return
         old = self._shown_id(device)
-        number = parse_id(box.text())
+        typed = box.text().strip()
+        number = parse_id(typed)
         if number is None:
             box.setText(fed_name(old))
             box.setStyleSheet(box.styleSheet() + f" border: 1px solid {theme.BAD};")
-            box.setToolTip(f"'{box.text()}' isn't an ID. Type a number from 1 to 999, "
-                           "e.g. 7 or FED007.")
-            self.id_note.setText("An ID is a number from 1 to 999, e.g. 7 or FED007.")
+            self.id_note.setText(f"'{typed}' isn't an ID, so {port} keeps {fed_name(old)}. "
+                                 "An ID is a number from 1 to 999, e.g. 7 or FED007."
+                                 if typed else
+                                 f"{port} keeps {fed_name(old)}: an ID can't be blank.")
             return
         box.setText(fed_name(number))
         self.id_note.setText("")
@@ -334,43 +320,64 @@ class SetupView(QWidget):
     # --- the table ---------------------------------------------------------
 
     def _wanted_rows(self):
-        """Connected FED3s in port order, and the IDs the protocol uses."""
+        """Connected FED3s in port order, then the protocol's IDs none of them has."""
         ports = tuple(sorted((d["port"] for d in self._connected()), key=port_order))
-        return ports, tuple(self._used_ids())
+        return ports, tuple(self._absent_ids()), tuple(self._used_ids())
 
     def _rebuild(self, wanted):
-        ports, _ = wanted
+        ports, absent, _ = wanted
         self.rows = wanted
-        self.table.setRowCount(len(ports))
+        self.table.setRowCount(len(ports) + len(absent))
         for row, port in enumerate(ports):
-            for column in (PORT, STATUS):
-                self.table.setItem(row, column, QTableWidgetItem(""))
-            self.table.item(row, PORT).setText(port)
-            box = QLineEdit()
-            box.setObjectName("id")
-            box.setMaxLength(8)
-            box.setFixedWidth(84)
-            box.setAlignment(Qt.AlignCenter)
-            box.setPlaceholderText("FED…")
-            box.editingFinished.connect(lambda p=port, b=box: self._renumber(p, b))
-            self.table.setCellWidget(row, ID, box)
-            tests = QWidget()
-            b = QHBoxLayout(tests)
-            b.setContentsMargins(2, 0, 2, 0)
-            lights = theme.small(QPushButton("Lights"))
-            lights.setObjectName("lights")
-            lights.setCheckable(True)
-            lights.setToolTip("Light this FED3 up to find it; press again to turn them off. "
-                              "They go dark when a run starts.")
-            lights.toggled.connect(lambda on, p=port: self._lights(p, on))
-            b.addWidget(lights)
-            for text, tip, slot in (("Tone", "Play the protocol's reward tone", self._tone),
-                                    ("Feed", "Dispense one pellet", self._feed)):
-                button = theme.small(QPushButton(text))
-                button.setToolTip(tip)
-                button.clicked.connect(lambda _=False, p=port, s=slot: s(p))
-                b.addWidget(button)
-            self.table.setCellWidget(row, TESTS, tests)
+            self._add_fed3_row(row, port)
+        for row, number in enumerate(absent, start=len(ports)):
+            self._add_absent_row(row, number)
+
+    def _add_absent_row(self, row, number):
+        """A greyed row for an ID the protocol uses that no FED3 plugged in has,
+        so the table is the protocol's whole list."""
+        name = fed_name(number)
+        for column, text, colour in (
+                (PORT, "—", theme.MUTED),
+                (STATUS, f"not plugged in: plug it in, or type {name} into a row's ID",
+                 theme.WARN)):
+            item = QTableWidgetItem(text)
+            item.setForeground(QColor(colour))
+            self.table.setItem(row, column, item)
+        label = QLabel(name)
+        label.setAlignment(Qt.AlignCenter)
+        label.setStyleSheet(f"color: {self._colour(number)}; font-weight: bold;")
+        self.table.setCellWidget(row, ID, label)
+
+    def _add_fed3_row(self, row, port):
+        for column in (PORT, STATUS):
+            self.table.setItem(row, column, QTableWidgetItem(""))
+        self.table.item(row, PORT).setText(port)
+        box = QLineEdit()
+        box.setObjectName("id")
+        box.setMaxLength(8)
+        box.setFixedWidth(84)
+        box.setAlignment(Qt.AlignCenter)
+        box.setPlaceholderText("FED…")
+        box.editingFinished.connect(lambda p=port, b=box: self._renumber(p, b))
+        self.table.setCellWidget(row, ID, box)
+        tests = QWidget()
+        b = QHBoxLayout(tests)
+        b.setContentsMargins(2, 0, 2, 0)
+        lights = theme.small(QPushButton("Lights"))
+        lights.setObjectName("lights")
+        lights.setCheckable(True)
+        lights.setToolTip("Light this FED3 up to find it; press again to turn them off. "
+                          "They go dark when a run starts.")
+        lights.toggled.connect(lambda on, p=port: self._lights(p, on))
+        b.addWidget(lights)
+        for text, tip, slot in (("Tone", "Play the protocol's reward tone", self._tone),
+                                ("Feed", "Dispense one pellet", self._feed)):
+            button = theme.small(QPushButton(text))
+            button.setToolTip(tip)
+            button.clicked.connect(lambda _=False, p=port, s=slot: s(p))
+            b.addWidget(button)
+        self.table.setCellWidget(row, TESTS, tests)
 
     def _fill_row(self, row, port, preflight):
         device = self._device(port)
@@ -381,7 +388,7 @@ class SetupView(QWidget):
         if number and not box.hasFocus() and box.text() != fed_name(number):
             box.setText(fed_name(number))      # never under someone's typing
         used = number in self._used_ids()
-        role = fed_name(number) if used else None
+        name = fed_name(number) if used else None     # its name in this protocol
         style = (f"color: {self._colour(number)}; font-weight: bold;" if used
                  else f"color: {theme.MUTED};" if self._used_ids() else "")
         if box.styleSheet() != style and not box.hasFocus():
@@ -391,15 +398,15 @@ class SetupView(QWidget):
                             else "")
                            + "Type another ID (e.g. 7 or FED007) and press Enter to "
                              "renumber this FED3; it's saved on its SD card.")
-        if role and role in preflight and preflight[role] != "ok":
-            text, colour = f"didn't pass pre-flight: {preflight[role]}", theme.BAD
+        if name and name in preflight and preflight[name] != "ok":
+            text, colour = f"didn't pass pre-flight: {preflight[name]}", theme.BAD
         elif device:
             text, colour = device_health(device)
-            if role and preflight.get(role) == "ok":
+            if name and preflight.get(name) == "ok":
                 text = f"pre-flight ok · {text}"
         else:
             text, colour = "not connected", theme.BAD
-        if not role and self._used_ids() and colour == theme.GOOD:
+        if not name and self._used_ids() and colour == theme.GOOD:
             text, colour = f"not in this protocol · {text}", theme.MUTED
         status = self.table.item(row, STATUS)
         status.setText(text)
@@ -424,9 +431,9 @@ class SetupView(QWidget):
         device = self._device(port)
         if not device:
             return
-        cue, role = TEST_TONE, fed_name(device["id"])
-        if self.compiled and role in self.compiled.schedules:
-            reward = self.compiled.schedules[role].phases[0].rule.get("cue.reward", "")
+        cue, name = TEST_TONE, fed_name(device["id"])
+        if self.compiled and name in self.compiled.schedules:
+            reward = self.compiled.schedules[name].phases[0].rule.get("cue.reward", "")
             cue = next((a for a in reward.split("+") if a.startswith("tone:")), TEST_TONE)
         self.engine.submit("test_cue", device=port, cue=cue)
 
@@ -454,17 +461,22 @@ class SetupView(QWidget):
 
     def _bound_devices(self):
         """Connected FED3s the protocol names, by name."""
-        roles = self._used_ids()
-        return {fed_name(d["id"]): d for d in self._connected() if d["id"] in roles}
+        ids = self._used_ids()
+        return {fed_name(d["id"]): d for d in self._connected() if d["id"] in ids}
+
+    def _live_runs(self):
+        """(name, device) for the protocol's FED3s still in a run nobody stopped:
+        Start ends it on them."""
+        return [(name, d) for name, d in self._bound_devices().items() if d.get("live_run")]
 
     def _start(self):
         if not self.compiled:
             return
-        live = [(role, d) for role, d in self._bound_devices().items() if d.get("live_run")]
+        live = self._live_runs()
         replace = False
         if live:
-            lines = "\n".join(f"  • {role} ({d['port']}): run {d['run_label']}"
-                              for role, d in live)
+            lines = "\n".join(f"  • {name} ({d['port']}): run {d['run_label']}"
+                              for name, d in live)
             box = QMessageBox(QMessageBox.Warning, "End a run that's still going?",
                               "These FED3s are in a run that hasn't been stopped:\n\n"
                               f"{lines}\n\n"
@@ -493,23 +505,26 @@ class SetupView(QWidget):
     def update_view(self, snapshot):
         self.snapshot = snapshot or {}
         connected = self._connected()
-        wanted = self._wanted_rows()
-        if wanted != self.rows:
-            self._rebuild(wanted)
         preflight = self.snapshot.get("preflight", {})
         if self.starting and (preflight or time.monotonic() - self.starting > STARTING_FOR):
             self.starting = 0.0
+        self._show_rows(preflight)
+        self._show_notes(connected)
+        self._show_start(connected, preflight)
+
+    def _show_rows(self, preflight):
+        wanted = self._wanted_rows()
+        if wanted != self.rows:
+            self._rebuild(wanted)
         for row, port in enumerate(self.rows[0]):
             self._fill_row(row, port, preflight)
 
+    def _show_notes(self, connected):
+        """The lines above and under the table."""
         names = ", ".join(fed_name(n) for n in self._used_ids())
         self.hint.setText((f"This protocol uses {names}. " if names else "")
-                          + "One row per FED3 plugged in. To change an ID, type it in the "
-                          "box and press Enter, or use the FED3's boot menu. Lights shows "
-                          "which FED3 a row is.")
-        problems = self._setup_problems(connected)   # IDs shared, even with no protocol
-        self.missing.setText("\n".join(problems) if connected else "")
-        self.missing.setStyleSheet(f"color: {theme.WARN};")
+                          + "Type an ID and press Enter to renumber a FED3; Lights finds it.")
+        self.id_problems.setText("\n".join(self._shared_ids(connected)))
         recording = sorted({d["run_label"] for d in connected
                             if d.get("run_label") and not d.get("live_run")})
         old = [p["message"] + (f" ({p['device']})" if p["device"] else "")
@@ -527,16 +542,23 @@ class SetupView(QWidget):
             f"{', '.join(recording)}. A FED3 stops when it starts a new run."
             if recording else "")
 
+    def _show_start(self, connected, preflight):
+        """Start, and the note under it: why not, or what starting will do."""
         ready, why = self._ready(connected)
         self.start.setEnabled(ready and not self.starting)
         if self.starting:
             return
         failed = [r for r, v in preflight.items() if v != "ok"]
+        live = self._live_runs()
         if not ready:
             note, colour = why, theme.MUTED
         elif failed:
             note, colour = (f"Nothing started: {', '.join(failed)} didn't pass pre-flight "
                             "(see its row). Fix it and press Start again."), theme.BAD
+        elif live:
+            runs = ", ".join(f"run {d['run_label']} on {name}" for name, d in live)
+            note = f"Ready, but starting ends {runs}, which hasn't been stopped."
+            colour = theme.WARN
         else:
             note, colour = "Ready. Start checks every FED3, then starts them together.", \
                 theme.MUTED
@@ -551,21 +573,26 @@ class SetupView(QWidget):
         """A line for the step bar: what Setup is waiting for."""
         if not self.compiled:
             return "Choose a protocol"
-        roles = self._used_ids()
+        ids = self._used_ids()
         here = len(self._bound_devices())
-        return (f"{self.compiled.protocol.name} · {here} of its {len(roles)} "
-                f"FED3{'s' if len(roles) != 1 else ''} plugged in")
+        return (f"{self.compiled.protocol.name} · {here} of its {len(ids)} "
+                f"FED3{'s' if len(ids) != 1 else ''} plugged in")
+
+    def _absent_ids(self):
+        """The protocol's IDs that no FED3 plugged in has."""
+        bound = self._bound_devices()
+        return [n for n in self._used_ids() if fed_name(n) not in bound]
 
     def _setup_problems(self, devices):
-        """What stops the FED3s plugged in from playing this protocol."""
-        out = []
-        roles = self._used_ids()
-        bound = self._bound_devices()
-        absent = [fed_name(n) for n in roles if fed_name(n) not in bound]
-        if absent:
-            out.append(f"{', '.join(absent)} {'isn' if len(absent) == 1 else 'aren'}'t plugged "
-                       "in. Plug in, or give a FED3 that ID.")
-        ids = {}
+        """What stops this protocol starting with the FED3s plugged in."""
+        absent = [fed_name(n) for n in self._absent_ids()]
+        out = [f"{', '.join(absent)} {'isn' if len(absent) == 1 else 'aren'}'t plugged in. "
+               "Plug in, or give a FED3 that ID."] if absent else []
+        return out + self._shared_ids(devices)
+
+    def _shared_ids(self, devices):
+        """FED3s plugged in that share an ID, so their data couldn't be told apart."""
+        out, ids = [], {}
         for device in devices:
             ids.setdefault(device["id"], []).append(device["port"])
         for number, ports in sorted(ids.items()):
@@ -586,5 +613,5 @@ class SetupView(QWidget):
         problems = self._setup_problems(devices)
         if problems:
             return False, ("Not ready: " + problems[0]) if len(problems) == 1 else \
-                f"Not ready: {len(problems)} things to sort out, listed under the FED3s."
+                f"Not ready: {len(problems)} things to sort out, shown with the FED3s."
         return True, ""
