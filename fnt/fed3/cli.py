@@ -1,7 +1,7 @@
 """``fnt-fed``: check, compile and preview FED3 protocol files without hardware.
 
     fnt-fed check protocol.yaml
-    fnt-fed compile protocol.yaml [--device P1] [--seed N]
+    fnt-fed compile protocol.yaml [--device FED001] [--seed N]
     fnt-fed preview protocol.yaml [--start 2026-10-20T19:00] [--days 21] [--seed N]
 
 Times are in the PC's standard time (daylight saving ignored), as on the devices.

@@ -314,7 +314,7 @@ These are newline-terminated ASCII lines at 115200 baud.
 | `PING` | `PONG,id=<n>,fw=3.0,proto=3` | Discovery. FNT refuses `proto` ≠ 3. |
 | `STATUS` | `STATUS,…` (below) | Full state. FNT polls it every 30 s. |
 | `TIME:<iso with offset>` | `TIME,before=<iso>,after=<iso>` | Set the clock and its UTC offset. During a run a jump over 10 min is refused with `ERR,TIME_JUMP`; `TIME!:` overrides that. |
-| `ID:<n>` | `ID,id=<n>` | Set and save the device number. This replaces the boot-time ID menu. |
+| `ID:<n>` | `ID,id=<n>` | Set and save the ID (1-999), as the boot menu does: hold both pokes while `FED3 ID` shows at power-on, then left −1, right +1, saved after 4 s idle. Not offered during a run or after a watchdog restart. |
 | `SCHED:BEGIN` | `OK` | Start receiving a schedule. |
 | `S:<line>` | `OK` or `ERR,SCHED,<line no>,<reason>` | One schedule line, checked as it arrives. |
 | `SCHED:COMMIT,<crc>[,<phase>]` | `SCHED,crc=<hex>,phases=<n>,slot=<now\|next>` | Commit the upload (see below). |
@@ -424,7 +424,7 @@ folder.
 format: fnt-fed3-protocol/1
 name: Short name
 description: Free text.
-devices: [A, B]          # logical names; bound to physical FEDs at Start
+devices: [FED001, FED002]   # FED3 IDs: the same name on the device, in data and in FNT
 
 colors:                  # optional; added to the built-in names
   amber: [30, 10, 0, 0]
@@ -600,8 +600,8 @@ Setup ──Start──▶ Pre-flight ──all pass──▶ Running ──Stop
 ```
 
 **Setup**
-- Choose the protocol and output folder, and bind each logical device to a
-  physical FED by ID.
+- Choose the protocol and output folder. The protocol names its FED3s by ID,
+  so there's nothing to bind: FED007 is the FED3 whose ID is 7.
 - Manual `FEED` and `TEST` work here for bench checks.
 
 **Pre-flight**, for each bound device:
@@ -689,9 +689,9 @@ an overnight jam is still visible at the morning check.
   run.json          # protocol hash, binding, t0 (UTC), clock offset, seed,
                     # edits, FNT-driven phase changes, firmware versions
   protocol.yaml     # exact copy (plus protocol.v2.yaml … after edits)
-  sched/P1.txt      # each device's compiled schedule
+  sched/FED001.txt  # each device's compiled schedule
   log.csv           # FNT actions, uploads, problems, disconnects (UTC)
-  P1_FED003.csv     # byte-identical copy of the device's data file
+  FED001.csv        # byte-identical copy of the device's data file
   P2_FED007.csv
   …
 ```
@@ -735,28 +735,48 @@ fnt/fed3/
 ### Setup
 
 ```
-┌ ✓ Setup › 2 Running › 3 Stopped ──────────────────────────────────────────────┐
+┌ 1 Setup › 2 Running › 3 Stopped  Four-patch competition · 3 of its 4 FED3s plugged in┐
 ├ Protocol ───────────────────────┬ FED3s ────────────────────────────────────────┤
-│ four-patch.yaml [Open][New][Edit]│ Port ID           Status           Tests     │
-│ ✓ 17 phases · 4 devices          │ COM3 [FED001 (P1)▾] plays P1 · SD ok  [L][T][F]│
-│ ┌ Timeline ────────────────────┐ │ COM4 [FED002 (P2)▾] plays P2 · SD ok  [L][T][F]│
-│ │ 0 Habituation                │ │ COM5 [FED003 (P3)▾] plays P3 · SD err [L][T][F]│
-│ │   ends at 19:00 on day 3     │ │ COM6 [FED004 (P4)▾] plays P4 · SD ok  [L][T][F]│
-│ │ 1 Training [needs FNT] …     │ │                                              │
-│ └──────────────────────────────┘ │                                              │
+│ four-patch.yaml [Open][New][Edit]│ This protocol uses FED001, FED002, FED003,    │
+│ ✓ 17 phases · 4 devices          │ FED004.                                       │
+│ ┌ Timeline ────────────────────┐ │ Port ID           Status             Tests    │
+│ │ 1 Habituation                │ │ COM3 [ FED001 ]   SD ok              [L][T][F]│
+│ │   ends at 19:00 on day 3     │ │ COM4 [ FED002 ]   SD ok              [L][T][F]│
+│ │ 2 Training [needs FNT] …     │ │ COM5 [ FED003 ]   SD error           [L][T][F]│
+│ └──────────────────────────────┘ │ COM6 [ FED009 ]   not in this protocol        │
+│                                  │ FED004 isn't plugged in. Plug in, or give a   │
+│                                  │ FED3 that ID.                                 │
 ├──────────────────────────────────┴──────────────────────────────────────────────┤
 │ Runs are saved in ~/FED3_Runs                [Change folder] [ Start run ▶ ]    │
+│                Not ready: FED004 isn't plugged in. Plug in, or give a FED3 that ID. │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- Every FED3 plugged in has a row. Its number is its place in the protocol:
-  FED00*n* plays the *n*th entry of `devices`. There is no separate binding
-  to keep, and the data file names match.
-- The ID list renumbers a FED3 (`ID:`); a number another FED3 has swaps them.
+- Every FED3 plugged in has a row, in port order, and a row stays with its
+  FED3.
+- **ID** is the FED3's one name, `FED001`-`FED999`: on its screen, in the
+  protocol's `devices`, in its data file (`FED007.csv`) and on its card. It's
+  kept in `DEVICE.TXT` and set on the FED3's boot menu, or with `ID:` from
+  the ID box: type `7`, `007` or `FED007` and press Enter (or leave the box);
+  anything outside 1-999 is put back. The box isn't refreshed while it has
+  focus, so typing is never overwritten. Firmware starts at 1. Start's binding
+  is simply `FED007 -> 7`. Two connected FED3s can't share an ID, since data
+  files and the engine find devices by it. The protocol's IDs show in their
+  series colour; a FED3 it doesn't name shows `not in this protocol`.
+- An ID changed on the FED3 itself shows up in its next `STATUS`, and FNT
+  follows it.
+- The ID box renumbers the FED3 on that row (`ID:`); a number another FED3
+  has swaps them, in one engine command, and Setup says so under the table. The engine refuses to renumber a
+  FED3 in the running run. A FED3 in a stopped run still records into it, and
+  rows are matched to a run's devices by number, so the stopped run follows
+  the new number (`run.json` keeps `binding` as it was at Start and lists the
+  change under `renumbered`).
 - **Lights** sends `LIGHTS:on`/`off` (firmware 3.1), and the button follows the
   device's `lights` status.
 - **Start** runs pre-flight and reports per row, so a failure is shown on the
-  row that caused it.
+  row that caused it. A FED3 in another run that hasn't ended fails
+  pre-flight (an upload would replace that run's schedule in place) unless
+  the person confirms ending it; then FNT sends `RUN:END` before uploading.
 
 ### Protocol editor
 
@@ -793,17 +813,17 @@ same file. Nothing else would change.
 ┌ Four-patch competition ── ● RUNNING  6d 03:12 ── 3 problems ── [Edit] [Stop] ┐
 │ Phase 5 of 17: Competition 3 · next phase Tue 19:00 (in 2h 47m)                 │
 ├────────────────────────────────────────────────┬───────────────────────────────┤
-│ P1 ● FED003       [Feed] [Test cue] [Set clock] │ cumulative pellets, per      │
+│ FED001 ●                      [Feed] [More ▾]   │ cumulative pellets, per      │
 │  ╭──────────────╮  Competition 3 · phase 5/17   │ device (standard time; phase │
 │  │ (912)▭801(340)│  FR1 · both · Q30/1h          │ changes dotted, Stop dashed) │
 │  ╰──────────────╯  12 rewards this phase        │                              │
 │                    last: retrieve, 40 s ago     │                              │
-│ P3 ● FED002  …  ⚠ jammed · Tue 02:14 [Acknowledge]                             │
+│ FED003 ●  …  ⚠ jammed · Tue 02:14 [Acknowledge]                                │
 ├────────────────────────────────────────────────┴───────────────────────────────┤
 │ ▼ Log                                                                           │
-│ Tue 19:00:00  P1  phase 5: Competition 3                                        │
-│ Tue 02:14:09  P3  problem: jammed: retrying every 10 minutes                    │
-│ Tue 08:02:31  P3  feed by hand: FEED,result=started                             │
+│ Tue 19:00:00  FED001  phase 5: Competition 3                                    │
+│ Tue 02:14:09  FED003  problem: jammed: retrying every 10 minutes                │
+│ Tue 08:02:31  FED003  feed by hand: FEED,result=started                         │
 └────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -816,14 +836,17 @@ same file. Nothing else would change.
     phase ends;
   - the last event, and the port, battery and temperature;
   - problems with an **Acknowledge** button;
-  - **Feed**, **Test cue…** and **Set clock**.
+  - **Feed**, and **More ▾** with **Play a cue…** and **Set its clock now…**
+    (which asks first: it's for jumps over 10 minutes, which the device
+    refuses mid-run until confirmed).
 - **Plot**, across the top at full width: cumulative pellets per device against standard
   time, with phase changes and Stop marked.
 - **Log**, along the bottom of the window in every state: phase changes,
   problems, uploads and manual actions, coloured by kind, and collapsible.
 
-**Stopped** shows when the run stopped, pellets per device, **Open folder** and
-**New run**.
+**Stopped** shows how long the run ran and when it stopped, the cards (each
+still counting, since the devices keep recording), **Open folder** and **New
+run**.
 
 ---
 
@@ -834,7 +857,7 @@ same file. Nothing else would change.
 ```yaml
 format: fnt-fed3-protocol/1
 name: FR1 to FR5, both pokes
-devices: [FED]
+devices: [FED001]
 
 cues:
   reward:
@@ -877,7 +900,7 @@ name: Four-patch competition
 description: >
   Two rich and two poor patches that each refill hourly. Which patches are
   rich is reshuffled every day at lights-off.
-devices: [P1, P2, P3, P4]
+devices: [FED001, FED002, FED003, FED004]
 
 cues:
   reward:
@@ -906,7 +929,7 @@ phases:
       every: 1d
       at: "19:00"
       mode: shuffle
-      assign: {P1: rich, P2: rich, P3: poor, P4: poor}
+      assign: {FED001: rich, FED002: rich, FED003: poor, FED004: poor}
 
   - name: Recovery
     all: {active: none, free_feed: 1}
@@ -925,7 +948,7 @@ one is short unless Training happens to end at 19:00.
 ```yaml
 format: fnt-fed3-protocol/1
 name: Timed feeding 19:00-21:00
-devices: [FED]
+devices: [FED001]
 phases:
   - name: Restricted
     all: {active: none}

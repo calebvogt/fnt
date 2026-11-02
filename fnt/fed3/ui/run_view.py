@@ -11,11 +11,13 @@ import sys
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
-    QComboBox, QFrame, QGridLayout, QHBoxLayout, QInputDialog, QLabel, QMessageBox,
+    QComboBox, QFrame, QGridLayout, QHBoxLayout, QInputDialog, QLabel, QMenu, QMessageBox,
     QPushButton, QSizePolicy, QVBoxLayout, QWidget,
 )
 
+from .. import protocol as proto
 from ..device_sim import parse_iso
+from ..run import check_edit
 from . import theme
 from .editor import ProtocolEditor, format_delta
 from .fed_graphic import FedGraphic
@@ -78,6 +80,7 @@ class DeviceCard(QFrame):
         self.logical = logical
         self.engine = engine
         self.problem_keys = []
+        self.device = None
         layout = QVBoxLayout(self)
         layout.setSpacing(4)
 
@@ -89,16 +92,18 @@ class DeviceCard(QFrame):
         self.fed = QLabel()
         top.addWidget(self.fed)
         top.addStretch()
-        for text, tip, slot in (
-                ("Feed", "Dispense one pellet now", self._feed),
-                ("Test cue…", "Play a cue on this device", self._test),
-                ("Set clock", "Set this device's clock to this PC's, even if that's a big "
-                              "jump (it refuses jumps over 10 minutes during a run "
-                              "otherwise)", self._set_clock)):
-            button = theme.small(QPushButton(text))
-            button.setToolTip(tip)
-            button.clicked.connect(slot)
-            top.addWidget(button)
+        feed = theme.small(QPushButton("Feed"))
+        feed.setToolTip("Dispense one pellet now. It's recorded as a manual dispense: it "
+                        "counts as a pellet, not a reward.")
+        feed.clicked.connect(self._feed)
+        top.addWidget(feed)
+        more = theme.small(QPushButton("More ▾"))
+        menu = QMenu(more)
+        menu.addAction("Play a cue…", self._test).setToolTip("Play a tone, flash or BNC "
+                                                              "pulse on this FED3")
+        menu.addAction("Set its clock now…", self._set_clock)
+        more.setMenu(menu)
+        top.addWidget(more)
         layout.addLayout(top)
 
         body = QHBoxLayout()
@@ -128,15 +133,28 @@ class DeviceCard(QFrame):
         self.engine.submit("feed", device=self.logical)
 
     def _test(self):
-        cue, ok = QInputDialog.getText(self, "Test a cue", "Cue (as in a schedule):",
-                                       text=TEST_CUE)
+        cue, ok = QInputDialog.getText(
+            self, f"Play a cue on {self.logical}",
+            "Cue, written as in a schedule. The default is a 4 kHz tone with a flash:",
+            text=TEST_CUE)
         if ok and cue:
             self.engine.submit("test_cue", device=self.logical, cue=cue)
 
     def _set_clock(self):
-        self.engine.submit("confirm_time", device=self.logical)
+        drift = (self.device or {}).get("drift")
+        off = (f"Its clock is {abs(drift):.0f} s {'ahead' if drift > 0 else 'behind'}. "
+               if drift is not None else "")
+        answer = QMessageBox.question(
+            self, f"Set {self.logical}'s clock",
+            f"{off}Set {self.logical}'s clock to this PC's time now?\n\n"
+            "FNT keeps clocks right by itself. This is for a jump over 10 minutes, which "
+            "a FED3 refuses during a run until someone confirms it: phases due in the "
+            "meantime happen at once.")
+        if answer == QMessageBox.Yes:
+            self.engine.submit("confirm_time", device=self.logical)
 
     def update_card(self, device, run, problems, now, zone):
+        self.device = device
         connected = bool(device and device["connected"])
         self.dot.setStyleSheet(f"color: {theme.GOOD if connected else theme.BAD};")
         status = device["status"] if device else {}
@@ -144,7 +162,9 @@ class DeviceCard(QFrame):
         health, colour = describe_health(device, status)
         self.health.setText(health)
         self.health.setStyleSheet(f"color: {colour};")
-        self.fed.setText(f"FED{device['id']:03d}" if device else "")
+        # The card is titled with the FED3's ID; say so only if it's been renumbered since.
+        current = f"FED{device['id']:03d}" if device else ""
+        self.fed.setText(f"now {current}" if current and current != self.logical else "")
 
         source = row or status
         counts = None
@@ -261,6 +281,8 @@ class RunView(QWidget):
         self.cards = {}
         self.run_id = None
         self.snapshot = {}
+        self.pending_edit = None        # (token, text) sent, awaiting the engine's answer
+        self.edit_tokens = 0
 
         layout = QVBoxLayout(self)
         header = QHBoxLayout()
@@ -275,14 +297,18 @@ class RunView(QWidget):
         header.addWidget(self.problem_count)
         header.addStretch()
         self.edit = theme.quiet(QPushButton("Edit protocol…"))
+        self.edit.setToolTip("Change the protocol mid-run. Phases already over can't change.")
         self.edit.clicked.connect(self._edit)
         self.advance = theme.quiet(QPushButton("Advance phase"))
         self.advance.clicked.connect(self._advance)
         self.stop = theme.danger(QPushButton("Stop run"))
         self.stop.clicked.connect(self._stop)
         self.open_folder = theme.quiet(QPushButton("Open folder"))
+        self.open_folder.setToolTip("Open this run's folder: its data, protocol and log")
         self.open_folder.clicked.connect(self._open_folder)
         self.close_run = QPushButton("New run")
+        self.close_run.setToolTip("Back to Setup. This run's FED3s keep recording into its "
+                                  "folder until they start another run.")
         self.close_run.clicked.connect(lambda: engine.submit("close"))
         for button in (self.edit, self.advance, self.stop, self.open_folder, self.close_run):
             header.addWidget(button)
@@ -331,13 +357,42 @@ class RunView(QWidget):
         if self.snapshot.get("run"):
             self.update_view(self.snapshot)
 
-    def _edit(self):
+    def _edit(self, text=None):
         run = self.snapshot.get("run")
         if not run:
             return
-        editor = ProtocolEditor(run["protocol_text"], self, running=True, t0=run["t0"])
+        old = proto.compile_protocol(proto.load(run["protocol_text"]), seed=run["seed"])
+
+        def edit_check(new_text):
+            """Why the running devices can't take this, as the engine would say."""
+            current = (self.snapshot.get("run") or run)["current"]
+            try:
+                check_edit(old, new_text, current, run["seed"])
+            except Exception as exc:      # noqa: BLE001 - shown in the editor
+                return str(exc)
+            return None
+
+        editor = ProtocolEditor(text or run["protocol_text"], self, running=True,
+                                t0=run["t0"], edit_check=edit_check)
         if editor.exec_():
-            self.engine.submit("edit", protocol_text=editor.text())
+            self.edit_tokens += 1
+            self.pending_edit = (self.edit_tokens, editor.text())
+            self.engine.submit("edit", protocol_text=editor.text(), token=self.edit_tokens)
+
+    def _edit_answered(self, snapshot):
+        """The engine refused an edit after all (a device moved on meanwhile):
+        say so, and reopen the editor on what was written so nothing is lost."""
+        result = snapshot.get("edit_result")
+        if not self.pending_edit or not result or result["token"] != self.pending_edit[0]:
+            return
+        _, text = self.pending_edit
+        self.pending_edit = None
+        if result["error"]:
+            QMessageBox.warning(self, "Edit not applied",
+                                f"The edit wasn't applied: {result['error']}.\n\nNothing "
+                                "changed on the devices. The editor opens again with your "
+                                "changes.")
+            self._edit(text)
 
     def _advance(self):
         if QMessageBox.question(self, "Advance phase",
@@ -381,8 +436,14 @@ class RunView(QWidget):
         self.title.setText(run["name"])
         self.state.setText("● RUNNING" if running else "■ STOPPED")
         self.state.setStyleSheet(f"color: {theme.GOOD if running else theme.MUTED}; font-weight: bold;")
-        self.elapsed.setText(f"{format_delta((now - run['t0']).total_seconds())} since "
-                             f"{run['t0']:%a %d %b %H:%M} ({run['t0']:%Z})")
+        stopped = parse_iso(run.get("stopped_at") or "")
+        if running or not stopped:
+            self.elapsed.setText(f"{format_delta((now - run['t0']).total_seconds())} since "
+                                 f"{run['t0']:%a %d %b %H:%M} ({run['t0']:%Z})")
+        else:
+            self.elapsed.setText(f"ran {format_delta((stopped - run['t0']).total_seconds())}"
+                                 f", {run['t0']:%a %d %b %H:%M} to "
+                                 f"{stopped.astimezone(zone):%a %d %b %H:%M} ({run['t0']:%Z})")
         problems = snapshot["problems"]
         open_count = sum(not p["acknowledged"] for p in problems)
         self.problem_count.setText(f"⚠ {open_count} problem{'s' if open_count != 1 else ''}"
@@ -404,17 +465,9 @@ class RunView(QWidget):
         self.advance.setVisible(running and any(run["manual"][p] for p, _ in phases_now
                                                 if p < len(run["manual"])))
         if not running:
-            stopped = next((e[0] for e in reversed(snapshot["events"])
-                            if e[2].startswith("run stopped")), None)
-            when = f" {stopped.astimezone(zone):%a %d %b %H:%M}" if stopped else ""
-            totals = []
-            for logical, device_id in run["binding"].items():
-                row = (devices.get(device_id) or {}).get("last_row") or {}
-                totals.append(f"{logical}: {row.get('pellets', '?')} pellets")
-            self.timeline.setText(f"Stopped{when}. The devices keep running their current "
-                                  f"phase and recording; their rows are still copied to this "
-                                  f"run's folder until they start another run.  ·  "
-                                  + "   ".join(totals))
+            self.timeline.setText("Stopped. Each FED3 stays in its current phase and keeps "
+                                  "recording; its rows still reach this run's folder (after "
+                                  "its run_end row) until it starts another run.")
         elif phases_now:
             index, nxt = min(phases_now)
             text = f"Phase {index + 1} of {len(run['phases'])}: {run['phases'][index]}"
@@ -426,6 +479,7 @@ class RunView(QWidget):
         self.banner.setText("\n".join(f"⚠ {p['message']}" for p in general))
         self.banner.setVisible(bool(general))
         self.plot.update_plot(run, self._plot_zone(zone, now))
+        self._edit_answered(snapshot)
 
     def _build_cards(self, run):
         self.run_id = run["run_id"]

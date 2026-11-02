@@ -80,6 +80,8 @@ class Device:
     status_at: float = -1e9
     clock_synced_at: float = -1e9
     last_open_attempt: float = -1e9
+    open_error: str = ""            # the last reason it couldn't be opened, logged once
+    not_fed3: bool = False          # answered, but not as a FED3: left alone until unplugged
     run: str = ""                   # the run its live rows belong to
     rows: deque = field(default_factory=lambda: deque(maxlen=400))
     last_row: dict = field(default_factory=dict)
@@ -103,11 +105,15 @@ class DataCopy:
         self.next_seq = 1
         self.pending = {}
         self.read_requested = -1e9
+        self.last_pellet = None     # time of the last dispense row copied
         if os.path.exists(path):
             with open(path, encoding="ascii", newline="") as handle:
                 lines = handle.read().splitlines()
             if len(lines) > 1:
                 self.next_seq = int(lines[-1].split(",")[2]) + 1
+            for line in reversed(lines[1:]):
+                if self._note_pellet(line):
+                    break
         else:
             with open(path, "w", encoding="ascii", newline="") as handle:
                 handle.write(HEADER + "\n")
@@ -128,8 +134,18 @@ class DataCopy:
                 text = self.pending.pop(self.next_seq)
                 handle.write(text + "\n")
                 written.append(text)
+                self._note_pellet(text)
                 self.next_seq += 1
         return written
+
+    def _note_pellet(self, text):
+        parts = text.split(",", 5)
+        if len(parts) > 4 and parts[4] == "dispense":
+            moment = parse_iso(parts[0])
+            if moment and (self.last_pellet is None or moment > self.last_pellet):
+                self.last_pellet = moment
+            return True
+        return False
 
 
 def parse_row(text):
@@ -158,7 +174,13 @@ class Run:
         self.folder = folder
         self.protocol_text = protocol_text
         self.compiled = compiled
-        self.binding = dict(binding)          # logical name -> device id
+        self.binding = dict(binding)          # logical name -> device id, at Start
+        # logical name -> the number that FED3 has now. The same as binding
+        # unless it was renumbered after Stop, while it still records into
+        # this run: rows are matched to a device by number, so this keeps
+        # them in the right copy.
+        self.ids = dict(binding)
+        self.renumbered = []
         self.run_id = run_id
         self.t0 = t0                          # aware, standard time
         self.seed = seed
@@ -172,17 +194,27 @@ class Run:
         # begins. Later than stopped_at for a device that was unplugged then.
         self.ended = {}
         for logical, device_id in self.binding.items():
-            self.copies[logical] = DataCopy(os.path.join(folder, f"{logical}_FED{device_id:03d}.csv"))
+            # FED007.csv: the protocol names FED3s by ID. Runs from before
+            # that named them otherwise, e.g. A_FED007.csv.
+            fed = f"FED{device_id:03d}"
+            name = fed if logical == fed else f"{logical}_{fed}"
+            self.copies[logical] = DataCopy(os.path.join(folder, f"{name}.csv"))
 
     @property
     def crcs(self):
         return {name: s.crc() for name, s in self.compiled.schedules.items()}
 
     def logical_for(self, device_id):
-        for logical, bound in self.binding.items():
+        for logical, bound in self.ids.items():
             if bound == device_id:
                 return logical
         return None
+
+    def renumber(self, logical, number, moment):
+        self.renumbered.append({"time": iso(moment), "device": logical,
+                                "from": self.ids[logical], "to": number})
+        self.ids[logical] = number
+        self.save()
 
     def save(self):
         data = {
@@ -204,6 +236,8 @@ class Run:
             data["stopped_at"] = self.stopped_at
         if self.ended:
             data["ended"] = self.ended
+        if self.renumbered:
+            data["renumbered"] = self.renumbered
         path = os.path.join(self.folder, RUN_FILE)
         with open(path + ".tmp", "w", encoding="utf-8") as handle:
             json.dump(data, handle, indent=2)
@@ -217,10 +251,36 @@ class Run:
                 handle.write(schedule.text())
 
 
+def check_edit(old, protocol_text, current, seed):
+    """The compiled edit, or RuntimeError saying why a running run can't take
+    it. ``old`` is the running compiled protocol, ``current`` each device's
+    phase. The editor runs this as you type; the engine again on Apply."""
+    protocol = proto.load(protocol_text)
+    if protocol.devices != old.protocol.devices:
+        raise RuntimeError("an edit can't change the list of devices "
+                           f"({', '.join(old.protocol.devices)})")
+    compiled = proto.compile_protocol(protocol, seed=seed)
+    for logical, phase in current.items():
+        before = old.schedules[logical].phases
+        after = compiled.schedules[logical].phases
+        if len(after) <= phase or after[phase].name != before[phase].name:
+            raise RuntimeError(f"{logical} is in phase {phase + 1}, {before[phase].name}: "
+                               "the edit must keep that phase, with that name, in the "
+                               "same place")
+        for index in range(phase):
+            if after[index] != before[index]:
+                raise RuntimeError(f"phase {index + 1}, {before[index].name}, is over for "
+                                   f"{logical} and can't change")
+    return compiled
+
+
 class Engine:
     def __init__(self, runs_root, ports=candidate_ports, open_port=SerialTransport,
-                 now=utc_now, monotonic=time.monotonic, zone=None):
+                 now=utc_now, monotonic=time.monotonic, zone=None, other_roots=()):
         self.runs_root = runs_root
+        # Folders runs were saved in before: a stopped run there is still
+        # followed, and an unfinished one still picked up.
+        self.other_roots = [r for r in other_roots if r and r != runs_root]
         self.ports = ports
         self.open_port = open_port
         self.now = now
@@ -231,10 +291,12 @@ class Engine:
         self.run = None
         self.state = SETUP
         self.stopped = {}                 # run id -> a stopped Run its devices still write to
-        self._searched = set()            # run ids already looked for in runs_root
+        self._searched = set()            # run ids already looked for in the run folders
+        self.run_names = {}               # run id -> its name, for runs found in them
+        self.edit_result = None           # {"token", "error"} for the last edit sent
         self.events = deque(maxlen=300)   # (utc time, device, text) for the UI
         self.event_count = 0              # events ever added, so the UI adds only new ones
-        self.preflight = {}               # logical -> "ok" or why not
+        self.preflight = {}               # logical -> "ok" or why not, from the last Start
         self.commands = queue.Queue()
         self.lock = threading.Lock()
         self.last_scan = -1e9
@@ -322,23 +384,30 @@ class Engine:
             device = self.devices.get(port)
             if device is None:
                 device = self.devices[port] = Device(port, description)
-            if device.connected:
+            if device.connected or device.not_fed3:
                 continue
             if self.monotonic() - device.last_open_attempt < RETRY_OPEN:
                 continue
             device.last_open_attempt = self.monotonic()
             self._open(device)
         for port, device in self.devices.items():
-            if port not in available and device.connected:
-                self._disconnect(device, "unplugged")
+            if port not in available:
+                device.not_fed3 = False
+                device.open_error = ""
+                if device.connected:
+                    self._disconnect(device, "unplugged")
 
     def _open(self, device):
         try:
             transport = self.open_port(device.port)
         except Exception as exc:
             device.firmware = ""
-            self._event(device.port, f"can't open: {exc}")
+            if str(exc) != device.open_error:     # once, not every retry
+                device.open_error = str(exc)
+                self._event(device.port, f"can't open: {exc} (another program may "
+                                         "have it open; retrying)")
             return
+        device.open_error = ""
         link = DeviceLink(transport, lambda line, d=device: self._on_line(d, line),
                           clock=self.monotonic)
         device.link = link
@@ -358,6 +427,9 @@ class Engine:
         if not reply.startswith("PONG,") or info.get("proto") != "3":
             link.close()
             device.link = None
+            if reply:
+                # Some other Adafruit board: stop sending it PINGs.
+                device.not_fed3 = True
             return
         device.connected = True
         device.compatible = True
@@ -421,6 +493,14 @@ class Engine:
         device.status = fields(reply)
         device.status_at = self.monotonic()
         status = device.status
+        reported = status.get("id", "")
+        if reported.isdigit() and device.id is not None and int(reported) != device.id:
+            # Changed on the FED3 itself, outside FNT.
+            self._log(f"FED{int(reported):03d}", "ID changed on the FED3",
+                      f"{device.port} was FED{device.id:03d}")
+            device.id = int(reported)
+            self.preflight = {}
+            self._duplicate_ids()
         if status.get("clock") == "ok" and status.get("time"):
             moment = parse_iso(status["time"])
             device.drift = (moment - self.now()).total_seconds() if moment else None
@@ -559,7 +639,7 @@ class Engine:
             return
         tick = self.monotonic()
         checks = self.run.compiled.protocol.checks
-        for logical, device_id in self.run.binding.items():
+        for logical, device_id in self.run.ids.items():
             device = self.device_by_id(device_id)
             if device is None or tick - device.link.last_heard > OFFLINE_AFTER:
                 self._problem(logical, "offline", logical, "not connected")
@@ -578,7 +658,9 @@ class Engine:
                 self._clear(logical, "schedule")
             limit = checks.get("no_pellets")
             if limit and self._can_dispense(logical, status):
-                since = device.last_pellet or self.run.t0
+                known = [t for t in (self.run.copies[logical].last_pellet, device.last_pellet)
+                         if t is not None]
+                since = max(known) if known else self.run.t0
                 quiet = (self.now() - since).total_seconds()
                 if quiet > limit:
                     self._problem(logical, "no_pellets", logical,
@@ -598,8 +680,11 @@ class Engine:
     # Runs
     # ------------------------------------------------------------------
 
-    def cmd_start(self, protocol_text, binding, seed=None, name_hint=""):
-        """Pre-flight every bound device, then start them all at one t0."""
+    def cmd_start(self, protocol_text, binding, seed=None, name_hint="", replace=False):
+        """Pre-flight every bound device, then start them all at one t0.
+
+        A FED3 still in another run that hasn't ended fails pre-flight unless
+        ``replace``: starting would end that run on it."""
         if self.state == RUNNING:
             raise RuntimeError("a run is already in progress")
         protocol = proto.load(protocol_text)
@@ -610,16 +695,17 @@ class Engine:
         compiled = proto.compile_protocol(protocol, seed=seed)
         self.preflight = {}
         for logical in protocol.devices:
-            self.preflight[logical] = self._preflight(logical, binding[logical], compiled)
+            self.preflight[logical] = self._preflight(logical, binding[logical], compiled,
+                                                      replace)
         if any(result != "ok" for result in self.preflight.values()):
             self._event("", "pre-flight failed; nothing started")
             return
         t0 = self.now().astimezone(self.zone).replace(microsecond=0)
-        folder = os.path.join(self.runs_root, f"{t0:%Y-%m-%d_%H%M}_{slug(protocol.name)}")
-        suffix = 1
+        base = os.path.join(self.runs_root, f"{t0:%Y-%m-%d_%H%M}_{slug(protocol.name)}")
+        folder, suffix = base, 1
         while os.path.exists(folder):
             suffix += 1
-            folder = f"{folder.rstrip('0123456789').rstrip('_')}_{suffix}"
+            folder = f"{base}_{suffix}"
         os.makedirs(folder)
         with open(os.path.join(folder, "protocol.yaml"), "w", encoding="utf-8") as handle:
             handle.write(protocol_text)
@@ -631,11 +717,21 @@ class Engine:
         for logical, device_id in binding.items():
             self._begin(logical, self.device_by_id(device_id))
 
-    def _preflight(self, logical, device_id, compiled):
+    def _preflight(self, logical, device_id, compiled, replace=False):
         device = self.device_by_id(device_id)
         if device is None:
             return f"FED{device_id:03d} is not connected"
         try:
+            self._read_status(device)
+            if self._in_live_run(device):
+                # An upload now would replace that run's schedule in place,
+                # so end it first, and only when told to.
+                label = self._run_label(device.status["run"])
+                if not replace:
+                    return f"still in run {label}"
+                self._log(logical, "ended another run", f"{label}: "
+                          f"{self._call(device, 'RUN:END')}")
+                self._read_status(device)
             if not self._sync_clock(device):
                 return "couldn't set its clock"
             self._read_status(device)
@@ -681,7 +777,7 @@ class Engine:
         return False
 
     def _run_step(self):
-        for logical, device_id in self.run.binding.items():
+        for logical, device_id in self.run.ids.items():
             device = self.device_by_id(device_id)
             if device is None:
                 continue
@@ -706,7 +802,33 @@ class Engine:
                 self._fill_gaps(self.run, logical, device)
             except LinkError as exc:
                 self._disconnect(device, str(exc))
+        self._catch_up()
         self._fnt_conditions()
+
+    def _catch_up(self):
+        """A device that missed a phase change FNT made (unplugged, or not
+        answering) is moved on when it's back in that phase."""
+        changed = False
+        for change in self.run.fnt_changes:
+            for logical in list(change.get("missed", [])):
+                device = self.device_by_id(self.run.ids[logical])
+                state = self._phase_of(logical)
+                if device is None or state is None:
+                    continue
+                if state[0] != change["from"]:
+                    # Behind it, it wasn't in that phase then; past it, it moved.
+                    change["missed"].remove(logical)
+                    changed = True
+                    continue
+                reply = self._call(device, f"GOTO:{change['from']},{change['to']}")
+                self._read_status(device)
+                if reply.startswith("PHASE,") or error(reply):
+                    change["missed"].remove(logical)
+                    changed = True
+                    self._log(logical, "phase caught up",
+                              f"{change['from']} -> {change['to']}, missed while away: {reply}")
+        if changed:
+            self.run.save()
 
     def _fill_gaps(self, run, logical, device, force=False):
         copy = run.copies[logical]
@@ -734,18 +856,33 @@ class Engine:
         self._read_status(device)
 
     def _phase_of(self, logical):
-        device = self.device_by_id(self.run.binding[logical])
-        row = device.last_row if device else {}
-        try:
-            return (int(row["phase"]), int(row["phase_rewards"]),
-                    int(row["phase_left"]), int(row["phase_right"]))
-        except (KeyError, ValueError):
+        """(phase, rewards, left, right) this phase, from whichever is newer:
+        the last live row or the last STATUS. Either can be missing, e.g. just
+        after FNT restarts, before the device has written a row."""
+        device = self.device_by_id(self.run.ids[logical])
+        if device is None:
             return None
+        sources = []
+        if device.status.get("run") == self.run.run_id:
+            sources.append(device.status)
+        if device.run == self.run.run_id and device.last_row:
+            sources.append(device.last_row)
+        best = None
+        for source in sources:
+            try:
+                state = (int(source.get("seq", -1)),
+                         (int(source["phase"]), int(source["phase_rewards"]),
+                          int(source["phase_left"]), int(source["phase_right"])))
+            except (KeyError, ValueError):
+                continue
+            if best is None or state[0] >= best[0]:
+                best = state
+        return best[1] if best else None
 
     def _fnt_conditions(self):
         """Phases that end on several devices' counts: FNT moves them."""
         compiled = self.run.compiled
-        states = {logical: self._phase_of(logical) for logical in self.run.binding}
+        states = {logical: self._phase_of(logical) for logical in self.run.ids}
         for index, phase in enumerate(compiled.phases):
             counted = [c for c in phase.fnt if c.kind != "manual"]
             if not counted:
@@ -781,18 +918,30 @@ class Engine:
         return True
 
     def _advance(self, index, why):
-        moved = []
-        for logical, device_id in self.run.binding.items():
+        moved, missed = [], []
+        for logical, device_id in self.run.ids.items():
             device = self.device_by_id(device_id)
             state = self._phase_of(logical)
-            if device is None or not state or state[0] != index:
+            if device is None or not state:
+                missed.append(logical)       # where it is isn't known: check when it's back
                 continue
-            reply = self._call(device, f"GOTO:{index},{index + 1}")
+            if state[0] != index:
+                continue
+            try:
+                reply = self._call(device, f"GOTO:{index},{index + 1}")
+                self._read_status(device)
+            except LinkError as exc:
+                self._disconnect(device, str(exc))
+                reply = ""
             if reply.startswith("PHASE,"):
                 moved.append(logical)
-            self._read_status(device)
-        self.run.fnt_changes.append({"time": iso(self.now()), "from": index,
-                                     "to": index + 1, "why": why, "devices": moved})
+            else:
+                missed.append(logical)
+        change = {"time": iso(self.now()), "from": index, "to": index + 1, "why": why,
+                  "devices": moved}
+        if missed:
+            change["missed"] = missed
+        self.run.fnt_changes.append(change)
         self.run.save()
         self._log("", "phase advanced", f"{index} -> {index + 1} on {', '.join(moved)}: {why}")
 
@@ -800,7 +949,7 @@ class Engine:
         """Advance phase: the current phase must end on a manual condition."""
         if not self.run:
             return
-        phases = {s[0] for s in (self._phase_of(l) for l in self.run.binding) if s}
+        phases = {s[0] for s in (self._phase_of(l) for l in self.run.ids) if s}
         for index in sorted(phases):
             phase = self.run.compiled.phases[index]
             if any(c.kind == "manual" for c in phase.fnt):
@@ -811,7 +960,7 @@ class Engine:
     def cmd_stop(self):
         if not self.run or self.state != RUNNING:
             return
-        for logical, device_id in self.run.binding.items():
+        for logical, device_id in self.run.ids.items():
             device = self.device_by_id(device_id)
             if device is None:
                 self._log(logical, "not stopped", "not connected", "failed")
@@ -835,28 +984,35 @@ class Engine:
         """Back to Setup after a stopped run. Its rows are still copied."""
         if self.state == STOPPED:
             self.stopped[self.run.run_id] = self.run
+            self.run_names[self.run.run_id] = self.run.compiled.protocol.name
             self.run = None
             self.state = SETUP
-            self.problems = {k: p for k, p in self.problems.items() if p.kind == "firmware"}
+            self.preflight = {}
+            self.problems = {k: p for k, p in self.problems.items()
+                             if p.kind == "firmware" or p.kind.startswith("resume")}
 
-    def cmd_edit(self, protocol_text):
-        """Apply an edited protocol to the running devices."""
+    def cmd_clear_preflight(self):
+        """The protocol or the numbering changed: the last Start's checks are stale."""
+        self.preflight = {}
+
+    def cmd_edit(self, protocol_text, token=None):
+        """Apply an edited protocol to the running devices. The outcome is
+        kept in ``edit_result`` under ``token`` so the window can say so."""
+        self.edit_result = {"token": token, "error": None}
+        try:
+            self._edit(protocol_text)
+        except Exception as exc:
+            self.edit_result["error"] = str(exc)
+            raise
+
+    def current_phases(self):
+        return {l: (self._phase_of(l) or (0,))[0] for l in self.run.ids}
+
+    def _edit(self, protocol_text):
         if not self.run or self.state != RUNNING:
             raise RuntimeError("no run in progress")
-        protocol = proto.load(protocol_text)
-        if protocol.devices != self.run.compiled.protocol.devices:
-            raise RuntimeError("an edit can't change the list of devices")
-        compiled = proto.compile_protocol(protocol, seed=self.run.seed)
-        current = {l: (self._phase_of(l) or (0,))[0] for l in self.run.binding}
-        for logical, phase in current.items():
-            old = self.run.compiled.schedules[logical].phases
-            new = compiled.schedules[logical].phases
-            if len(new) <= phase or new[phase].name != old[phase].name:
-                raise RuntimeError(f"{logical} is in phase {phase} ({old[phase].name}); "
-                                   "an edit must keep it in place")
-            for index in range(phase):
-                if new[index] != old[index]:
-                    raise RuntimeError(f"phase {old[index].name} is over and can't change")
+        current = self.current_phases()
+        compiled = check_edit(self.run.compiled, protocol_text, current, self.run.seed)
         version = len(self.run.edits) + 2
         name = f"protocol.v{version}.yaml"
         with open(os.path.join(self.run.folder, name), "w", encoding="utf-8") as handle:
@@ -866,24 +1022,31 @@ class Engine:
         self.run.edits.append({"time": iso(self.now()), "file": name})
         self.run.write_schedules()
         self.run.save()
-        for logical, device_id in self.run.binding.items():
+        for logical, device_id in self.run.ids.items():
             device = self.device_by_id(device_id)
             if device is None:
+                self._log(logical, "edit waiting", "not connected; it gets the edit when "
+                                                   "it's back")
                 continue        # reconciled when it reconnects
             phase = current[logical]
-            reply = self._upload(device, compiled.schedules[logical], phase=phase)
-            if error(reply) and error(reply)[0] == "SCHED_STALE":
+            try:
+                reply = self._upload(device, compiled.schedules[logical], phase=phase)
+                if error(reply) and error(reply)[0] == "SCHED_STALE":
+                    self._read_status(device)
+                    reply = self._upload(device, compiled.schedules[logical],
+                                         phase=int(device.status.get("phase", phase)))
                 self._read_status(device)
-                reply = self._upload(device, compiled.schedules[logical],
-                                     phase=int(device.status.get("phase", phase)))
+            except LinkError as exc:
+                # Saved already: it's sent again when the device answers.
+                self._disconnect(device, str(exc))
+                reply = "not sent yet; it gets the edit when it's back"
             self._log(logical, "edit applied", reply)
-            self._read_status(device)
 
     # --- manual actions --------------------------------------------------
 
     def _device_for(self, who):
-        if self.run and who in self.run.binding:
-            return self.device_by_id(self.run.binding[who])
+        if self.run and who in self.run.ids:
+            return self.device_by_id(self.run.ids[who])
         if isinstance(who, int):
             return self.device_by_id(who)
         return self.devices.get(who)
@@ -912,13 +1075,41 @@ class Engine:
             self._log(self._name(target), "test cue", f"{cue}: {self._call(target, f'TEST:{cue}')}")
 
     def cmd_set_id(self, port, number):
+        """Renumber the FED3 on a port. If another FED3 plugged in has that
+        number, the two swap, so no two share one.
+
+        Refused for a FED3 in the running run. A FED3 in a stopped run still
+        records into it, so that run follows its new number."""
+        number = int(number)
         target = self.devices.get(port)
-        if target and target.connected:
-            reply = self._call(target, f"ID:{number}")
-            if reply.startswith("ID,"):
-                target.id = int(number)
-            self._log(self._name(target), "renumbered", reply)
-            self._duplicate_ids()
+        if not (target and target.connected) or number == target.id:
+            return
+        other = self.device_by_id(number)
+        moves = [(target, number)] + ([(other, target.id)] if other else [])
+        plans = []
+        for device, new in moves:
+            if not device.status:
+                self._read_status(device)
+            run_id = device.status.get("run")
+            if self.run and self.state == RUNNING and run_id == self.run.run_id:
+                raise RuntimeError(f"{self._name(device)} is in the running run; "
+                                   "renumber it after Stop")
+            run = self._run_by_id(run_id) if run_id not in (None, "-") else None
+            logical = run.logical_for(device.id) if run else None
+            plans.append((device, new, run, logical))
+        for device, new, run, logical in plans:
+            old = device.id
+            reply = self._call(device, f"ID:{new}")
+            if not reply.startswith("ID,"):
+                self._log(device.port, "renumber", f"FED{old:03d} -> FED{new:03d}: {reply}",
+                          "failed")
+                break
+            device.id = new
+            if logical:
+                run.renumber(logical, new, self.now())
+            self._log(f"FED{new:03d}", "renumbered", f"{device.port} was FED{old:03d}")
+        self.preflight = {}
+        self._duplicate_ids()
 
     def cmd_confirm_time(self, device):
         target = self._device_for(device)
@@ -927,20 +1118,59 @@ class Engine:
 
     # --- resuming ----------------------------------------------------------
 
+    @property
+    def roots(self):
+        return [self.runs_root] + [r for r in self.other_roots if r != self.runs_root]
+
+    def cmd_set_runs_root(self, path):
+        """Save new runs in ``path``. Runs in the old folder are still followed."""
+        if path == self.runs_root:
+            return
+        if self.runs_root not in self.other_roots:
+            self.other_roots.append(self.runs_root)
+        self.runs_root = path
+        self._searched.clear()
+
+    def _run_files(self):
+        """Every run.json in the run folders, newest first: (folder, data).
+        One that can't be read is reported once and skipped."""
+        found = []
+        for root in self.roots:
+            try:
+                names = os.listdir(root)
+            except OSError:
+                continue
+            for name in names:
+                path = os.path.join(root, name, RUN_FILE)
+                if not os.path.exists(path):
+                    continue
+                try:
+                    with open(path, encoding="utf-8") as handle:
+                        data = json.load(handle)
+                except (OSError, ValueError) as exc:
+                    self._problem("", f"resume:{path}", "", f"can't read {path}: {exc}")
+                    continue
+                if data.get("format") == RUN_FORMAT:
+                    found.append((name, os.path.dirname(path), data))
+        found.sort(key=lambda item: item[0], reverse=True)
+        return [(folder, data) for _, folder, data in found]
+
     def resume_latest(self):
-        """Pick up an unfinished run left by a crash or a closed window."""
-        if not os.path.isdir(self.runs_root):
-            return None
-        for name in sorted(os.listdir(self.runs_root), reverse=True):
-            path = os.path.join(self.runs_root, name, RUN_FILE)
-            if not os.path.exists(path):
+        """Pick up an unfinished run left by a crash or a closed window.
+
+        If it can't be loaded (a protocol this FNT can't read, a missing file)
+        it's reported and the window still opens; Setup then shows its FED3s
+        as still in that run, and won't end it without asking."""
+        for folder, data in self._run_files():
+            self.run_names[data.get("run_id")] = data.get("name", "?")
+            if data.get("state") != RUNNING or self.run:
                 continue
-            with open(path, encoding="utf-8") as handle:
-                data = json.load(handle)
-            if data.get("format") != RUN_FORMAT or data.get("state") != RUNNING:
+            try:
+                self.run = self._load_run(folder, data)
+            except Exception as exc:          # noqa: BLE001 - shown, not raised
+                self._problem("", "resume", "",
+                              f"couldn't pick up the unfinished run in {folder}: {exc}")
                 continue
-            folder = os.path.dirname(path)
-            self.run = self._load_run(folder, data)
             self.state = RUNNING
             self._log("", "run resumed", f"{data['name']} ({data['run_id']})")
             return folder
@@ -959,6 +1189,9 @@ class Engine:
         run.fnt_changes = data.get("fnt_phase_changes", [])
         run.stopped_at = data.get("stopped_at")
         run.ended = data.get("ended", {})
+        run.renumbered = data.get("renumbered", [])
+        for change in run.renumbered:
+            run.ids[change["device"]] = change["to"]
         return run
 
     # --- stopped runs ------------------------------------------------------
@@ -981,33 +1214,35 @@ class Engine:
 
     def _find_stopped(self, run_id):
         """A device reports a run FNT doesn't hold: if it's a stopped run in
-        runs_root, keep copying its rows there."""
+        the run folders, keep copying its rows there."""
         if self._run_by_id(run_id) or run_id in self._searched:
             return
         self._searched.add(run_id)
-        try:
-            names = os.listdir(self.runs_root)
-        except OSError:
-            return
-        for name in names:
-            path = os.path.join(self.runs_root, name, RUN_FILE)
-            try:
-                with open(path, encoding="utf-8") as handle:
-                    data = json.load(handle)
-            except (OSError, ValueError):
+        for folder, data in self._run_files():
+            if data.get("run_id") != run_id:
                 continue
-            if (data.get("format") != RUN_FORMAT or data.get("run_id") != run_id
-                    or data.get("state") != STOPPED):
-                continue
+            self.run_names[run_id] = data.get("name", "?")
+            if data.get("state") != STOPPED:
+                return
             try:
-                self.stopped[run_id] = self._load_run(os.path.dirname(path), data)
+                self.stopped[run_id] = self._load_run(folder, data)
             except (OSError, KeyError, proto.ProtocolError):
                 return
             self._log("", "copying a stopped run", f"{data.get('name')} ({run_id})", quiet=True)
             return
 
+    def _in_live_run(self, device):
+        """In a run that hasn't ended, other than the one running here."""
+        run_id = device.status.get("run")
+        return (run_id not in (None, "-") and device.status.get("ended") == "0"
+                and not (self.run and run_id == self.run.run_id))
+
+    def _run_label(self, run_id):
+        name = self.run_names.get(run_id)
+        return f"'{name}' ({run_id})" if name else run_id
+
     def _stopped_step(self, run):
-        for logical, device_id in run.binding.items():
+        for logical, device_id in run.ids.items():
             device = self.device_by_id(device_id)
             if device is None or device.status.get("run") != run.run_id:
                 continue
@@ -1041,13 +1276,16 @@ class Engine:
                 "name": self._name(device), "rows": list(device.rows)[-50:],
                 "last_row": dict(device.last_row),
                 "lights": device.status.get("lights") == "1",
+                "live_run": self._in_live_run(device),
+                "run_label": (self._run_label(device.status["run"])
+                              if device.status.get("run") not in (None, "-") else ""),
             })
         run = None
         if self.run:
             run = {
                 "folder": self.run.folder, "run_id": self.run.run_id,
                 "name": self.run.compiled.protocol.name, "t0": self.run.t0,
-                "binding": dict(self.run.binding), "state": self.run.state,
+                "binding": dict(self.run.ids), "state": self.run.state,
                 "phases": [p.name for p in self.run.compiled.phases],
                 "manual": [any(c.kind == "manual" for c in p.fnt)
                            for p in self.run.compiled.phases],
@@ -1057,12 +1295,15 @@ class Engine:
                           for l, s in self.run.compiled.schedules.items()},
                 "actives": {l: [p.rule["active"] for p in s.phases]
                             for l, s in self.run.compiled.schedules.items()},
+                "seed": self.run.seed, "stopped_at": self.run.stopped_at,
+                "current": self.current_phases(),
             }
         snapshot = {
             "state": self.state, "now": self.now(), "zone": self.zone,
             "devices": devices, "run": run, "preflight": dict(self.preflight),
             "problems": [vars(p).copy() for p in self.problems.values()],
             "events": list(self.events)[-100:], "event_count": self.event_count,
+            "edit_result": dict(self.edit_result) if self.edit_result else None,
         }
         with self.lock:
             self._snapshot = snapshot

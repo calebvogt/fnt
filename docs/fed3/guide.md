@@ -15,14 +15,21 @@ and it picks the run back up.
 1. **Flash every FED3 with firmware v3** (`fnt-fed3`; 3.1 adds **Lights**).
    - Devices on older firmware show up in FED3 with a warning and aren't used.
    - On 3.0 everything works except Lights.
-2. **Give each one a number.**
-   - Plug them in one at a time.
-   - Open **FNT → FED → FED3** and choose its number in Setup's **ID** list.
-   - The number is stored on the device's SD card, and labels its data files.
+2. **Give each one its own ID.** A FED3's ID is its one name: on its screen,
+   in your protocols, in its data file and on FNT's screens, e.g. `FED007`.
+   A newly flashed FED3 is FED001. Set it either way; it's kept on the SD card,
+   so it's a one-time job:
+   - **On the FED3:** power it on, and while the screen shows `FED3 ID`, hold
+     both pokes for a second. Left poke −1, right poke +1 (hold to go faster).
+     It saves after 4 seconds without a poke. (Not offered during a run.)
+   - **In FNT:** **FNT → FED → FED3**, then type the ID in the **ID** box on
+     that FED3's row in Setup and press Enter: `7`, `007` or `FED007`, any
+     number from 1 to 999. **Lights** shows which FED3 a row is.
 
 ## Writing a protocol
 
-A protocol is a short YAML file: phases, each with a rule and a way to end.
+A protocol is a short YAML file: the FED3s it uses, by ID (`devices: [FED001,
+FED002]`), and phases, each with a rule and a way to end.
 
 - **Start from a template.** In Setup, **New…** opens the editor; **New from
   template** has:
@@ -69,16 +76,22 @@ daylight saving. FNT labels every time it shows with its zone.
 ## Starting a run
 
 Setup has the protocol and its timeline on the left, and every FED3 plugged
-in on the right, one row each: Port, ID, Status, and Tests (Lights, Tone,
-Feed).
+in on the right, one row each in port order: Port, ID, Status, and Tests
+(Lights, Tone, Feed). A row always shows the same FED3. The bar across the top
+says how many of the protocol's FED3s are plugged in.
 
 1. **Choose the protocol** (**Open…**).
-2. **Number the FED3s to match it.** A FED3's number is its place in the
-   protocol: FED001 plays the first device listed in `devices:`, FED002 the
-   second, and so on. Status says which (`plays P1`).
-   - Choose a number in a FED3's **ID** list to renumber it. Choosing one
-     another FED3 has swaps the two.
-   - The number is kept on the FED3's card, so this is a one-time job.
+2. **Plug in the FED3s it names.** Setup lists them (`This protocol uses
+   FED001, FED002`) and shows their IDs in the colour each has on the cards
+   and plot. A FED3 the protocol doesn't name shows `not in this protocol`
+   and isn't used.
+   - If one is missing, Setup says so (`FED004 isn't plugged in`). Plug it in,
+     or type that ID in another FED3's **ID** box.
+   - Typing an ID another FED3 has swaps the two, and Setup says so. Two
+     FED3s can't share an ID, because their data files are named by it.
+   - A FED3 can't be renumbered during a run. After Stop it can: the stopped
+     run's copy keeps following it under its new number, and `run.json`
+     records the change.
    - **Lights** lights a FED3's bar and pokes white until you press it again, so
      you can see which is which. They go dark when the run starts.
    - The status column shows whether the device is ready: clock, SD card and
@@ -93,8 +106,19 @@ Feed).
    - If any device fails, nothing starts and the reason shows on that device's
      row.
    - Otherwise every device starts at the same moment.
+   - **A FED3 still in a run that was never stopped** (its row says `still in
+     run …`) isn't started over without asking. This happens when FNT couldn't
+     pick that run back up, for example because it was saved in another
+     folder. Start names the FED3s and the run and asks: **Cancel**, then
+     **Change folder…** to that run's folder, to keep it going; **End it and
+     start** ends it on those FED3s first.
+   - FED3s still recording into a stopped run are listed under the table;
+     starting a new run on them ends that.
 
-Runs are saved in `Documents/FED3_Runs` unless you choose another folder.
+Runs are saved in `Documents/FED3_Runs` unless you choose another folder. Runs
+in folders used before are still followed: a stopped run keeps copying, and an
+unfinished one is picked back up. If FNT can't read or load one, it says so in
+Setup instead of failing to open.
 
 ## During a run
 
@@ -112,8 +136,11 @@ Stopped**, with a note on the current step.
   A problem stays on the card, outlined in red, until you press
   **Acknowledge**, even if it has cleared, so an overnight jam is still visible
   in the morning.
-- **Feed**, **Test cue…** and **Set clock** on a card feed a pellet by hand,
-  play a cue, or set the device's clock even across a big jump.
+- **Feed** on a card dispenses a pellet by hand (recorded as manual: a pellet,
+  not a reward). **More ▾** has **Play a cue…** and **Set its clock now…**,
+  which sets the clock even across a big jump, after asking.
+- **The counts on the drawing** are left pokes, pellets and right pokes, as
+  labelled under it.
 - **The plot** runs across the top at full width: cumulative pellets per
   device, with phase changes dotted and Stop dashed. The menu in its title
   draws the time axis in standard time (as the devices keep it), local time
@@ -127,7 +154,14 @@ Stopped**, with a note on the current step.
 - **Edit protocol…** changes the protocol mid-run.
   - Phases already over can't change.
   - The current phase can, and the change applies at once.
+  - The editor says as you type if the running devices can't take an edit,
+    and won't apply it. If one moves on to the next phase while you're
+    editing and the edit no longer fits, FNT says so and reopens the editor
+    with your changes.
+  - A FED3 that's unplugged when you apply gets the edit when it's back.
   - Each version is kept in the run folder.
+- **Phases FNT moves** (counts across devices, or by hand): a FED3 that's
+  unplugged at that moment is moved on as soon as it's back.
 - **Advance phase** appears only when the current phase ends by hand.
 - **Closing the window** doesn't stop the run. The devices keep running and
   recording to their SD cards; when you reopen FED3, FNT copies what it
@@ -158,10 +192,10 @@ To separate the experiment from what came after it:
 
 | File | |
 | --- | --- |
-| `run.json` | The run: protocol hash, which FED3 played which device, start time, rotation seed, edits, phase changes FNT made, when Stop was pressed (`stopped_at`), and where each device's data after Stop begins (`ended`). |
+| `run.json` | The run: protocol hash, which FED3 played which device, start time, rotation seed, edits, phase changes FNT made (with any device that missed one, under `missed`, until it's caught up), when Stop was pressed (`stopped_at`), where each device's data after Stop begins (`ended`), and any FED3 renumbered after Stop (`renumbered`). |
 | `protocol.yaml` | The protocol exactly as started, plus `protocol.v2.yaml` and so on after edits. |
-| `sched/<device>.txt` | What each device was sent. |
-| `<device>_FED<nnn>.csv` | A byte-identical copy of that device's data file for the run, including what it recorded after Stop. |
+| `sched/FED<nnn>.txt` | What each FED3 was sent. |
+| `FED<nnn>.csv` | A byte-identical copy of that FED3's data file for the run, including what it recorded after Stop. |
 | `log.csv` | Everything FNT did and noticed, in UTC. |
 
 The data columns are described in [design.md](design.md), Part 3.

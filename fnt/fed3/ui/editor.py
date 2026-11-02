@@ -417,7 +417,7 @@ def _classic(name, phase, explain, **settings):
             f"name: {_plain(name)}\n"
             f"description: >\n"
             + "".join(f"  {line}\n" for line in explain.splitlines())
-            + "devices: [FED]\n"
+            + "devices: [FED001]\n"
               "phases:\n"
             + phase_yaml(s))
 
@@ -482,7 +482,7 @@ name: Timed feeding 19:00-21:00
 description: >
   Classic FED3 Timed feeding: free feeding between two clock times each
   day, nothing outside them. Change the window's from and to.
-devices: [FED]
+devices: [FED001]
 phases:
   - name: Restricted
     all: {active: none}
@@ -509,7 +509,7 @@ EXAMPLES = {
     "FR1, both pokes, with a cue": """\
 format: fnt-fed3-protocol/1
 name: FR1 both pokes
-devices: [FED]
+devices: [FED001]
 phases:
   - name: FR1
     all:
@@ -522,7 +522,7 @@ phases:
     "Step up the ratio by rewards": """\
 format: fnt-fed3-protocol/1
 name: FR1 to FR5, both pokes
-devices: [FED]
+devices: [FED001]
 
 cues:
   reward:
@@ -548,7 +548,7 @@ name: Four-patch competition
 description: >
   Two rich and two poor patches that each refill hourly. Which patches are
   rich is reshuffled every day at lights-off.
-devices: [P1, P2, P3, P4]
+devices: [FED001, FED002, FED003, FED004]
 
 cues:
   reward:
@@ -577,7 +577,7 @@ phases:
       every: 1d
       at: "19:00"
       mode: shuffle
-      assign: {P1: rich, P2: rich, P3: poor, P4: poor}
+      assign: {FED001: rich, FED002: rich, FED003: poor, FED004: poor}
 
   - name: Recovery
     all: {active: none, free_feed: 1}
@@ -870,15 +870,18 @@ class PhaseDialog(QDialog):
 # ---------------------------------------------------------------------------
 
 class ProtocolEditor(QDialog):
-    """Edit a protocol. ``running`` locks it to edits a running run accepts."""
+    """Edit a protocol. ``running`` locks it to edits a running run accepts:
+    ``edit_check(text)`` says why the run can't take the text, or None."""
 
-    def __init__(self, text="", parent=None, path=None, running=False, t0=None):
+    def __init__(self, text="", parent=None, path=None, running=False, t0=None,
+                 edit_check=None):
         super().__init__(parent)
         self.setWindowTitle("Edit protocol" if not running else "Edit the running protocol")
         self.resize(1200, 760)
         self.path = path
         self.running = running
         self.t0 = t0
+        self.edit_check = edit_check
         self.compiled = None
         self.problems = []
 
@@ -1030,7 +1033,14 @@ class ProtocolEditor(QDialog):
             self.sent.setPlainText("\n".join(
                 f"── {name} ({sch.plural(len(s.phases), 'phase')}, crc {s.crc():08x})\n{s.text()}"
                 for name, s in c.schedules.items()))
-        self.ok.setEnabled(not errors)
+        refused = None
+        if not errors and self.edit_check:
+            refused = self.edit_check(self.text())
+            if refused:
+                self.verdict.setText(f"✗ The running devices can't take this: {refused}")
+                self.verdict.setStyleSheet(f"color: {theme.BAD}; font-weight: bold;")
+                self.verdict.setWordWrap(True)
+        self.ok.setEnabled(not errors and not refused)
 
     def _jump(self, item):
         self._go_to_line(item.data(Qt.UserRole))

@@ -33,7 +33,7 @@ def at(day, hour, minute=0, second=0):
     return datetime(2026, 10, day, hour, minute, second, tzinfo=TZ)
 
 
-def compile_one(phases, devices="[A]", extra="", seed=None):
+def compile_one(phases, devices="[FED001]", extra="", seed=None):
     text = (f"format: {proto.FORMAT}\nname: Test\ndevices: {devices}\n{extra}"
             f"phases:\n{phases}")
     return proto.compile_protocol(proto.load(text), seed=seed)
@@ -64,7 +64,7 @@ def outcomes(device):
     return [r["outcome"] for r in rows(device, "poke")]
 
 
-def fresh(phases, devices="[A]", extra="", now=None, seed=None):
+def fresh(phases, devices="[FED001]", extra="", now=None, seed=None):
     compiled = compile_one(phases, devices, extra, seed)
     device = MAKE(device_id=3, now=now or at(20, 9))
     reply = start(device, compiled.schedules[compiled.protocol.devices[0]])
@@ -124,7 +124,7 @@ def main(make=None):
   - name: Both
     all: {active: both}
 """)
-    schedule = compiled.schedules["A"]
+    schedule = compiled.schedules["FED001"]
     device = MAKE(device_id=3, now=at(20, 9))
     replies, commit = upload(device, schedule)
     check("every line is accepted", all(r == "OK" for r in replies))
@@ -361,12 +361,12 @@ def main(make=None):
     all: {active: none, free_feed: 1}
   - name: Rot
     until: {after: 3d}
-    rotate: {every: 1d, at: "19:00", mode: cycle, assign: {A: rich, B: poor}}
+    rotate: {every: 1d, at: "19:00", mode: cycle, assign: {FED001: rich, FED002: poor}}
   - name: End
     all: {active: none, free_feed: 1}
-""", devices="[A, B]", extra="rules:\n  rich: {ratio: 1}\n  poor: {ratio: 5}\n")
+""", devices="[FED001, FED002]", extra="rules:\n  rich: {ratio: 1}\n  poor: {ratio: 5}\n")
     device = MAKE(now=at(20, 9))
-    start(device, rotating.schedules["A"])
+    start(device, rotating.schedules["FED001"])
     device.advance(6 * 86400)
     changes = [(r["time"], r["detail"]) for r in rows(device, "phase")]
     expected = [(dev.iso(at(21, 19)), "Rot 1"), (dev.iso(at(22, 19)), "Rot 2"),
@@ -374,7 +374,7 @@ def main(make=None):
     check("each phase changes at 19:00, day after day", changes == expected, f"{changes}")
 
     device = MAKE(now=at(20, 9))
-    start(device, rotating.schedules["A"])
+    start(device, rotating.schedules["FED001"])
     device.advance(3600)
     device.power_off(3 * 86400)
     changes = [r["detail"] for r in rows(device, "phase")]
@@ -497,14 +497,14 @@ def main(make=None):
 """)
     device.advance(3600)
     device.poke("L")
-    _, reply = upload(device, edited.schedules["A"], phase=0)
+    _, reply = upload(device, edited.schedules["FED001"], phase=0)
     check("an edit applies at once", reply.endswith("slot=now")
           and sch.summarize(device.rule()) == "FR2 · left")
     check("counts in the phase carry over", status(device)["phase_left"] == "1")
     device.advance(3600 + 1)
     check("its new end time counts from the original phase start",
           rows(device, "phase")[-1]["time"] == dev.iso(at(20, 11)))
-    _, reply = upload(device, edited.schedules["A"], phase=0)
+    _, reply = upload(device, edited.schedules["FED001"], phase=0)
     check("an edit for a phase the device has left is refused",
           reply.startswith("ERR,SCHED_STALE,phase=1"))
 
@@ -541,14 +541,14 @@ def main(make=None):
     all: {active: both, cue: {reward: [click]}}
   - name: Rot
     until: {after: 3d}
-    rotate: {every: 1d, at: "19:00", mode: cycle, assign: {A: rich, B: poor}}
+    rotate: {every: 1d, at: "19:00", mode: cycle, assign: {FED001: rich, FED002: poor}}
   - name: End
     all: {active: none, free_feed: 1}
-""", devices="[A, B]", extra="rules:\n  rich: {active: both, quota: 20, quota_period: 1h}\n"
+""", devices="[FED001, FED002]", extra="rules:\n  rich: {active: both, quota: 20, quota_period: 1h}\n"
                              "  poor: {active: both, ratio: 5}\n")
     rng = random.Random(5)
     device = MAKE(now=at(20, 9), seed=5)
-    start(device, weekly.schedules["A"])
+    start(device, weekly.schedules["FED001"])
     elapsed = 0.0
     while elapsed < 8 * 86400:
         roll = rng.random()

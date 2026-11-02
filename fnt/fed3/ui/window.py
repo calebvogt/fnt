@@ -49,7 +49,8 @@ class FedWindow(QMainWindow):
             self.engine = Engine(root, ports=self.world.ports, open_port=self.world.open,
                                  now=self.world.now, monotonic=self.world.monotonic)
         else:
-            self.engine = Engine(root)
+            known = self.settings.value("runs_roots", []) or []
+            self.engine = Engine(root, other_roots=[known] if isinstance(known, str) else known)
         resumed = self.engine.resume_latest()
 
         self.stack = QStackedWidget()
@@ -110,6 +111,7 @@ class FedWindow(QMainWindow):
                 self.stack.setCurrentWidget(self.setup_view)
             self.setup_view.update_view(snapshot)
         else:
+            self.setup_view.left_setup()
             if self.stack.currentWidget() is not self.run_view:
                 self.stack.setCurrentWidget(self.run_view)
             self.run_view.update_view(snapshot)
@@ -117,7 +119,7 @@ class FedWindow(QMainWindow):
     def _stage_note(self, snapshot):
         run = snapshot.get("run")
         if snapshot["state"] == "setup":
-            return self.setup_view.start_note.text() or "Ready to start"
+            return self.setup_view.stage_note()
         elapsed = format_delta((snapshot["now"] - run["t0"]).total_seconds())
         if snapshot["state"] == "running":
             return f"{run['name']} · {elapsed} since t0"

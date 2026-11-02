@@ -24,6 +24,9 @@ POKE_RADIUS = 0.0953
 LEFT_POKE = (0.2501, 0.6444)
 RIGHT_POKE = (0.7488, 0.6426)
 WELL = (0.4108, 0.6095, 0.1772, 0.1677)
+CAPTION = 14                        # px under the drawing saying what each count is
+CAPTIONS = (("left", LEFT_POKE[0]), ("pellets", WELL[0] + WELL[2] / 2),
+            ("right", RIGHT_POKE[0]))
 
 
 def _svg_path():
@@ -40,8 +43,14 @@ class FedGraphic(QWidget):
         self.counts = None              # None: nothing known yet
         self.connected = False
         self.flashing = {}
+        # Owned by the widget, so it dies with it: a flash ending after the
+        # card is gone (window closed, new run) must not touch it.
+        self.flash_timer = QTimer(self)
+        self.flash_timer.setSingleShot(True)
+        self.flash_timer.setInterval(FLASH_MS)
+        self.flash_timer.timeout.connect(self._end_flash)
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        self.setFixedHeight(118)
+        self.setFixedHeight(118 + CAPTION)
         self.setMinimumWidth(150)
 
     def set_state(self, counts, connected):
@@ -57,14 +66,18 @@ class FedGraphic(QWidget):
 
     def _flash(self, key):
         self.flashing[key] = FLASH[key]
-        QTimer.singleShot(FLASH_MS, lambda: (self.flashing.pop(key, None), self.update()))
+        self.flash_timer.start()
+
+    def _end_flash(self):
+        self.flashing.clear()
+        self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         if not self.connected:
             painter.setOpacity(0.45)
-        width, height = self.width(), self.height()
+        width, height = self.width(), self.height() - CAPTION
         if width / max(height, 1) > ASPECT:
             draw_h, draw_w = height, int(height * ASPECT)
         else:
@@ -86,6 +99,14 @@ class FedGraphic(QWidget):
         rect = QRect(x0 + int(draw_w * fx), y0 + int(draw_h * fy),
                      int(draw_w * fw), int(draw_h * fh))
         self._badge(painter, rect, "pellets", circle=False)
+        caption = QFont()
+        caption.setPixelSize(10)
+        painter.setFont(caption)
+        painter.setPen(QColor(150, 150, 150))
+        for text, fx in CAPTIONS:
+            centre = x0 + int(draw_w * fx)
+            painter.drawText(QRect(centre - 30, y0 + draw_h + 1, 60, CAPTION - 1),
+                             Qt.AlignHCenter | Qt.AlignTop, text)
         painter.end()
 
     def _badge(self, painter, rect, key, circle):
@@ -109,4 +130,4 @@ class FedGraphic(QWidget):
         painter.setFont(font)
 
     def sizeHint(self):
-        return QSize(int(118 * ASPECT), 118)
+        return QSize(int(118 * ASPECT), 118 + CAPTION)

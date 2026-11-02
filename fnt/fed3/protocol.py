@@ -7,7 +7,7 @@ device. No Qt: the CLI, the editor, the run engine and the tests all share it.
 
     protocol = load(text)                 # raises ProtocolError
     compiled = compile_protocol(protocol, seed=1234)
-    compiled.schedules["P1"].text()
+    compiled.schedules["FED001"].text()
     preview(compiled, t0)
 """
 from __future__ import annotations
@@ -24,7 +24,7 @@ from . import schedule as sch
 
 FORMAT = "fnt-fed3-protocol/1"
 MAX_PROTOCOL_NAME = 60
-DEVICE_NAME = re.compile(r"[A-Za-z0-9_-]{1,16}")
+DEVICE_NAME = re.compile(r"FED(?!000)\d{3}")     # a FED3's ID, as on its screen and in FNT
 BUILTIN_COLORS = {
     "white": (0, 0, 0, 40),
     "red": (30, 0, 0, 0),
@@ -688,13 +688,13 @@ class _Parser:
         devices = root.get("devices")
         if (not isinstance(devices, list) or not devices
                 or not all(isinstance(d, str) for d in devices)):
-            self.error(root.line_of("devices"), "devices is a list of names, "
-                                                "e.g. [A, B]")
+            self.error(root.line_of("devices"), "devices is a list of FED3 IDs, "
+                                                "e.g. [FED001, FED002]")
             devices = []
         for device in devices:
             if not DEVICE_NAME.fullmatch(device):
-                self.error(root.line_of("devices"), f"device name '{device}' "
-                           "must be 1-16 letters, digits, - or _")
+                self.error(root.line_of("devices"), f"'{device}' isn't a FED3 ID: write "
+                           "FED and three digits, as on the FED3's screen, e.g. FED001")
         if len(set(devices)) != len(devices):
             self.error(root.line_of("devices"), "device names must be unique")
         self.devices = devices
@@ -1046,7 +1046,7 @@ def preview_text(compiled, t0, days=None):
         else:
             starts = "after the previous phase"
         fnt = "  [needs FNT]" if row.needs_fnt else ""
-        out.append(f"\n{row.index:>3}  {row.name}{fnt}")
+        out.append(f"\n{row.index + 1:>3}  {row.name}{fnt}")   # 1-based, as the window shows them
         out.append(f"     starts  {starts}")
         out.append(f"     ends    {row.ends}")
         rules = set(row.rules.values())

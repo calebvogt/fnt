@@ -55,7 +55,7 @@ def has_error(text, fragment, line=None):
 
 
 def protocol_text(phases, extra=""):
-    return (f"format: {proto.FORMAT}\nname: Test\ndevices: [A, B]\n{extra}"
+    return (f"format: {proto.FORMAT}\nname: Test\ndevices: [FED001, FED002]\n{extra}"
             f"phases:\n{phases}")
 
 
@@ -173,16 +173,16 @@ def main():
     stepped = by_name.get("FR1 to FR5, both pokes")
     compiled_doc = [b for b in schedules if b.startswith("NAME FR1 to FR5")]
     check("example 1 compiles to exactly the text the doc shows",
-          stepped and compiled_doc and stepped.schedules["FED"].text() == compiled_doc[0])
+          stepped and compiled_doc and stepped.schedules["FED001"].text() == compiled_doc[0])
     four = by_name.get("Four-patch competition")
     sample = [b for b in schedules if b.startswith("NAME Four-patch")]
     if four and sample:
         shown = [l for l in sample[0].splitlines() if l != "…"]
-        actual = four.schedules["P1"].lines()[:len(shown)]
-        check("the Part 2 sample matches P1's compiled schedule", shown == actual,
+        actual = four.schedules["FED001"].lines()[:len(shown)]
+        check("the Part 2 sample matches FED001's compiled schedule", shown == actual,
               "" if shown == actual else f"\n      doc: {shown}\n      got: {actual}")
     else:
-        check("the Part 2 sample matches P1's compiled schedule", False, "missing")
+        check("the Part 2 sample matches FED001's compiled schedule", False, "missing")
 
     print("\n--- schedule text: what the device would parse ---")
     for compiled in filter(None, compiled_examples):
@@ -194,8 +194,8 @@ def main():
             check(f"{compiled.protocol.name} / {device}: every line fits",
                   all(len(l) <= sch.MAX_LINE for l in schedule.lines()))
     check("the crc is CRC-32 of the text",
-          stepped.schedules["FED"].crc()
-          == __import__("zlib").crc32(stepped.schedules["FED"].text().encode()))
+          stepped.schedules["FED001"].crc()
+          == __import__("zlib").crc32(stepped.schedules["FED001"].text().encode()))
 
     def bad(text):
         try:
@@ -241,18 +241,26 @@ def main():
     all: {active: both}
 """)
     compiled, _ = proto.check(text)
-    plain = compiled.schedules["A"].phases[1].rule
+    plain = compiled.schedules["FED001"].phases[1].rule
     check("a phase does not inherit the previous phase's ratio",
           plain["ratio"] == "1" and plain["timeout"] == "0")
     check("durations become seconds",
-          compiled.schedules["A"].phases[0].rule["timeout"] == "30")
+          compiled.schedules["FED001"].phases[0].rule["timeout"] == "30")
+
+    print("\n--- devices are FED3 IDs ---")
+    named = protocol_text("  - name: Only\n    all: {active: both}\n")
+    check("FED3 IDs are the device names", not has_error(named, "isn't a FED3 ID"))
+    check("any other name is refused, saying how to write one",
+          has_error(named.replace("FED002", "B"), "'B' isn't a FED3 ID", line=3)
+          and has_error(named.replace("FED002", "FED2"), "e.g. FED001")
+          and has_error(named.replace("FED002", "FED000"), "isn't a FED3 ID"))
 
     print("\n--- rules: names, use, and merge order ---")
     text = protocol_text("""\
   - name: One
     until: {after: 1d}
     all: base
-    devices: {B: {use: base, ratio: 3, cue: {counted: [click]}}}
+    devices: {FED002: {use: base, ratio: 3, cue: {counted: [click]}}}
   - name: Two
     all: {active: none, free_feed: true}
 """, extra="""\
@@ -262,13 +270,13 @@ rules:
   base: {active: both, cue: {reward: ding}}
 """)
     compiled, problems = proto.check(text)
-    a, b = (compiled.schedules[d].phases[0].rule for d in "AB")
+    a, b = (compiled.schedules[d].phases[0].rule for d in ("FED001", "FED002"))
     check("a named rule applies", a["active"] == "both" and a["cue.reward"] == "tone:3000:100")
     check("a device override keeps the rule it uses",
           b["ratio"] == "3" and b["cue.reward"] == "tone:3000:100"
           and b["cue.counted"] == "click")
     check("other devices are untouched by it", a["ratio"] == "1" and a["cue.counted"] == "none")
-    check("true becomes 1", compiled.schedules["A"].phases[1].rule["free_feed"] == "1")
+    check("true becomes 1", compiled.schedules["FED001"].phases[1].rule["free_feed"] == "1")
 
     print("\n--- rotation ---")
     rotating = protocol_text("""\
@@ -278,7 +286,7 @@ rules:
       every: 1d
       at: "19:00"
       mode: MODE
-      assign: {A: rich, B: poor}
+      assign: {FED001: rich, FED002: poor}
   - name: End
     all: {active: none, free_feed: 1}
 """, extra="""\
@@ -290,14 +298,14 @@ rules:
     names = [p.name for p in cycle.phases]
     check("a rotation expands into one phase per period",
           names == ["Rot 1", "Rot 2", "Rot 3", "Rot 4", "End"], f"{names}")
-    ratios = [[cycle.schedules[d].phases[i].rule["ratio"] for i in range(4)] for d in "AB"]
+    ratios = [[cycle.schedules[d].phases[i].rule["ratio"] for i in range(4)] for d in ("FED001", "FED002")]
     check("cycle alternates the assignment", ratios == [["1", "5", "1", "5"],
                                                         ["5", "1", "5", "1"]], f"{ratios}")
     check("each period ends at the next 19:00",
           all(p.untils == [sch.Until("at", clock=1140)] for p in cycle.phases[:4]))
     check("every device gets the same phases",
-          [p.name for p in cycle.schedules["A"].phases]
-          == [p.name for p in cycle.schedules["B"].phases])
+          [p.name for p in cycle.schedules["FED001"].phases]
+          == [p.name for p in cycle.schedules["FED002"].phases])
 
     shuffled = proto.load(rotating.replace("MODE", "shuffle"))
     check("a shuffle won't compile without a seed",
@@ -305,16 +313,16 @@ rules:
     first = proto.compile_protocol(shuffled, seed=42)
     again = proto.compile_protocol(shuffled, seed=42)
     check("the same seed gives the same schedules",
-          all(first.schedules[d].text() == again.schedules[d].text() for d in "AB"),
+          all(first.schedules[d].text() == again.schedules[d].text() for d in ("FED001", "FED002")),
           "a resumed run must rebuild exactly what the devices hold")
     labels = [sorted(p.labels.values()) for p in first.phases[:4]]
     check("each period deals out the same set of rules",
           all(l == ["poor", "rich"] for l in labels))
     check("the first period is the assignment as written",
-          first.phases[0].labels == {"A": "rich", "B": "poor"})
+          first.phases[0].labels == {"FED001": "rich", "FED002": "poor"})
     seeds_differ = any(
-        proto.compile_protocol(shuffled, seed=s).schedules["A"].text()
-        != first.schedules["A"].text() for s in range(1, 20))
+        proto.compile_protocol(shuffled, seed=s).schedules["FED001"].text()
+        != first.schedules["FED001"].text() for s in range(1, 20))
     check("other seeds give other sequences", seeds_differ)
 
     check("a rotation must last whole periods",
@@ -324,7 +332,7 @@ rules:
           has_error(rotating.replace("every: 1d", "every: 12h").replace("MODE", "cycle"),
                     "every: 1d"))
     check("an unknown rule in assign is found",
-          has_error(rotating.replace("B: poor", "B: pour").replace("MODE", "cycle"),
+          has_error(rotating.replace("FED002: poor", "FED002: pour").replace("MODE", "cycle"),
                     "did you mean 'poor'"))
 
     print("\n--- conditions that need FNT ---")
@@ -355,19 +363,19 @@ rules:
     all: {active: none}
     daily:
       - {from: "19:00", to: "21:00", all: {free_feed: 1}}
-      - {from: "22:00", to: "23:00", devices: {B: {ratio: 3}}}
+      - {from: "22:00", to: "23:00", devices: {FED002: {ratio: 3}}}
 """)
     compiled, _ = proto.check(text)
-    a_windows = compiled.schedules["A"].phases[0].windows
-    b_windows = compiled.schedules["B"].phases[0].windows
+    a_windows = compiled.schedules["FED001"].phases[0].windows
+    b_windows = compiled.schedules["FED002"].phases[0].windows
     check("a window for all devices reaches every device",
           a_windows[0].settings == {"free_feed": "1"})
     check("a window for one device reaches only that device",
           len(a_windows) == 1 and len(b_windows) == 2
           and b_windows[1].settings == {"ratio": "3"})
     check("the rule in force follows the window",
-          compiled.schedules["A"].phases[0].rule_at(at(20, 20))["free_feed"] == "1"
-          and compiled.schedules["A"].phases[0].rule_at(at(20, 21))["free_feed"] == "0")
+          compiled.schedules["FED001"].phases[0].rule_at(at(20, 20))["free_feed"] == "1"
+          and compiled.schedules["FED001"].phases[0].rule_at(at(20, 21))["free_feed"] == "0")
 
     print("\n--- mistakes are reported where they are ---")
     good = protocol_text("""\
@@ -429,7 +437,7 @@ rules:
           has_error(protocol_text("""\
   - name: One
     until: {after: 1d}
-    rotate: {every: 0s, assign: {A: x, B: x}}
+    rotate: {every: 0s, assign: {FED001: x, FED002: x}}
   - name: Two
 """, extra="rules:\n  x: {ratio: 2}\n"), "at least 1m"))
     check("an unknown device is found",
@@ -466,7 +474,7 @@ rules:
           has_error(protocol_text("""\
   - name: Hourly
     until: {after: 11d}
-    rotate: {every: 1h, assign: {A: x, B: x}}
+    rotate: {every: 1h, assign: {FED001: x, FED002: x}}
   - name: End
 """, extra="rules:\n  x: {ratio: 2}\n"), "phases"))
     check("non-ASCII names are refused before they reach a device",
@@ -502,7 +510,7 @@ rules:
         with redirect_stdout(out), redirect_stderr(err):
             code_good = cli.main(["check", good_path])
             code_bad = cli.main(["check", bad_path])
-            cli.main(["compile", good_path, "--device", "P1", "--seed", "3"])
+            cli.main(["compile", good_path, "--device", "FED001", "--seed", "3"])
             cli.main(["preview", good_path, "--seed", "3", "--start",
                       "2026-10-20T09:00", "--days", "5"])
         check("check passes a good file", code_good == 0)
