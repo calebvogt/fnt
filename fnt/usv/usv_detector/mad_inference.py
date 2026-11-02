@@ -17,6 +17,7 @@ from __future__ import annotations
 import csv
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -57,7 +58,13 @@ class MADInferenceConfig:
     # Time-column budget for the per-chunk float32 accumulator; bounds peak RAM
     # independently of recording length. See infer_probability_mask.
     chunk_frames: int = DEFAULT_CHUNK_FRAMES
-    save_blob_csv: bool = True
+    #: Write a CSV alongside the run. Off by default: the store holds every
+    #: detection, and a CSV that is only ever regenerated cannot drift from it.
+    save_blob_csv: bool = False
+    #: Re-attempt errored files once, after the main pass. On by default: the
+    #: usual batch failure is transient memory pressure, not a bad recording,
+    #: and losing a quarter of an overnight run to it is the worse outcome.
+    retry_failed: bool = True
     # If True (default), the probability mask is zeroed out in any time
     # column that already contains a confirmed call for this file (rebuilt
     # from the example store via
@@ -67,12 +74,34 @@ class MADInferenceConfig:
     # Example store used to look up confirmed labels for preserve_labels.
     training_data_dir: str = ""
     # Merge consecutive detections that belong to one call but surfaced as
-    # separate blobs (tile seams, brief sub-threshold dips). Off by default.
-    # ``merge_max_gap_s`` is the largest time gap bridged; freq-overlap gating
-    # keeps time-adjacent but frequency-separated calls (harmonics) distinct.
-    merge_consecutive: bool = False
+    # separate blobs (brief sub-threshold dips mid-call). ON by default: a
+    # connected component needs a contiguous above-threshold path, so a long
+    # whistle that dips for a few frames splits into fragments, and reporting
+    # one call as six is worse than the rare over-merge. ``merge_max_gap_s``
+    # is the largest time gap bridged; freq-overlap gating keeps time-adjacent
+    # but frequency-separated calls (harmonics) distinct.
+    merge_consecutive: bool = True
     merge_max_gap_s: float = 0.01
     merge_require_freq_overlap: bool = True
+    # How far apart in frequency two SEQUENTIAL fragments may sit and still be
+    # one call. 8 bins is ~2 kHz at the usual grid — wide enough for a steep
+    # sweep's pieces (a real one missed by 4), far narrower than the tens of
+    # kHz separating a fundamental from its harmonic.
+    merge_max_freq_gap_bins: int = 8
+    # Above this fractional time overlap two blobs are treated as sounding
+    # together, so they must genuinely share a band to merge. A harmonic
+    # overlaps its fundamental almost completely; sweep fragments barely.
+    merge_concurrent_fraction: float = 0.5
+    # Build the next file's spectrogram on a background thread while this one
+    # scans on the GPU (see run_inference_on_files). Same output either way.
+    prefetch_next: bool = True
+    # Build the inference spectrogram on the GPU (CUDA only) when it
+    # reproduces the CPU one -- 14.5 s -> 1.2 s per 10-minute recording.
+    gpu_spectrogram: bool = True
+    # Store each detection's brightness ridge (mad_ridge) with it, and fill in
+    # the ridges a resumed run's already-analysed recordings lack. The
+    # project's ``ridge`` setting; on by default.
+    ridge: bool = True
     # Optional per-wav processing parameters — filled from model checkpoint
     # when not specified.
     nperseg: Optional[int] = None
@@ -80,6 +109,9 @@ class MADInferenceConfig:
     nfft: Optional[int] = None
     db_min: Optional[float] = None
     db_max: Optional[float] = None
+    # Normalization rule. None → take it from the checkpoint, which is what the
+    # model was actually trained with; an explicit value overrides.
+    db_norm: Optional[str] = None
 
 
 # ----------------------------------------------------------------------
@@ -103,6 +135,57 @@ def _resolve_device(pref: str) -> str:
 # ----------------------------------------------------------------------
 # Model loading
 # ----------------------------------------------------------------------
+#: File stems that name a checkpoint's role, not the model. Every training run
+#: saves ``weights.pt``, so a stem from this set says nothing about which run.
+_GENERIC_CHECKPOINT_STEMS = frozenset(
+    {"weights", "best", "model", "checkpoint", "last"})
+
+
+def model_label(model_path) -> str:
+    """The name to record against anything ``model_path`` produced.
+
+    The run folder (``20261006_134117_unet_n=1012``) when the file itself has a
+    generic name, which every MAD run's does; otherwise the file's own stem.
+    Every stored detection used to say ``weights``, so a recording holding
+    reviewed detections from an older run beside fresh ones from a newer run
+    could not say which were which.
+    """
+    if not model_path:
+        return ""
+    p = Path(str(model_path))
+    if p.stem.lower() in _GENERIC_CHECKPOINT_STEMS and p.parent.name:
+        return p.parent.name
+    return p.stem
+
+
+def stored_decision_ids(wav_path: str) -> List[int]:
+    """Integer blob ids that any stored example for ``wav_path`` refers to.
+
+    Those are the prediction ids an accept or a reject was made on. A new run
+    must number its detections above all of them, or a fresh detection takes
+    over an old decision's id. String ids (hand labels, prefixed ids) cannot
+    collide with a run's integer ids and are skipped.
+    """
+    from .fnt_mask_store import store_paths_for, td_iter_meta
+    out: List[int] = []
+    name = Path(wav_path).name
+    for store in store_paths_for(wav_path):
+        if not Path(store).is_file():
+            continue
+        try:
+            for meta in td_iter_meta(store):
+                if Path(str(meta.get('source_wav', ''))).name != name:
+                    continue
+                b = meta.get('blob_id')
+                if isinstance(b, (int, np.integer)):
+                    out.append(int(b))
+                elif isinstance(b, str) and b.strip().isdigit():
+                    out.append(int(b.strip()))
+        except Exception:
+            continue
+    return out
+
+
 def load_model(model_path: str, device: str = "auto"):
     """Load a U-Net checkpoint saved by :func:`train_unet`.
 
@@ -260,7 +343,13 @@ def infer_probability_mask(
                 dtype=np.float32)
             for k, t0 in enumerate(bstarts):
                 t1 = min(W, t0 + tile_time_frames)
-                tiles[k, 0, :f_crop, :t1 - t0] = spec_image[:f_crop, t0:t1]
+                src = spec_image[:f_crop, t0:t1]
+                if src.dtype == np.uint8:
+                    # Stored quantised; the model wants [0,1]. Same round trip
+                    # training examples make (uint8 in the store, /255 on read).
+                    tiles[k, 0, :f_crop, :t1 - t0] = src / np.float32(255.0)
+                else:
+                    tiles[k, 0, :f_crop, :t1 - t0] = src
             xb = torch.from_numpy(tiles).to(device)
             with torch.no_grad():
                 if amp_on:
@@ -344,6 +433,12 @@ def extract_blobs(
     # 8-connectivity via 3x3 structuring element.
     structure = np.ones((3, 3), dtype=np.uint8)
     labels, n_labels = ndi.label(binary, structure=structure)
+    # ndi.label returns int32, so `labels` alone is 2.4 GB for a 10-minute
+    # recording — the largest single block this pipeline asks for. Nothing
+    # below reads `binary` again (the per-blob masks come from `labels`), so
+    # holding both at once costs another 600 MB for no reason. Peak footprint
+    # is what makes a long batch run fail on a fragmented heap, not total use.
+    del binary
     if n_labels == 0:
         return []
 
@@ -379,14 +474,255 @@ def extract_blobs(
     return blobs
 
 
+#: Time frames per labelling chunk. 100k frames is ~205 MB of int32 labels at
+#: 513 bins — an ordinary allocation, and a 10-minute recording is a dozen of
+#: them.
+DEFAULT_LABEL_CHUNK_FRAMES = 100_000
+
+
+class _UnionFind:
+    """Plain union-find over hashable ids, with path compression.
+
+    Deliberately the textbook version. A hand-rolled merge scheme written
+    inline got the seam cases subtly wrong — it reported 82 blobs where the
+    whole-grid labeller found 78 — and the failure mode is a detector that
+    invents split calls at chunk boundaries on long recordings only. Not worth
+    being clever about.
+    """
+
+    def __init__(self):
+        self._parent: Dict = {}
+
+    def find(self, x):
+        p = self._parent.setdefault(x, x)
+        while p != x:
+            x, p = p, self._parent.setdefault(p, p)
+        return x
+
+    def union(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self._parent[ra] = rb
+
+
+def _seam_pairs(last_col: np.ndarray, first_col: np.ndarray):
+    """Label pairs joined across a chunk boundary, under 8-connectivity.
+
+    A set pixel at row r in the left chunk's final column touches rows r-1, r
+    and r+1 of the right chunk's first column.
+    """
+    pairs = set()
+    rows = np.nonzero(last_col)[0]
+    n = len(first_col)
+    for r in rows:
+        left = int(last_col[r])
+        for rr in (r - 1, r, r + 1):
+            if 0 <= rr < n:
+                right = int(first_col[rr])
+                if right:
+                    pairs.add((left, right))
+    return pairs
+
+
+def extract_blobs_chunked(
+    prob_mask: np.ndarray, threshold: float,
+    min_blob_pixels: int = 8,
+    include_mask: bool = False,
+    spec: Optional[np.ndarray] = None,
+    chunk_frames: int = DEFAULT_LABEL_CHUNK_FRAMES,
+) -> List[Dict]:
+    """:func:`extract_blobs`, labelling in time chunks instead of all at once.
+
+    Identical output, bounded memory. ``ndi.label`` returns int32, so labelling
+    a whole recording asks for a contiguous block four times the size of the
+    grid: 2.4 GB for ten minutes, 14.4 GB for an hour, 29 GB for two. That is a
+    ceiling, not a slowdown — a 217-file batch failed on 29 of them with
+    "Unable to allocate 572 MiB" while 25 GB was free, because hours of
+    multi-gigabyte allocations had left no block that size contiguous, and at
+    an hour per recording it would not run at all on a 16 GB machine.
+
+    Chunking the time axis alone suffices: the grid is 513 bins against
+    millions of frames, so a 100k-frame chunk is ~205 MB however long the
+    recording.
+
+    The work is at the seams. A call crossing a boundary is labelled separately
+    on each side, and the halves must come back as one blob — otherwise the
+    detector silently invents a split call at every boundary, on long files
+    only. Two passes keep that honest: the first labels each chunk and records
+    per-component statistics plus the boundary columns, then unions components
+    that touch across a seam; the second re-labels only to paint the surviving
+    components' masks. Labelling twice costs a little time (blob extraction is
+    a small share of a file's runtime) and buys a merge rule that is simply
+    union-find rather than a carry protocol that has to be reasoned about.
+    """
+    from scipy import ndimage as ndi
+    u8 = prob_mask.dtype == np.uint8
+    cut = prob_threshold_u8(threshold) if u8 else threshold
+    score_scale = (1.0 / 255.0) if u8 else 1.0
+    want_mask = bool(include_mask or spec is not None)
+    H, W = prob_mask.shape
+    structure = np.ones((3, 3), dtype=np.uint8)
+    chunk = max(1, int(chunk_frames))
+    starts = list(range(0, W, chunk)) or [0]
+
+    uf = _UnionFind()
+    stats: Dict = {}          # (chunk, local label) -> bbox/area/prob_sum
+    prev_last = None          # previous chunk's final column of labels
+
+    # --- pass 1: per-chunk labels, statistics, and seam unions -----------
+    for ci, c0 in enumerate(starts):
+        c1 = min(W, c0 + chunk)
+        sub_prob = prob_mask[:, c0:c1]
+        binary = (sub_prob >= cut).astype(np.uint8)
+        if not binary.any():
+            prev_last = None          # an empty chunk breaks every run
+            continue
+        labels, n = ndi.label(binary, structure=structure)
+        del binary
+        for i, sl in enumerate(ndi.find_objects(labels), start=1):
+            if sl is None:
+                continue
+            fs, ts = sl
+            sub_labels = labels[fs, ts]
+            m = sub_labels == i
+            probs = sub_prob[fs, ts]
+            key = (ci, i)
+            uf.find(key)                       # register even if never unioned
+            stats[key] = {
+                'f_low': int(fs.start), 'f_high': int(fs.stop),
+                't_start': int(ts.start) + c0, 't_end': int(ts.stop) + c0,
+                'area': int(m.sum()),
+                'prob_sum': float(probs[m].sum()) * score_scale,
+            }
+        if prev_last is not None:
+            for left, right in _seam_pairs(prev_last, labels[:, 0]):
+                uf.union((ci - 1, left), (ci, right))
+        prev_last = labels[:, -1].copy()       # copy: `labels` is about to go
+        del labels
+
+    if not stats:
+        return []
+
+    # --- merge components, then drop the ones too small to keep ---------
+    groups: Dict = {}
+    for key, st in stats.items():
+        groups.setdefault(uf.find(key), []).append(key)
+
+    keep: Dict = {}
+    for root, keys in groups.items():
+        area = sum(stats[k]['area'] for k in keys)
+        if area < min_blob_pixels:
+            continue
+        keep[root] = {
+            't_start': min(stats[k]['t_start'] for k in keys),
+            't_end_exclusive': max(stats[k]['t_end'] for k in keys),
+            'f_low': min(stats[k]['f_low'] for k in keys),
+            'f_high_exclusive': max(stats[k]['f_high'] for k in keys),
+            'area_pixels': area,
+            'score': sum(stats[k]['prob_sum'] for k in keys) / float(area),
+        }
+    if not keep:
+        return []
+
+    # --- pass 2: paint the surviving masks ------------------------------
+    if want_mask:
+        for b in keep.values():
+            b['mask'] = np.zeros(
+                (b['f_high_exclusive'] - b['f_low'],
+                 b['t_end_exclusive'] - b['t_start']), dtype=bool)
+        # Which roots have a piece in each chunk, so a chunk with nothing
+        # surviving is skipped without relabelling it.
+        by_chunk: Dict = {}
+        for root, keys in groups.items():
+            if root not in keep:
+                continue
+            for ci, lab in keys:
+                by_chunk.setdefault(ci, []).append((lab, root))
+        for ci, wanted in sorted(by_chunk.items()):
+            c0 = starts[ci]
+            c1 = min(W, c0 + chunk)
+            binary = (prob_mask[:, c0:c1] >= cut).astype(np.uint8)
+            labels, _n = ndi.label(binary, structure=structure)
+            del binary
+            for lab, root in wanted:
+                b = keep[root]
+                fs = slice(b['f_low'], b['f_high_exclusive'])
+                piece = labels[fs, :] == lab
+                to = c0 - b['t_start']
+                # The piece spans this chunk's columns; place it in the blob's
+                # own bounding box.
+                lo = max(0, to)
+                hi = min(b['mask'].shape[1], to + (c1 - c0))
+                if hi > lo:
+                    b['mask'][:, lo:hi] |= piece[:, lo - to:hi - to]
+            del labels
+
+    blobs = list(keep.values())
+    blobs.sort(key=lambda b: (b['t_start'], b['f_low']))
+    return blobs
+
+
 def _freq_overlap(a: Dict, b: Dict) -> bool:
     return (a['f_low'] < b['f_high_exclusive']
             and b['f_low'] < a['f_high_exclusive'])
 
 
+def _freq_gap_bins(a: Dict, b: Dict) -> int:
+    """Frequency bins separating two blobs; 0 when their bands overlap."""
+    if _freq_overlap(a, b):
+        return 0
+    return max(a['f_low'] - b['f_high_exclusive'],
+               b['f_low'] - a['f_high_exclusive'])
+
+
+def _time_overlap_fraction(a: Dict, b: Dict) -> float:
+    """Shared duration as a fraction of the shorter blob's duration.
+
+    ~1.0 means the two sound at the same moment; ~0 means one follows the
+    other. This is what actually separates a harmonic from a fragment.
+    """
+    lo = max(a['t_start'], b['t_start'])
+    hi = min(a['t_end_exclusive'], b['t_end_exclusive'])
+    shared = max(0, hi - lo)
+    shorter = min(a['t_end_exclusive'] - a['t_start'],
+                  b['t_end_exclusive'] - b['t_start'])
+    return (shared / shorter) if shorter > 0 else 0.0
+
+
+def _bands_joinable(a: Dict, b: Dict, max_freq_gap_bins: int,
+                    concurrent_fraction: float) -> bool:
+    """May these two blobs be parts of one call, judged on frequency?
+
+    Overlapping bands always qualify. The interesting case is bands that do
+    not overlap, where the old rule refused outright — and that refusal broke
+    on the shape it most needed to handle.
+
+    A steep FM sweep fragments into pieces that are *sequential in time and
+    adjacent in frequency*: a real 81.5 → 63.5 kHz downsweep came back as
+    73.2–81.5 kHz followed by 63.5–72.3 kHz, missing overlap by 0.98 kHz —
+    four bins — and so was reported as two calls with half the duration and
+    half the bandwidth each. Requiring overlap assumes fragments of one call
+    share a frequency band, which is true of flat calls and false of sweeps.
+
+    The guard is still needed: it exists so a fundamental is not merged with
+    its harmonic. But that case is distinguished by *time*, not frequency — a
+    harmonic sounds simultaneously with its fundamental, while sweep fragments
+    follow one another. So concurrency decides which rule applies: blobs that
+    overlap in time by more than ``concurrent_fraction`` must genuinely share a
+    band, and sequential ones may join across a small frequency gap.
+    """
+    if _freq_overlap(a, b):
+        return True
+    if _time_overlap_fraction(a, b) >= concurrent_fraction:
+        return False            # sounding together — a harmonic, not a fragment
+    return _freq_gap_bins(a, b) <= max_freq_gap_bins
+
+
 def merge_consecutive_blobs(
     blobs: List[Dict], max_gap_frames: int,
     require_freq_overlap: bool = True,
+    max_freq_gap_bins: int = 8,
+    concurrent_fraction: float = 0.5,
 ) -> List[Dict]:
     """Merge runs of consecutive blobs into single detections.
 
@@ -395,8 +731,12 @@ def merge_consecutive_blobs(
     Two blobs join when the time gap between the running cluster's offset and
     the next blob's onset is ``<= max_gap_frames`` (a negative gap means they
     already overlap in time) and — when ``require_freq_overlap`` — their
-    frequency bands overlap, so calls stacked in time but separated in
-    frequency (e.g. a harmonic vs. its fundamental) are left distinct.
+    frequency bands are compatible per :func:`_bands_joinable`: overlapping,
+    or merely adjacent (within ``max_freq_gap_bins``) when the two are
+    sequential rather than concurrent. That keeps a harmonic distinct from its
+    fundamental, which is what the gating is for, while still stitching the
+    fragments of a steep frequency sweep, whose pieces land in adjacent bands
+    and never overlap at all.
 
     Inspired by BirdNET's ``--merge_consecutive``. Blobs must carry the
     ``'mask'`` bbox crop (as :func:`extract_blobs` produces with
@@ -440,7 +780,8 @@ def merge_consecutive_blobs(
         gap = b['t_start'] - cur_end
         joins = gap <= max_gap_frames and (
             not require_freq_overlap
-            or any(_freq_overlap(b, g) for g in group))
+            or any(_bands_joinable(b, g, max_freq_gap_bins,
+                                   concurrent_fraction) for g in group))
         if joins:
             group.append(b)
             cur_end = max(cur_end, b['t_end_exclusive'])
@@ -456,6 +797,35 @@ def merge_consecutive_blobs(
 # ----------------------------------------------------------------------
 # Blob index → time / freq conversion
 # ----------------------------------------------------------------------
+#: Halo, in grid cells, around a confirmed label when shielding it from
+#: re-detection. Without one a prediction can hug the label's edge and come
+#: back as a near-duplicate of a call you already reviewed; much larger and it
+#: starts hiding the genuinely separate call stacked next to it.
+LABEL_SHIELD_PAD = 3
+
+
+def _dilate_mask(mask: np.ndarray, pad: int) -> np.ndarray:
+    """Grow ``mask`` by ``pad`` cells in each direction.
+
+    A full-grid recording is ~513 x 1.2M cells, so this uses scipy's separable
+    box dilation and falls back to shifted ORs if scipy is unavailable.
+    """
+    if pad <= 0 or not mask.any():
+        return mask
+    try:
+        from scipy import ndimage
+        return ndimage.binary_dilation(
+            mask, structure=np.ones((2 * pad + 1, 2 * pad + 1), dtype=bool))
+    except Exception:
+        out = mask.copy()
+        for df in range(-pad, pad + 1):
+            for dt in range(-pad, pad + 1):
+                if df == 0 and dt == 0:
+                    continue
+                out |= np.roll(np.roll(mask, df, axis=0), dt, axis=1)
+        return out
+
+
 def _time_per_frame(nperseg: int, noverlap: int, sr: int) -> float:
     return (nperseg - noverlap) / float(sr)
 
@@ -513,6 +883,163 @@ CALL_METRIC_KEYS = [
 _TONALITY_HALF_BINS = 2
 
 
+def _prepare_call(spec_db_cols, mask, f_low: int, db_min: float,
+                  db_max: float):
+    """Shared input handling for the per-call quantifiers.
+
+    Returns ``(full, bb, Pbb)`` — the full-frequency dB columns clipped to
+    [db_min, db_max], the call-band crop of them, and that crop as linear power
+    — or None when the mask is empty or doesn't fit the columns. Clipping here
+    is what puts predictions (clipped spec) and hand-labels (raw dB) on one
+    scale.
+    """
+    if mask is None or mask.size == 0 or not mask.any():
+        return None
+    H, W = mask.shape
+    full = np.clip(np.asarray(spec_db_cols, dtype=np.float64), db_min, db_max)
+    F_full = full.shape[0]
+    f_hi = f_low + H
+    if f_hi > F_full or full.shape[1] != W:
+        return None
+    bb = full[f_low:f_hi, :]                  # call-band crop (H, W), dB
+    Pbb = np.power(10.0, bb / 10.0)           # linear power in the band
+    return full, bb, Pbb
+
+
+def _frame_features(full, bb, Pbb, mask, f_low: int, df: float) -> Dict:
+    """Per-frame arrays for one call, all of length W (one per time column).
+
+    Mask-dependent features are NaN in columns the mask doesn't touch; entropy
+    and tonality are computed over the full column (CAD parity) so they are
+    defined everywhere. The loops deliberately repeat the exact per-column
+    arithmetic :func:`compute_call_metrics` has always used, so reducing these
+    arrays reproduces its numbers bit for bit — the metric CSV and anything
+    plotted from these frames can never disagree.
+    """
+    H, W = mask.shape
+    F_full = full.shape[0]
+    has = mask.any(axis=0)
+    peak_hz = np.full(W, np.nan)
+    centroid_hz = np.full(W, np.nan)
+    bandwidth_hz = np.full(W, np.nan)
+    Pm = np.where(mask, Pbb, 0.0)
+    freqs = (f_low + np.arange(H)) * df
+    for t in range(W):
+        rows_t = np.where(mask[:, t])[0]
+        if rows_t.size == 0:
+            continue
+        # Loudest masked pixel in the column → the call's frequency contour.
+        peak_row = rows_t[int(np.argmax(bb[rows_t, t]))]
+        peak_hz[t] = (f_low + peak_row) * df
+        bandwidth_hz[t] = (rows_t[-1] - rows_t[0] + 1) * df
+        pw = Pm[:, t]
+        s = float(pw.sum())
+        if s > 0:
+            centroid_hz[t] = float((freqs * pw).sum() / s)
+
+    # --- per-frame spectral entropy + tonality over the FULL column (CAD) ---
+    Pfull = np.power(10.0, full / 10.0)
+    max_ent = np.log2(F_full) if F_full > 1 else 1.0
+    ton = np.zeros(W)
+    ent = np.zeros(W)
+    half = _TONALITY_HALF_BINS
+    for t in range(W):
+        col = Pfull[:, t]
+        s = float(col.sum())
+        if s <= 0:
+            ent[t] = 1.0       # empty column → maximally "noisy"
+            continue
+        pk = int(np.argmax(col))
+        lo, hi = max(0, pk - half), min(F_full, pk + half + 1)
+        ton[t] = float(col[lo:hi].sum()) / s
+        p = col / s
+        p = p[p > 0]
+        ent[t] = float(-(p * np.log2(p)).sum()) / max_ent
+
+    energy = Pm.sum(axis=0)                  # masked band power per frame
+    with np.errstate(divide='ignore'):
+        power_db = np.where(has, 10.0 * np.log10(np.where(has, energy, 1.0)),
+                            np.nan)
+    return {
+        'has_mask': has,
+        'peak_freq_hz': peak_hz,
+        'centroid_hz': centroid_hz,
+        'bandwidth_hz': bandwidth_hz,
+        'energy': energy,
+        'power_db': power_db,
+        'entropy': ent,
+        'tonality': ton,
+    }
+
+
+def _interp_peak_hz(raw_db: np.ndarray, mask: np.ndarray, f_low: int,
+                    df: float) -> np.ndarray:
+    """Sub-bin peak frequency per masked column (NaN where the mask misses).
+
+    The loudest masked bin is only resolved to one bin (~244 Hz at nfft 1024 /
+    250 kHz), so a contour built from it staircases, and its frame-to-frame
+    rate of change is mostly those steps. Fitting a parabola through that bin
+    and its two neighbours on the dB spectrum puts the peak between bins — the
+    standard quadratic interpolation of a spectral peak, accurate to a small
+    fraction of a bin for a Hann window.
+
+    Works on the **unclipped** dB: a call louder than ``db_max`` clips flat
+    across its peak, which would leave no curvature to fit (and several tied
+    bins to choose between). Neighbours are read from the full column even
+    when they fall outside the mask; they are the true spectral shape around
+    the peak. The offset is clamped to ±0.5 bin, and a peak without downward
+    curvature (not a local maximum) keeps its bin centre.
+    """
+    H, W = mask.shape
+    F = raw_db.shape[0]
+    out = np.full(W, np.nan)
+    for t in range(W):
+        rows = np.where(mask[:, t])[0]
+        if rows.size == 0:
+            continue
+        k = f_low + int(rows[int(np.argmax(raw_db[f_low + rows, t]))])
+        p = 0.0
+        if 0 < k < F - 1:
+            a, b, c = raw_db[k - 1, t], raw_db[k, t], raw_db[k + 1, t]
+            den = a - 2.0 * b + c
+            if den < 0:
+                p = min(0.5, max(-0.5, 0.5 * (a - c) / den))
+        out[t] = (k + p) * df
+    return out
+
+
+def call_frame_features(
+    spec_db_cols: np.ndarray, mask: np.ndarray, f_low: int,
+    df: float, db_min: float, db_max: float,
+) -> Optional[Dict]:
+    """Per-frame features of one call — the time series :func:`compute_call_metrics`
+    summarises into single numbers, before it does.
+
+    Same inputs as :func:`compute_call_metrics` (minus ``dt``, since nothing here
+    depends on frame spacing). Returns a dict of length-W arrays:
+    ``has_mask`` (bool), ``peak_freq_hz`` (the frequency contour, to the
+    nearest bin — what the CSV metrics use), ``peak_freq_interp_hz`` (the same
+    contour to a fraction of a bin — see :func:`_interp_peak_hz`),
+    ``centroid_hz``, ``bandwidth_hz``, ``power_db`` and ``energy`` (masked-band
+    power), plus full-column ``entropy`` and ``tonality``. Mask-dependent arrays
+    are NaN where the mask misses a column. None when the mask is empty or
+    doesn't fit.
+
+    ``peak_freq_interp_hz`` is deliberately *not* used by
+    :func:`compute_call_metrics`: switching the CSV contour to it would move
+    every existing start/end/mean frequency, slope and excursion.
+    """
+    prep = _prepare_call(spec_db_cols, mask, f_low, db_min, db_max)
+    if prep is None:
+        return None
+    full, bb, Pbb = prep
+    mask = np.asarray(mask, dtype=bool)
+    frames = _frame_features(full, bb, Pbb, mask, f_low, df)
+    frames['peak_freq_interp_hz'] = _interp_peak_hz(
+        np.asarray(spec_db_cols, dtype=np.float64), mask, f_low, df)
+    return frames
+
+
 def compute_call_metrics(
     spec_db_cols: np.ndarray, mask: np.ndarray, f_low: int,
     df: float, dt: float, db_min: float, db_max: float,
@@ -527,18 +1054,20 @@ def compute_call_metrics(
     hand-labels (raw dB) compute on the same scale. Per-frame spectral entropy
     and tonality use the full column (matching CAD's `dsp_detector`). Returns a
     dict keyed by :data:`CALL_METRIC_KEYS`; degenerate metrics are omitted.
+
+    The per-frame quantities come from :func:`call_frame_features`' shared core,
+    so these summaries and any per-frame view of the same call agree exactly.
     """
     m: Dict = {}
-    if mask is None or mask.size == 0 or not mask.any():
+    prep = _prepare_call(spec_db_cols, mask, f_low, db_min, db_max)
+    if prep is None:
         return m
+    full, bb, Pbb = prep
+    mask = np.asarray(mask, dtype=bool)
     H, W = mask.shape
-    full = np.clip(np.asarray(spec_db_cols, dtype=np.float64), db_min, db_max)
     F_full = full.shape[0]
     f_hi = f_low + H
-    if f_hi > F_full or full.shape[1] != W:
-        return m
-    bb = full[f_low:f_hi, :]                  # call-band crop (H, W), dB
-    Pbb = np.power(10.0, bb / 10.0)           # linear power in the band
+    frames = _frame_features(full, bb, Pbb, mask, f_low, df)
     ys, xs = np.where(mask)
     vals_db = bb[mask]
 
@@ -550,17 +1079,10 @@ def compute_call_metrics(
     m['peak_freq_hz'] = round(float((f_low + ys[peak_pix]) * df), 2)
 
     # --- frequency contour: peak-power freq per masked time column ---
-    cols, cfreq = [], []
-    for t in range(W):
-        rows_t = np.where(mask[:, t])[0]
-        if rows_t.size == 0:
-            continue
-        peak_row = rows_t[int(np.argmax(bb[rows_t, t]))]
-        cols.append(t)
-        cfreq.append((f_low + peak_row) * df)
-    if cfreq:
-        cols_a = np.asarray(cols, dtype=np.float64)
-        cf = np.asarray(cfreq, dtype=np.float64)
+    has = frames['has_mask']
+    if has.any():
+        cols_a = np.nonzero(has)[0].astype(np.float64)
+        cf = frames['peak_freq_hz'][has]
         m['start_freq_hz'] = round(float(cf[0]), 2)
         m['end_freq_hz'] = round(float(cf[-1]), 2)
         m['mean_freq_hz'] = round(float(cf.mean()), 2)
@@ -592,28 +1114,11 @@ def compute_call_metrics(
         m['spectral_centroid_hz'] = round(float((freqs * row_power).sum() / tot), 2)
 
     # --- per-frame spectral entropy + tonality over the FULL column (CAD) ---
-    Pfull = np.power(10.0, full / 10.0)
-    max_ent = np.log2(F_full) if F_full > 1 else 1.0
-    ton = np.zeros(W)
-    ent = np.zeros(W)
-    half = _TONALITY_HALF_BINS
-    for t in range(W):
-        col = Pfull[:, t]
-        s = float(col.sum())
-        if s <= 0:
-            ent[t] = 1.0       # empty column → maximally "noisy"
-            continue
-        pk = int(np.argmax(col))
-        lo, hi = max(0, pk - half), min(F_full, pk + half + 1)
-        ton[t] = float(col[lo:hi].sum()) / s
-        p = col / s
-        p = p[p > 0]
-        ent[t] = float(-(p * np.log2(p)).sum()) / max_ent
-    m['tonality'] = round(float(ton.mean()), 4)
-    m['spectral_entropy'] = round(float(ent.mean()), 4)
+    m['tonality'] = round(float(frames['tonality'].mean()), 4)
+    m['spectral_entropy'] = round(float(frames['entropy'].mean()), 4)
 
     # --- amplitude envelope over time (masked band energy per frame) ---
-    col_energy = Pm.sum(axis=0)
+    col_energy = frames['energy']
     if W > 1:
         m['peak_time_frac'] = round(int(np.argmax(col_energy)) / float(W - 1), 3)
     env = col_energy[col_energy > 0]
@@ -673,8 +1178,16 @@ def blobs_to_rows(
             'source': 'prediction',
         }
         if (spec is not None and b.get('mask') is not None and span is not None):
-            # Full-frequency dB columns for this call's time span.
-            cols_db = spec[:, b['t_start']:b['t_end_exclusive']] * span + db_min
+            # Full-frequency dB columns for this call's time span. The grid
+            # is uint8 (0-255) since the memory change; de-normalizing it as
+            # if it were [0,1] made every dB value ~255x too large, and
+            # compute_call_metrics' 10**(dB/10) then overflowed to inf — so
+            # tonality, entropy, centroid, max_power_db, snr_db and AM came
+            # back inf/NaN for every detection.
+            cols = spec[:, b['t_start']:b['t_end_exclusive']]
+            if cols.dtype == np.uint8:
+                cols = cols / np.float32(255.0)
+            cols_db = cols * span + db_min
             row.update(compute_call_metrics(
                 cols_db, b['mask'], b['f_low'], df, dt, db_min, db_max))
         rows.append(row)
@@ -696,7 +1209,16 @@ _EXTRA_COLS = [
     'total_energy_db', 'snr_db', 'peak_time_frac', 'amplitude_modulation',
     'fill_ratio', 'aspect_ratio',
     'model_name', 'threshold', 'min_blob_pixels',
+    # Brightness ridge inside the mask (mad_ridge): turns of the brightest
+    # continuous path, its rate and depth, and whether that makes a trill.
+    'ridge_turns', 'ridge_rate_hz', 'ridge_depth_khz', 'ridge_trill',
 ]
+
+# Harmonic grouping (see mad_harmonics). Written by the review GUI, not by
+# inference: which elements form one call is decided after detection, so these
+# stay blank until the grouping has been run. Element count is the row count;
+# call count is the number of distinct harmonic_call_id.
+_HARMONIC_COLS = ['harmonic_call_id', 'harmonic_n', 'f0_hz']
 
 # CAD-shared core (first 16, matching _FNT_CAD_detections.csv naming/order) +
 # MAD-specific quantification columns appended.
@@ -705,7 +1227,7 @@ CSV_FIELDNAMES = [
     'min_freq_hz', 'max_freq_hz', 'peak_freq_hz', 'freq_bandwidth_hz',
     'max_power_db', 'mean_power_db', 'class', 'score', 'area_pixels',
     'status', 'source',
-] + _EXTRA_COLS
+] + _EXTRA_COLS + _HARMONIC_COLS
 
 # Local-window half-width (seconds) for the call_rate_hz density estimate.
 _CALL_RATE_WINDOW_S = 0.5
@@ -775,7 +1297,7 @@ def write_blob_csv(path: str, rows: List[Dict]) -> None:
                 'status': r.get('status', 'pending') or 'pending',
                 'source': r.get('source', '') or '',
             }
-            for col in _EXTRA_COLS:
+            for col in _EXTRA_COLS + _HARMONIC_COLS:
                 out[col] = r.get(col, '')
             out['inter_call_interval_ms'] = ici
             out['call_rate_hz'] = rate
@@ -814,7 +1336,7 @@ def read_blob_csv(path: str) -> List[Dict]:
             # verbatim, so a read-modify-write (e.g. status change) preserves
             # them. inter_call_interval_ms / call_rate_hz are recomputed on
             # write, so they needn't round-trip.
-            for col in _EXTRA_COLS:
+            for col in _EXTRA_COLS + _HARMONIC_COLS:
                 row[col] = g(col, default='')
             rows.append(row)
     return rows
@@ -967,18 +1489,241 @@ def write_embeddings_npz(path: str, results: List[Dict]) -> int:
 # ----------------------------------------------------------------------
 # End-to-end per-file run
 # ----------------------------------------------------------------------
+def _spec_params(cfg: MADInferenceConfig, ckpt: Dict):
+    """``(nperseg, noverlap, nfft, db_min, db_max, db_norm)`` for a run:
+    the config's where it sets them, the checkpoint's otherwise."""
+    nperseg = int(cfg.nperseg if cfg.nperseg is not None else ckpt.get('nperseg', 512))
+    noverlap = int(cfg.noverlap if cfg.noverlap is not None else ckpt.get('noverlap', 384))
+    nfft = int(cfg.nfft if cfg.nfft is not None else ckpt.get('nfft', 1024))
+    db_min = float(cfg.db_min if cfg.db_min is not None else ckpt.get('db_min', -100.0))
+    db_max = float(cfg.db_max if cfg.db_max is not None else ckpt.get('db_max', -20.0))
+    # The normalization rule has to be the model's, not the caller's: a model
+    # trained on per-file ranges sees garbage if fed fixed-range input.
+    db_norm = str(cfg.db_norm if cfg.db_norm is not None
+                  else ckpt.get('db_norm', 'fixed'))
+    return nperseg, noverlap, nfft, db_min, db_max, db_norm
+
+
+def backfill_pred_specs(wav_path: str, db_min: float = -100.0,
+                        db_max: float = -20.0, db_norm: str = 'fixed',
+                        overwrite: bool = False, ridges: bool = True) -> int:
+    """Add the spectrogram image under each stored prediction crop of a
+    recording analysed before MAD saved them (/pred_specs), recomputed from
+    the audio on the grid recorded in its .mad file. ``db_*`` must be the
+    model's (MAD's defaults: fixed, -100 to -20 dB). Crops that already have
+    one are left alone unless ``overwrite``. With ``ridges`` the new images'
+    ridges are stored too. Returns the number filled."""
+    from .fnt_mask_store import (masks_sibling_path, get_grid_attrs,
+                                 read_all_pred_masks, spec_crop,
+                                 PRED_SPEC_GROUP)
+    import h5py
+    h5 = masks_sibling_path(wav_path)
+    crops = read_all_pred_masks(h5, include_spec=True)
+    todo = {k: c for k, c in crops.items() if overwrite or 'spec' not in c}
+    if not todo:
+        return 0
+    g = get_grid_attrs(h5)
+    nperseg, noverlap, nfft = (int(g.get('nperseg', 512)),
+                               int(g.get('noverlap', 384)),
+                               int(g.get('nfft', 1024)))
+    audio, sr = load_audio(wav_path)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    from .mad_dataset import db_range_for
+    db_min, db_max = db_range_for(db_norm, db_min, db_max, audio=audio,
+                                  sample_rate=sr, nperseg=nperseg,
+                                  noverlap=noverlap, nfft=nfft)
+    spec = compute_full_spec_image(np.asarray(audio, dtype=np.float32), sr,
+                                   nperseg=nperseg, noverlap=noverlap,
+                                   nfft=nfft, db_min=db_min, db_max=db_max,
+                                   as_uint8=True)
+    del audio
+    with h5py.File(h5, 'a') as f:
+        sgrp = f.require_group(PRED_SPEC_GROUP)
+        for key, c in todo.items():
+            if key in sgrp:
+                del sgrp[key]
+            sgrp.create_dataset(key, data=spec_crop(spec, c['f_off'], c['t_off'],
+                                                    c['mask'].shape),
+                                compression='gzip', compression_opts=4)
+    # The images make the brightness ridge measurable (no audio needed).
+    if ridges:
+        from .fnt_mask_store import add_pred_ridges
+        add_pred_ridges(h5, overwrite=overwrite)
+    return len(todo)
+
+
+def fill_ridges(wav_path: str, db_min: float = -100.0, db_max: float = -20.0,
+                db_norm: str = 'fixed', use_audio: bool = True) -> Dict:
+    """Complete the brightness ridges of one recording's .mad, and stamp it.
+
+    Detections without a ridge get one from their stored spectrogram, or, with
+    ``use_audio``, from the audio first (as :func:`backfill_pred_specs`; the
+    ``db_*`` must be those of the model that made them). Labels without one get
+    theirs from their own patch. A file not yet stamped with the current ridge
+    version also has its multi-piece masks recomputed, one ridge per piece.
+    Without the audio, detections lacking a spectrogram keep no ridge and
+    nothing is recomputed; the file stays unstamped, so a later fill looks
+    again.
+
+    Returns ``{needed, pred, examples, specs, stamped}`` (whether the file
+    lacked anything, ridges stored, spectrograms added). Does nothing when ridges are off (fnt_mask_store.set_ridge_enabled)
+    or the file is stamped already. Never run on a file another process is
+    writing."""
+    from .fnt_mask_store import (add_example_ridges, add_pred_ridges,
+                                 mark_ridges_complete, masks_sibling_path,
+                                 ridge_enabled, ridge_status)
+    out = {'needed': False, 'pred': 0, 'examples': 0, 'specs': 0,
+           'stamped': False}
+    if not ridge_enabled():
+        return out
+    h5 = masks_sibling_path(wav_path)
+    st = ridge_status(h5)
+    if not st['needed']:
+        return out
+    out['needed'] = True
+    complete = use_audio or not st['pred_no_spec']
+    if st['pred_no_spec'] and use_audio:
+        out['specs'] = backfill_pred_specs(wav_path, db_min=db_min,
+                                           db_max=db_max, db_norm=db_norm,
+                                           ridges=False)
+    out['pred'] = add_pred_ridges(h5, redo_pieces=complete)
+    out['examples'] = add_example_ridges(h5, redo_pieces=complete)
+    if complete:
+        mark_ridges_complete(h5)
+        out['stamped'] = True
+    return out
+
+
+def fill_ridges_for_run(wav_paths: List[str], cfg: MADInferenceConfig,
+                        ckpt: Optional[Dict] = None,
+                        progress: Optional[Callable] = None,
+                        should_stop: Optional[Callable[[], bool]] = None,
+                        wait_if_paused: Optional[Callable[[], None]] = None,
+                        on_done: Optional[Callable[[Dict], None]] = None
+                        ) -> List[Dict]:
+    """:func:`fill_ridges` over recordings this run's model analysed earlier,
+    with that model's spectrogram settings (from ``ckpt``, else read from
+    ``cfg.model_path``). ``progress`` as in :func:`run_inference_on_files`,
+    with stage ``'ridge'``; ``on_done`` gets each file's result with its
+    ``wav_path`` (and ``error`` when the fill failed)."""
+    if not getattr(cfg, 'ridge', True) or not wav_paths:
+        return []
+    if ckpt is None:
+        import torch
+        ckpt = torch.load(cfg.model_path, map_location='cpu',
+                          weights_only=False)
+    _, _, _, db_min, db_max, db_norm = _spec_params(cfg, ckpt)
+    out: List[Dict] = []
+    m = len(wav_paths)
+    for j, wav in enumerate(wav_paths):
+        if wait_if_paused is not None:
+            wait_if_paused()
+        if should_stop and should_stop():
+            break
+        if progress:
+            progress(j, m, Path(wav).name, 'ridge', 0, 1)
+        try:
+            r = fill_ridges(wav, db_min=db_min, db_max=db_max, db_norm=db_norm)
+        except Exception as e:
+            r = {'error': str(e)}
+        r['wav_path'] = wav
+        out.append(r)
+        if on_done is not None:
+            try:
+                on_done(r)
+            except Exception:
+                pass
+    return out
+
+
+def prepare_file(wav_path: str, cfg: MADInferenceConfig, ckpt: Dict,
+                 device: Optional[str] = None) -> Dict:
+    """Decode a recording and build the model's input spectrogram.
+
+    The CPU half of a file's inference -- on a 10-minute recording, 1.2 s of
+    decoding and 14.6 s of spectrogram against an 11.8 s GPU scan -- split out
+    so :func:`run_inference_on_files` can build the next file's while this one
+    scans. Returns ``{wav_path, spec, sr, audio_dur, db_min, db_max, t_spec,
+    spec_backend}``. On CUDA the spectrogram is built on the GPU when it
+    reproduces the CPU one (``cfg.gpu_spectrogram``; see
+    mad_dataset.spec_image_for_device).
+    """
+    import time as _time
+    nperseg, noverlap, nfft, db_min, db_max, db_norm = _spec_params(cfg, ckpt)
+    _t_spec0 = _time.perf_counter()
+    audio, sr = load_audio(wav_path)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    audio_dur = len(audio) / float(sr) if sr else 0.0
+    from .mad_dataset import db_range_for
+    db_min, db_max = db_range_for(
+        db_norm, db_min, db_max, audio=audio, sample_rate=sr,
+        nperseg=nperseg, noverlap=noverlap, nfft=nfft)
+    # uint8: a quarter of the memory (2.4 GB -> 0.6 GB on a 600 s recording),
+    # and the precision the model was actually trained at — examples are
+    # stored as (clip*255).round().astype(uint8) and read back /255, so a
+    # float32 grid here was finer-grained than anything the weights ever saw.
+    # Measured on a 474-detection file: identical count, 473/474 matched at
+    # IoU>=0.5, median box shift 0 frames.
+    # asarray, not astype: load_audio already returns float32, and astype
+    # copies regardless of dtype — a second 600 MB block for a 10-minute
+    # recording, alive at the same moment as the original.
+    if (getattr(cfg, 'gpu_spectrogram', True)
+            and str(device or '').startswith('cuda')):
+        from .mad_dataset import spec_image_for_device
+        spec, backend = spec_image_for_device(
+            np.asarray(audio, dtype=np.float32), sr, nperseg, noverlap, nfft,
+            db_min, db_max, device=str(device))
+    else:
+        spec = compute_full_spec_image(
+            np.asarray(audio, dtype=np.float32), sr,
+            nperseg=nperseg, noverlap=noverlap, nfft=nfft,
+            db_min=db_min, db_max=db_max, as_uint8=True,
+        )
+        backend = 'cpu'
+    # The audio is finished with — everything downstream works off the
+    # spectrogram. Holding it through the scan and blob phases pinned 600 MB
+    # for ~75 s of every file and, worse, kept a large block busy exactly when
+    # the NEXT file asked for one the same size.
+    #
+    # Worth releasing on its own merits, but NOT the cure for the batch OOMs:
+    # a 217-file run failed 29 files, and a later 262-file run failed 72, both
+    # with "Unable to allocate 572 MiB". An earlier note here blamed heap
+    # fragmentation, reasoning from RSS holding steady (+-3 MB across six
+    # files) that nothing leaked. That was wrong twice over. A 572 MiB
+    # reservation cannot fail for want of a contiguous block in a 64-bit
+    # address space, and RSS is the wrong gauge: Windows trims the working set
+    # while commit keeps climbing.
+    #
+    # The Resource-Exhaustion event for the 2026-09-09 run settles it —
+    # pythonw.exe CommitCharge 78.6 GiB, system commit charge 91.4 GiB against
+    # a 91.4 GiB limit, with physical memory barely touched. Something in the
+    # GUI process leaks; measured here, this module does not (7x30 s and
+    # 5x300 s files, commit flat at 2725 MB, no live ndarray >= 1 MB between
+    # files). ``mem`` in each run summary is what will localise the rest.
+    del audio
+    return {'wav_path': wav_path, 'spec': spec, 'sr': sr,
+            'audio_dur': audio_dur, 'db_min': db_min, 'db_max': db_max,
+            't_spec': _time.perf_counter() - _t_spec0, 'spec_backend': backend}
+
+
 def run_inference_on_file(
     wav_path: str,
     cfg: MADInferenceConfig,
     model=None, ckpt=None, device: Optional[str] = None,
     progress: Optional[Callable[[str, int, int], None]] = None,
     wait_if_paused: Optional[Callable[[], None]] = None,
+    prepared: Optional[Dict] = None,
 ) -> Dict:
     """Run inference on one wav, write sibling PNG + CSV, return summary.
 
     ``progress`` is invoked with ``(stage, i, n)`` where ``stage`` is one
     of ``'spec'``, ``'infer'``, ``'blobs'`` so the GUI can show a live
     bar even for files that take a while.
+
+    ``prepared`` is this file's :func:`prepare_file` result when it was built
+    ahead of time; without it (or for another file) it is built here.
     """
     if model is None:
         model, ckpt, device = load_model(cfg.model_path, cfg.device)
@@ -986,28 +1731,25 @@ def run_inference_on_file(
     assert device is not None
 
     # Fall back to checkpoint-saved spec params when cfg leaves them None.
-    nperseg = int(cfg.nperseg if cfg.nperseg is not None else ckpt.get('nperseg', 512))
-    noverlap = int(cfg.noverlap if cfg.noverlap is not None else ckpt.get('noverlap', 384))
-    nfft = int(cfg.nfft if cfg.nfft is not None else ckpt.get('nfft', 1024))
-    db_min = float(cfg.db_min if cfg.db_min is not None else ckpt.get('db_min', -100.0))
-    db_max = float(cfg.db_max if cfg.db_max is not None else ckpt.get('db_max', -20.0))
+    nperseg, noverlap, nfft, db_min, db_max, db_norm = _spec_params(cfg, ckpt)
     tile_freq_bins = int(ckpt.get('tile_freq_bins', cfg.tile_freq_bins))
     tile_time_frames = int(ckpt.get('tile_time_frames', cfg.tile_time_frames))
 
     import time as _time
     if progress:
         progress('spec', 0, 1)
-    _t_spec0 = _time.perf_counter()
-    audio, sr = load_audio(wav_path)
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
-    audio_dur = len(audio) / float(sr) if sr else 0.0
-    spec = compute_full_spec_image(
-        audio.astype(np.float32), sr,
-        nperseg=nperseg, noverlap=noverlap, nfft=nfft,
-        db_min=db_min, db_max=db_max,
-    )
-    t_spec = _time.perf_counter() - _t_spec0
+    prefetched = bool(prepared is not None and 'spec' in prepared
+                      and prepared.get('wav_path') == wav_path)
+    if not prefetched:
+        prepared = prepare_file(wav_path, cfg, ckpt, device)
+    spec, sr = prepared['spec'], prepared['sr']
+    audio_dur, t_spec = prepared['audio_dur'], prepared['t_spec']
+    db_min, db_max = prepared['db_min'], prepared['db_max']
+    spec_backend = prepared.get('spec_backend', 'cpu')
+    # Time this file actually held the run up: the wait for a spectrogram
+    # built in the background, or the whole build when it was not.
+    t_wait = float(prepared.get('t_wait', 0.0)) if prefetched else t_spec
+    del prepared
     if progress:
         progress('spec', 1, 1)
 
@@ -1061,7 +1803,7 @@ def run_inference_on_file(
     from .fnt_mask_store import (masks_sibling_path as _masks_path,
                                  read_all_pred_masks)
     try:
-        old_crops = read_all_pred_masks(_masks_path(wav_path))
+        old_crops = read_all_pred_masks(_masks_path(wav_path), include_spec=True)
     except Exception:
         old_crops = {}
 
@@ -1108,45 +1850,103 @@ def run_inference_on_file(
             if f1 > f0 and t1 > t0:
                 prob[f0:f1, t0:t1] = 0.0
 
-    # Preserve confirmed labels: zero out the probability mask in any time
-    # column that already contains a human-confirmed call for this file, so
-    # predictions never overwrite confirmed annotations. Skipped when the user
-    # asked to re-detect from scratch (preserve_labels False).
+    # Preserve confirmed labels: zero the probability under each confirmed
+    # call (plus a small halo, so a prediction cannot hug its edge and come
+    # back as a near-duplicate), leaving the rest of the frequency axis alone.
+    #
+    # This used to blank whole TIME COLUMNS -- prob[:, cols] = 0 across all
+    # 0-125 kHz -- which made a confirmed call at 25 kHz suppress detection of
+    # everything stacked above it for the call's whole duration. Rodent USVs
+    # overlap in time constantly, so that is not a corner case: measured on one
+    # 600 s recording, shielding 19,695 labelled pixels blanked 763,344 grid
+    # cells, a 39x over-reach that silently cost real detections.
+    #
+    # Labels come from the recording's own .mad, which is the MASTER set --
+    # labels always save there, and the project's training store is a cache
+    # rebuilt from the sidecars at the start of each run. Reading the cache
+    # here was the second half of the bug: it was stale, so 11 confirmed calls
+    # on one recording went unshielded and were drawn over. Unioning the two
+    # would be wrong in the other direction -- a label deleted from the sidecar
+    # lingers in the cache until the next rebuild, and shielding it would
+    # protect a call the user has already removed. The cache is the fallback
+    # only when a recording has no sidecar at all.
     if cfg.preserve_labels and cfg.training_data_dir:
         try:
             from .mad_examples import reconstruct_file_mask
+            from .fnt_mask_store import store_paths_for
+            sidecars = [p for p in store_paths_for(wav_path)
+                        if Path(p).is_file()]
             user_mask = reconstruct_file_mask(
-                cfg.training_data_dir, Path(wav_path).name, prob.shape
+                "" if sidecars else cfg.training_data_dir,
+                Path(wav_path).name, prob.shape, extra_stores=sidecars,
             )
-            cols = (user_mask > 0).any(axis=0)
-            if cols.any():
-                prob[:, cols] = 0.0
+            if user_mask.any():
+                prob[_dilate_mask(user_mask > 0, LABEL_SHIELD_PAD)] = 0.0
         except Exception:
             # Don't let a label-store hiccup block inference.
+            pass
+
+    # Rejected calls stay rejected. This used to come from the CSV's
+    # 'rejected' rows (reviewed_rows above), and silently stopped when the CSV
+    # became an export only: every re-run re-proposed calls the reviewer had
+    # already turned down -- 66 detections sitting on rejected calls across the
+    # anosmia sidecars, and 19 rejections duplicating an earlier one, each a
+    # second hard negative for the same call. The store's rejected examples
+    # keep the exact traced mask, so suppress those, tight to the call.
+    #
+    # Not the label shield above: a rejected region is never painted as a
+    # confirmed call. "Re-detect from scratch" (preserve_labels off) skips it
+    # like it skips everything else.
+    if cfg.preserve_labels:
+        try:
+            from .mad_examples import reconstruct_file_mask
+            from .fnt_mask_store import REJECTED_KINDS, store_paths_for
+            sidecars = [p for p in store_paths_for(wav_path)
+                        if Path(p).is_file()]
+            if sidecars:
+                rej_mask = reconstruct_file_mask(
+                    "", Path(wav_path).name, prob.shape,
+                    extra_stores=sidecars, kinds=REJECTED_KINDS)
+                if rej_mask.any():
+                    prob[_dilate_mask(rej_mask > 0, LABEL_SHIELD_PAD)] = 0.0
+        except Exception:
             pass
 
     if progress:
         progress('blobs', 0, 1)
     _t_blob0 = _time.perf_counter()
-    blobs = extract_blobs(prob, threshold=cfg.threshold,
-                          min_blob_pixels=cfg.min_blob_pixels, include_mask=True,
-                          spec=spec)
+    # Chunked: labelling a whole recording at once needs a contiguous
+    # int32 block four times the grid's size, which is a ceiling rather
+    # than a cost — 14.4 GB for an hour of audio, 29 GB for two.
+    blobs = extract_blobs_chunked(
+        prob, threshold=cfg.threshold,
+        min_blob_pixels=cfg.min_blob_pixels, include_mask=True, spec=spec)
     if cfg.merge_consecutive:
         # dt (seconds/frame) → gap in frames; both derived above.
         max_gap_frames = int(round(cfg.merge_max_gap_s / dt)) if dt else 0
         blobs = merge_consecutive_blobs(
             blobs, max_gap_frames=max_gap_frames,
-            require_freq_overlap=cfg.merge_require_freq_overlap)
+            require_freq_overlap=cfg.merge_require_freq_overlap,
+            max_freq_gap_bins=cfg.merge_max_freq_gap_bins,
+            concurrent_fraction=cfg.merge_concurrent_fraction)
     rows = blobs_to_rows(blobs, nperseg=nperseg, noverlap=noverlap, nfft=nfft,
                          sr=sr, db_min=db_min, db_max=db_max, spec=spec)
-    # Re-key the fresh predictions so their int blob_ids never collide with the
-    # reviewed predictions we're keeping (whose ids came from an earlier run).
+    # Re-key the fresh predictions so their int blob_ids never collide with an
+    # id a stored decision already points at. Taking the floor from the CSV's
+    # reviewed rows alone stopped working when the CSV became an export: with
+    # no CSV every run numbered from 0, and a new detection inherited the id of
+    # an old, unrelated accept or reject. Review then hid it as "already
+    # loaded" (confirmed_ids) and the store counted it as decided -- 456
+    # detections across 52 anosmia recordings, 404 of them behind an accepted
+    # label. The store's examples are the record of every decision, so they
+    # set the floor.
     kept_int_ids = [r['blob_id'] for r in reviewed_rows]
+    kept_int_ids += stored_decision_ids(wav_path)
     id_offset = (max(kept_int_ids) + 1) if kept_int_ids else 0
     for i, r in enumerate(rows):
         r['blob_id'] = id_offset + i
     # Provenance: which model + settings produced these predictions.
-    model_name = Path(cfg.model_path).stem if cfg.model_path else ''
+    model_name = model_label(cfg.model_path)
     for r in rows:
         r['model_name'] = model_name
         r['threshold'] = cfg.threshold
@@ -1156,7 +1956,11 @@ def run_inference_on_file(
         # The CSV is unified: hand-labels (string blob_ids) and reviewed
         # predictions (Accepted/Rejected) are carried over verbatim; only
         # pending predictions are regenerated.
-        write_blob_csv(csv_path, handlabel_rows + reviewed_rows + rows)
+        # Inference records its detections in the .mad store (the crops
+        # above, carrying score and provenance). The CSV is an export the user
+        # asks for, so a run no longer writes one — see mad_csv_rebuild.
+        if cfg.save_blob_csv:
+            write_blob_csv(csv_path, handlabel_rows + reviewed_rows + rows)
     # Persist each blob's small cropped mask (NOT the multi-GB /prob grid):
     # blob_id matches the CSV row's blob_id. On file switch these few-MB crops
     # are read directly, so predictions redraw without decompressing the full
@@ -1166,21 +1970,58 @@ def run_inference_on_file(
     h5_path = None
     try:
         from .fnt_mask_store import (masks_sibling_path, write_pred_masks,
-                                     set_grid_attrs, delete_prob)
+                                     set_grid_attrs, delete_prob, spec_crop)
         h5_path = masks_sibling_path(wav_path)
         set_grid_attrs(h5_path, sample_rate=sr, nperseg=nperseg,
                        noverlap=noverlap, nfft=nfft,
-                       n_freq_bins=prob.shape[0], n_time_frames=prob.shape[1])
+                       n_freq_bins=prob.shape[0], n_time_frames=prob.shape[1],
+                       source_wav=Path(wav_path).name)
+        # Carry score and provenance onto the crop itself. These used to exist
+        # only in the CSV, which is what forced the CSV to be a second source of
+        # truth: without them the h5 cannot answer "how confident was this?" or
+        # "which model produced it?", so the review UI's score filter and the
+        # run record both depended on a file that has to be kept in sync.
+        def _prov(r):
+            return {k: r.get(k) for k in
+                    ('score', 'class', 'model_name', 'threshold',
+                     'min_blob_pixels') if r.get(k) not in (None, '')}
+
         crops = []
         for r in reviewed_rows:
             c = old_crops.get(str(r['blob_id']))
             if c is not None:
                 crops.append({'blob_id': r['blob_id'], 'mask': c['mask'],
-                              'f_off': c['f_off'], 't_off': c['t_off']})
+                              'f_off': c['f_off'], 't_off': c['t_off'],
+                              'spec': c.get('spec'), **_prov(r)})
+        # Each new detection also keeps the image under its mask
+        # (/pred_specs): what the call looks like inside the mask, for contour
+        # measures without the audio.
         for i, b in enumerate(blobs):
             crops.append({'blob_id': id_offset + i, 'mask': b['mask'],
-                          'f_off': b['f_low'], 't_off': b['t_start']})
+                          'f_off': b['f_low'], 't_off': b['t_start'],
+                          'spec': spec_crop(spec, b['f_low'], b['t_start'],
+                                            np.shape(b['mask'])),
+                          **_prov(rows[i] if i < len(rows) else {})})
         write_pred_masks(h5_path, crops)
+        # Stamp the run itself, so a file that came back empty is recorded as
+        # "analyzed, found nothing at these settings" rather than being
+        # indistinguishable from one that was never analyzed.
+        from .fnt_mask_store import set_infer_run_attrs
+        set_infer_run_attrs(
+            h5_path,
+            last_infer_at=datetime.now().isoformat(timespec='seconds'),
+            last_infer_model=model_label(cfg.model_path),
+            last_infer_threshold=float(cfg.threshold),
+            last_infer_min_blob=int(cfg.min_blob_pixels),
+            last_infer_merge=1.0 if cfg.merge_consecutive else 0.0,
+            last_infer_n=float(len(blobs)),
+        )
+        # The detections just got their ridges (each new one keeps its image);
+        # complete the labels' and stamp the file, so no later fill reopens it.
+        try:
+            fill_ridges(wav_path, use_audio=False)
+        except Exception:
+            pass
         # Reclaim disk from any legacy full-grid prob map for this file.
         delete_prob(h5_path)
     except Exception:
@@ -1189,15 +2030,40 @@ def run_inference_on_file(
     if progress:
         progress('blobs', 1, 1)
 
-    total = t_spec + t_infer + t_blobs
-    # Realtime factor: seconds of audio scanned per wall-second of inference
-    # (the tile-scan stage). <1 means slower than realtime — typical on CPU.
-    rt_factor = (audio_dur / t_infer) if t_infer > 0 else 0.0
+    # Wall time this file took in the run: a spectrogram built in the
+    # background while the previous file scanned counts only as long as
+    # the run waited for it.
+    total = t_wait + t_infer + t_blobs
+    # Two rates, because they answer different questions and reporting one
+    # under the other's name is how an ETA comes out at half the truth.
+    #
+    #   realtime_factor — seconds of audio per wall-second of *all* the work
+    #     this file cost: spectrogram, tile scan and blob extraction. This is
+    #     the one to multiply a corpus by. It matches what mad_batch.summarize
+    #     computes run-wide, so a per-file row and the run header finally
+    #     agree; they used to differ by ~35% under the same column name.
+    #   scan_realtime_factor — the tile scan alone, i.e. what the GPU does.
+    #     The right number for comparing devices or batch sizes, and the wrong
+    #     one for "how long will 11,402 files take?".
+    #
+    # <1 means slower than realtime — typical on CPU.
+    rt_factor = (audio_dur / total) if total > 0 else 0.0
+    scan_rt_factor = (audio_dur / t_infer) if t_infer > 0 else 0.0
     return {
         'wav_path': wav_path,
         'csv_path': csv_path if cfg.save_blob_csv else None,
         'h5_path': h5_path,
         'n_blobs': len(rows),
+        # The cutoff these detections were actually written at. Reported so
+        # the run summary can state what ran rather than what training
+        # recommended — those are different numbers, and the summary used to
+        # show the recommendation while claiming it had been applied.
+        'threshold': float(cfg.threshold),
+        'min_blob_pixels': int(cfg.min_blob_pixels),
+        # Poolable counts describing this file's detections, gathered here
+        # because the rows are already in hand — reading them back afterwards
+        # would mean reopening every sidecar over the network.
+        'det_stats': detection_profile(rows),
         'prob_shape': list(prob.shape),
         'sample_rate': sr,
         'nperseg': nperseg, 'noverlap': noverlap, 'nfft': nfft,
@@ -1205,12 +2071,209 @@ def run_inference_on_file(
             'device': device,
             'audio_dur_s': round(audio_dur, 1),
             't_spec': round(t_spec, 2),
+            't_wait': round(t_wait, 2),
+            'spec_backend': spec_backend,
+            'prefetched': prefetched,
             't_infer': round(t_infer, 2),
             't_blobs': round(t_blobs, 2),
             't_total': round(total, 2),
             'realtime_factor': round(rt_factor, 2),
+            'scan_realtime_factor': round(scan_rt_factor, 2),
         },
     }
+
+
+#: Upper edges for the detection-duration histogram, in milliseconds. Fixed so
+#: the per-file histograms simply add up across a run — a quantile cannot be
+#: pooled from per-file quantiles, a histogram can.
+DUR_EDGES_MS = (5.0, 10.0, 20.0, 40.0, 80.0, 160.0, 320.0, 1e9)
+
+#: Score histogram resolution. 0.05 is fine enough to answer "what would
+#: raising the threshold cost me?" at every cutoff the spin box offers.
+SCORE_BIN = 0.05
+N_SCORE_BINS = 20
+
+#: Peak-frequency histogram, 2.5 kHz bins up to 125 kHz (Nyquist at the 250 kHz
+#: these recordings use). Fine enough to separate the 50-80 kHz band mouse and
+#: vole USVs occupy from the low-frequency noise that gets detected alongside.
+FREQ_BIN_KHZ = 2.5
+N_FREQ_BINS = 50
+
+
+def detection_profile(rows: List[Dict]) -> Dict:
+    """Describe the detections one file produced, as poolable counts.
+
+    This exists so the run summary can characterise its OWN output. The
+    alternative on offer was projecting a reject rate from previous models onto
+    a freshly trained one, which assumes the two behave alike — the very thing
+    retraining is meant to change — and errs in the flattering direction
+    exactly when training worked.
+
+    Everything here is a count in a fixed bin, so summing across files is
+    exact. Quantiles are deliberately not returned: a median of per-file
+    medians is not a median.
+    """
+    score_hist = [0] * N_SCORE_BINS
+    dur_hist = [0] * len(DUR_EDGES_MS)
+    freq_hist = [0] * N_FREQ_BINS
+    for r in rows:
+        try:
+            s = float(r.get('score') or 0.0)
+        except (TypeError, ValueError):
+            s = 0.0
+        b = int(min(max(s, 0.0), 0.9999) / SCORE_BIN)
+        score_hist[min(b, N_SCORE_BINS - 1)] += 1
+        try:
+            ms = (float(r.get('stop_s') or 0.0)
+                  - float(r.get('start_s') or 0.0)) * 1000.0
+        except (TypeError, ValueError):
+            ms = 0.0
+        for i, edge in enumerate(DUR_EDGES_MS):
+            if ms < edge:
+                dur_hist[i] += 1
+                break
+        khz = _row_peak_khz(r)
+        if khz is not None:
+            fb = int(khz / FREQ_BIN_KHZ)
+            if 0 <= fb < N_FREQ_BINS:
+                freq_hist[fb] += 1
+    return {'n': len(rows), 'score_hist': score_hist, 'dur_hist': dur_hist,
+            'freq_hist': freq_hist}
+
+
+def _row_peak_khz(r: Dict) -> Optional[float]:
+    """Where a detection sits in frequency, in kHz.
+
+    Prefers the loudest pixel's frequency, which is what a reader would call
+    the call's frequency; falls back to the band centre when the acoustic
+    metrics were not computed (they need the spectrogram, which the interactive
+    view path does not always pass).
+    """
+    v = r.get('peak_freq_hz')
+    if v in (None, ''):
+        lo, hi = r.get('min_freq_hz'), r.get('max_freq_hz')
+        if lo in (None, '') or hi in (None, ''):
+            return None
+        try:
+            v = (float(lo) + float(hi)) / 2.0
+        except (TypeError, ValueError):
+            return None
+    try:
+        return float(v) / 1000.0
+    except (TypeError, ValueError):
+        return None
+
+
+def _mem_snapshot() -> Dict:
+    """This process's memory right now, in MB. ``{}`` when psutil is absent.
+
+    ``commit_mb`` is the number that matters on Windows. A batch dies when the
+    *system commit charge* reaches its limit, and a leak can grow commit for
+    hours while RSS stays flat — the working set is trimmed, the commit is not.
+    Logging RSS alone is what made an earlier investigation conclude "nothing
+    leaked" from a +-3 MB RSS reading, when the process was in fact on its way
+    to 78.6 GB of commit.
+
+    ``peak_commit_mb`` is monotonic, so a run already trimmed back still
+    reports its high-water mark.
+    """
+    try:
+        import psutil
+        mi = psutil.Process().memory_info()
+    except Exception:
+        return {}
+    out: Dict = {'rss_mb': round(mi.rss / (1 << 20), 1)}
+    priv = getattr(mi, 'private', None)          # Windows: commit charge
+    out['commit_mb'] = round((priv if priv is not None else mi.vms)
+                             / (1 << 20), 1)
+    peak = getattr(mi, 'peak_pagefile', None)    # Windows only
+    if peak is not None:
+        out['peak_commit_mb'] = round(peak / (1 << 20), 1)
+    return out
+
+
+def _system_commit() -> Dict:
+    """System-wide commit limit and headroom, in MB. Windows only; else ``{}``.
+
+    This is the quantity that actually decides whether the next allocation
+    succeeds, and it is not RAM: the 2026-09-09 batch failed 72 recordings with
+    23 GB of physical memory free and roughly 60 MB of commit left.
+    """
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [('dwLength', wt.DWORD), ('dwMemoryLoad', wt.DWORD),
+                        ('ullTotalPhys', ctypes.c_ulonglong),
+                        ('ullAvailPhys', ctypes.c_ulonglong),
+                        ('ullTotalPageFile', ctypes.c_ulonglong),
+                        ('ullAvailPageFile', ctypes.c_ulonglong),
+                        ('ullTotalVirtual', ctypes.c_ulonglong),
+                        ('ullAvailVirtual', ctypes.c_ulonglong),
+                        ('ullAvailExtendedVirtual', ctypes.c_ulonglong)]
+
+        st = MEMORYSTATUSEX()
+        st.dwLength = ctypes.sizeof(st)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+            return {}
+        mb = 1 << 20
+        return {
+            'sys_commit_limit_mb': round(st.ullTotalPageFile / mb, 1),
+            'sys_commit_avail_mb': round(st.ullAvailPageFile / mb, 1),
+            'sys_ram_avail_mb': round(st.ullAvailPhys / mb, 1),
+        }
+    except Exception:
+        return {}
+
+
+def _mem_record(before: Dict) -> Dict:
+    """Memory after a file, plus how much this file added and what is left."""
+    rec = _mem_snapshot()
+    rec.update(_system_commit())
+    b, a = before.get('commit_mb'), rec.get('commit_mb')
+    if b is not None and a is not None:
+        rec['delta_commit_mb'] = round(a - b, 1)
+    return rec
+
+
+def _collect_cycles() -> None:
+    """Free the last file's grids. Call between files — this is not optional.
+
+    Measured over a 275-file run with per-file commit logging: each file
+    retained **exactly 4.00x its full-file grid size**, at every duration
+    (346 s, 600 s, 825 s, 888 s and 1800 s files all came out at 4.00-4.01).
+    That is the audio buffer plus three grids, held in a reference cycle, so
+    nothing frees them until the *cyclic* collector runs.
+
+    The cyclic collector triggers on object *counts*, and one file allocates
+    very few, very large objects, so it can go dozens of files without firing.
+    The run's memory trace is the signature: a straight climb of +2295 MB per
+    600 s file to a peak of 70.1 GB, punctuated by 36 sudden drops (the
+    biggest -62.8 GB) as gen-2 finally ran. System commit headroom reached
+    4.7 GB. The two previous runs died exactly this way.
+
+    A collect costs milliseconds against ~170 s of work per file, and holds
+    the process flat at roughly one file's working set.
+    """
+    import gc
+    gc.collect()
+
+
+def _release_between_files() -> None:
+    """``_collect_cycles`` plus the CUDA cache — for the retry pass only.
+
+    ``empty_cache`` synchronises the device and makes the next file's first
+    allocations slower, which is worth paying once before re-attempting
+    failures and not worth paying between every file.
+    """
+    _collect_cycles()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 
 def run_inference_on_files(
@@ -1221,6 +2284,9 @@ def run_inference_on_files(
     wait_if_paused: Optional[Callable[[], None]] = None,
     on_device: Optional[Callable[[str], None]] = None,
     on_file_done: Optional[Callable[[Dict], None]] = None,
+    on_retry_start: Optional[Callable[[int], None]] = None,
+    ridge_fill: Optional[List[str]] = None,
+    on_ridge_done: Optional[Callable[[Dict], None]] = None,
 ) -> List[Dict]:
     """Run inference on a batch of wavs. Loads the model once.
 
@@ -1229,8 +2295,40 @@ def run_inference_on_files(
     tiles; it should block while the run is paused and return on resume/stop.
     ``on_device(device)`` is called once after the model loads; ``on_file_done``
     is called with each file's summary (incl. timing) as it completes — both let
-    the GUI log device + per-file speed live.
+    the GUI log device + per-file speed live. ``on_retry_start(n)`` fires once
+    before the retry pass, with the number of files it will re-attempt.
+
+    ``ridge_fill``: recordings this model analysed before (a resumed run's
+    skipped ones). Their missing brightness ridges are filled after the
+    inference (:func:`fill_ridges_for_run`, stage ``'ridge'``), each result
+    going to ``on_ridge_done`` rather than into the returned list. With
+    ``cfg.ridge`` off the run stores no ridges at all.
+
+    Every summary carries a ``mem`` dict (see :func:`_mem_snapshot`), on the
+    error path too — the memory reading at the moment of a failure is the one
+    most worth having.
+
+    When ``cfg.retry_failed`` is set, files that errored are re-attempted once
+    after the main pass. A recovered file *replaces* its error entry in the
+    returned list, so callers counting ``'error'`` keys see the true final
+    state; its summary is marked ``retry: True``.
     """
+    from .fnt_mask_store import ridge_enabled, set_ridge_enabled
+    ridge_was = ridge_enabled()
+    set_ridge_enabled(getattr(cfg, 'ridge', True))
+    try:
+        return _run_inference_on_files(
+            wav_paths, cfg, progress, should_stop, wait_if_paused, on_device,
+            on_file_done, on_retry_start, ridge_fill, on_ridge_done)
+    finally:
+        set_ridge_enabled(ridge_was)
+
+
+def _run_inference_on_files(wav_paths, cfg, progress, should_stop,
+                            wait_if_paused, on_device, on_file_done,
+                            on_retry_start, ridge_fill,
+                            on_ridge_done) -> List[Dict]:
+    """The body of :func:`run_inference_on_files`, with its ridge switch set."""
     model, ckpt, device = load_model(cfg.model_path, cfg.device)
     if on_device is not None:
         try:
@@ -1239,27 +2337,123 @@ def run_inference_on_files(
             pass
     results: List[Dict] = []
     n = len(wav_paths)
-    for i, wav in enumerate(wav_paths):
-        if wait_if_paused is not None:
-            wait_if_paused()
-        if should_stop and should_stop():
-            break
-        name = Path(wav).name
+
+    def _run_one(wav: str, i: int, retry: bool = False,
+                 prepared: Optional[Dict] = None) -> Dict:
+        name = Path(wav).name + (" (retry)" if retry else "")
 
         def _inner(stage: str, si: int, sn: int, _i=i, _n=n, _name=name):
             if progress:
                 progress(_i, _n, _name, stage, si, sn)
+
+        before = _mem_snapshot()
+        # Only passed when there is one: a background build that failed is
+        # simply redone here, so its error is reported exactly as before.
+        extra = ({'prepared': prepared}
+                 if prepared is not None and 'error' not in prepared else {})
         try:
-            summary = run_inference_on_file(
-                wav, cfg, model=model, ckpt=ckpt, device=device, progress=_inner,
-                wait_if_paused=wait_if_paused,
+            s = run_inference_on_file(
+                wav, cfg, model=model, ckpt=ckpt, device=device,
+                progress=_inner, wait_if_paused=wait_if_paused, **extra,
             )
-            results.append(summary)
         except Exception as e:
-            results.append({'wav_path': wav, 'error': str(e)})
-        if on_file_done is not None:
-            try:
-                on_file_done(results[-1])
-            except Exception:
-                pass
+            s = {'wav_path': wav, 'error': str(e)}
+        del extra, prepared
+        # Before the reading, so `mem` reports what is actually still held
+        # rather than what has merely not been collected yet.
+        _collect_cycles()
+        s['mem'] = _mem_record(before)
+        if retry:
+            s['retry'] = True
+        return s
+
+    def _emit(summary: Dict) -> None:
+        if on_file_done is None:
+            return
+        try:
+            on_file_done(summary)
+        except Exception:
+            pass
+
+    # Prefetch: build file i+1's spectrogram on a background thread while file
+    # i scans. Per 10-minute recording that is ~16 s of CPU (decode +
+    # spectrogram) against ~12 s of GPU, done one after the other -- so most
+    # of the CPU half can hide behind the scan. One file ahead only: each
+    # spectrogram is 600 MB.
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor
+    pool = (ThreadPoolExecutor(1, thread_name_prefix="mad-prefetch")
+            if getattr(cfg, 'prefetch_next', True) and n > 1 else None)
+    pending: Dict[int, object] = {}
+
+    def _prepare(j: int) -> Dict:
+        try:
+            return prepare_file(wav_paths[j], cfg, ckpt, device)
+        except Exception as e:      # redone in the foreground; see _run_one
+            return {'wav_path': wav_paths[j], 'error': str(e)}
+
+    def _queue(j: int) -> None:
+        if pool is not None and j < n and j not in pending:
+            pending[j] = pool.submit(_prepare, j)
+
+    try:
+        for i, wav in enumerate(wav_paths):
+            if wait_if_paused is not None:
+                wait_if_paused()
+            if should_stop and should_stop():
+                break
+            prepared = None
+            if pool is not None:
+                _queue(i)
+                _queue(i + 1)
+                _t0 = _time.perf_counter()
+                prepared = pending.pop(i).result()
+                prepared['t_wait'] = _time.perf_counter() - _t0
+            results.append(_run_one(wav, i, prepared=prepared))
+            prepared = None
+            _emit(results[-1])
+    finally:
+        # A stop leaves at most one build running: let it finish rather than
+        # abandon a thread mid-allocation, and drop what it made.
+        if pool is not None:
+            for f in pending.values():
+                f.cancel()
+            pool.shutdown(wait=True)
+            pending.clear()
+
+    # --- one retry pass over the failures --------------------------------
+    # A batch failure here is nearly always an out-of-memory one, and it is not
+    # a property of the recording: the 2026-09-09 run lost 72 files that were
+    # the same format, sample rate and duration as 190 that had just succeeded,
+    # each dying on its first allocation before a sample was read.
+    #
+    # Retrying at the END is what makes it worth doing. By then every per-file
+    # grid has been released, so the retry runs with headroom the first attempt
+    # did not have. One pass only: a file that fails twice is not waiting on
+    # memory and needs a person to look at it.
+    if getattr(cfg, 'retry_failed', True):
+        retry_idx = [i for i, r in enumerate(results) if r.get('error')]
+        if retry_idx and not (should_stop and should_stop()):
+            _release_between_files()
+            if on_retry_start is not None:
+                try:
+                    on_retry_start(len(retry_idx))
+                except Exception:
+                    pass
+            for i in retry_idx:
+                if wait_if_paused is not None:
+                    wait_if_paused()
+                if should_stop and should_stop():
+                    break
+                s = _run_one(results[i]['wav_path'], i, retry=True)
+                # Keep the first attempt's error when the retry fails too, so
+                # the reported reason is the one that started the trouble.
+                if not s.get('error'):
+                    results[i] = s
+                _emit(s)
+    if ridge_fill and not (should_stop and should_stop()):
+        fill_ridges_for_run(ridge_fill, cfg, ckpt=ckpt, progress=progress,
+                            should_stop=should_stop,
+                            wait_if_paused=wait_if_paused,
+                            on_done=on_ridge_done)
     return results

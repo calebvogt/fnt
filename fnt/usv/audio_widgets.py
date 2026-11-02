@@ -16,9 +16,101 @@ from PyQt5.QtWidgets import QWidget, QSizePolicy
 # ~0.5s import before any spectrogram is actually computed.
 
 
+#: Ceiling on an exported view, in megapixels. Not a Qt or clipboard limit —
+#: both cope well past it — but PNG encoding scales superlinearly with pixel
+#: count and entropy, and a spectrogram is high-entropy: 28 Mpx takes ~2-4 s.
+MAX_EXPORT_MP = 40.0
+
+
 # =============================================================================
 # Spectrogram Widget
 # =============================================================================
+
+def compute_view_spec_arrays(audio_data, sample_rate, view_start, view_end,
+                             min_freq, max_freq, total_duration):
+    """Everything needed to draw a view's spectrogram, as plain numpy.
+
+    Split out of :meth:`SpectrogramWidget._compute_view_spectrogram` so it can
+    run on a worker thread: it touches no widget state and returns arrays, not
+    a QImage. On a 600 s recording this was ~1.2 s on the UI thread every time
+    a file was opened, which is most of what made switching files feel frozen.
+
+    Returns a dict with the uint8 colormap ``indices`` (already flipped so row
+    0 is the top of the image), the raw dB slice and its frequencies for the
+    filter overlay, and the view it was computed for — the caller checks that
+    before installing it, since the user may have moved on. Returns None when
+    there is nothing to draw.
+    """
+    if audio_data is None or sample_rate is None:
+        return None
+
+    # Extract segment with padding
+    pad_time = 0.1
+    start_time = max(0, view_start - pad_time)
+    end_time = min(total_duration, view_end + pad_time)
+    start_sample = int(start_time * sample_rate)
+    end_sample = int(end_time * sample_rate)
+    segment = audio_data[start_sample:end_sample]
+    if len(segment) < 512:
+        return None
+
+    # Downsample if needed, but ensure Nyquist stays above max display freq
+    effective_sr = sample_rate
+    if len(segment) > 2_000_000:
+        downsample_factor = int(np.ceil(len(segment) / 2_000_000))
+        if max_freq > 0:
+            max_allowed = max(1, int(sample_rate / (2 * max_freq)))
+            downsample_factor = min(downsample_factor, max_allowed)
+        if downsample_factor > 1:
+            segment = segment[::downsample_factor]
+            effective_sr = sample_rate / downsample_factor
+
+    # For very large segments, reduce time resolution instead of frequency.
+    target_time_cols = 2000
+    nperseg = min(512, len(segment) // 10)
+    nperseg = max(128, nperseg)
+    min_hop = max(1, len(segment) // target_time_cols)
+    noverlap = max(0, nperseg - min_hop)
+    noverlap = min(noverlap, int(nperseg * 0.75))    # cap at 75% overlap
+    nfft = max(nperseg, 512)
+
+    from scipy import signal
+    frequencies, times, Sxx = signal.spectrogram(
+        segment, fs=effective_sr,
+        nperseg=nperseg, noverlap=noverlap, nfft=nfft, window='hann')
+
+    times = times + start_time
+    spec_db = 10 * np.log10(Sxx + 1e-10)
+
+    time_mask = (times >= view_start) & (times <= view_end)
+    if not np.any(time_mask):
+        return None
+    view_spec = spec_db[:, time_mask]
+
+    freq_mask = (frequencies >= min_freq) & (frequencies <= max_freq)
+    if not np.any(freq_mask):
+        return None
+    view_spec = view_spec[freq_mask, :]
+
+    # Raw dB kept for the filter overlay, before normalization.
+    raw_db = view_spec.copy()
+    raw_freqs = frequencies[freq_mask].copy()
+
+    vmin = np.percentile(view_spec, 5)
+    vmax = np.percentile(view_spec, 99)
+    normalized = np.clip((view_spec - vmin) / (vmax - vmin + 1e-10), 0, 1)
+    indices = np.flipud((normalized * 255).astype(np.uint8))
+
+    return {
+        'indices': indices,
+        'raw_db': raw_db,
+        'raw_freqs': raw_freqs,
+        'view_start': view_start,
+        'view_end': view_end,
+        'min_freq': min_freq,
+        'max_freq': max_freq,
+    }
+
 
 class SpectrogramWidget(QWidget):
     """Custom widget for displaying spectrogram with detection boxes."""
@@ -32,6 +124,14 @@ class SpectrogramWidget(QWidget):
     sample_freq_adjusted = pyqtSignal(int, int, float)
     # A sample-dot drag finished (det_idx) — persist + refresh.
     sample_drag_complete = pyqtSignal(int)
+
+    #: Set only while render_view_image() is rendering. paintEvent reads it to
+    #: resample the spectrogram straight to the export resolution instead of to
+    #: the widget's logical size. Deliberately NOT derived from the painter's
+    #: transform: on a 125%/150% Windows display that would silently change
+    #: every interactive repaint, and this widget is repainted on every brush
+    #: stroke and box drag.
+    export_scale = 1.0
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -340,7 +440,8 @@ class SpectrogramWidget(QWidget):
 
         return lut
 
-    def set_audio_data(self, audio_data, sample_rate, preserve_view=False):
+    def set_audio_data(self, audio_data, sample_rate, preserve_view=False,
+                       precomputed=None):
         """Set audio data for spectrogram computation.
 
         Args:
@@ -377,7 +478,17 @@ class SpectrogramWidget(QWidget):
         self.spec_image = None
 
         if self.total_duration > 0:
-            self._compute_view_spectrogram()
+            # A worker may already have done the expensive part for the view
+            # we are about to show. Use it only if it matches, so a stale
+            # result can never be painted as if it were this view.
+            if (precomputed is not None
+                    and abs(precomputed['view_start'] - self.view_start) < 1e-9
+                    and abs(precomputed['view_end'] - self.view_end) < 1e-9
+                    and precomputed['min_freq'] == self.min_freq
+                    and precomputed['max_freq'] == self.max_freq):
+                self._install_spec_arrays(precomputed)
+            else:
+                self._compute_view_spectrogram()
         self.update()
 
     def set_detections(self, detections, current_idx=-1):
@@ -424,6 +535,28 @@ class SpectrogramWidget(QWidget):
         """Get total audio duration."""
         return self.total_duration
 
+    def _install_spec_arrays(self, res):
+        """Turn arrays from :func:`compute_view_spec_arrays` into the QImage.
+
+        Only the LUT lookup and the QImage build happen here — both cheap —
+        so this is safe and quick on the UI thread whether the arrays came
+        from a worker or from a synchronous recompute.
+        """
+        indices = res['indices']
+        self._raw_spec_db = res['raw_db']
+        self._raw_spec_freqs = res['raw_freqs']
+        rgb_data = np.ascontiguousarray(self.colormap_lut[indices])
+        height, width = indices.shape
+        self.spec_image = QImage(
+            rgb_data.data, width, height, width * 3,
+            QImage.Format_RGB888).copy()
+        self.cached_view_start = res['view_start']
+        self.cached_view_end = res['view_end']
+        self.cached_min_freq = res['min_freq']
+        self.cached_max_freq = res['max_freq']
+        if self._filter_overlay_active:
+            self._compute_filter_overlay()
+
     def _compute_view_spectrogram(self):
         """Compute spectrogram for current view window."""
         if self.audio_data is None or self.sample_rate is None:
@@ -445,93 +578,13 @@ class SpectrogramWidget(QWidget):
             if zoom_similar and same_position and same_freq:
                 return
 
-        # Extract segment with padding
-        pad_time = 0.1
-        start_time = max(0, self.view_start - pad_time)
-        end_time = min(self.total_duration, self.view_end + pad_time)
-
-        start_sample = int(start_time * self.sample_rate)
-        end_sample = int(end_time * self.sample_rate)
-        segment = self.audio_data[start_sample:end_sample]
-
-        if len(segment) < 512:
+        res = compute_view_spec_arrays(
+            self.audio_data, self.sample_rate, self.view_start, self.view_end,
+            self.min_freq, self.max_freq, self.total_duration)
+        if res is None:
             self.spec_image = None
             return
-
-        # Downsample if needed, but ensure Nyquist stays above max display freq
-        effective_sr = self.sample_rate
-        if len(segment) > 2_000_000:
-            downsample_factor = int(np.ceil(len(segment) / 2_000_000))
-            # Limit downsample so Nyquist (effective_sr/2) >= max_freq
-            if self.max_freq > 0:
-                max_allowed = max(1, int(self.sample_rate / (2 * self.max_freq)))
-                downsample_factor = min(downsample_factor, max_allowed)
-            if downsample_factor > 1:
-                segment = segment[::downsample_factor]
-                effective_sr = self.sample_rate / downsample_factor
-
-        # For very large segments, reduce time resolution instead of frequency
-        # Target ~2000 time columns max for the spectrogram image
-        target_time_cols = 2000
-        nperseg = min(512, len(segment) // 10)
-        nperseg = max(128, nperseg)
-        # Adjust overlap to limit output columns for wide windows
-        min_hop = max(1, len(segment) // target_time_cols)
-        noverlap = max(0, nperseg - min_hop)
-        noverlap = min(noverlap, int(nperseg * 0.75))  # Cap at 75% overlap
-        nfft = max(nperseg, 512)
-
-        from scipy import signal
-        frequencies, times, Sxx = signal.spectrogram(
-            segment, fs=effective_sr,
-            nperseg=nperseg, noverlap=noverlap, nfft=nfft, window='hann'
-        )
-
-        times = times + start_time
-        spec_db = 10 * np.log10(Sxx + 1e-10)
-
-        # Filter to view range (time)
-        time_mask = (times >= self.view_start) & (times <= self.view_end)
-        if not np.any(time_mask):
-            self.spec_image = None
-            return
-
-        view_spec = spec_db[:, time_mask]
-
-        # Filter to frequency display range
-        freq_mask = (frequencies >= self.min_freq) & (frequencies <= self.max_freq)
-        if not np.any(freq_mask):
-            self.spec_image = None
-            return
-        view_spec = view_spec[freq_mask, :]
-
-        # Cache raw dB data for filter overlay (before normalization)
-        self._raw_spec_db = view_spec.copy()
-        self._raw_spec_freqs = frequencies[freq_mask].copy()
-
-        # Normalize and apply colormap
-        vmin = np.percentile(view_spec, 5)
-        vmax = np.percentile(view_spec, 99)
-        normalized = np.clip((view_spec - vmin) / (vmax - vmin + 1e-10), 0, 1)
-        indices = (normalized * 255).astype(np.uint8)
-        indices = np.flipud(indices)
-
-        rgb_data = np.ascontiguousarray(self.colormap_lut[indices])
-
-        height, width = indices.shape
-        self.spec_image = QImage(
-            rgb_data.data, width, height, width * 3,
-            QImage.Format_RGB888
-        ).copy()
-
-        self.cached_view_start = self.view_start
-        self.cached_view_end = self.view_end
-        self.cached_min_freq = self.min_freq
-        self.cached_max_freq = self.max_freq
-
-        # Recompute filter overlay if active
-        if self._filter_overlay_active:
-            self._compute_filter_overlay()
+        self._install_spec_arrays(res)
 
     def paintEvent(self, event):
         """Paint spectrogram and detection boxes."""
@@ -550,11 +603,34 @@ class SpectrogramWidget(QWidget):
                          if self._filter_overlay_active
                          and self._filter_overlay_image
                          else self.spec_image)
-        scaled_image = display_image.scaled(
-            int(spec_rect.width()), int(spec_rect.height()),
-            Qt.IgnoreAspectRatio, Qt.SmoothTransformation
-        )
-        painter.drawImage(spec_rect.topLeft(), scaled_image)
+        # Resample once, to the resolution actually being painted.
+        #
+        # On screen (export_scale 1.0) this is exactly the old code. During a
+        # high-resolution export the painter carries a scale transform, and
+        # scaling to the LOGICAL rect first would resample twice — spec_image
+        # to ~1300 px, then that intermediate up to ~4000 by the transform,
+        # which Qt does with nearest-neighbour unless asked otherwise. The
+        # result is a blocky magnification of the screen image carrying no
+        # more information than the screen image. Scaling straight to the
+        # device size keeps whatever real detail spec_image has, which above
+        # roughly a 0.7 s window is substantial: at 2 s the view holds ~3900
+        # STFT columns and the screen throws three quarters of them away.
+        s = self.export_scale
+        if s == 1.0:
+            scaled_image = display_image.scaled(
+                int(spec_rect.width()), int(spec_rect.height()),
+                Qt.IgnoreAspectRatio, Qt.SmoothTransformation
+            )
+            painter.drawImage(spec_rect.topLeft(), scaled_image)
+        else:
+            scaled_image = display_image.scaled(
+                max(1, int(round(spec_rect.width() * s))),
+                max(1, int(round(spec_rect.height() * s))),
+                Qt.IgnoreAspectRatio, Qt.SmoothTransformation
+            )
+            # Rect overload: the source is already at the target's device size,
+            # so this lands 1:1 rather than resampling again.
+            painter.drawImage(spec_rect, scaled_image)
 
         # Draw per-call masks (under the boxes).
         if self.call_masks and self.spec_grid is not None:
@@ -647,6 +723,70 @@ class SpectrogramWidget(QWidget):
             self.width() - margin_left - margin_right,
             self.height() - margin_top - margin_bottom
         )
+
+    def render_view_image(self, dpi=96.0, max_megapixels=None):
+        """Render the current view to a QImage at ``dpi``, ready to copy out.
+
+        The picture keeps the panel's own geometry and physical size — a
+        1400 px panel is 14.6 in wide at any dpi — so raising dpi multiplies
+        pixels rather than changing the layout. What those extra pixels buy:
+
+        * Axes, tick labels, detection boxes, mask outlines and contours are
+          redrawn at the output resolution. Real, at every zoom.
+        * The spectrogram raster is bounded by the analysis. Above roughly a
+          0.7 s window the view holds more STFT columns than the panel has
+          pixels, and the extra resolution recovers them — measured about
+          1.8x at a 2 s window and 2.3x at 5 s, on a 1378 px panel. Below
+          that there is nothing to recover and it is an honest
+          interpolation. Vertically it is always interpolation: 513 frequency
+          bins against a 700-1300 px pane.
+
+        Returns ``(QImage, effective_dpi)``, or ``(None, 0.0)`` when there is
+        no spectrogram to render. ``effective_dpi`` is below ``dpi`` when the
+        megapixel cap bit — say so rather than quietly under-delivering.
+        """
+        if self.spec_image is None:
+            return None, 0.0
+
+        logical_w = max(1, self.width())
+        logical_h = max(1, self.height())
+        scale = max(1.0, float(dpi) / 96.0)
+
+        # Cap total pixels rather than the scale factor: the preview grows with
+        # the window, so a maximised 4K pane at a fixed multiplier runs to tens
+        # of megapixels, and it is the PNG encode downstream — not the render —
+        # that then freezes the GUI for seconds.
+        # Resolved here, not as a default argument: a default is bound at
+        # import, so the module constant would be frozen at that moment and
+        # neither a caller nor a test could move it.
+        cap = MAX_EXPORT_MP if max_megapixels is None else max_megapixels
+        mp = (logical_w * scale) * (logical_h * scale) / 1e6
+        if cap and mp > cap:
+            scale *= (cap / mp) ** 0.5
+
+        img = QImage(max(1, int(round(logical_w * scale))),
+                     max(1, int(round(logical_h * scale))),
+                     QImage.Format_RGB32)   # no alpha: keeps the dpi in CF_DIBV5
+        img.setDevicePixelRatio(scale)
+        img.fill(QColor(30, 30, 30))
+
+        # The widget is never resized for this: render() draws it at its own
+        # geometry through a scaled painter, so nothing about the live layout
+        # is touched and there is no window in which a repaint could catch the
+        # panel at the wrong size. export_scale is the only mutated state, and
+        # it is reset in the finally.
+        try:
+            self.export_scale = scale
+            self.render(img)
+        finally:
+            self.export_scale = 1.0
+
+        eff_dpi = 96.0 * scale
+        img.setDevicePixelRatio(1.0)
+        dpm = int(round(eff_dpi / 0.0254))
+        img.setDotsPerMeterX(dpm)
+        img.setDotsPerMeterY(dpm)
+        return img, eff_dpi
 
     def _time_to_x(self, time_s, spec_rect):
         """Convert time to x coordinate."""
@@ -1346,8 +1486,11 @@ class WaveformOverviewWidget(QWidget):
         """Set status-colored tick marks along the overview strip.
 
         Args:
-            marks: list of ``(center_seconds, QColor)`` — one tick per detection,
-                colored by labeling status (pending/accepted/rejected).
+            marks: list of ``(center_seconds, QColor)`` or
+                ``(center_seconds, QColor, priority)`` — one entry per
+                detection, colored by labeling status. ``priority`` breaks the
+                tie when several detections land on the same pixel column
+                (higher wins); it defaults to 0.
         """
         self.status_marks = marks or []
         self.update()
@@ -1384,14 +1527,31 @@ class WaveformOverviewWidget(QWidget):
                 cx = int((start_s + stop_s) / 2.0 / self.total_duration * w)
                 painter.drawLine(cx, 0, cx, h)
 
-        # Draw status-colored tick marks (pending/accepted/rejected). One per
-        # detection at its center time, so the user can see where calls cluster
-        # along the whole file without zooming out.
+        # Status ticks (pending/accepted/rejected), showing where calls sit
+        # across the whole file without zooming out.
+        #
+        # Drawing one full-height line per detection does not survive real
+        # files: a thousand calls over a strip a thousand pixels wide puts a
+        # line in every column, and they overdraw into a solid block that
+        # carries no information. So collapse to at most one mark per pixel
+        # column (highest priority wins) and confine them to a short lane at
+        # the top, which keeps the waveform readable underneath and turns the
+        # cost from O(detections) into O(width).
         if self.status_marks and self.total_duration > 0:
-            for cs, color in self.status_marks:
+            lane = max(4, int(h * 0.22))
+            best = {}
+            for mark in self.status_marks:
+                cs, color = mark[0], mark[1]
+                rank = mark[2] if len(mark) > 2 else 0
                 cx = int(cs / self.total_duration * w)
+                if not 0 <= cx < w:
+                    continue
+                prev = best.get(cx)
+                if prev is None or rank > prev[0]:
+                    best[cx] = (rank, color)
+            for cx, (_rank, color) in best.items():
                 painter.setPen(QPen(color, 1))
-                painter.drawLine(cx, 0, cx, h)
+                painter.drawLine(cx, 0, cx, lane)
 
         # Draw viewport highlight
         x1 = int(self.view_start / self.total_duration * w)

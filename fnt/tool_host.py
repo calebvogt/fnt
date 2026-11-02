@@ -75,6 +75,88 @@ def install_faulthandler(label=""):
             pass
 
 
+def install_slot_excepthook():
+    """Log unhandled Python exceptions instead of letting Qt abort the process.
+
+    PyQt5 (>= 5.5) responds to an unhandled exception inside a slot by calling
+    Qt's ``qFatal()``, which calls ``abort()``. Under ``pythonw.exe`` there is
+    no stderr, so the traceback goes nowhere and the tool simply vanishes:
+    Windows records exit code 0xC0000409 in Qt5Core.dll and nothing else. That
+    is exactly how a MAD session died after finishing four hours of overnight
+    training and inference — all the work was on disk, and the only evidence of
+    why was an event-log entry.
+
+    ``faulthandler`` cannot catch it. 0xC0000409 with FAST_FAIL_FATAL_APP_EXIT
+    is ``__fastfail``, which bypasses signal and SEH handlers by design, and Qt
+    aborts through its own C runtime rather than the one Python installed its
+    SIGABRT handler in.
+
+    Installing an exception hook is what actually prevents it: PyQt only calls
+    ``qFatal()`` for an exception no hook handled, so this both records the
+    traceback and keeps the tool alive. A bug in one slot then costs a log
+    entry rather than the session.
+    """
+    import traceback
+
+    def hook(exc_type, exc, tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc, tb)
+            return
+        try:
+            import threading
+            where = threading.current_thread().name
+            text = "".join(traceback.format_exception(exc_type, exc, tb))
+            stamp = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
+            block = (f"\n----- unhandled exception [{where}] {stamp} -----\n"
+                     f"{text}")
+            if _FAULT_LOG is not None:
+                _FAULT_LOG.write(block)
+                _FAULT_LOG.flush()
+            else:                         # log file unavailable; still say it
+                sys.__excepthook__(exc_type, exc, tb)
+        except Exception:
+            # A failure in here must never be what takes the tool down.
+            pass
+
+    sys.excepthook = hook
+
+
+def install_qt_message_handler():
+    """Copy Qt's own warnings and fatal messages into the crash log.
+
+    Neither hook above sees Qt aborting on its own account: "QThread:
+    Destroyed while thread is still running" is a qFatal(), so the process dies
+    with 0xC0000409 in Qt5Core.dll and, under pythonw.exe, the message goes
+    nowhere. A Mask Tracker session died exactly that way. The handler writes
+    the message (and, for a fatal one, every thread's Python stack) before Qt
+    aborts.
+    """
+    try:
+        from PyQt5.QtCore import QtCriticalMsg, QtFatalMsg, QtWarningMsg, qInstallMessageHandler
+    except Exception:
+        return
+    names = {QtWarningMsg: "warning", QtCriticalMsg: "critical", QtFatalMsg: "FATAL"}
+
+    def handler(mode, context, message):
+        if mode not in names:
+            return
+        try:
+            if _FAULT_LOG is None:
+                return
+            where = ""
+            if context is not None and context.file:
+                where = f" ({context.file}:{context.line})"
+            _FAULT_LOG.write(f"\n----- Qt {names[mode]} {datetime.now():%Y-%m-%d %H:%M:%S}"
+                             f"{where} -----\n{message}\n")
+            if mode == QtFatalMsg:
+                faulthandler.dump_traceback(file=_FAULT_LOG, all_threads=True)
+            _FAULT_LOG.flush()
+        except Exception:
+            pass
+
+    qInstallMessageHandler(handler)
+
+
 def resource_path(relative_path):
     """Locate a bundled resource, working from source and from PyInstaller."""
     try:
@@ -201,6 +283,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     install_faulthandler(args.title or f"{args.module}.{args.attr}")
+    # faulthandler covers native crashes; this covers the far more
+    # common Python exception in a slot, which Qt turns into an abort.
+    install_slot_excepthook()
+    install_qt_message_handler()
 
     from PyQt5.QtGui import QIcon
     from PyQt5.QtWidgets import QApplication, QMessageBox

@@ -1,4 +1,5 @@
 import base64
+import html
 import faulthandler
 import io
 import os
@@ -10,6 +11,7 @@ import time
 import sqlite3
 import struct
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 import pandas as pd
 import pytz
 import json
@@ -33,18 +35,29 @@ from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLabel, QFileDialog, QMessageBox,
                              QGroupBox, QCheckBox, QScrollArea, QComboBox,
                              QSpinBox, QDoubleSpinBox, QFrame, QLineEdit,
+                             QPlainTextEdit,
                              QDialog, QDialogButtonBox, QFormLayout, QTableWidget,
                              QTableWidgetItem, QHeaderView, QTextEdit, QProgressBar,
                              QDateTimeEdit, QTreeWidget, QTreeWidgetItem,
                              QSplitter, QSlider, QProgressDialog, QGridLayout,
-                             QListWidget)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QDateTime
-from PyQt5.QtGui import QFont, QTextCursor, QImage, QPixmap
+                             QListWidget, QListWidgetItem, QAbstractItemView,
+                             QColorDialog, QInputDialog, QMenu)
+from PyQt5.QtCore import (Qt, QThread, pyqtSignal, QTimer, QDateTime,
+                          QByteArray, QMimeData, QSettings)
+from PyQt5.QtGui import (QFont, QTextCursor, QImage, QPixmap, QColor,
+                         QCursor)
 
 from fnt.uwb.uwb_preview_canvas import (
     UWBPreview2D, UWBPreview3D, PreviewArena, fit_arena_to_data,
-    BUILTIN_ARENAS, HAVE_GL as PREVIEW_HAVE_GL, GL_ERROR as PREVIEW_GL_ERROR)
+    BUILTIN_ARENAS, HAVE_GL as PREVIEW_HAVE_GL, GL_ERROR as PREVIEW_GL_ERROR,
+    label_halo, MAX_RENDER_MP, COPY_VIEW_DPI, LightBar, MoonIcon, SkyIcon)
 from fnt.uwb import animation as uwb_animation
+from fnt.uwb import weather as WX
+from fnt.uwb.identities import (
+    ID_DISPLAY_TYPES, SEX_ID, NAME, CODE, HEX_ID, SHORT_ID, normalize_id_type,
+    tag_label, hex_label, identity_field_problems, describe_problems,
+    OFF_INTERVALS, off_intervals, merge_intervals, inside_intervals)
+from fnt.uwb import uwb_roi
 
 
 # Columns the processing pipeline actually consumes. Wiser tables carry ~20
@@ -56,7 +69,7 @@ from fnt.uwb import animation as uwb_animation
 # downsampled exports). The raw CSV export still does SELECT * so the
 # full-fidelity dump of the database is preserved untouched.
 PROCESSING_COLUMNS = ("shortid", "timestamp", "location_x", "location_y",
-                      "battery_voltage")
+                      "battery_voltage", "anchors_used")
 # Without these the pipeline cannot run at all, so a table missing any of them
 # falls back to SELECT * rather than failing on a missing column.
 REQUIRED_COLUMNS = ("shortid", "timestamp", "location_x", "location_y")
@@ -108,11 +121,28 @@ def list_visible_files(directory):
         return []
 
 
-# Default spatial context layers for exported plots/animation. The user picks
-# these per-export in PlotLayersDialog; the choice is stored on the window and
-# in the config. Kept separate from the Preview Options 'Show ...' toggles,
-# which only affect the live preview.
-DEFAULT_PLOT_LAYERS = {'background': True, 'zones': True, 'anchors': True}
+# Fallback spatial context layers for exported plots/animation, used only
+# before a preview exists (a config restored for a trial that has not been
+# opened yet). In normal use the layers are INHERITED from the Preview Options
+# 'Show ...' toggles - see plot_layers_from_preview.
+DEFAULT_PLOT_LAYERS = {'background': True, 'zones': True, 'anchors': True,
+                       'rois': True}
+
+
+def _polygon_len(region):
+    """Corner count of a zone or region, 0 if it has no usable polygon.
+
+    Written as a function because ``region.get('points') or []`` looks right
+    and is not: a drawn region's points are a numpy array, and testing one for
+    truth raises rather than returning False.
+    """
+    pts = region.get('points')
+    if pts is None:
+        return 0
+    try:
+        return len(np.asarray(pts, dtype=float).reshape(-1, 2))
+    except Exception:
+        return 0
 
 # ── Displacement (supplant) detection: PARKED, not removed ────────────────
 # FUTURE FEATURE. The detector runs and its thresholds are still configurable
@@ -135,16 +165,606 @@ DEFAULT_PLOT_LAYERS = {'background': True, 'zones': True, 'anchors': True}
 # which is what the current thresholds cannot distinguish.
 DISPLACEMENT_ENABLED = False
 
+# ── clearing an analysis folder ──────────────────────────────────────────
+# Everything in the folder is an export EXCEPT these. A keep-list rather than
+# a list of things to delete, and that asymmetry is the whole point: a product
+# that has been renamed or retired leaves a file FNT no longer produces, so a
+# list of "files we write" is blind to exactly the orphans worth removing.
+# VT001 carried a _proximity_bouts.csv (renamed) and a _runSummary.csv
+# (retired) for months for this reason - stale files that still looked current.
+CLEAR_KEEP_SUFFIXES = (
+    '_indexed.sqlite',      # the fast-index copy: gigabytes, and a cache of
+    '_indexed.json',        # the SOURCE database rather than an export
+    '_indexed.sqlite.partial',
+)
+CLEAR_KEEP_NAMES = (
+    'fnt_config.json',      # the settings record; losing it loses provenance
+    'weather_cache',        # raw weather downloads - a cache of the SOURCE
+    'fnt_site.json',        # the site profile; settings, not an export
+)
+
+# Raw weather/solar downloads live here, inside the analysis folder, so a
+# re-run is reproducible offline and a clear does not force a re-download.
+WEATHER_CACHE_DIR = 'weather_cache'
+
+# Files FNT currently writes or has written. Only used to tell the user which
+# deletions are expected and which are strangers - never to decide what goes.
+_KNOWN_EXPORT_PATTERNS = (
+    '_smoothed.csv', '_raw.csv', '_SocialOverlapBouts.csv', '_proximity_bouts.csv',
+    '_behavior_events.csv', '_ROI_bout_occupancy.csv', '_ROI_DailySummary.csv',
+    '_weather.csv', '_daylight.csv', '_sky.csv', '_DailyPathGrid.png',
+    # Retired products. Kept in the list so a re-export of a trial processed by
+    # an older build reports clearing them as expected, not as strangers.
+    '_network_GBI.csv', '_network_edgelist',
+    '_zone_occupancy.csv', '_roiSummary.csv',
+    '_messageLog.txt', '_runSummary.csv', '_sitemap.png', '.partial',
+)
+_KNOWN_EXPORT_DIRS = ('plots', 'animation_Tracking', 'animation_SocialNetworks',
+                      'csvs')
+
+# Recently opened databases, newest first. Per-user app settings (never in the
+# analysis folder), under this tool's own key.
+RECENT_DATABASES_KEY = "uwb/recent_databases"
+MAX_RECENT_DATABASES = 10
+
+# Every CSV product goes in one subfolder, so the analysis folder's top level
+# is the handful of things a person opens (config, message log, site map) plus
+# the plots/animation/csv folders - rather than a dozen tables mixed in with
+# them.
+CSV_SUBDIR = 'csvs'
+
+
+def ensure_dir(path, attempts=12, delay=0.25):
+    """Create a directory, tolerating a delete that has not landed yet.
+
+    On a NETWORK SHARE a removed directory lingers in a pending-delete state
+    until every handle closes. CreateDirectory then fails with ERROR_ALREADY
+    EXISTS while os.path.isdir() reports False, so makedirs(exist_ok=True)
+    re-raises rather than succeeding - and Clear & Re-export, which deletes
+    this very folder moments earlier, walks straight into it.
+
+    Retries briefly instead of failing the export over a race that resolves
+    itself in well under a second.
+    """
+    last = None
+    for i in range(attempts):
+        try:
+            os.makedirs(path, exist_ok=True)
+            if os.path.isdir(path):
+                return path
+        except OSError as e:
+            last = e
+        time.sleep(delay * (i + 1))
+        if os.path.isdir(path):
+            return path
+    if last is not None:
+        raise last
+    raise OSError(f"could not create {path}")
+
+
+def csv_output_dir(output_dir, create=False):
+    """The folder CSV products are written to."""
+    path = os.path.join(output_dir, CSV_SUBDIR)
+    if create:
+        ensure_dir(path)
+    return path
+
+
+def check_dir_usable(path):
+    """Why ``path`` cannot serve as an output folder, or None if it can.
+
+    Creating and writing a file is not enough: a directory can accept writes
+    while refusing to be ENUMERATED, which is the state a network share can
+    leave one in after a delete that did not complete. Everything still
+    exports, but the folder can never be cleared again, so each run's output
+    silently accumulates on the last one's.
+
+    Checked before a long export rather than after, because finding out at the
+    end costs the whole run.
+    """
+    if not os.path.isdir(path):
+        return None
+    try:
+        os.listdir(path)
+    except OSError as e:
+        return (f"{path} cannot be listed ({e.strerror or e}). It still "
+                f"accepts files, so an export would appear to work - but it "
+                f"can never be cleared, and old products would survive beside "
+                f"the new ones looking identical. Delete this folder in "
+                f"Explorer; the next export recreates it.")
+    return None
+
+
+def export_csv_path(output_dir, filename, create=False):
+    """Where a CSV product goes, or where an existing one already is.
+
+    Writes always land in the subfolder. Reads prefer it but fall back to the
+    analysis folder's top level, because trials exported before this change
+    have their CSVs there and re-deriving a multi-gigabyte smoothed CSV just
+    because it sits one directory up would be a poor trade.
+    """
+    nested = os.path.join(csv_output_dir(output_dir, create=create), filename)
+    if os.path.exists(nested):
+        return nested
+    flat = os.path.join(output_dir, filename)
+    if os.path.exists(flat):
+        return flat
+    return nested
+
+
+def classify_analysis_folder(folder):
+    """What a Clear & Re-export would remove from ``folder``.
+
+    Returns ``(removable, kept, unknown)``. Each of ``removable`` and ``kept``
+    is a list of ``(relative_path, bytes, is_dir)``; ``unknown`` is the subset
+    of ``removable`` that does not match anything FNT is known to write, so the
+    caller can show those separately - a file you put there yourself should be
+    something you get to see before it goes, not a silent casualty.
+    """
+    removable, kept, unknown = [], [], []
+    if not folder or not os.path.isdir(folder):
+        return removable, kept, unknown
+
+    def _dir_size(path):
+        total = 0
+        for root, _dirs, files in os.walk(path):
+            for f in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    pass
+        return total
+
+    for entry in sorted(os.listdir(folder)):
+        full = os.path.join(folder, entry)
+        is_dir = os.path.isdir(full)
+        try:
+            size = _dir_size(full) if is_dir else os.path.getsize(full)
+        except OSError:
+            size = 0
+        if entry in CLEAR_KEEP_NAMES or entry.endswith(CLEAR_KEEP_SUFFIXES):
+            kept.append((entry, size, is_dir))
+            continue
+        removable.append((entry, size, is_dir))
+        known = (entry in _KNOWN_EXPORT_DIRS if is_dir
+                 else any(p in entry for p in _KNOWN_EXPORT_PATTERNS))
+        if not known:
+            unknown.append((entry, size, is_dir))
+    return removable, kept, unknown
+
+
+def clear_analysis_folder(folder, log=None):
+    """Delete every export in ``folder``, keeping the config and fast index.
+
+    Returns ``(removed_count, freed_bytes, failures)``. A file that cannot be
+    deleted - open in Excel, locked by another process - is reported rather
+    than raised on, because a partial clear followed by a full re-export is a
+    recoverable state while an aborted export is not.
+    """
+    removable, _kept, _unknown = classify_analysis_folder(folder)
+    removed, freed, failures = 0, 0, []
+    for name, size, is_dir in removable:
+        full = os.path.join(folder, name)
+        try:
+            if is_dir:
+                # EMPTIED, not removed. Deleting a directory and recreating it
+                # moments later races on a network share, where the removal is
+                # pending until every handle closes - which is exactly what
+                # Clear & Re-export does to csvs/. Leaving the (now empty)
+                # directory in place removes the race entirely.
+                entries = os.listdir(full)
+                if not entries:
+                    # Already empty, so there is nothing to clear and nothing
+                    # to report: a second clear must be a genuine no-op, not a
+                    # count of the directories the first one left behind.
+                    continue
+                for entry in entries:
+                    child = os.path.join(full, entry)
+                    if os.path.isdir(child):
+                        shutil.rmtree(child)
+                    else:
+                        os.remove(child)
+            else:
+                os.remove(full)
+            removed += 1
+            freed += size
+        except OSError as e:
+            failures.append(f"{name}: {e}")
+    if log:
+        log(f"Cleared {removed} item(s) from "
+            f"{os.path.basename(folder)} ({human_bytes(freed)} freed)")
+        if failures:
+            # A clear that did not clear is not a detail. Whatever survived is
+            # about to sit beside this run's output looking exactly like it,
+            # and a product this run does not write would be read as if it did.
+            log(f"  ⚠ CLEAR INCOMPLETE - {len(failures)} item(s) could "
+                f"NOT be removed:")
+            for f in failures:
+                log(f"      {f}")
+            log("      Files left behind are from an EARLIER run. Anything "
+                "this export does not overwrite will survive and look "
+                "current. Delete the folder by hand before trusting a "
+                "product this run did not write.")
+    return removed, freed, failures
+
+
+def human_bytes(n):
+    """A byte count at the precision a person actually reads."""
+    n = float(n)
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if abs(n) < 1024.0 or unit == 'GB':
+            return f"{n:.0f} {unit}" if unit == 'B' else f"{n:.1f} {unit}"
+        n /= 1024.0
+
+
+# Defined in dataview.py so animation.py can format panel cells without
+# importing THIS module - which imports animation.py, and would close the
+# circle. Re-exported under the name callers already use.
+from fnt.uwb.dataview import human_duration          # noqa: E402,F401
+
+
+# A parked tag reports the same spot over and over, so its MAD is 0 and every
+# fix is infinitely many deviations from the median. The floor says "never
+# call anything an outlier for being more than 5 cm off a perfectly still
+# track", which is below the positional noise of the system anyway.
+HAMPEL_MAD_FLOOR_M = 0.05
+
+SOCIAL_BOUTS_TOOLTIP = (
+    "FILE: {db}_SocialOverlapBouts.csv\n"
+    "\n"
+    "THE social product. One row per dyad per contiguous contact bout: "
+    "animal1, animal2, Day, Date, bout_start, bout_stop, duration_s, "
+    "mean_distance, n_reads.\n"
+    "\n"
+    "CONTACT = centres within 2x the social radius (the preview's dotted "
+    "circles overlapping). Measured on the filtered and smoothed track at "
+    "full temporal resolution, so no fixes are dropped before pairwise "
+    "distances are computed.\n"
+    "\n"
+    "STRICTLY DYADIC, no chain rule. A pair appears only if those two animals "
+    "were themselves within the radius — and a bout does NOT fragment when a "
+    "third animal joins, because the pair's own relationship did not change.\n"
+    "\n"
+    "GROUPS ARE RECOVERABLE FROM THIS FILE, exactly. Pool every bout_start "
+    "and bout_stop, and between consecutive boundaries the contact graph is "
+    "constant; connected components on each interval give chain-rule groups "
+    "with true durations. The reverse is not possible, which is why the GBI "
+    "and the windowed edge list were removed rather than exported alongside: "
+    "both were lossy projections of this table. See "
+    "SOCIAL_OVERLAP_ANALYSIS.md for worked R.\n"
+    "\n"
+    "NOT SPLIT AT MIDNIGHT. Day is the day the bout STARTED.\n"
+    "\n"
+    "THRESHOLD-SPECIFIC. To analyse a different distance, re-export with a "
+    "new social radius; raw per-timestamp distances are not written.")
+
+ROI_BOUTS_TOOLTIP = (
+    "FILE: {db}_ROI_bout_occupancy.csv\n"
+    "\n"
+    "One row per VISIT: a run of consecutive reads inside one drawn region. "
+    "Columns: SexID, Day, ROI, bout_start, bout_stop, duration_s, n_reads.\n"
+    "\n"
+    "STRICT. A single fix outside the region ends the bout, and the next fix "
+    "back inside starts a new one; so does a recording gap longer than the "
+    "Time gap setting (the one that splits the track into segments), even "
+    "inside one region. Nothing is bridged, no dropout is filled in, and no "
+    "duration is rounded — millisecond edges throughout.\n"
+    "\n"
+    "A LONE READ inside a region reports identical bout_start and bout_stop "
+    "and duration 0.0 s, with n_reads = 1. That is what was observed: the "
+    "visit is real but its length is not measurable from a single read. So "
+    "duration_s IS bout_stop - bout_start on every row without exception, "
+    "occupancy totals are a strict LOWER BOUND on the truth, and n_reads is "
+    "what tells you how much evidence stands behind a row.\n"
+    "\n"
+    "Count entrances with the ROW COUNT, not with time — a lone-read visit "
+    "adds 1 to the count and 0 to the seconds.\n"
+    "\n"
+    "NOT SPLIT AT MIDNIGHT. A bout that crosses midnight stays one row and "
+    "Day is the day it STARTED. Splitting would destroy the difference "
+    "between one long visit and two short ones; you can always split "
+    "downstream, but you cannot un-split.\n"
+    "\n"
+    "Keyed on the ANIMAL, not the tag: two tags configured to one identity "
+    "are one animal, and their visits are unioned so a replacement tag "
+    "cannot bill the same minute twice.\n"
+    "\n"
+    "Regions are the ones DRAWN in the preview. Site-XML zones are measured "
+    "only once imported with 'Import XML' beside the region list. Where two "
+    "regions overlap the fix goes to whichever is HIGHER in the region list, "
+    "never to both, so an animal is in at most one region at a time.")
+
+ROI_DAILY_TOOLTIP = (
+    "FILE: {db}_ROI_DailySummary.csv\n"
+    "\n"
+    "Who held each region, each day. One row per animal per region per day, "
+    "for animals that actually entered it. Columns: SexID, Day, ROI, "
+    "total_ROI_time_s, focal_ROI_time_s, focal_ROI_perc_time, rank_order, "
+    "n_reads.\n"
+    "\n"
+    "A row may show 0 s with n_reads ≥ 1: the animal was there, in lone reads "
+    "whose duration cannot be measured. Ranking is by TIME, so those rows sit "
+    "last — n_reads is how you see them at all.\n"
+    "\n"
+    "total_ROI_time_s is EVERY animal's time in that region that day, so "
+    "focal_ROI_perc_time is a share of the region's whole traffic and "
+    "rank_order says who owned it — rank 1 is the animal holding the largest "
+    "share. Tied shares take the average rank, so two animals level for "
+    "third are both 3.5.\n"
+    "\n"
+    "THE ONLY FILE THAT SPLITS AT MIDNIGHT, because it is the only one that "
+    "is definitionally per-day. A bout crossing midnight is divided at the "
+    "boundary and its seconds land on both days, so this file's seconds sum "
+    "to exactly the bout file's totals.\n"
+    "\n"
+    "Computed from the same visits as the bout CSV, but exported "
+    "independently — tick either, both or neither.")
+
+ROI_IMPORT_XML_TOOLTIP = (
+    "Copy the site XML's zones in as regions of interest, so they can be "
+    "edited, reordered, recoloured, renamed or deleted like any region you "
+    "drew yourself.\n"
+    "\n"
+    "This is the ONLY route from an XML zone to an occupancy statistic. The "
+    "occupancy outputs measure drawn regions and nothing else — one region "
+    "pipeline, not two — so a zone that has not been imported is not "
+    "measured.\n"
+    "\n"
+    "The copy is one-way and taken once. Editing an imported region changes "
+    "the region, never the XML, and re-importing later will not pull your "
+    "edits back out or overwrite them: a zone whose name is already in the "
+    "list is skipped, so pressing this twice is safe.\n"
+    "\n"
+    "Zone boundaries were authored against the raw fix stream, which is noisy "
+    "enough that they are often placed by guesswork. Check them against the "
+    "smoothed track before trusting the numbers, and drag the corners where "
+    "they do not fit.\n"
+    "\n"
+    "Imported regions can overlap each other or the ones you drew. A fix "
+    "inside two regions is credited to exactly one: whichever sits HIGHER in "
+    "the region list. Zones arrive smallest-first, so a zone contained in an "
+    "arena boundary is counted before the boundary; drag a row to change "
+    "that.")
+
+DATA_VIEW_TOOLTIP = (
+    "Add a panel beside the arena showing time in each region accumulating "
+    "in step with the video — one row per animal, one column per region.\n"
+    "\n"
+    "Counters run from the START OF THE TRIAL, not the start of the clip, so "
+    "the last frame carries the trial's real totals: scrub the preview to the "
+    "end, render a 10 s clip, and the numbers you read are the ones the "
+    "summary CSV holds.\n"
+    "\n"
+    "The numbers are read from the same intervals the CSV sums, at each "
+    "frame's own timestamp, so they cannot drift with the video's speed or "
+    "frame rate. Units follow the value (0.0s → m → h → d).\n"
+    "\n"
+    "SOCIAL OVERLAP IS NOT SHOWN. Recomputing proximity here would give the "
+    "trial a second opinion on who was together and for how long, competing "
+    "with the exported bouts — and catching that kind of disagreement is what "
+    "this panel is for. Social overlap lives in the Social Overlap Bouts CSV, "
+    "the GBI and the edge list.\n"
+    "\n"
+    "The first render after a settings change reads the whole recording to "
+    "build the counters, which takes a while on a long trial; it is then "
+    "reused. The video is also wider, to fit the panel without shrinking the "
+    "arena."
+)
+
+
+ADJACENCY_FILTER_TOOLTIP = (
+    "Removes short runs of fixes that only look plausible because their "
+    "neighbours were already removed.\n"
+    "\n"
+    "Runs last, after the three thresholds above — it can only test the joins "
+    "their removals create.\n"
+    "\n"
+    "The other thresholds measure each fix against the one before it and "
+    "delete in a single pass. Deleting changes who is next to whom, and "
+    "nothing re-checks the new pairs. A RUN of bad fixes therefore loses only "
+    "its first and last members — the ones with a visible step — while the "
+    "middle, which is internally consistent, survives attached to the real "
+    "track by a stride nobody looked at. That is how a tag can appear to "
+    "cross the arena in half a second with every threshold satisfied.\n"
+    "\n"
+    "This re-measures what is left, splits the track wherever a join is still "
+    "impossible, and removes a displaced run only when the track joins up "
+    "sensibly without it — the test that separates a ghost from an animal "
+    "that really went somewhere.\n"
+    "\n"
+    "WHAT THE NUMBER MEANS. It is a LENGTH LIMIT on what may be deleted, not "
+    "a detection threshold. A stranded run SHORTER than this many seconds is "
+    "removed; a run LONGER is kept and reported. Raising it deletes more; "
+    "lowering it deletes less and leaves more flagged.\n"
+    "\n"
+    "Nothing is deleted for merely being long. A run is only ever removed "
+    "when the join into it is impossible AND the track reads sensibly once "
+    "it is gone. The seconds are the cap on how much evidence may be "
+    "discarded on that judgement, because deleting minutes of data on an "
+    "inference is worse than saying the track is broken there and letting "
+    "you look.\n"
+    "\n"
+    "Judged on SPEED, not distance: 7 m in half a second is a teleport, 7 m "
+    "in a minute is a walk.\n"
+    "\n"
+    "HOW MANY IT TAKES is in the threshold read-out under the preview, on "
+    "its own Excursion row. Expect it to remove MORE than the three tests "
+    "above on a tag with long ghost runs - those tests strand the runs, this "
+    "one clears them. If the read-out still warns that the largest remaining "
+    "step exceeds the jump threshold, this filter looked at that join and "
+    "declined: the run was longer than the seconds set here."
+)
+
+OUTLIER_FILTER_TOOLTIP = (
+    "Remove fixes that sit far off the LOCAL track, judged against the median of a window of neighbouring fixes rather than against the previous fix alone (a Hampel filter).\n\nWHY THIS AND NOT JUST THE JUMP THRESHOLD. A jump test asks how far a fix is from the one before it, so a RUN of consecutive ghosts defeats it: the first ghost is caught, the second looks like a small step from the first and survives, and the real fix after the run gets deleted in its place. A median over many samples cannot be moved by a few wild values, so every fix in the run is rejected and the honest ones are kept.\n\nOn this project's pilot data, adding it alongside the jump threshold took physically impossible steps (over a metre inside a second) from 884 down to 69 across six tags, while keeping 99% of fixes.")
+
+OUTLIER_WINDOW_TOOLTIP = (
+    "How many neighbouring fixes the local median is taken over. Forced odd so the window has a centre.\n\nIt must be more than TWICE the longest run of consecutive ghosts you want to survive - a run longer than half the window becomes the majority and moves the median it is being judged against. Short windows fail quietly for exactly this reason: on the pilot data a window of 11 left MORE impossible steps than the jump threshold alone, while 31 removed almost all of them.\n\nThis is in SAMPLES, not seconds, so its real-time span follows the reporting rate.")
+
+OUTLIER_SIGMA_TOOLTIP = (
+    "How far off the local median a fix may sit before it is rejected, in MADs (median absolute deviations) of the same window.\n\nMAD is the median of each fix's distance from the window's median - a spread measure built from medians, so, unlike a standard deviation, a wild value cannot inflate it and hide inside it. It is scaled by 1.4826 so that on ordinary noise one MAD equals one standard deviation, which is why this reads on the familiar sigma scale.\n\n6 means 'further out than essentially any honest fix'. Lower it to cut harder; raise it if a real fast movement is being clipped at its onset.")
+
+VELOCITY_MIN_DT_TOOLTIP = (
+    "The shortest interval the velocity threshold is allowed to divide by.\n\nSpeed is distance over time, and this system's reports can arrive a millisecond apart. Dividing a few centimetres of positional noise by a millisecond gives tens of m/s, so an unfloored velocity threshold mostly measures HOW CLOSELY SPACED THE REPORTS WERE rather than how fast the animal moved - it deletes tightly spaced fixes wherever they occur.\n\nOn this project's pilot data the raw interval put 41% of fixes over 1 m/s with a median step of only 9 cm; flooring at 0.5 s brings that to 2%.\n\nSet 0 for the old unfloored behaviour (what configs written before this option restore, so an old trial reproduces exactly).")
+
+
+def hampel_deviation(x, y, window=31, group=None,
+                     mad_floor=HAMPEL_MAD_FLOOR_M):
+    """How many MADs each fix sits from its local median, worst of x and y.
+
+    The score the threshold is compared against, returned separately so the
+    live stats can re-price a different sigma without recomputing the medians
+    - and so the preview can show what a change would cost before it is made.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    out = np.zeros(len(x), dtype=float)
+    if len(x) == 0:
+        return out
+    if group is not None:
+        g = np.asarray(group)
+        if g.ndim != 1:
+            raise ValueError("group must be one scalar key per fix")
+        for val in np.unique(g):
+            m = g == val
+            out[m] = hampel_deviation(x[m], y[m], window, None, mad_floor)
+        return out
+    k = max(3, int(window) | 1)
+    if len(x) < k:
+        return out
+    pad = k // 2
+    for arr in (x, y):
+        filled = pd.Series(arr).ffill().bfill().to_numpy()
+        win = sliding_window_view(np.pad(filled, pad, mode='edge'), k)
+        med = np.median(win, axis=1)
+        mad = np.median(np.abs(win - med[:, None]), axis=1) * 1.4826
+        out = np.maximum(out, np.abs(filled - med)
+                         / np.maximum(mad, float(mad_floor)))
+    return out
+
+
+def hampel_keep(x, y, window=31, n_sigma=6.0, group=None,
+                mad_floor=HAMPEL_MAD_FLOOR_M):
+    """Boolean mask of fixes that are NOT spatial outliers of the local track.
+
+    A Hampel filter compares each coordinate against the MEDIAN of a window
+    centred on it, and measures the distance in units of that window's median
+    absolute deviation (MAD). A fix further than ``n_sigma`` MADs from the
+    local median in x or y is an outlier.
+
+    Median and MAD are used rather than mean and standard deviation because
+    both are ROBUST: a handful of wild values inside the window cannot drag
+    them, whereas one 20 m ghost moves a mean and inflates an SD enough to
+    hide itself. That is the whole reason this catches what a step-distance
+    threshold cannot - a ghost fix is an outlier against the surrounding
+    track even when it lands close to the ghost before it, so RUNS of
+    consecutive ghosts (which defeat a step test, because the second ghost
+    looks like a small step from the first) are still rejected as long as the
+    run is shorter than half the window.
+
+    MAD is scaled by 1.4826 so that for normally distributed noise one MAD
+    equals one standard deviation; ``n_sigma`` then reads on the familiar
+    scale, and 6 means "further out than essentially any honest fix".
+
+    ``window`` is in SAMPLES, not seconds, and is forced odd so it can be
+    centred. ``group`` optionally splits the track (per tag, per time-gap
+    segment) so no window ever spans two animals or a dropout.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    keep = np.ones(len(x), dtype=bool)
+    if len(x) == 0:
+        return keep
+    if group is not None:
+        g = np.asarray(group)
+        if g.ndim != 1:
+            raise ValueError("group must be one scalar key per fix")
+        for val in np.unique(g):
+            m = g == val
+            keep[m] = hampel_keep(x[m], y[m], window, n_sigma, None, mad_floor)
+        return keep
+
+    k = max(3, int(window) | 1)          # odd, so the window has a centre
+    if len(x) < k:
+        return keep                      # too short to have a local median
+    pad = k // 2
+    for arr in (x, y):
+        # A NaN inside the window would poison its median, so hold the last
+        # good value; a NaN fix is dropped by the coordinate check anyway.
+        filled = pd.Series(arr).ffill().bfill().to_numpy()
+        win = sliding_window_view(np.pad(filled, pad, mode='edge'), k)
+        med = np.median(win, axis=1)
+        mad = np.median(np.abs(win - med[:, None]), axis=1) * 1.4826
+        keep &= np.abs(filled - med) <= float(n_sigma) * np.maximum(
+            mad, float(mad_floor))
+    return keep & np.isfinite(x) & np.isfinite(y)
+
+
+# The smoothing methods that read the window control as something other than a
+# window, spelled once so the config writer and the loader cannot drift apart.
+EWMA_METHOD = "Forward-Backward Exponentially Weighted Moving Average"
+SAVGOL_METHOD = "Savitzky-Golay"
+
+
+def smoothing_window_fields(method, window, units, *, window_key,
+                            units_key, span_key="smoothing_span"):
+    """How a method's window settings should be SERIALISED.
+
+    Only the rolling methods actually have a window. Savitzky-Golay derives
+    its own from the data (31 samples or the group length, whichever is
+    smaller) and never reads the control; EWMA reads the same control as a
+    sample SPAN, with no units at all - the units combo is hidden for it, so
+    whatever it holds is left over from another method.
+
+    Writing a number and a unit for those two asserted something the run had
+    not done: a config reading ``window: 30, window_units: "Seconds"`` under
+    EWMA had in fact smoothed with a 30-SAMPLE span, and nothing in the file
+    said so. Null means "not applicable to this method", and ``smoothing_span``
+    names the one value that did apply.
+
+    Returns a dict of the keys to merge into the config.
+    """
+    if method == EWMA_METHOD:
+        return {window_key: None, units_key: None, span_key: int(window)}
+    if method == SAVGOL_METHOD:
+        # No span key either: Savitzky-Golay takes no parameter from the user,
+        # so there is nothing to record.
+        return {window_key: None, units_key: None}
+    return {window_key: window, units_key: units}
+
+
+def smoothing_window_value(cfg, *, window_key, span_key="smoothing_span"):
+    """The window/span to restore from a config, or None if it said nothing.
+
+    ``smoothing_span`` wins where present. Falling back to the window key
+    keeps every config written before this split loading correctly: those
+    stored the EWMA span in the window field, so the number is right even
+    though the label was not.
+    """
+    span = cfg.get(span_key)
+    if isinstance(span, (int, float)) and not isinstance(span, bool):
+        return int(span)
+    val = cfg.get(window_key)
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        return int(val)
+    return None
+
 
 def draw_context_layers(ax, layers, *, bg_image=None, bg_extent=None,
-                        zones_xml=None, zones_df=None, anchors=None):
-    """Draw the background image, zone polygons and anchor markers on ``ax``.
+                        zones_xml=None, zones_df=None, anchors=None,
+                        rois=None):
+    """Draw the background image, zone polygons, ROIs and anchors on ``ax``.
 
-    Gated by ``layers`` (a dict with 'background'/'zones'/'anchors' booleans) so
-    every exported spatial figure honours the same per-export choice. Sources
-    are passed explicitly because the worker and the main window hold them in
-    different forms (loaded PNG vs. XML map image; xml_zones list vs.
-    arena_zones DataFrame).
+    Gated by ``layers`` (a dict with 'background'/'zones'/'anchors'/'rois'
+    booleans) so every exported spatial figure honours the same per-export
+    choice. Sources are passed explicitly because the worker and the main
+    window hold them in different forms (loaded PNG vs. XML map image;
+    xml_zones list vs. arena_zones DataFrame).
+
+    ``rois`` are the user's own regions, drawn over the preview rather than
+    authored in the site XML. They are outlined in their own colour and given
+    only a faint wash, because the point of drawing one is to read tracks
+    against it - a solid fill would bury the tracks it exists to frame.
     """
     layers = layers or {}
     if layers.get('background') and bg_image is not None and bg_extent is not None:
@@ -170,9 +790,40 @@ def draw_context_layers(ax, layers, *, bg_image=None, bg_extent=None,
                     ax.add_patch(MplPolygon(coords, closed=True, fill=False,
                                             edgecolor='black', linewidth=1.5,
                                             linestyle='--', zorder=1))
+    if layers.get('rois', True) and rois:
+        for r in rois:
+            pts = np.asarray(r.get('points'), dtype=float).reshape(-1, 2)
+            if len(pts) < 3:
+                continue
+            col = r.get('color', '#e6194b')
+            ax.add_patch(MplPolygon(pts, closed=True, facecolor=col,
+                                    alpha=0.10, edgecolor='none', zorder=1.5))
+            ax.add_patch(MplPolygon(pts, closed=True, facecolor='none',
+                                    edgecolor=col,
+                                    linewidth=float(r.get('linewidth', 2.0)),
+                                    zorder=1.6))
+            ax.annotate(r.get('name', ''),
+                        (pts[:, 0].mean(), pts[:, 1].mean()),
+                        color=col, fontsize=7, fontweight='bold',
+                        ha='center', va='center', zorder=5,
+                        path_effects=label_halo(col, 2.0))
     if layers.get('anchors') and anchors:
         ax.scatter([a['x'] for a in anchors], [a['y'] for a in anchors],
                    marker='^', s=40, c='#f2c24f', edgecolors='none', zorder=2)
+
+
+def _dyad_type(sex_a, sex_b):
+    """MM / FF / MF / NA for a pair of sexes.
+
+    Mixed pairs are ALWAYS 'MF'. Sorting the two letters would yield 'FM',
+    which is not the convention used elsewhere and would silently break a
+    downstream filter written against 'MF'.
+    """
+    a = str(sex_a or 'U')[:1].upper()
+    b = str(sex_b or 'U')[:1].upper()
+    if 'U' in (a, b) or a not in 'MF' or b not in 'MF':
+        return 'NA'
+    return a + b if a == b else 'MF'
 
 
 def is_network_path(path):
@@ -359,6 +1010,201 @@ def processing_select_clause(conn, table_name):
     if not have or any(c not in have for c in REQUIRED_COLUMNS):
         return "*"
     return ", ".join(c for c in PROCESSING_COLUMNS if c in have)
+
+
+def resolve_adjacency(t, x, y, keep, *, group=None, v_thresh=None, min_dt=0.0,
+                      j_thresh=None, max_excursion_s=5.0,
+                      max_removed_frac=0.10, max_passes=32):
+    """Re-apply the step tests to the adjacency that REMOVAL creates.
+
+    The ordinary masks measure every point against its neighbour in the
+    original sequence and are applied once. Deleting a point makes its
+    neighbours adjacent, and that new pair is never tested - so a RUN of bad
+    fixes loses only its first and last members (the ones with visible steps)
+    while its interior, which is internally consistent, survives joined to the
+    real track by an impossible stride.
+
+    Each pass re-measures the survivors and drops the arrival point of any
+    join that is still impossible, until nothing changes. Velocity is the test
+    that matters here rather than distance: after a removal the gap in TIME
+    has grown too, and 7 m is a teleport across half a second and an ordinary
+    walk across a minute. ``j_thresh`` is applied as well when given.
+
+    Bounded by ``max_passes`` because convergence is not guaranteed: where a
+    tag has genuinely relocated and stayed, each pass peels one more point off
+    the far side, and it only settles once enough time has elapsed to make the
+    move plausible. Returns (mask, removed, converged).
+    """
+    idx = np.flatnonzero(keep)
+    removed = 0
+    if idx.size < 3:
+        return keep, 0, True
+
+    def bad_joins(ii):
+        d = np.hypot(np.diff(x[ii]), np.diff(y[ii]))
+        dt = np.diff(t[ii])
+        b = np.zeros(d.shape, dtype=bool)
+        if v_thresh:
+            b |= d / np.maximum(dt, min_dt if min_dt else 1e-9) > v_thresh
+        if j_thresh:
+            b |= d > j_thresh
+        if group is not None:
+            # A join between two tags, or across a reporting gap, is not a
+            # step at all - the existing grouping already says not to measure
+            # there, and testing it would delete the first fix after every gap.
+            b &= group[ii][1:] == group[ii][:-1]
+        return b
+
+    def joins_cleanly(a, b):
+        if group is not None and group[a] != group[b]:
+            return True
+        d = float(np.hypot(x[b] - x[a], y[b] - y[a]))
+        gap = float(t[b] - t[a])
+        if v_thresh and d / max(gap, min_dt if min_dt else 1e-9) > v_thresh:
+            return False
+        if j_thresh and d > j_thresh:
+            return False
+        return True
+
+    for _ in range(max_passes):
+        bad = bad_joins(idx)
+        if not bad.any():
+            break
+        # Split at the impossible joins and judge whole SEGMENTS, never single
+        # points. Dropping the arrival point of every bad join eats whichever
+        # side follows the discontinuity - so a ghost that goes out and comes
+        # back would take the real track after it with it.
+        cuts = np.flatnonzero(bad) + 1
+        starts = np.concatenate([[0], cuts])
+        ends = np.concatenate([cuts, [idx.size]])
+        segs = list(zip(starts, ends))
+        drop = np.zeros(idx.size, dtype=bool)
+        # INTERIOR segments first, and by the only criterion that actually
+        # justifies deleting data: the track carries on sensibly without this
+        # piece. A segment whose removal reconnects the two sides was an
+        # excursion; one whose removal leaves the join impossible was not.
+        for k, (s, e) in enumerate(segs):
+            if not (0 < k < len(segs) - 1):
+                continue
+            if float(t[idx[e - 1]] - t[idx[s]]) > max_excursion_s:
+                continue
+            if joins_cleanly(idx[s - 1], idx[e]):
+                drop[s:e] = True
+        if not drop.any() and len(segs) > 1:
+            # An END segment reconnects nothing, so that test cannot vouch for
+            # it. Only a clear minority is removed - otherwise a recording
+            # that simply begins or ends somewhere else would lose real data
+            # on nothing more than being first.
+            for k in (0, len(segs) - 1):
+                s, e = segs[k]
+                other = segs[1] if k == 0 else segs[-2]
+                if float(t[idx[e - 1]] - t[idx[s]]) > max_excursion_s:
+                    continue
+                if (e - s) <= 0.05 * (other[1] - other[0]):
+                    drop[s:e] = True
+        if not drop.any():
+            break                          # discontinuities remain, but real
+        # A floor as well as a fraction: on a short stretch any excursion is a
+        # large share of it, and a percentage alone would refuse to remove a
+        # six-fix ghost from a twenty-fix window.
+        budget = max(max_removed_frac * keep.sum(), 50)
+        if removed + int(drop.sum()) > budget:
+            # A safety valve, not a threshold. Wanting to remove this much
+            # means the track is not a good track with a few ghosts in it -
+            # it is substantially disputed - and quietly deleting a large
+            # share of a recording on a heuristic is not a call this should
+            # make. Stop, keep what is left, and let it be reported.
+            break
+        idx = idx[~drop]
+        removed += int(drop.sum())
+        if idx.size < 3:
+            break
+
+    out = np.zeros_like(keep)
+    out[idx] = True
+    resolved = bool(idx.size < 2 or not bad_joins(idx).any())
+    return out, removed, resolved
+
+
+def collapse_multi_solutions(df, log=None, label=""):
+    """One position per (tag, instant); returns (frame, stats).
+
+    The Wiser export can carry SEVERAL rows for the same shortid and the same
+    millisecond, each an independent solution from a different anchor subset
+    (different ``reportid`` and ``anchors_list``). They are not duplicate rows:
+    in VT001, 3,974,096 instants carry more than one row and exactly 8 of them
+    hold identical coordinates.
+
+    Nothing in the schema marks them as alternatives, so read as a time series
+    they look like movement between positions in zero elapsed time. That does
+    two things: ~10 cm of jitter at every instant roughly DOUBLES measured path
+    length, and the ~1% of instants whose solutions diverge past a metre seed
+    apparent teleports that survive speed and step filtering.
+
+    The rule is the highest ``anchors_used`` - more ranging constraints, better
+    geometry - and, where several tie at the top count (about a fifth of
+    multi-solution instants), the coordinate-wise MEDIAN of the tied rows.
+    Taking the median of ALL solutions instead gives a smoother track overall
+    but a worse >1 m tail, because a minimum-anchor outlier drags the median
+    when only two or three solutions exist.
+
+    This must run BEFORE thresholding. Velocity is meaningless while two
+    consecutive rows can share a timestamp, and a step-distance test cannot
+    tell a solver disagreement from a stride.
+
+    See WISER_MULTI_SOLUTION_REPORT.md.
+    """
+    stats = {'rows_in': len(df), 'rows_out': len(df), 'dropped': 0, 'tied': 0}
+    if df is None or len(df) == 0:
+        return df, stats
+    if not {'shortid', 'timestamp'} <= set(df.columns):
+        return df, stats
+
+    # anchors_used is read ONLY to make this choice, and is dropped on the way
+    # out. The export streams every column of the frame it is handed straight
+    # into the smoothed CSV, which is meant to stay lightweight, so a column
+    # carried past here would silently become a permanent export column.
+    def _shed(frame):
+        return (frame.drop(columns=['anchors_used'])
+                if 'anchors_used' in frame.columns else frame)
+
+    # Fast path, and the common one: eleven of VT001's seventeen tags never do
+    # this, so a clean read must not pay for the machinery.
+    dup = df.duplicated(subset=['shortid', 'timestamp'], keep=False)
+    if not dup.any():
+        return _shed(df), stats
+
+    keys = ['shortid', 'timestamp']
+    if 'anchors_used' in df.columns:
+        best = df.groupby(keys, sort=False)['anchors_used'].transform('max')
+        top = df[df['anchors_used'] == best]
+    else:
+        # Older exports without the column: fall back to the median of every
+        # solution, which is still far better than treating them as movement.
+        top = df
+
+    grp = top.groupby(keys, sort=False)
+    out = grp.first().reset_index()
+    coord = [c for c in ('location_x', 'location_y', 'location_z')
+             if c in top.columns]
+    if coord:
+        med = grp[coord].median().reset_index()
+        for c in coord:
+            out[c] = med[c]
+    stats['tied'] = int((grp.size() > 1).sum())
+    stats['rows_out'] = len(out)
+    stats['dropped'] = stats['rows_in'] - stats['rows_out']
+
+    if log and stats['dropped']:
+        pct = 100.0 * stats['dropped'] / max(stats['rows_in'], 1)
+        who = f"{label}: " if label else ""
+        log(f"  {who}collapsed {stats['dropped']:,} co-timestamped solution(s) "
+            f"-> {stats['rows_out']:,} fixes ({pct:.1f}% of rows were "
+            f"alternative solutions for an instant already present)")
+        if stats['tied']:
+            log(f"      {stats['tied']:,} instant(s) tied on anchor count; "
+                f"took the median position of the tied solutions")
+    return _shed(out), stats
 
 
 def date_axis(values):
@@ -676,6 +1522,10 @@ class PreviewChunkLoader(QThread):
                 f"ORDER BY shortid, timestamp",
                 conn, params=self.tags + [self.start_ms, self.end_ms])
             conn.close()
+            # On a worker thread, so no logging from here - the preview's
+            # collapse is reported once by the chunk consumer instead of once
+            # per chunk, which would be thousands of identical lines.
+            df, _ = collapse_multi_solutions(df)
             self.loaded.emit(self.chunk_index, df)
         except Exception as e:
             self.failed.emit(self.chunk_index, str(e))
@@ -860,8 +1710,8 @@ class InheritSettingsDialog(QDialog):
                                        "Moving Average", "EWMA"))
             for key, tag in (('export_raw_csv', 'raw'),
                              ('proximity_detection', 'prox'),
-                             ('export_gbi', 'GBI'),
-                             ('export_edgelist', 'EL'),
+                             ('export_roi_bouts', 'ROIbouts'),
+                             ('export_roi_daily', 'ROIdaily'),
                              ('export_behavior_events', 'behav'),
                              ('save_plots', 'plots'),
                              ('save_animation', 'anim')):
@@ -895,6 +1745,123 @@ class InheritSettingsDialog(QDialog):
         return self.combo.currentData()
 
 
+
+class TagStatsDialog(QDialog):
+    """Measured ping rate, ping count and voltage for every tag in the database.
+
+    A tag's rate profile (10/1, 4/1, 1/1) is written on its label and nowhere
+    in the data, so a mis-flashed tag or the wrong tag on an animal shows up
+    only as one animal being sampled more often than another - and, eventually,
+    as a battery dead in six days. This reads the profile back out of the
+    recording so it can be checked before the trial, not after it.
+
+    No battery forecast: a fitted voltage drain called 18 days two days before
+    a tag died (see fnt/uwb/tag_stats.py). The ping count and the voltage are
+    shown as measured, with what each can and cannot tell you in its tooltip.
+    """
+
+    COLUMNS = [
+        ("HexID", "The ID written on the tag"),
+        ("Animal", "Who it is assigned to in Configure Identities"),
+        ("Median Hz", "Typical rate: the median over the minutes it reported"),
+        ("Peak Hz", "Busiest minute - the fastest rate this tag reached"),
+        ("Quiet Hz", "5th-percentile minute - the slowest it ran, which is "
+                     "where a rest rate shows itself"),
+        ("Median gap", "Median gap between pings, in ms"),
+        ("Common gap", "Most frequent gap between pings, in ms"),
+        ("Pings", "Total reports recorded in this database.\n\n"
+                  "A better guide to battery than voltage. On VT-P002, five "
+                  "battery lives ended at 5.57-5.76 million recorded pings, at "
+                  "both ~22 Hz and ~7 Hz, so a tag's remaining life is roughly "
+                  "(5.6 M - pings) / its rate.\n\n"
+                  "Not yet checked on 1-3 Hz tags. The count starts at this "
+                  "database's first ping, not the battery's: a battery used "
+                  "before, or swapped mid-trial, is not reflected. Pings sent "
+                  "while the system was not recording are not counted either."),
+        ("Hours", "Span from first to last ping"),
+        ("Battery V", "Most recent voltage.\n\n"
+                      "Not a fuel gauge. These cells sit near 2.9 V for most of "
+                      "their life, then fall off a cliff: on VT-P002, tag 000B "
+                      "went from 2.80 V to dead in 49 h and from 2.60 V in 6 h. "
+                      "Readings also run ~30 mV higher in the afternoon than "
+                      "before dawn. Treat anything under ~2.8 V as due for a "
+                      "swap at the next visit."),
+        ("Last ping", "Local time of its most recent report"),
+    ]
+
+    def __init__(self, stats, labels, tz, db_name, parent=None):
+        from fnt.uwb import tag_stats as TS
+        super().__init__(parent)
+        self.setWindowTitle(f"Tag Statistics — {db_name}")
+        self.resize(1180, 460)
+        self._stats = stats
+        lay = QVBoxLayout()
+
+        head = QLabel(
+            "Measured from the recording, not from the tag's label. Compare "
+            "Peak against Quiet to see the rate pair a tag is running: two "
+            "clearly different numbers mean it switches between an active and "
+            "a rest rate, while a peak close to the quiet figure means it "
+            "holds one rate whatever the animal does. The gap columns and the "
+            "distribution to the right show the same thing per ping.")
+        head.setWordWrap(True)
+        head.setStyleSheet("color:#9aa7b4;")
+        lay.addWidget(head)
+
+        table = QTableWidget(len(stats), len(self.COLUMNS))
+        table.setHorizontalHeaderLabels([c[0] for c in self.COLUMNS])
+        for i, (_name, tip) in enumerate(self.COLUMNS):
+            if tip:
+                table.horizontalHeaderItem(i).setToolTip(tip)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSortingEnabled(False)
+        gap_cols = list(TS.GAP_LABELS)
+        table.setColumnCount(len(self.COLUMNS) + len(gap_cols))
+        table.setHorizontalHeaderLabels([c[0] for c in self.COLUMNS] + gap_cols)
+        for i, label in enumerate(gap_cols, start=len(self.COLUMNS)):
+            table.horizontalHeaderItem(i).setToolTip(
+                f"Percentage of this tag's gaps between pings that fell in {label}")
+        for r, (_idx, row) in enumerate(stats.iterrows()):
+            last = pd.Timestamp(int(row["last_ns"]), tz="UTC").tz_convert(tz)
+            def _num(v, fmt="{:.2f}"):
+                return "—" if v is None or (isinstance(v, float) and np.isnan(v)) else fmt.format(v)
+
+            values = [
+                row["HexID"], labels.get(int(row["shortid"]), "—"),
+                _num(row["median_hz"]), _num(row["peak_hz"], "{:.1f}"),
+                _num(row["slow_hz"]), f"{int(row['median_gap_ms'])} ms",
+                f"{int(row['modal_gap_ms'])} ms",
+                f"{int(row['pings']):,}", _num(row["hours"], "{:.1f}"),
+                _num(row["v_last"]),
+                last.strftime("%m-%d %H:%M"),
+            ] + [_num(row[g], "{:.1f}") for g in gap_cols]
+            for c, text in enumerate(values):
+                item = QTableWidgetItem(str(text))
+                if c >= 2:
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                table.setItem(r, c, item)
+        table.resizeColumnsToContents()
+        table.setSortingEnabled(True)
+        lay.addWidget(table)
+
+        row = QHBoxLayout()
+        btn_copy = QPushButton("Copy Table")
+        btn_copy.setToolTip("Copy every column as tab-separated text, ready to "
+                            "paste into a spreadsheet or an email to the vendor.")
+        btn_copy.clicked.connect(self._copy)
+        row.addWidget(btn_copy)
+        row.addStretch(1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        row.addWidget(buttons)
+        lay.addLayout(row)
+        self.setLayout(lay)
+
+    def _copy(self):
+        QApplication.clipboard().setText(self._stats.to_csv(sep="\t", index=False))
+
+
 class ExportConflictDialog(QDialog):
     """Dialog shown when export would overwrite existing files.
     Shows categorized lists of conflicting and new files."""
@@ -906,6 +1873,11 @@ class ExportConflictDialog(QDialog):
     SKIP = 1
     OVERWRITE = 2
     NEW_FOLDER = 3
+    # Delete every previous export from the folder, then write the current
+    # selection into it. Distinct from OVERWRITE, which only replaces the
+    # files this run happens to produce and so leaves a renamed or retired
+    # product's file behind looking current.
+    CLEAR = 4
 
     def __init__(self, conflicting_files, new_files, parent=None):
         """
@@ -1022,6 +1994,24 @@ class ExportConflictDialog(QDialog):
         skip_btn.clicked.connect(lambda: self.done(self.SKIP))
         btn_layout.addWidget(skip_btn)
 
+        clear_btn = QPushButton("Clear && Re-export")
+        clear_btn.setToolTip(
+            "Delete EVERY previous export from this trial's analysis folder, "
+            "then write the current selection into the empty folder.\n"
+            "\n"
+            "Different from Overwrite in one way that matters: Overwrite only "
+            "replaces the files this run produces, so a product that has been "
+            "renamed or switched off leaves its old file behind, still looking "
+            "current. This removes those too.\n"
+            "\n"
+            "KEPT: fnt_config.json and the fast-index copy (gigabytes, and a "
+            "cache of the source database rather than an export).\n"
+            "\n"
+            "You are shown exactly what will be deleted, and asked again, "
+            "before anything is removed.")
+        clear_btn.clicked.connect(lambda: self.done(self.CLEAR))
+        btn_layout.addWidget(clear_btn)
+
         new_folder_btn = QPushButton("New Folder")
         new_folder_btn.setToolTip("Create a new timestamped analysis folder instead")
         new_folder_btn.clicked.connect(lambda: self.done(self.NEW_FOLDER))
@@ -1035,81 +2025,151 @@ class ExportConflictDialog(QDialog):
         self.setLayout(layout)
 
 
-class PlotLayersDialog(QDialog):
-    """Choose which spatial context layers exported plots/animation include.
+class OffAnimalIntervalsDialog(QDialog):
+    """Edit one tag's off-animal intervals: stretches it reported off the animal.
 
-    Shown on export when plots or an animation are requested and at least one
-    layer (background image / XML zones / anchors) is available. Each toggle is
-    independent — unchecking all draws tag positions only. Options with no data
-    are disabled. OK applies the choice; Cancel aborts the export.
+    A tag that came off and went back on - a head cap scratched off in the
+    nest and re-glued the next morning - keeps reporting the whole time, so
+    the data hold hours of a tag lying still under the animal's name.
+    Start/Stop can't carve that out of the middle of a deployment; these
+    intervals do. Fixes inside one are dropped from the preview and every
+    export, so the animal reads as absent rather than as motionless.
     """
 
-    def __init__(self, has_background, has_zones, has_anchors, defaults=None, parent=None):
+    TIME_FMT = "yyyy-MM-dd HH:mm:ss.zzz"
+
+    def __init__(self, title, intervals, observed=(None, None), parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Plot & Animation Layers")
-        self.setModal(True)
-        defaults = defaults or DEFAULT_PLOT_LAYERS
+        self.setWindowTitle(f"Off-animal intervals \u2014 {title}")
+        self.setMinimumWidth(940)
+        self._observed = observed
+        layout = QVBoxLayout(self)
 
-        layout = QVBoxLayout()
-        info = QLabel(
-            "Choose the spatial context to draw under the tag trajectories in "
-            "exported plots and animations. Unavailable layers are greyed out; "
-            "with none checked, only the tag positions are drawn.")
-        info.setWordWrap(True)
-        layout.addWidget(info)
+        intro = QLabel(
+            "Periods when this tag was reporting but <b>not on the animal</b> "
+            "(e.g. a head cap found off in the nest and re-attached). Fixes "
+            "inside an interval are removed from the preview and every export "
+            "- the animal reads as absent, not motionless. The tag's own "
+            "hardware statistics are unaffected.")
+        intro.setWordWrap(True)
+        intro.setTextFormat(Qt.RichText)
+        layout.addWidget(intro)
 
-        def _make(text, available, default, tip):
-            cb = QCheckBox(text)
-            cb.setEnabled(available)
-            cb.setChecked(bool(default) and available)
-            if not available:
-                cb.setToolTip("Not available for this dataset")
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(
+            ["Off from", "Back on", "Duration", "Note", ""])
+        hdr = self.table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        # Fixed: ResizeToContents measures the header text, not the label
+        # widget in the cell, and clipped "13 h 46 min".
+        hdr.setSectionResizeMode(2, QHeaderView.Fixed)
+        self.table.setColumnWidth(2, 110)
+        hdr.setSectionResizeMode(3, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.table.verticalHeader().setVisible(False)
+        layout.addWidget(self.table, 1)
+
+        for item in intervals or []:
+            self._add_row(item.get('start'), item.get('stop'), item.get('note', ''))
+
+        btn_add = QPushButton("Add interval")
+        btn_add.clicked.connect(lambda: self._add_row())
+        layout.addWidget(btn_add)
+
+        box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        box.accepted.connect(self.accept)
+        box.rejected.connect(self.reject)
+        layout.addWidget(box)
+
+    def _picker(self, value, fallback):
+        e = QDateTimeEdit()
+        e.setDisplayFormat(self.TIME_FMT)
+        e.setCalendarPopup(True)
+        dt = IdentityAssignmentDialog.parse_time(value) if value else QDateTime()
+        e.setDateTime(dt if dt.isValid() else fallback)
+        return e
+
+    def _default_start(self):
+        """A new row starts where the last one ended, else at the tag's first fix."""
+        if self.table.rowCount():
+            return self.table.cellWidget(self.table.rowCount() - 1, 1).dateTime()
+        first = IdentityAssignmentDialog.parse_time(self._observed[0] or '')
+        return first if first.isValid() else QDateTime.currentDateTime()
+
+    def _add_row(self, start=None, stop=None, note=''):
+        row = self.table.rowCount()
+        begin = self._default_start()
+        self.table.insertRow(row)
+        a = self._picker(start, begin)
+        b = self._picker(stop, a.dateTime().addSecs(3600))
+        dur = QLabel()
+        note_edit = QLineEdit(note or '')
+        note_edit.setPlaceholderText("optional, e.g. head cap off in Z7 nest")
+        rm = QPushButton("Remove")
+
+        def _update():
+            secs = a.dateTime().msecsTo(b.dateTime()) / 1000.0
+            if secs <= 0:
+                dur.setText("\u26a0 ends before it starts")
+                dur.setStyleSheet("color:#e06c75; font-weight:bold;")
             else:
-                cb.setToolTip(tip)
-            layout.addWidget(cb)
-            return cb
+                h, m = divmod(int(round(secs / 60.0)), 60)
+                dur.setText(f"{h} h {m:02d} min" if h else f"{m} min")
+                dur.setStyleSheet("")
+        a.dateTimeChanged.connect(_update)
+        b.dateTimeChanged.connect(_update)
+        _update()
 
-        self.chk_background = _make(
-            "Background image", has_background, defaults.get('background', True),
-            "Draw the loaded floorplan / site-map image beneath the tracks.")
-        self.chk_zones = _make(
-            "Zones (from XML)", has_zones, defaults.get('zones', True),
-            "Draw the surveyed zone polygons parsed from the site XML.")
-        self.chk_anchors = _make(
-            "Anchor positions", has_anchors, defaults.get('anchors', True),
-            "Draw the UWB anchor/antenna positions as triangles.")
+        def _remove():
+            for r in range(self.table.rowCount()):
+                if self.table.cellWidget(r, 4) is rm:
+                    self.table.removeRow(r)
+                    return
+        rm.clicked.connect(_remove)
 
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
-        ok_btn = QPushButton("OK")
-        ok_btn.setToolTip("Use these layers for this export")
-        ok_btn.clicked.connect(self.accept)
-        btn_layout.addWidget(ok_btn)
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.setToolTip("Cancel the export")
-        cancel_btn.clicked.connect(self.reject)
-        btn_layout.addWidget(cancel_btn)
-        layout.addLayout(btn_layout)
-        self.setLayout(layout)
+        for col, w in enumerate((a, b, dur, note_edit, rm)):
+            self.table.setCellWidget(row, col, w)
 
-    def get_layers(self):
-        return {
-            'background': self.chk_background.isChecked(),
-            'zones': self.chk_zones.isChecked(),
-            'anchors': self.chk_anchors.isChecked(),
-        }
+    def intervals(self):
+        """The rows as stored dicts, in the order shown."""
+        out = []
+        for r in range(self.table.rowCount()):
+            a = self.table.cellWidget(r, 0).dateTime().toString(self.TIME_FMT)
+            b = self.table.cellWidget(r, 1).dateTime().toString(self.TIME_FMT)
+            note = self.table.cellWidget(r, 3).text().strip()
+            out.append({'start': a, 'stop': b, 'note': note})
+        return out
+
+    def accept(self):
+        bad = [r + 1 for r in range(self.table.rowCount())
+               if self.table.cellWidget(r, 0).dateTime().msecsTo(
+                   self.table.cellWidget(r, 1).dateTime()) <= 0]
+        if bad:
+            QMessageBox.warning(
+                self, "Interval ends before it starts",
+                f"Row(s) {', '.join(map(str, bad))}: 'Back on' must be later "
+                "than 'Off from'.")
+            return
+        super().accept()
 
 
 class IdentityAssignmentDialog(QDialog):
-    """Assign sex, identity and an optional active time window to each tag.
+    """Assign sex, identity, optional Name/Code and an active window to each tag.
+
+    Name and Code are free text and optional. They are display labels (Show Tag
+    ID -> Name / Code) and extra smoothed-CSV columns; the SexID remains the key
+    every analysis joins on. Saving a partly-filled roster asks for
+    confirmation (see identities.identity_field_problems).
 
     The Start/Stop pickers TRIM the data: fixes outside a bound window are
     dropped from the preview and from every export. Each bound therefore has an
     explicit mode:
 
-      * FOLLOW DATA (default) - the bound is not applied. The picker shows the
-        tag's observed first/last fix for information only.
-      * LIMIT TO - the bound is applied, at exactly the value shown.
+      * AUTO (default) - the bound is not applied. The picker shows the tag's
+        observed first/last fix, read-only: in Auto there is nothing for the
+        user to choose, the answer is whatever the data says.
+      * MANUAL - the bound is applied, at exactly the value shown.
 
     That distinction exists because the pickers are pre-filled from the data's
     own extent. Without it, simply opening this dialog and pressing OK armed a
@@ -1117,6 +2177,21 @@ class IdentityAssignmentDialog(QDialog):
     database that grew afterwards (a trial still running, re-copied later) had
     its new days silently discarded.
     """
+
+    # Bounds are shown and stored to the millisecond, because the fixes they
+    # trim are. Truncating to the second made a Stop ambiguous by up to one
+    # second, which at ~7.6 Hz is several fixes either side of the cut.
+    TIME_FMT = "yyyy-MM-dd HH:mm:ss.zzz"
+    LEGACY_TIME_FMT = "yyyy-MM-dd HH:mm:ss"     # configs written before ms
+
+    @classmethod
+    def parse_time(cls, value):
+        """A stored bound as a QDateTime, tolerating the pre-millisecond form."""
+        for fmt in (cls.TIME_FMT, cls.LEGACY_TIME_FMT):
+            dt = QDateTime.fromString(value or '', fmt)
+            if dt.isValid():
+                return dt
+        return QDateTime()
 
     def __init__(self, available_tags, existing_identities=None, tag_time_ranges=None,
                  parent=None):
@@ -1144,18 +2219,20 @@ class IdentityAssignmentDialog(QDialog):
         return 'manual' if info.get(f'{which}_time') else default
 
     def initUI(self):
-        self.setWindowTitle("Assign Tag Identities")
+        self.setWindowTitle("Configure Tag Identities")
         self.setMinimumWidth(860)
 
         layout = QVBoxLayout()
 
         instructions = QLabel(
             "Assign sex (M/F) and IDs. To merge tags (e.g. a lost tag replaced), "
-            "give both the same ID.\n"
+            "give both the same ID. <b>Name</b> and <b>Code</b> are optional "
+            "(e.g. Hera / HER) \u2014 if you use them, fill them in for every "
+            "animal; a replacement tag inherits its animal's.\n"
             "<b>Start / Stop trim the data.</b> Leave a bound on "
-            "<i>Follow data</i> unless you actually want fixes outside it "
-            "discarded \u2014 tick <i>Limit to</i> only for a real deployment or "
-            "removal time.")
+            "<i>Auto</i> \u2014 the tag's own first/last fix, shown read-only \u2014 "
+            "unless you actually want fixes outside it discarded; choose "
+            "<i>Manual</i> only for a real deployment or removal time.")
         instructions.setWordWrap(True)
         instructions.setTextFormat(Qt.RichText)
         layout.addWidget(instructions)
@@ -1163,10 +2240,16 @@ class IdentityAssignmentDialog(QDialog):
         form_layout = QFormLayout()
         self.sex_combos = {}
         self.identity_edits = {}
+        self.name_edits = {}
+        self.code_edits = {}
         self.start_edits = {}
         self.stop_edits = {}
         self.start_modes = {}
         self.stop_modes = {}
+        # Holes inside the deployment (see OffAnimalIntervalsDialog), kept
+        # here as the stored dicts and edited through a per-tag button.
+        self.off_intervals = {}
+        self.off_buttons = {}
         stale = []
 
         for tag in sorted(self.available_tags):
@@ -1177,18 +2260,32 @@ class IdentityAssignmentDialog(QDialog):
             sex_combo.addItems(["M", "F"])
             identity_edit = QLineEdit()
             identity_edit.setPlaceholderText(f"e.g., {tag}")
+            # Optional human-friendly labels. Selectable as the on-screen tag
+            # label (Show Tag ID -> Name / Code); the SexID stays the key every
+            # analysis joins on.
+            name_edit = QLineEdit()
+            name_edit.setPlaceholderText("optional, e.g. Hera")
+            name_edit.setToolTip(
+                "Optional animal name. Shown when Show Tag ID is set to Name. "
+                "If you name any animal, name them all.")
+            code_edit = QLineEdit()
+            code_edit.setPlaceholderText("e.g. HER")
+            code_edit.setFixedWidth(90)
+            code_edit.setToolTip(
+                "Optional short code (e.g. a 3-letter abbreviation). Shown when "
+                "Show Tag ID is set to Code. Must be unique per animal.")
 
             def _picker():
                 e = QDateTimeEdit()
-                e.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+                e.setDisplayFormat(self.TIME_FMT)
                 e.setCalendarPopup(True)
                 return e
 
             start_edit, stop_edit = _picker(), _picker()
 
             # Seed from the observed range; a saved time overrides it below.
-            obs_start = QDateTime.fromString(tr.get('start', ''), "yyyy-MM-dd HH:mm:ss")
-            obs_stop = QDateTime.fromString(tr.get('end', ''), "yyyy-MM-dd HH:mm:ss")
+            obs_start = self.parse_time(tr.get('start', ''))
+            obs_stop = self.parse_time(tr.get('end', ''))
             if obs_start.isValid():
                 start_edit.setDateTime(obs_start)
             if obs_stop.isValid():
@@ -1200,17 +2297,17 @@ class IdentityAssignmentDialog(QDialog):
             if info:
                 sex_combo.setCurrentIndex(0 if info.get('sex', 'M') == 'M' else 1)
                 identity_edit.setText(info.get('identity', ''))
+                name_edit.setText(str(info.get('name', '') or ''))
+                code_edit.setText(str(info.get('code', '') or ''))
                 # A manual bound keeps its saved value; an automatic one is
                 # re-seeded from the CURRENT data extent, so it can never go
                 # stale.
                 if start_mode == 'manual':
-                    dt = QDateTime.fromString(info.get('start_time', ''),
-                                              "yyyy-MM-dd HH:mm:ss")
+                    dt = self.parse_time(info.get('start_time', ''))
                     if dt.isValid():
                         start_edit.setDateTime(dt)
                 if stop_mode == 'manual':
-                    dt = QDateTime.fromString(info.get('stop_time', ''),
-                                              "yyyy-MM-dd HH:mm:ss")
+                    dt = self.parse_time(info.get('stop_time', ''))
                     if dt.isValid():
                         stop_edit.setDateTime(dt)
             else:
@@ -1219,8 +2316,8 @@ class IdentityAssignmentDialog(QDialog):
 
             def _mode_combo(mode, tip):
                 c = QComboBox()
-                c.addItem("Follow data", "auto")
-                c.addItem("Limit to", "manual")
+                c.addItem("Auto", "auto")
+                c.addItem("Manual", "manual")
                 c.setCurrentIndex(1 if mode == 'manual' else 0)
                 c.setFixedWidth(96)
                 c.setToolTip(tip)
@@ -1228,22 +2325,46 @@ class IdentityAssignmentDialog(QDialog):
 
             start_combo = _mode_combo(
                 start_mode,
-                "Follow data: use the tag's first fix; nothing is trimmed.\n"
-                "Limit to: discard everything BEFORE the time shown.")
+                "Auto: the tag's own first fix, shown read-only; nothing is "
+                "trimmed.\n"
+                "Manual: discard everything BEFORE the time you set.")
             stop_combo = _mode_combo(
                 stop_mode,
-                "Follow data: use the tag's last fix; nothing is trimmed. Choose "
-                "this if the recording may still grow.\n"
-                "Limit to: discard everything AFTER the time shown - for an "
+                "Auto: the tag's own last fix, shown read-only; nothing is "
+                "trimmed. Choose this if the recording may still grow.\n"
+                "Manual: discard everything AFTER the time you set - for an "
                 "animal actually removed or dead at that moment.")
 
-            def _wire(combo, edit):
+            def _wire(combo, edit, observed):
+                """Auto shows the data's extent; Manual restores the user's own.
+
+                The manual entry has to survive a round trip through Auto.
+                Auto overwrites the picker with the observed extent, so without
+                remembering the typed value, switching back would hand the user
+                that extent as though they had chosen it - which is exactly the
+                stale-trim trap the two modes exist to prevent.
+                """
+                remembered = {'dt': edit.dateTime()}
+
+                def _remember(dt):
+                    if combo.currentData() == 'manual':
+                        remembered['dt'] = dt
+
                 def _sync():
-                    edit.setEnabled(combo.currentData() == 'manual')
+                    manual = combo.currentData() == 'manual'
+                    if manual:
+                        edit.setDateTime(remembered['dt'])
+                    elif observed.isValid():
+                        edit.setDateTime(observed)
+                    # Disabled rather than merely read-only: in Auto the value
+                    # is not the user's to set, and it should not look like it.
+                    edit.setEnabled(manual)
+
+                edit.dateTimeChanged.connect(_remember)
                 combo.currentIndexChanged.connect(_sync)
                 _sync()
-            _wire(start_combo, start_edit)
-            _wire(stop_combo, stop_edit)
+            _wire(start_combo, start_edit, obs_start)
+            _wire(stop_combo, stop_edit, obs_stop)
 
             tag_widget = QWidget()
             tag_vlayout = QVBoxLayout()
@@ -1254,7 +2375,26 @@ class IdentityAssignmentDialog(QDialog):
             row1.addWidget(QLabel("Sex:"))
             row1.addWidget(sex_combo)
             row1.addWidget(QLabel("ID:"))
-            row1.addWidget(identity_edit)
+            row1.addWidget(identity_edit, 1)
+            row1.addSpacing(6)
+            row1.addWidget(QLabel("Name:"))
+            row1.addWidget(name_edit, 1)
+            row1.addWidget(QLabel("Code:"))
+            row1.addWidget(code_edit)
+            # On the name row rather than beside Start/Stop: the two
+            # millisecond pickers already set the dialog's minimum width, and
+            # a button there pushed every row into a horizontal scroll.
+            self.off_intervals[tag] = off_intervals(info)
+            btn_off = QPushButton()
+            btn_off.setToolTip(
+                "Periods this tag reported while NOT on the animal - e.g. a "
+                "head cap found off and re-attached. Fixes inside them are "
+                "removed from the preview and every export.")
+            btn_off.clicked.connect(lambda _=False, t=tag: self._edit_off_intervals(t))
+            self.off_buttons[tag] = btn_off
+            self._label_off_button(tag)
+            row1.addSpacing(6)
+            row1.addWidget(btn_off)
             tag_vlayout.addLayout(row1)
 
             row2 = QHBoxLayout()
@@ -1269,24 +2409,25 @@ class IdentityAssignmentDialog(QDialog):
             row2.addWidget(stop_edit, 1)
             tag_vlayout.addLayout(row2)
 
-            # What the data actually covers, so a bound can be judged against it.
-            if tr.get('start') and tr.get('end'):
-                hint = QLabel(f"data: {tr['start']} \u2192 {tr['end']}")
-                hint.setStyleSheet("color:#9fb3c8; font-size: 9px;")
-                # Flag a stop that is throwing days away - the stale-default case.
-                if stop_mode == 'manual':
-                    try:
-                        cut = ((pd.Timestamp(tr['end'])
-                                - pd.Timestamp(stop_edit.dateTime().toString(
-                                    "yyyy-MM-dd HH:mm:ss"))).total_seconds() / 86400.0)
-                    except Exception:
-                        cut = 0.0
-                    if cut > 0.5:
-                        hint.setText(f"data: {tr['start']} \u2192 {tr['end']}   "
-                                     f"\u26a0 Stop discards the last {cut:.1f} day(s)")
-                        hint.setStyleSheet("color:#e5c07b; font-size: 9px; font-weight: bold;")
-                        stale.append(tag)
-                tag_vlayout.addWidget(hint)
+            # Only the WARNING. The plain "data: start \u2192 end" line that used to
+            # sit here repeated what the two pickers already show - on an Auto
+            # bound, character for character - so it was a row of noise under
+            # every tag. A Stop that is throwing days away is the one thing the
+            # pickers cannot tell you, so that stays.
+            if tr.get('start') and tr.get('end') and stop_mode == 'manual':
+                try:
+                    cut = ((pd.Timestamp(tr['end'])
+                            - pd.Timestamp(stop_edit.dateTime().toString(
+                                self.TIME_FMT))).total_seconds() / 86400.0)
+                except Exception:
+                    cut = 0.0
+                if cut > 0.5:
+                    hint = QLabel(f"\u26a0 Stop discards the last {cut:.1f} day(s) "
+                                  f"\u2014 data runs to {tr['end']}")
+                    hint.setStyleSheet(
+                        "color:#e5c07b; font-size: 9px; font-weight: bold;")
+                    tag_vlayout.addWidget(hint)
+                    stale.append(tag)
 
             tag_widget.setLayout(tag_vlayout)
             hex_id = hex(tag).upper().replace('0X', '')
@@ -1294,6 +2435,8 @@ class IdentityAssignmentDialog(QDialog):
 
             self.sex_combos[tag] = sex_combo
             self.identity_edits[tag] = identity_edit
+            self.name_edits[tag] = name_edit
+            self.code_edits[tag] = code_edit
             self.start_edits[tag] = start_edit
             self.stop_edits[tag] = stop_edit
             self.start_modes[tag] = start_combo
@@ -1304,18 +2447,18 @@ class IdentityAssignmentDialog(QDialog):
                 f"\u26a0 {len(stale)} tag(s) have a Stop time earlier than their "
                 "last recorded fix, so those days are being discarded. If those "
                 "Stop times were only ever the pre-filled data extent (not a real "
-                "removal), set them back to <i>Follow data</i>.")
+                "removal), set them back to <i>Auto</i>.")
             banner.setWordWrap(True)
             banner.setTextFormat(Qt.RichText)
             banner.setStyleSheet(
                 "color:#e5c07b; background:#3a3226; padding:6px; border-radius:3px;")
             layout.addWidget(banner)
 
-            btn_release = QPushButton("Set every flagged Stop back to \u201cFollow data\u201d")
+            btn_release = QPushButton("Set every flagged Stop back to \u201cAuto\u201d")
             btn_release.setToolTip(
-                "Switch the Stop bound to Follow data for every tag flagged "
-                "above, so their full recordings are used. Start times are left "
-                "exactly as they are.")
+                "Switch the Stop bound to Auto for every tag flagged above, so "
+                "their full recordings are used. Start times are left exactly "
+                "as they are.")
             btn_release.clicked.connect(lambda _=False, t=list(stale): self._release_stops(t))
             layout.addWidget(btn_release)
 
@@ -1351,20 +2494,21 @@ class IdentityAssignmentDialog(QDialog):
         that means the earlier tag's Stop, or the later tag's Start, was never
         narrowed to the moment of the swap.
 
-        Compares the EFFECTIVE window: a bound on Follow data contributes the
-        tag's real data extent, not the value sitting in its (disabled) picker.
-        The timestamps are fixed-width 'yyyy-MM-dd HH:mm:ss', so ordering them
-        as strings is ordering them chronologically.
+        Compares the EFFECTIVE window: a bound on Auto contributes the tag's
+        real data extent, not the value sitting in its (disabled) picker.
+        The timestamps are fixed-width TIME_FMT, so ordering them as strings is
+        ordering them chronologically - which holds only while both sides carry
+        milliseconds, so tag_time_ranges must format to TIME_FMT too.
         """
         windows = {}
         for tag in self.available_tags:
             tr = self.tag_time_ranges.get(tag) or {}
             key = (self.sex_combos[tag].currentText(),
                    self.identity_edits[tag].text().strip() or str(tag))
-            start = (self.start_edits[tag].dateTime().toString("yyyy-MM-dd HH:mm:ss")
+            start = (self.start_edits[tag].dateTime().toString(self.TIME_FMT)
                      if self.start_modes[tag].currentData() == 'manual'
                      else tr.get('start'))
-            stop = (self.stop_edits[tag].dateTime().toString("yyyy-MM-dd HH:mm:ss")
+            stop = (self.stop_edits[tag].dateTime().toString(self.TIME_FMT)
                     if self.stop_modes[tag].currentData() == 'manual'
                     else tr.get('end'))
             if start and stop:
@@ -1400,14 +2544,55 @@ class IdentityAssignmentDialog(QDialog):
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if reply != QMessageBox.Yes:
                 return
+
+        # Optional Name/Code: a partly-filled roster is almost always an
+        # oversight, and with Show Tag ID on Name/Code it would mix names with
+        # SexIDs in the same frame. Warn, don't block - leaving some blank is
+        # a legitimate choice mid-trial.
+        problems = identity_field_problems(self.get_identities())
+        if problems:
+            reply = QMessageBox.warning(
+                self, "Incomplete Names / Codes",
+                "Some animals have a Name or Code and others do not, or the "
+                "values clash:\n\n" + "\n".join(describe_problems(problems)) +
+                "\n\nAnimals without one fall back to their SexID when the "
+                "tag label is set to Name or Code. Save anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
         super().accept()
 
+    def _label_off_button(self, tag):
+        n = len(self.off_intervals.get(tag) or [])
+        btn = self.off_buttons[tag]
+        btn.setText(f"Off-animal ({n})\u2026" if n else "Off-animal\u2026")
+        btn.setStyleSheet("color:#e5c07b; font-weight:bold;" if n else "")
+
+    def _edit_off_intervals(self, tag):
+        tr = self.tag_time_ranges.get(tag) or {}
+        hex_id = hex(tag).upper().replace('0X', '')
+        sexid = (self.sex_combos[tag].currentText()
+                 + self.identity_edits[tag].text().strip())
+        name = self.name_edits[tag].text().strip()
+        title = f"HexID {hex_id}" + (f" \u2014 {sexid}" if sexid.strip() else "") \
+            + (f" ({name})" if name else "")
+        dlg = OffAnimalIntervalsDialog(title, self.off_intervals.get(tag),
+                                       (tr.get('start'), tr.get('end')), self)
+        if dlg.exec_() == QDialog.Accepted:
+            self.off_intervals[tag] = dlg.intervals()
+            self._label_off_button(tag)
+
     def _release_stops(self, tags):
-        """Put the flagged tags' Stop bounds back on Follow data."""
+        """Put the flagged tags' Stop bounds back on Auto.
+
+        Switching the mode is enough: Auto re-reads the tag's observed last
+        fix into the picker, so the stale value that triggered the flag is
+        replaced rather than merely ignored.
+        """
         for tag in tags:
             combo = self.stop_modes.get(tag)
             if combo is not None:
-                combo.setCurrentIndex(0)          # Follow data
+                combo.setCurrentIndex(0)          # Auto
 
     def get_identities(self):
         """Configured identities, with each bound's mode recorded alongside it."""
@@ -1418,12 +2603,22 @@ class IdentityAssignmentDialog(QDialog):
                 'sex': self.sex_combos[tag].currentText(),
                 'identity': identity,
                 'start_time': self.start_edits[tag].dateTime().toString(
-                    "yyyy-MM-dd HH:mm:ss"),
+                    self.TIME_FMT),
                 'stop_time': self.stop_edits[tag].dateTime().toString(
-                    "yyyy-MM-dd HH:mm:ss"),
+                    self.TIME_FMT),
                 'start_mode': self.start_modes[tag].currentData(),
                 'stop_mode': self.stop_modes[tag].currentData(),
             }
+            # Optional; only written when set, so a roster without names keeps
+            # exactly the config it had before these fields existed.
+            for key, edit in (('name', self.name_edits[tag]),
+                              ('code', self.code_edits[tag])):
+                value = edit.text().strip()
+                if value:
+                    result[tag][key] = value
+            holes = self.off_intervals.get(tag) or []
+            if holes:
+                result[tag][OFF_INTERVALS] = [dict(h) for h in holes]
         return result
 
 
@@ -1440,9 +2635,10 @@ class PlotSaverWorker(QThread):
                  bg_width_meters=None, bg_height_meters=None, csv_path=None, save_svg=False,
                  output_dir=None, plots_dir=None, rolling_window_units='Seconds',
                  plot_layers=None, xml_zones=None, anchor_positions=None,
+                 rois=None, occupancy_sources=None,
                  xml_map_image=None, xml_map_extent=None,
                  bg_offset_x=0.0, bg_offset_y=0.0, behavior_params=None,
-                 axis_limits=None):
+                 axis_limits=None, label_type=SEX_ID):
         super().__init__()
         self.db_path = db_path
         self.table_name = table_name
@@ -1463,6 +2659,10 @@ class PlotSaverWorker(QThread):
         self.timezone = timezone
         self.tag_identities = tag_identities if tag_identities else {}
         self.use_identities = use_identities
+        # Which ID names an animal in the FIGURES (SexID / Name / Code / HexID
+        # / ShortID). Data files never follow it: every CSV keeps the SexID,
+        # the key the analyses join on.
+        self.label_type = normalize_id_type(label_type)
         self.background_image = background_image
         self.bg_width_meters = bg_width_meters
         self.bg_height_meters = bg_height_meters
@@ -1472,6 +2672,15 @@ class PlotSaverWorker(QThread):
         # Spatial context layer choice + sources for the trajectory plots.
         self.plot_layers = plot_layers if plot_layers is not None else dict(DEFAULT_PLOT_LAYERS)
         self.xml_zones = xml_zones or []
+        # The user's own regions, drawn over the preview (see uwb_roi).
+        self.rois = rois or []
+        # Which of the two region sets the occupancy plot is allowed to use.
+        # The plot has to agree with the occupancy CSV about what was being
+        # measured, so this is the SAME choice, passed in rather than
+        # re-derived.
+        self.occupancy_sources = (('zone', 'roi') if occupancy_sources is None
+                                  else tuple(occupancy_sources))
+        self.occupancy_zones = self._merge_occupancy_zones()
         self.anchor_positions = anchor_positions or []
         self.xml_map_image = xml_map_image
         self.xml_map_extent = xml_map_extent
@@ -1557,7 +2766,9 @@ class PlotSaverWorker(QThread):
                          f"FROM {self.table_name}")
                 data = pd.read_sql_query(query, conn)
                 conn.close()
-                
+
+                data, _cs = collapse_multi_solutions(
+                    data, log=self.progress.emit, label="read")
                 self.progress.emit(f"Loaded {len(data)} records")
                 
                 # Process data
@@ -1601,8 +2812,8 @@ class PlotSaverWorker(QThread):
             plots_dir = self.plots_dir if self.plots_dir else os.path.join(output_dir, 'plots')
 
             db_name = os.path.splitext(os.path.basename(self.db_path))[0]
-            os.makedirs(output_dir, exist_ok=True)
-            os.makedirs(plots_dir, exist_ok=True)
+            ensure_dir(output_dir)
+            ensure_dir(plots_dir)
             
             # Generate and save plots based on selection
             generated_count = 0
@@ -1614,6 +2825,7 @@ class PlotSaverWorker(QThread):
             # bad plot silently cancelled every plot after it in this list.
             plot_jobs = [
                 ('daily_paths', self.save_daily_paths_per_tag),
+                ('daily_path_grid', self.save_daily_path_grid),
                 ('trajectory_overview', self.save_trajectory_overview),
                 ('battery_levels', self.save_battery_levels),
                 ('activity_timeline', self.save_activity_timeline),
@@ -1784,7 +2996,8 @@ class PlotSaverWorker(QThread):
                 draw_context_layers(
                     ax, self.plot_layers,
                     bg_image=day_bg_image, bg_extent=day_bg_extent,
-                    zones_xml=self.xml_zones, anchors=self.anchor_positions)
+                    zones_xml=self.xml_zones, anchors=self.anchor_positions,
+                    rois=self.rois)
 
                 if not day_data.empty:
                     ax.plot(day_data[x_col], day_data[y_col],
@@ -1806,7 +3019,9 @@ class PlotSaverWorker(QThread):
                 ax.grid(True, alpha=0.3)
                 ax.set_aspect('equal')
             
-            fig.suptitle(f'Daily Paths - {file_suffix}', fontsize=14, fontweight='bold')
+            title_id = (file_suffix if self.label_type == SEX_ID
+                        else self._animal_label(member_tags))
+            fig.suptitle(f'Daily Paths - {title_id}', fontsize=14, fontweight='bold')
             fig.tight_layout()
             
             self.save_figure(fig, output_path)
@@ -1817,6 +3032,150 @@ class PlotSaverWorker(QThread):
         
         return generated
     
+    #: Daily-path grid geometry. One cell per animal-day, in inches.
+    GRID_CELL_W = 1.6
+    #: Cap on the finished figure. matplotlib cannot write past 2^16 px a
+    #: side, and 200 dpi turns 55 in into 11,000 - wide enough for ~34 days
+    #: before the cells start shrinking instead.
+    GRID_MAX_FIG_W = 55.0
+    GRID_MAX_FIG_H = 55.0
+
+    def _grid_row_label(self, member_tags):
+        """Row label: the chosen ID, else the SexID the CSVs join on.
+
+        By default the analysis key rather than the hyphenated form the other
+        figures title with - this grid is read alongside the exported tables,
+        and a label you can search for in them is worth more here.
+        """
+        if self.label_type in (HEX_ID, SHORT_ID):
+            return " / ".join(self._chosen_label(t) for t in member_tags)
+        chosen = self._chosen_label(member_tags[0])
+        return chosen if chosen is not None else self._grid_sexid_label(member_tags)
+
+    def _grid_sexid_label(self, member_tags):
+        """The SexID (F9801), else the HexID(s). Also the grid's row order."""
+        info = (self.tag_identities.get(member_tags[0]) or {}) if self.use_identities else {}
+        sex, ident = info.get('sex'), info.get('identity')
+        if sex and ident:
+            return f"{str(sex)[:1].upper()}{ident}"
+        return " / ".join(f"HexID {hex(t).upper().replace('0X', '')}"
+                          for t in member_tags)
+
+    def save_daily_path_grid(self, data, output_dir, db_name):
+        """Animals in rows, days in columns: the whole trial in one figure.
+
+        The per-animal daily figures wrap days onto several rows, so comparing
+        two animals on the same day means flipping between files. Here an
+        animal is ALWAYS one row and a day always one column, which is what
+        makes a cohort-wide change on day 9 visible at a glance.
+
+        Deliberately bare - no background image, no start/stop markers, a thin
+        line - because at this cell size that furniture covers the track
+        rather than orienting it. Every cell shares one set of axis limits, so
+        cells are comparable; only the outer edges carry ticks.
+
+        Returns True if the figure was written.
+        """
+        self.progress.emit("Generating daily path grid...")
+        output_path = os.path.join(output_dir, f'{db_name}_DailyPathGrid.png')
+        if self.skip_existing and os.path.exists(output_path):
+            self.progress.emit(f"Skipped (exists): {db_name}_DailyPathGrid.png")
+            return False
+
+        data = data.copy()
+        if 'Date' not in data.columns:
+            data['Date'] = data['Timestamp'].dt.date
+        x_col = 'smoothed_x' if 'smoothed_x' in data.columns else 'location_x'
+        y_col = 'smoothed_y' if 'smoothed_y' in data.columns else 'location_y'
+
+        days = sorted(data['Date'].unique())
+        # Rows read as the SexID the rest of the analysis uses, ordered the way
+        # the ROI tables order animals (M9 before M10, sexes kept together).
+        from fnt.uwb import roi_bouts as _RB
+        # Ordered by SexID whatever the rows are labelled with, so choosing
+        # Name does not shuffle the sexes together alphabetically.
+        groups = [(self._grid_sexid_label(tags), self._grid_row_label(tags), tags)
+                  for _suffix, tags in
+                  self.animal_groups(sorted(data['shortid'].unique()))]
+        groups.sort(key=lambda g: _RB.natural_animal_key(g[0]))
+        groups = [(label, tags) for _key, label, tags in groups]
+        if not days or not groups:
+            self.progress.emit("Daily path grid: nothing to plot.")
+            return False
+
+        # One window for every cell, from the tracks themselves: no background
+        # is drawn here, so there is no image extent to honour.
+        x_min, x_max = float(data[x_col].min()), float(data[x_col].max())
+        y_min, y_max = float(data[y_col].min()), float(data[y_col].max())
+        x_pad = (x_max - x_min) * 0.05 or 1.0
+        y_pad = (y_max - y_min) * 0.05 or 1.0
+        x_min, x_max = x_min - x_pad, x_max + x_pad
+        y_min, y_max = y_min - y_pad, y_max + y_pad
+        if self.axis_limits is not None:
+            x_min, x_max, y_min, y_max = self.axis_limits
+
+        n_rows, n_cols = len(groups), len(days)
+        # Cells keep the arena's shape, so a long thin enclosure does not come
+        # out stretched. Shrink the cell (never the layout) if a long trial
+        # would otherwise overflow the figure limits.
+        aspect = (y_max - y_min) / (x_max - x_min) if x_max > x_min else 1.0
+        cell_w = self.GRID_CELL_W
+        cell_w = min(cell_w, (self.GRID_MAX_FIG_W - 1.6) / n_cols)
+        cell_h = cell_w * max(0.3, min(aspect, 3.0))
+        if cell_h * n_rows + 1.2 > self.GRID_MAX_FIG_H:
+            cell_h = (self.GRID_MAX_FIG_H - 1.2) / n_rows
+        fig_w = cell_w * n_cols + 1.6          # row labels on the left
+        fig_h = cell_h * n_rows + 1.2          # day headers + title on top
+        fig = Figure(figsize=(fig_w, fig_h))
+        axes = fig.subplots(n_rows, n_cols, squeeze=False,
+                            sharex=True, sharey=True)
+        # Cells butt up against each other: at this size the gaps cost more
+        # track than they buy in separation, and the frames still divide them.
+        fig.subplots_adjust(left=1.3 / fig_w, right=1 - 0.3 / fig_w,
+                            top=1 - 0.95 / fig_h, bottom=0.25 / fig_h,
+                            wspace=0.04, hspace=0.04)
+
+        for r, (label, member_tags) in enumerate(groups):
+            animal = data[data['shortid'].isin(member_tags)]
+            sex = str((self.tag_identities.get(member_tags[0]) or {})
+                      .get('sex', '') or '')[:1].upper()
+            colour = {'M': '#1f6fd0', 'F': '#d02f4a'}.get(sex, '#1f6fd0')
+            for c, date in enumerate(days):
+                ax = axes[r][c]
+                cell = animal[animal['Date'] == date]
+                if not cell.empty:
+                    ax.plot(cell[x_col], cell[y_col], linewidth=0.5,
+                            alpha=0.85, color=colour, solid_capstyle='round')
+                else:
+                    # An empty cell and a cell whose animal never moved look
+                    # the same otherwise.
+                    ax.text(0.5, 0.5, '\u2013', transform=ax.transAxes,
+                            ha='center', va='center', fontsize=7,
+                            color='#b0b0b0')
+                ax.set_xlim(x_min, x_max)
+                ax.set_ylim(y_min, y_max)
+                ax.set_aspect('equal', adjustable='box')
+                ax.set_xticks([])
+                ax.set_yticks([])
+                for spine in ax.spines.values():
+                    spine.set_linewidth(0.4)
+                    spine.set_color('#999999')
+                if r == 0:
+                    ax.set_title(f'Day {c + 1}\n{date}', fontsize=6.5,
+                                 pad=3)
+                if c == 0:
+                    ax.set_ylabel(label, fontsize=8, rotation=0,
+                                  ha='right', va='center', labelpad=8,
+                                  color=colour)
+
+        fig.suptitle(f'Daily paths - {n_rows} animal(s) x {n_cols} day(s)',
+                     fontsize=12, fontweight='bold', y=1 - 0.12 / fig_h)
+        self.save_figure(fig, output_path)
+        plt.close(fig)
+        self.progress.emit(f"Saved: {db_name}_DailyPathGrid.png "
+                           f"({fig_w:.0f}x{fig_h:.0f} in)")
+        return True
+
     def save_trajectory_overview(self, data, output_dir, db_name):
         """Save trajectory overview
         Returns: True if generated, False if skipped"""
@@ -1840,7 +3199,8 @@ class PlotSaverWorker(QThread):
         draw_context_layers(
             ax, self.plot_layers,
             bg_image=bg_image, bg_extent=bg_extent,
-            zones_xml=self.xml_zones, anchors=self.anchor_positions)
+            zones_xml=self.xml_zones, anchors=self.anchor_positions,
+            rois=self.rois)
 
         x_col = 'smoothed_x' if 'smoothed_x' in data.columns else 'location_x'
         y_col = 'smoothed_y' if 'smoothed_y' in data.columns else 'location_y'
@@ -1860,6 +3220,7 @@ class PlotSaverWorker(QThread):
                 hex_id = hex(tag).upper().replace('0X', '')
                 label = f"HexID {hex_id}"
                 color = 'blue'  # Default to blue
+            label = self._chosen_label(tag) or label
             
             ax.plot(tag_data[x_col], tag_data[y_col], 
                    linewidth=1, alpha=0.7, color=color, label=label)
@@ -1961,6 +3322,7 @@ class PlotSaverWorker(QThread):
             else:
                 hex_id = hex(tag).upper().replace('0X', '')
                 label = f"HexID {hex_id}"
+            label = self._chosen_label(tag) or label
 
             color = 'tab:blue'
             if self.use_identities and tag in self.tag_identities:
@@ -2082,14 +3444,11 @@ class PlotSaverWorker(QThread):
         # A shared x-axis is what makes the panels comparable; y is per-panel
         # because a mostly-still animal has a far taller spike at zero.
         v_max = float(data['velocity'].dropna().max() or 1.0)
-        still = getattr(self.behavior_params, 'still_speed', None)
         for i, tag in enumerate(tags):
             ax = fig.add_subplot(n_rows, n_cols, i + 1)
             vals = data[data['shortid'] == tag]['velocity'].dropna()
             ax.hist(vals, bins=50, range=(0, v_max), density=True,
                     color='#4da3ff', alpha=0.85)
-            if still is not None:
-                ax.axvline(still, color='#ff4d4d', linestyle='--', lw=1.0)
             ax.set_title(self._tag_label(tag), fontsize=9)
             ax.set_xlim(0, v_max)
             ax.tick_params(labelsize=7)
@@ -2098,10 +3457,8 @@ class PlotSaverWorker(QThread):
                 ax.set_ylabel('Density', fontsize=8)
             if i >= len(tags) - n_cols:
                 ax.set_xlabel('Velocity (m/s)', fontsize=8)
-        title = 'Velocity Distribution by Animal'
-        if still is not None:
-            title += f'   (dashed = inactive threshold, {still:g} m/s)'
-        fig.suptitle(title, fontsize=13, fontweight='bold')
+        fig.suptitle('Velocity Distribution by Animal',
+                     fontsize=13, fontweight='bold')
         fig.tight_layout(rect=[0, 0, 1, 0.96])
         self.save_figure(fig, output_path)
         plt.close(fig)
@@ -2163,6 +3520,7 @@ class PlotSaverWorker(QThread):
                 else:
                     hex_id = hex(tag).upper().replace('0X', '')
                     label = f"HexID {hex_id}"
+                label = self._chosen_label(tag) or label
                 
                 ax.plot(tag_data['time_of_day'], tag_data['cumulative_distance'], label=label, alpha=0.7)
             
@@ -2216,7 +3574,6 @@ class PlotSaverWorker(QThread):
         # to call an animal inactive, so the line shows exactly where the
         # inactive/moving split falls on this trial rather than a hard-coded
         # 0.1 m/s that matched nothing.
-        still = getattr(self.behavior_params, 'still_speed', None)
 
         n_rows, n_cols, figsize = self.facet_grid(
             len(tags), max_cols=3, panel_w=5.5, panel_h=2.4, extra_h=0.7)
@@ -2230,8 +3587,6 @@ class PlotSaverWorker(QThread):
             d = data[data['shortid'] == tag]
             ax.plot(d['_x'].to_numpy(), d['velocity'].to_numpy(),
                     alpha=0.6, linewidth=0.4, color='#4da3ff')
-            if still is not None:
-                ax.axhline(y=still, color='#ff4d4d', linestyle='--', linewidth=1.0)
             ax.set_title(self._tag_label(tag), fontsize=9)
             # Shared time axis so the panels line up as a single timeline.
             ax.set_xlim(t0, t1)
@@ -2241,10 +3596,8 @@ class PlotSaverWorker(QThread):
             if i % n_cols == 0:
                 ax.set_ylabel('m/s', fontsize=8)
 
-        title = 'Velocity Timeline by Animal'
-        if still is not None:
-            title += f'   (dashed = inactive below {still:g} m/s)'
-        fig.suptitle(title, fontsize=13, fontweight='bold')
+        fig.suptitle('Velocity Timeline by Animal',
+                     fontsize=13, fontweight='bold')
         fig.tight_layout(rect=[0, 0, 1, 0.96])
         self.save_figure(fig, output_path)
         plt.close(fig)
@@ -2276,6 +3629,7 @@ class PlotSaverWorker(QThread):
             else:
                 hex_id = hex(tag).upper().replace('0X', '')
                 label = f"HexID {hex_id}"
+            label = self._chosen_label(tag) or label
             
             median_gap = gaps.median()
             max_gap = gaps.max()
@@ -2317,8 +3671,50 @@ class PlotSaverWorker(QThread):
 
     # ── Home range ───────────────────────────────────────────────────────────
 
+    def _chosen_label(self, tag):
+        """The ID picked under 'Label animals by', or None for the SexID form.
+
+        SexID is the default and keeps each figure's established wording
+        ('F-9905' in titles, 'F9905' on the grid). Name and Code fall back to
+        the SexID for an animal without one (identities.tag_label), so a
+        half-filled roster still labels every animal.
+        """
+        kind = getattr(self, 'label_type', SEX_ID)
+        if kind == SEX_ID:
+            return None
+        if kind == HEX_ID:
+            return f"HexID {hex_label(tag)}"
+        if kind == SHORT_ID:
+            return f"ShortID {int(tag)}"
+        info = self.tag_identities.get(tag) if self.use_identities else None
+        if not info:
+            return None
+        return tag_label(tag, info, kind)
+
+    def _display_animal(self, key):
+        """Figure text for an animal named by its behaviour-table key.
+
+        The behaviour events carry the SexID ('F9905', or 'HexID2A' for an
+        unconfigured tag) because they are also the exported CSV. Figures
+        drawn from them translate that key here, so they follow 'Label
+        animals by' like every other plot while the table does not.
+        """
+        for tag, info in (self.tag_identities.items() if self.use_identities else ()):
+            if f"{info.get('sex', 'M')}{info.get('identity', str(tag))}" == key:
+                return self._chosen_label(tag) or key
+        if str(key).startswith('HexID'):
+            try:
+                tag = int(str(key)[5:], 16)
+            except ValueError:
+                return key
+            return self._chosen_label(tag) or key
+        return key
+
     def _tag_label(self, tag):
-        """Display label for a tag: sex-identity when configured, else hex ID."""
+        """Display label for a tag: the chosen ID, else sex-identity, else hex."""
+        chosen = self._chosen_label(tag)
+        if chosen is not None:
+            return chosen
         if self.use_identities and tag in self.tag_identities:
             info = self.tag_identities[tag]
             return f"{info.get('sex', 'M')}-{info.get('identity', str(tag))}"
@@ -2327,6 +3723,11 @@ class PlotSaverWorker(QThread):
     def _tag_legend_label(self, tag):
         """'HexID 30 - F9701' when identities are configured, else the hex alone."""
         hex_id = hex(tag).upper().replace('0X', '')
+        chosen = self._chosen_label(tag)
+        if chosen is not None:
+            # The legend already leads with the HexID; don't say it twice.
+            return (chosen if self.label_type == HEX_ID
+                    else f"HexID {hex_id} \u2014 {chosen}")
         if self.use_identities and tag in self.tag_identities:
             info = self.tag_identities[tag]
             return (f"HexID {hex_id} \u2014 "
@@ -2349,8 +3750,11 @@ class PlotSaverWorker(QThread):
         if len(member_tags) == 1:
             return self._tag_label(member_tags[0])
         hexes = ', '.join(hex(t).upper().replace('0X', '') for t in member_tags)
+        if self.label_type in (HEX_ID, SHORT_ID):
+            return " / ".join(self._chosen_label(t) for t in member_tags)
         info = self.tag_identities.get(member_tags[0], {}) if self.use_identities else {}
-        name = f"{info.get('sex', '')}{info.get('identity', '')}" or None
+        name = (self._chosen_label(member_tags[0])
+                or f"{info.get('sex', '')}{info.get('identity', '')}" or None)
         return f"HexIDs {hexes}" + (f" — {name}" if name else "")
 
     # Plots that describe an ANIMAL take the merged frame; plots that
@@ -2496,7 +3900,8 @@ class PlotSaverWorker(QThread):
         def _draw(ax, sub_x, sub_y, title, show_legend):
             draw_context_layers(
                 ax, self.plot_layers, bg_image=bg_image, bg_extent=bg_extent,
-                zones_xml=self.xml_zones, anchors=self.anchor_positions)
+                zones_xml=self.xml_zones, anchors=self.anchor_positions,
+                rois=self.rois)
             ax.plot(sub_x, sub_y, '.', ms=0.6, color='#999999', alpha=0.35, zorder=2)
             areas = self._hr_estimate(ax, sub_x, sub_y, method)
             self._apply_axis_limits(ax, gx_min - pad, gx_max + pad,
@@ -2566,7 +3971,8 @@ class PlotSaverWorker(QThread):
         ax = fig.add_subplot(111)
         draw_context_layers(ax, self.plot_layers, bg_image=bg_image,
                             bg_extent=bg_extent, zones_xml=self.xml_zones,
-                            anchors=self.anchor_positions)
+                            anchors=self.anchor_positions,
+                            rois=self.rois)
         cmap = plt.get_cmap('tab10')
         handles, rows = [], []
         for i, (_suffix, member_tags) in enumerate(self.animal_groups(unique_tags)):
@@ -2630,19 +4036,35 @@ class PlotSaverWorker(QThread):
         """Minimum convex polygon home range: 95% peeled and 100%."""
         return self._save_home_range(data, output_dir, db_name, 'mcp')
 
-    def save_zone_occupancy(self, data, output_dir, db_name):
-        """Time spent in each arena zone, per animal, over the recording.
+    def _merge_occupancy_zones(self):
+        """The regions this plot measures: the drawn ones, in list order.
 
-        Needs zone polygons from the site XML; returns False if none are loaded.
+        DRAWN REGIONS ONLY, matching the occupancy CSVs. Site-XML zones used
+        to be a second measurement source merged in ahead of these; they are
+        now imported into the ROI list instead, so a zone that has not been
+        imported is drawn (if the zones layer is on) but not measured. One
+        source means precedence is just list order, first match wins - the
+        same rule the CSVs and the preview use.
+        """
+        zones = [dict(r) for r in (self.rois or [])
+                 if 'roi' in self.occupancy_sources]
+        return [z for z in zones if _polygon_len(z) >= 3]
+
+    def save_zone_occupancy(self, data, output_dir, db_name):
+        """Time spent in each region, per animal, over the recording.
+
+        Regions are the ones drawn over the preview; returns False if the
+        trial has none. Independent of whether they are being DRAWN on the
+        other figures - a region hidden for legibility is still measured here.
         """
         from fnt.uwb import spatial_metrics as SM
 
         self.progress.emit("Generating zone occupancy...")
 
-        zones = list(self.xml_zones or [])
+        zones = list(self.occupancy_zones or [])
         if not zones:
             self.progress.emit(
-                "No arena zones loaded (site XML), skipping zone occupancy")
+                "No regions drawn for this trial, skipping zone occupancy")
             return False
 
         output_path = os.path.join(output_dir, f'{db_name}_ZoneOccupancy.png')
@@ -2736,7 +4158,8 @@ class PlotSaverWorker(QThread):
         fig.colorbar(im, ax=ax, fraction=0.04, pad=0.03).ax.tick_params(labelsize=6)
 
         fig.suptitle(
-            f'Zone Occupancy — {len(zones)} zones, {len(unique_dates)} day(s)',
+            f'Zone Occupancy — {len(zones)} drawn region(s), '
+            f'{len(unique_dates)} day(s)',
             fontsize=13, fontweight='bold')
         fig.tight_layout(rect=[0, 0, 1, 0.96])
         self.save_figure(fig, output_path)
@@ -2767,7 +4190,7 @@ class PlotSaverWorker(QThread):
         grid = np.arange(t0, t1 + step_ns, step_ns, dtype='int64')
         n_frames, n_tags = len(grid), len(tags)
         if n_frames == 0 or n_tags == 0:
-            return None, None, None
+            return None, None, None, None, None
 
         # Bin fixes onto the grid, one column per tag.
         binned = data.copy()
@@ -2804,7 +4227,10 @@ class PlotSaverWorker(QThread):
         # arrays comfortably small even for a full cohort.
         block = max(margin * 4, int(7200 * hz))
 
-        loc = np.full((n_frames, n_tags), BD.LOC_NODATA, dtype=np.int8)
+        # Has-a-fix, which is all the locomotor array was still needed
+        # for once the inactive/moving split went: the social raster has
+        # to tell 'alone' from 'not tracked'.
+        have = np.zeros((n_frames, n_tags), dtype=bool)
         soc = np.full((n_frames, n_tags), BD.SOC_NONE, dtype=np.int8)
         events = []
         links = []
@@ -2814,15 +4240,14 @@ class PlotSaverWorker(QThread):
             lo = max(0, start - margin)
             hi = min(n_frames, stop + margin)
             res = BD.classify(times_ns[lo:hi], X[lo:hi], Y[lo:hi], params)
-            loc[start:stop] = res['locomotor'][start - lo:stop - lo]
+            have[start:stop] = res['present'][start - lo:stop - lo]
             soc[start:stop] = res['social'][start - lo:stop - lo]
             if not DISPLACEMENT_ENABLED:
                 # classify() still resolves displacement and it outranks
                 # contact in the social precedence, so leaving it here would
                 # paint a parked detector's output straight into the exported
                 # ethogram. Fall back to what the animal was otherwise doing:
-                # contact if it was touching someone, else no social state, so
-                # the locomotor colour shows through.
+                # contact if it was touching someone, else no social state.
                 blk = soc[start:stop]
                 hit = (blk == BD.SOC_DISPLACING) | (blk == BD.SOC_DISPLACED)
                 if hit.any():
@@ -2868,7 +4293,7 @@ class PlotSaverWorker(QThread):
             # Sorted by frame so a renderer can slice one frame's links with
             # two searchsorted calls instead of scanning.
             link_arr = link_arr[np.argsort(link_arr[:, 0], kind='stable')]
-        return grid, loc, soc, events, link_arr
+        return grid, have, soc, events, link_arr
 
     # (key, result) for the last classification, shared across every worker in
     # this process. An export classifies the same data twice - once to write
@@ -2912,15 +4337,48 @@ class PlotSaverWorker(QThread):
         animal was chasing, this says whom it was chasing.
         """
         cols = ['behavior', 'actor', 'target', 'actor_sex', 'target_sex',
-                'dyad_type', 'Day', 'Date', 'start', 'stop', 'duration_s']
-        grid, loc, soc, events, _links = self._behavior_classification(data, tags)
+                'dyad_type', 'Day', 'Date', 'bout_start', 'bout_stop',
+                'duration_s', 'n_frames', 'n_fixes']
+        grid, _have, soc, events, _links = self._behavior_classification(data, tags)
         if grid is None or not events:
             return pd.DataFrame(columns=cols)
 
         times = pd.to_datetime(grid, utc=True)
         if tz is not None:
             times = times.tz_convert(tz)
-        dt_s = (grid[1] - grid[0]) / 1e9 if len(grid) > 1 else 1.0
+
+        def _as_local(ns):
+            ts = pd.Timestamp(int(ns), unit='ns', tz='UTC')
+            return ts.tz_convert(tz) if tz is not None else ts
+        step_ns = int(grid[1] - grid[0]) if len(grid) > 1 else int(1e9)
+
+        # Each tag's real fix times (int64 ns, sorted), on the same epoch
+        # scale as the grid. The classifier runs on a 1 Hz lattice with
+        # positions held forward, so bout edges are taken from these instead:
+        # the first and last fix the ACTOR or TARGET actually reported inside
+        # the classified window. Another animal's fix in the same second says
+        # nothing about this dyad, and a lattice time only carries the grid's
+        # constant sub-second offset.
+        _t_all = data['Timestamp'].dt.as_unit('ns').astype('int64').to_numpy()
+        tag_ns = {tag: np.sort(_t_all[ix]) for tag, ix in
+                  data.groupby('shortid', sort=False).indices.items()}
+
+        def _dyad_edges(a, b, i, j):
+            lo_ns, hi_ns = int(grid[i]), int(grid[j]) + step_ns
+            first = last = None
+            n = 0
+            for k in (a, b):
+                arr = tag_ns.get(tags[k])
+                if arr is None or not len(arr):
+                    continue
+                lo = int(np.searchsorted(arr, lo_ns, 'left'))
+                hi = int(np.searchsorted(arr, hi_ns, 'left'))
+                if hi <= lo:
+                    continue
+                n += hi - lo
+                first = arr[lo] if first is None else min(first, arr[lo])
+                last = arr[hi - 1] if last is None else max(last, arr[hi - 1])
+            return first, last, n
 
         def _label(i):
             tag = tags[i]
@@ -2944,17 +4402,36 @@ class PlotSaverWorker(QThread):
             if not DISPLACEMENT_ENABLED and ev['behavior'] == 'displacement':
                 continue
             i, j = ev['start_frame'], ev['stop_frame']
+            first, last, n_fixes = _dyad_edges(ev['actor'], ev['target'], i, j)
+            if n_fixes:
+                ev_start, ev_stop = _as_local(first), _as_local(last)
+            else:
+                # Classified entirely on held positions: no fix from either
+                # animal fell inside the window, so the lattice slots are the
+                # only edges there are. n_fixes = 0 marks these rows.
+                ev_start, ev_stop = times[i], times[j]
             sa, sb = _sex(ev['actor']), _sex(ev['target'])
             rows.append({
                 'behavior': ev['behavior'],
                 'actor': _label(ev['actor']),
                 'target': _label(ev['target']),
                 'actor_sex': sa, 'target_sex': sb,
-                'dyad_type': ''.join(sorted((sa, sb))) if 'U' not in (sa, sb) else 'NA',
-                'start': times[i], 'stop': times[j],
-                # +1 frame: start and stop are both inclusive frame indices, so
-                # a single-frame bout lasts one sampling interval, not zero.
-                'duration_s': float((j - i + 1) * dt_s),
+                # MM / FF / MF / NA. Mixed is always 'MF', never 'FM':
+                # sorting the two letters would give 'FM', which is not the
+                # convention the rest of the work uses and would make a
+                # downstream filter on "MF" match nothing at all.
+                'dyad_type': _dyad_type(sa, sb),
+                'bout_start': ev_start, 'bout_stop': ev_stop,
+                # Exactly bout_stop - bout_start, at full resolution, as in
+                # the overlap and ROI bout files. It used to be the larger of
+                # that and the frame count, which the frame count always won
+                # (edge fixes sit inside the frames), so every duration was a
+                # whole number of seconds. The classifier's own measure is
+                # kept alongside as n_frames (1 Hz slots the state held); a
+                # bout backed by one fix reports 0.0 s with n_fixes = 1.
+                'duration_s': float((ev_stop - ev_start).total_seconds()),
+                'n_frames': int(j - i + 1),
+                'n_fixes': int(n_fixes),
             })
         if not rows:
             # Every bout was filtered out - all of them displacement,
@@ -2962,10 +4439,13 @@ class PlotSaverWorker(QThread):
             # datetimelike, so the .dt work below cannot run on it.
             return pd.DataFrame(columns=cols)
         out = pd.DataFrame(rows, columns=cols)
-        day0 = out['start'].dt.normalize()
+        # Day is the day the bout STARTED. Nothing is split at a boundary,
+        # here or in the overlap bouts: a split row is indistinguishable from
+        # two real ones, and downstream can always divide what it needs.
+        day0 = out['bout_start'].dt.normalize()
         out['Date'] = day0.dt.date
         out['Day'] = (day0 - day0.min()).dt.days + 1
-        return out.sort_values('start').reset_index(drop=True)
+        return out.sort_values('bout_start').reset_index(drop=True)
 
     def save_chase_timeline(self, data, output_dir, db_name):
         """Chase and displacement counts per day, one line per animal.
@@ -3010,7 +4490,8 @@ class PlotSaverWorker(QThread):
                     y = (counts.loc[animal].to_numpy()
                          if animal in counts.index else np.zeros(len(days)))
                     ax.plot(days, y, marker='o', ms=4, lw=1.6,
-                            color=colour[animal], label=animal, alpha=0.9)
+                            color=colour[animal],
+                            label=self._display_animal(animal), alpha=0.9)
                 ax.set_xlabel('Day', fontsize=9)
                 ax.set_ylabel(f'{beh}s {label}', fontsize=9)
                 ax.set_title(f'{beh.capitalize()} — {label}', fontsize=10)
@@ -3075,8 +4556,9 @@ class PlotSaverWorker(QThread):
             im = ax.imshow(mat, cmap='magma', vmin=0,
                            vmax=max(1.0, mat.max()))
             ax.set_xticks(range(n)); ax.set_yticks(range(n))
-            ax.set_xticklabels(animals, rotation=45, ha='right', fontsize=8)
-            ax.set_yticklabels(animals, fontsize=8)
+            shown = [self._display_animal(a) for a in animals]
+            ax.set_xticklabels(shown, rotation=45, ha='right', fontsize=8)
+            ax.set_yticklabels(shown, fontsize=8)
             ax.set_xlabel(f'target (was {beh}d)', fontsize=9)
             ax.set_ylabel(f'actor (did the {beh[:5]})', fontsize=9)
             ax.set_title(f'{beh.capitalize()}: {int(mat.sum()):,} events',
@@ -3115,28 +4597,18 @@ class PlotSaverWorker(QThread):
     # alone, saturated as an event.
     ALONE_COLOR = '#cfd8e3'
 
-    def _behaviour_rasters(self, loc, soc):
-        """(locomotor, social) display codes and their colour keys.
-
-        Two independent codings of the same frames rather than one with a
-        precedence rule. The combined raster had to let a social state
-        overwrite the locomotor one - the old title said as much - so an animal
-        in contact showed no locomotor state at all, and time spent alone was
-        invisible. Split, each panel answers exactly one question.
+    def _behaviour_rasters(self, have, soc):
+        """Social display codes and their colour keys.
 
         Codes ascend by how much they are worth seeing, because a pixel covers
         many frames and the rasteriser keeps the maximum in each bin.
+
+        ``have`` is the has-a-fix mask, which is what separates an animal that
+        was alone from one that was not being tracked at all.
         """
         from fnt.uwb import behavior_detection as BD
 
-        loc_key = [('no data', BD.STATE_COLORS[BD.LOC_NODATA]),
-                   ('inactive', BD.STATE_COLORS[BD.LOC_INACTIVE]),
-                   ('moving', BD.STATE_COLORS[BD.LOC_MOVING])]
-        loc_disp = np.zeros(loc.shape, dtype=np.int8)
-        loc_disp[loc == BD.LOC_INACTIVE] = 1
-        loc_disp[loc == BD.LOC_MOVING] = 2
-
-        soc_spec = [('no data', None, BD.STATE_COLORS[BD.LOC_NODATA]),
+        soc_spec = [('no data', None, BD.NODATA_COLOR),
                     ('alone', 'alone', self.ALONE_COLOR),
                     ('contact', BD.SOC_CONTACT, BD.SOCIAL_COLORS[BD.SOC_CONTACT])]
         if DISPLACEMENT_ENABLED:
@@ -3152,12 +4624,12 @@ class PlotSaverWorker(QThread):
             if code == 'alone':
                 # Has a fix, but nothing social - the state the combined
                 # raster could not show.
-                soc_disp[(loc != BD.LOC_NODATA) & (soc == BD.SOC_NONE)] = k
+                soc_disp[have & (soc == BD.SOC_NONE)] = k
             elif code is not None:
                 soc_disp[soc == code] = k
 
         soc_key = [(lab, colour) for lab, _code, colour in soc_spec]
-        return (loc_disp, loc_key), (soc_disp, soc_key)
+        return soc_disp, soc_key
 
     @staticmethod
     def _rasterise(disp, n_tags, max_cols=3000):
@@ -3179,7 +4651,7 @@ class PlotSaverWorker(QThread):
         return raster, stride
 
     def save_ethogram(self, data, output_dir, db_name):
-        """Locomotion and social state as two stacked rasters per animal.
+        """Social state as one raster per animal.
 
         Returns the number of plots generated.
         """
@@ -3192,14 +4664,13 @@ class PlotSaverWorker(QThread):
 
         data = data.copy()
         tags = sorted(data['shortid'].unique())
-        grid, loc, soc, _events, _links = self._behavior_classification(data, tags)
+        grid, have, soc, _events, _links = self._behavior_classification(data, tags)
         if grid is None:
             self.progress.emit("No data to classify, skipping ethogram")
             return 0
 
-        (loc_disp, loc_key), (soc_disp, soc_key) = self._behaviour_rasters(loc, soc)
-        loc_raster, stride = self._rasterise(loc_disp, len(tags))
-        soc_raster, _ = self._rasterise(soc_disp, len(tags))
+        soc_disp, soc_key = self._behaviour_rasters(have, soc)
+        soc_raster, stride = self._rasterise(soc_disp, len(tags))
 
         times = pd.to_datetime(grid, utc=True).tz_convert(
             data['Timestamp'].dt.tz or 'UTC')
@@ -3209,11 +4680,10 @@ class PlotSaverWorker(QThread):
         labels = [self._tag_label(t) for t in tags]
 
         row_h = 0.55 * len(tags)
-        fig = Figure(figsize=(16, 2.0 + 2 * (row_h + 1.4)))
-        panels = ((loc_raster, loc_key, 'Locomotion'),
-                  (soc_raster, soc_key, 'Social state'))
+        fig = Figure(figsize=(16, 2.0 + (row_h + 1.4)))
+        panels = ((soc_raster, soc_key, 'Social state'),)
         for i, (raster, key, name) in enumerate(panels):
-            ax = fig.add_subplot(2, 1, i + 1)
+            ax = fig.add_subplot(1, 1, i + 1)
             ax.imshow(raster, aspect='auto', interpolation='nearest',
                       cmap=ListedColormap([c for _l, c in key]),
                       vmin=0, vmax=len(key) - 1, extent=extent)
@@ -3267,12 +4737,12 @@ class PlotSaverWorker(QThread):
 
         data = data.copy()
         tags = sorted(data['shortid'].unique())
-        grid, loc, soc, _events, _links = self._behavior_classification(data, tags)
+        grid, have, soc, _events, _links = self._behavior_classification(data, tags)
         if grid is None:
             self.progress.emit("No data to classify, skipping social budget")
             return False
 
-        (_loc_disp, _lk), (soc_disp, soc_key) = self._behaviour_rasters(loc, soc)
+        soc_disp, soc_key = self._behaviour_rasters(have, soc)
         # Code 0 is 'no data'; a budget of TRACKED time excludes it.
         slices = list(soc_key[1:])
         dt_s = (grid[1] - grid[0]) / 1e9 if len(grid) > 1 else 1.0
@@ -3382,6 +4852,10 @@ class UWBQuickVisualizationWindow(QWidget):
     VIEW_XML = "XML (site map)"
     VIEW_2D = "2D Idealized"
     VIEW_3D = "3D Idealized"
+    # Resting label of the Copy View button. Held as a constant because the
+    # button briefly shows a confirmation instead, and reading the label back
+    # to restore it would latch the confirmation on a fast second click.
+    _COPY_VIEW_LABEL = "Copy View"
 
     def __init__(self):
         super().__init__()
@@ -3422,31 +4896,41 @@ class UWBQuickVisualizationWindow(QWidget):
         self.xml_scale = None  # Scale from XML in inches/pixel (first Map element)
         self.bg_width_meters = None  # Background image width in meters
         self.bg_height_meters = None  # Background image height in meters
-        # Manual background-image transform (option (b)): the loaded floorplan is
-        # placed by pixels * bg_scale(in/px), then shifted by (bg_offset_x,
-        # bg_offset_y) metres. Defaults come from the XML but the user can nudge
-        # them live to match the Wiser server frame — needed when the loaded
-        # image is a different render (resolution/decoration) than the one the
-        # XML scale was calibrated against.
-        self.bg_scale = None          # effective in/px for the loaded image
+        # Manual background transform (option (b)): the background is placed by
+        # pixels * bg_scale(in/px), then shifted by (bg_offset_x, bg_offset_y)
+        # metres. Defaults come from the XML but the user can nudge them live to
+        # match the Wiser server frame — needed when the image is a different
+        # render (resolution/decoration) than the one the XML scale was
+        # calibrated against, and when the XML's own site map does not land on
+        # the surveyed zones. It governs whichever background is ACTIVE: the
+        # loaded floorplan if there is one, otherwise the XML site map.
+        self.bg_scale = None          # effective in/px for the active background
         self.bg_offset_x = 0.0        # metres: world X of the image's left edge
         self.bg_offset_y = 0.0        # metres: world Y of the image's bottom edge
         self.arena_zones = None  # DataFrame with zone coordinates from XML
         self.anchor_positions = []  # List of dicts: {'shortid': int, 'x': float, 'y': float, 'z': float}
         self.xml_zones = []         # [{name, color, points:(N,2) m}] from the site XML
+        # User-drawn regions of interest, same shape as an XML zone. These
+        # belong to the trial, not to the analysis settings: they are drawn
+        # against THIS arena, so they are never inherited from another one.
+        self.rois = []              # [{name, color, linewidth, points:(N,2) m}]
         self.xml_map_image = None   # site map decoded from the XML
-        self.xml_map_extent = None  # (x0, x1, y0, y1) in metres
+        self.xml_map_extent = None  # (x0, x1, y0, y1) in metres, AS PLACED
+        self.xml_map_px = None      # (w_px, h_px) of that map, for re-placing it
+        self.xml_map_scale = None   # in/px the XML authored for that map
         # Every embedded <Map>/<Image> render, each with its own pixel dims and
         # scale: Wiser writes several (e.g. 'default' + a decorated 'Dark2d').
         # Used to pick the correct default scale for a loaded external image by
         # matching its resolution.
         self.xml_maps = []          # [{name, scale, w_px, h_px}]
 
-        # Spatial context layers drawn on exported plots/animation. Chosen per
-        # export via PlotLayersDialog, persisted in the config, and applied to
+        # Spatial context layers drawn on exported plots/animation, applied to
         # every spatial output (trajectory plots, animation, occupancy,
-        # last-known). Independent of the Preview Options 'Show ...' toggles,
-        # which only affect the live preview.
+        # last-known). NOT an independent setting: plot_layers_from_preview
+        # copies the Preview Options 'Show ...' toggles into it at export /
+        # add-to-queue time, so the export draws the arena the preview drew.
+        # Persisted in the config so a queued or re-run job replays the layers
+        # it was queued with.
         self.plot_layers = dict(DEFAULT_PLOT_LAYERS)
         self._exported_sitemap = None  # {filename, extent_m} once an export writes it
         self._animation_tags = None    # None = all; else a subset of shortids
@@ -3455,6 +4939,15 @@ class UWBQuickVisualizationWindow(QWidget):
         # holds at most MAX_CACHED_CHUNKS slices — see the streaming chunk
         # engine below.
         self.preview_timer = None
+        # Playback state. The playhead is derived from the WALL CLOCK rather
+        # than accumulated per tick, so a slow render drops frames instead of
+        # making the trial clock run slow. See _playback_tick.
+        self._playing = False
+        self._playback_seeking = False   # True while playback moves the slider
+        self._play_wall0 = 0.0           # perf_counter at the last anchor
+        self._play_media0 = 0.0          # playhead (s from t0) at that anchor
+        self._play_frames = 0
+        self._play_fps_t0 = 0.0
         self.preview_arena = None
         self.preview_tags = []
         self.preview_times = None
@@ -3466,15 +4959,35 @@ class UWBQuickVisualizationWindow(QWidget):
         self.preview_raw_x = None       # same grid, pre-smoothing
         self.preview_raw_y = None
         self.preview_batt = None        # battery voltage per tag, same grid
+        self.preview_step = None        # raw step distance (m) per tag, same grid
+        self.preview_speed = None       # raw step speed (m/s) per tag, same grid
+        self._preview_step_pool = None  # (step, speed) over the chunk, PRE-filter
+        # (tags, points) an export would process, cached against the tag
+        # configuration that determines it. See export_scope_points.
+        self._export_scope_key = None
+        self._export_scope_value = None
         self.preview_colors = None
 
         self.preview_cache = OrderedDict()   # chunk_index -> frame arrays (LRU)
         self.preview_inflight = {}           # chunk_index -> running loader
         self.preview_current_chunk = None
         self.preview_pending_current = None  # chunk to display once it lands
+        self._scrub_deadline = None          # forces a read during a long drag
         self.preview_t0 = None               # first ping, epoch ms
         self.preview_t1 = None               # last ping, epoch ms
         self.preview_playhead_ms = 0
+        # Weather / sunlight (see fnt/uwb/weather.py). The environment is what
+        # Fetch Weather downloaded; the timeline answers "what was it like at
+        # t" for the preview and the video.
+        self.environment = None
+        self.weather_timeline = None
+        self._weather_summary = None         # provenance, for fnt_config.json
+        self._sun_timeline = None            # (key, sun-only timeline)
+        self._light_day = None               # (day, timeline id) on the bar
+        self._light_span = (0, 1)
+        self._weather_fetching = False
+        self._weather_restore_key = None
+        self._site_name = ""
         self._timeline_guard = False         # suppress slider feedback loops
         self._tag_selection_guard = False    # suppress bulk checkbox churn
         self._preview_active = False         # streaming begins once data exists
@@ -3550,145 +5063,6 @@ class UWBQuickVisualizationWindow(QWidget):
             self.log_message(f"✓ Message log saved: {os.path.basename(log_path)}")
         except Exception as e:
             self.log_message(f"Warning: Could not save message log: {str(e)}")
-    
-    def save_run_summary(self, output_dir):
-        """Save run summary with filtering statistics to CSV"""
-        try:
-            from datetime import datetime
-            db_name = os.path.splitext(os.path.basename(self.db_path))[0]
-            summary_path = os.path.join(output_dir, f"{db_name}_runSummary.csv")
-            
-            # Collect run parameters
-            summary_data = {
-                'Parameter': [],
-                'Value': []
-            }
-            
-            # General info
-            summary_data['Parameter'].append('FNT Version')
-            summary_data['Value'].append(get_fnt_version())
-
-            summary_data['Parameter'].append('Run Date')
-            summary_data['Value'].append(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-
-            summary_data['Parameter'].append('Database')
-            summary_data['Value'].append(os.path.basename(self.db_path))
-            
-            summary_data['Parameter'].append('Table')
-            summary_data['Value'].append(self.table_name)
-            
-            summary_data['Parameter'].append('Timezone')
-            summary_data['Value'].append(self.combo_timezone.currentText())
-            
-            # Selected tags
-            selected_tags = [tag for tag, cb in self.tag_checkboxes.items() if cb.isChecked()]
-            summary_data['Parameter'].append('Selected Tags')
-            summary_data['Value'].append(', '.join([str(t) for t in selected_tags]))
-            
-            # Thresholding settings (pre-smoothing outlier rejection)
-            summary_data['Parameter'].append('Velocity Threshold Enabled')
-            summary_data['Value'].append('Yes' if self.chk_velocity_filter.isChecked() else 'No')
-
-            if self.chk_velocity_filter.isChecked():
-                summary_data['Parameter'].append('Velocity Threshold (m/s)')
-                summary_data['Value'].append(self.spin_velocity_threshold.value())
-
-            summary_data['Parameter'].append('Jump Threshold Enabled')
-            summary_data['Value'].append('Yes' if self.chk_jump_filter.isChecked() else 'No')
-
-            if self.chk_jump_filter.isChecked():
-                summary_data['Parameter'].append('Jump Threshold (m)')
-                summary_data['Value'].append(self.spin_jump_threshold.value())
-
-            summary_data['Parameter'].append('Time Gap Threshold (s)')
-            summary_data['Value'].append(self.spin_time_gap.value())
-            
-            # Smoothing settings
-            summary_data['Parameter'].append('Smoothing')
-            summary_data['Value'].append(self.combo_smoothing.currentText())
-
-            smoothing_method = self.get_smoothing_method()
-            if smoothing_method in ("Rolling Average", "Rolling Median"):
-                unit = "s" if self.combo_window_units.currentText() == "Seconds" else "samples"
-                summary_data['Parameter'].append('Smoothing Window')
-                summary_data['Value'].append(f"{self.spin_rolling_window.value()} {unit}")
-            elif smoothing_method == "Forward-Backward Exponentially Weighted Moving Average":
-                summary_data['Parameter'].append('EWMA Span (samples)')
-                summary_data['Value'].append(self.spin_rolling_window.value())
-
-            # Filtering statistics (if available)
-            if hasattr(self, 'filter_stats') and self.filter_stats:
-                summary_data['Parameter'].append('')
-                summary_data['Value'].append('')
-                
-                summary_data['Parameter'].append('--- Filtering Statistics (all tags) ---')
-                summary_data['Value'].append('')
-
-                summary_data['Parameter'].append('Tags Processed')
-                summary_data['Value'].append(self.filter_stats.get('tags_processed', 'N/A'))
-
-                summary_data['Parameter'].append('Initial Data Points')
-                summary_data['Value'].append(self.filter_stats.get('initial_count', 'N/A'))
-                
-                summary_data['Parameter'].append('Points Removed (Velocity)')
-                summary_data['Value'].append(self.filter_stats.get('removed_velocity', 0))
-                
-                summary_data['Parameter'].append('Points Removed (Jump)')
-                summary_data['Value'].append(self.filter_stats.get('removed_jump', 0))
-                
-                summary_data['Parameter'].append('Final Data Points')
-                summary_data['Value'].append(self.filter_stats.get('final_count', 'N/A'))
-                
-                summary_data['Parameter'].append('Percent Filtered')
-                summary_data['Value'].append(f"{self.filter_stats.get('percent_filtered', 0):.2f}%")
-            
-            # Export options
-            summary_data['Parameter'].append('')
-            summary_data['Value'].append('')
-            
-            summary_data['Parameter'].append('--- Export Options ---')
-            summary_data['Value'].append('')
-            
-            summary_data['Parameter'].append('Raw CSV Exported')
-            summary_data['Value'].append('Yes' if self.chk_export_raw_csv.isChecked() else 'No')
-
-            summary_data['Parameter'].append('Smoothed CSV Exported')
-            summary_data['Value'].append('Yes' if self.chk_export_smoothed_csv.isChecked() else 'No')
-
-            summary_data['Parameter'].append('Plots Generated')
-            summary_data['Value'].append('Yes' if self.chk_save_plots.isChecked() else 'No')
-            
-            summary_data['Parameter'].append('Animation Generated')
-            summary_data['Value'].append('Yes' if self.chk_save_animation.isChecked() else 'No')
-
-            # All three social products share one contact criterion, so the
-            # threshold is recorded once and each file is listed separately.
-            thr = self.spin_proximity_threshold.value()
-            summary_data['Parameter'].append('Contact Threshold (centre-to-centre)')
-            summary_data['Value'].append(f'{thr} m')
-
-            summary_data['Parameter'].append('Proximity Bout CSV')
-            summary_data['Value'].append(
-                'Yes' if self.chk_proximity_detection.isChecked() else 'No')
-
-            summary_data['Parameter'].append('Social GBI')
-            summary_data['Value'].append(
-                'Yes' if self.chk_export_gbi.isChecked() else 'No')
-
-            summary_data['Parameter'].append('Social Edge List CSV')
-            if self.chk_export_edgelist.isChecked():
-                summary_data['Value'].append(
-                    f'Yes ({self.spin_el_window.value():g} h windows)')
-            else:
-                summary_data['Value'].append('No')
-            
-            # Create DataFrame and save
-            summary_df = pd.DataFrame(summary_data)
-            summary_df.to_csv(summary_path, index=False)
-            
-            self.log_message(f"✓ Run summary saved: {os.path.basename(summary_path)}")
-        except Exception as e:
-            self.log_message(f"Warning: Could not save run summary: {str(e)}")
     
     def initUI(self):
         self.setWindowTitle("UWB PreProcessing Tool")
@@ -3843,6 +5217,14 @@ class UWBQuickVisualizationWindow(QWidget):
         main_layout.addWidget(self.main_splitter)
         self.setLayout(main_layout)
 
+        # The preview canvas exists now, so its ROI signals can be hooked up
+        # and any regions restored from a config painted onto it.
+        self._wire_roi_canvas()
+        self._refresh_roi_list(keep=-1)
+        # Both occupancy sources exist by now, so the sub-choices can be
+        # shown or greyed out against what this trial actually has.
+        self.on_zone_occupancy_toggled()
+
         # First pass over the animation "Show" rows: the preview toggles they
         # follow exist by now, so hide the ones the preview is not offering.
         self._sync_anim_show_options()
@@ -3890,10 +5272,25 @@ class UWBQuickVisualizationWindow(QWidget):
         db_group = QGroupBox("Database Selection")
         db_layout = QVBoxLayout()
 
+        open_row = QHBoxLayout()
         btn_select = QPushButton("Select SQLite Database")
         btn_select.setToolTip("Open a UWB SQLite database file (.db) for preprocessing")
         btn_select.clicked.connect(self.select_database)
-        db_layout.addWidget(btn_select)
+        open_row.addWidget(btn_select, 1)
+        self.btn_recent_db = QPushButton("Open Recent ▾")
+        self.btn_recent_db.setToolTip(
+            "Reopen one of the last databases you loaded, newest first. The "
+            "folder it sits in is shown beside the name; hover an entry for "
+            "the full path. A database that has been moved or whose drive is "
+            "not mounted is listed as (not found).")
+        self.btn_recent_db.setStyleSheet(
+            "QPushButton::menu-indicator { image: none; width: 0px; }")
+        self.menu_recent_db = QMenu(self.btn_recent_db)
+        self.menu_recent_db.setToolTipsVisible(True)
+        self.menu_recent_db.aboutToShow.connect(self._rebuild_recent_db_menu)
+        self.btn_recent_db.setMenu(self.menu_recent_db)
+        open_row.addWidget(self.btn_recent_db)
+        db_layout.addLayout(open_row)
 
         self.lbl_db = QLabel("No database selected")
         self.lbl_db.setStyleSheet("color: #666666; font-style: italic;")
@@ -3963,6 +5360,11 @@ class UWBQuickVisualizationWindow(QWidget):
         tz_group_layout.addLayout(tz_layout)
         tz_group.setLayout(tz_group_layout)
         layout.addWidget(tz_group)
+
+        # Where the trial was recorded, and the weather/sunlight sources.
+        # Lives in its own window (Preview → Weather Settings…); built here so
+        # its widgets exist for the config, the export and the batch queue.
+        self._build_weather_dialog()
 
         # Tag selection
         self.tag_group = QGroupBox("Tag Selection")
@@ -4123,6 +5525,48 @@ class UWBQuickVisualizationWindow(QWidget):
         self.on_smoothing_changed(self.combo_smoothing.currentText())
 
         # ---- CSV / plot / animation export options (continue the same group) --
+        # Spatial-outlier threshold. Lives beside the other two thresholds so
+        # the export record and the run summary carry it; the visible controls
+        # are the preview's.
+        self.chk_outlier_filter = QCheckBox("Hampel threshold")
+        self.chk_outlier_filter.setChecked(True)
+        self.chk_outlier_filter.setToolTip(OUTLIER_FILTER_TOOLTIP)
+        self.spin_outlier_window = QSpinBox()
+        self.spin_outlier_window.setRange(5, 501)
+        self.spin_outlier_window.setSingleStep(2)
+        self.spin_outlier_window.setValue(31)
+        self.spin_outlier_sigma = QDoubleSpinBox()
+        self.spin_outlier_sigma.setRange(1.0, 20.0)
+        self.spin_outlier_sigma.setDecimals(1)
+        self.spin_outlier_sigma.setSingleStep(0.5)
+        self.spin_outlier_sigma.setValue(6.0)
+        self.chk_adjacency_filter = QCheckBox("Excursion threshold")
+        self.chk_adjacency_filter.setChecked(True)
+        self.chk_adjacency_filter.setToolTip(ADJACENCY_FILTER_TOOLTIP)
+        self.spin_excursion_s = QDoubleSpinBox()
+        self.spin_excursion_s.setRange(0.5, 120.0)
+        self.spin_excursion_s.setDecimals(1)
+        self.spin_excursion_s.setValue(5.0)
+        self.spin_velocity_min_dt = QDoubleSpinBox()
+        self.spin_velocity_min_dt.setRange(0.0, 10.0)
+        self.spin_velocity_min_dt.setDecimals(2)
+        self.spin_velocity_min_dt.setSingleStep(0.05)
+        self.spin_velocity_min_dt.setValue(0.50)
+        for _w in (self.chk_outlier_filter, self.spin_outlier_window,
+                   self.spin_outlier_sigma, self.spin_velocity_min_dt,
+                   self.chk_adjacency_filter, self.spin_excursion_s):
+            _w.setVisible(False)
+
+        # No standalone "Clear Previous Exports" button: clearing is offered by
+        # the export's conflict dialog, and a second red button at the top of
+        # the panel was one more destructive thing to mis-click.
+        #
+        # The trade, so it is not rediscovered as a bug: that dialog only opens
+        # when a file the CURRENT run produces already exists. Switch a product
+        # off and its old file becomes an orphan the dialog never mentions. To
+        # sweep those, tick the product back on so the dialog appears, then
+        # choose Clear & Re-export. clear_previous_exports() is still here and
+        # still tested if a route back to it is ever wanted.
         self.chk_export_raw_csv = QCheckBox("Export Raw CSV")
         self.chk_export_raw_csv.setChecked(False)
         self.chk_export_raw_csv.setToolTip(
@@ -4145,27 +5589,9 @@ class UWBQuickVisualizationWindow(QWidget):
         # within 2x the social radius set in the preview. Ticking either social
         # product runs the proximity computation whether or not the bouts CSV
         # itself is written.
-        self.chk_proximity_detection = QCheckBox("Export Proximity Bout CSV")
+        self.chk_proximity_detection = QCheckBox("Export Social Overlap Bouts CSV")
         self.chk_proximity_detection.setChecked(True)
-        self.chk_proximity_detection.setToolTip(
-            "FILE: {db}_proximity_bouts.csv\n"
-            "\n"
-            "One row per dyad per contiguous contact bout: animal1, animal2, "
-            "bout_start, bout_stop, duration_s, mean_distance, n_obs, Day, "
-            "Date. A bout runs from the moment two animals come within contact "
-            "distance until they separate for longer than the merge gap.\n"
-            "\n"
-            "CONTACT = centres within 2x the social radius (the preview's "
-            "dotted circles overlapping). Measured from the filtered + smoothed "
-            "data at full temporal resolution, so no fixes are dropped before "
-            "pairwise distances are computed.\n"
-            "\n"
-            "Strictly DIRECT dyadic contact: a pair appears only if those two "
-            "animals were themselves within the radius. No chain rule.\n"
-            "\n"
-            "This is the file the edge list is aggregated from. Bouts are "
-            "threshold-specific - to analyze a different distance, re-run with "
-            "a new social radius. Raw per-timestamp distances are not exported.")
+        self.chk_proximity_detection.setToolTip(SOCIAL_BOUTS_TOOLTIP)
         self.chk_proximity_detection.stateChanged.connect(self.on_proximity_detection_toggled)
         export_layout.addWidget(self.chk_proximity_detection)
 
@@ -4189,97 +5615,13 @@ class UWBQuickVisualizationWindow(QWidget):
         self.proximity_threshold_widget.setVisible(False)   # inherited from the preview
         export_layout.addWidget(self.proximity_threshold_widget)
 
-        self.chk_export_gbi = QCheckBox("Export Social GBI CSV")
-        self.chk_export_gbi.setChecked(False)
-        self.chk_export_gbi.setToolTip(
-            "FILE: {db}_network_GBI.csv\n"
-            "\n"
-            "An asnipe-style group-by-individual matrix: one row per flocking "
-            "event, one 0/1 column per animal, plus m_sum / f_sum / mf_sum "
-            "counts and the event's start, stop and duration.\n"
-            "\n"
-            "CHAIN RULE: membership is transitive. If A-B are in contact and "
-            "B-C are in contact, then A, B and C are all placed in ONE group - "
-            "even if A and C were never near each other. That is the standard "
-            "gambit-of-the-group convention, and it is what makes this file a "
-            "GBI rather than a list of pairs.\n"
-            "\n"
-            "CALCULATED INDEPENDENTLY from the per-second pairwise distances. "
-            "It is NOT derived from the proximity bouts file or from the edge "
-            "list, and needs neither of them ticked.\n"
-            "\n"
-            "Drops straight into R:\n"
-            "    m <- asnipe::get_network(gbi, data_format='GBI',\n"
-            "                             association_index='SRI')\n"
-            "    g <- igraph::graph.adjacency(m, mode='undirected',\n"
-            "                                 weighted=TRUE, diag=FALSE)\n"
-            "\n"
-            "Association indices (SRI/HWI) are computed there, from this "
-            "matrix - they are deliberately not written here.")
-        self.chk_export_gbi.stateChanged.connect(self.on_social_network_toggled)
-        export_layout.addWidget(self.chk_export_gbi)
-
-        self.chk_export_edgelist = QCheckBox("Export Social Edge List CSV")
-        self.chk_export_edgelist.setChecked(False)
-        self.chk_export_edgelist.setToolTip(
-            "FILE: {db}_network_edgelist_{window}h.csv  (e.g. "
-            "T005_network_edgelist_6h.csv - the aggregation window set "
-            "below is part of the name, so runs at different windows sit "
-            "side by side instead of overwriting each other)\n"
-            "\n"
-            "DERIVED FROM the proximity bouts file - it is simply those same "
-            "bouts aggregated per dyad over the time window set below. "
-            "Columns: window_start, window_end, animal1, animal2, sex1, sex2, "
-            "dyad_type, n_events, total_duration_s, mean_distance.\n"
-            "\n"
-            "Weights are contact-derived: n_events counts bouts (event-based) "
-            "and total_duration_s sums their durations (time-based). These are "
-            "NOT association indices - SRI/HWI are properties of the GBI and "
-            "belong to that file's workflow.\n"
-            "\n"
-            "Strictly DIRECT dyadic contact, with NO chain rule: a pair appears "
-            "only if those two animals were themselves within the radius. An "
-            "edge list rebuilt downstream from the GBI is therefore NOT this "
-            "file - transitive grouping would invent dyads that never met.\n"
-            "\n"
-            "Ticking this runs proximity detection even if the bouts CSV above "
-            "is left unticked.")
-        self.chk_export_edgelist.stateChanged.connect(self.on_social_network_toggled)
-        export_layout.addWidget(self.chk_export_edgelist)
-
-        # Edge-list resolution. The old export hard-coded two files (whole-trial
-        # and per-day); this is the same axis exposed as a single knob, so one
-        # file covers both and anything between.
-        el_win_row = QHBoxLayout()
-        el_win_row.setContentsMargins(30, 0, 0, 0)
-        el_win_row.addWidget(QLabel("Edge list window:"))
-        self.spin_el_window = QDoubleSpinBox()
-        self.spin_el_window.setRange(1.0, 24.0)
-        self.spin_el_window.setValue(24.0)
-        self.spin_el_window.setSingleStep(1.0)
-        self.spin_el_window.setDecimals(1)
-        self.spin_el_window.setSuffix(" h")
-        self.spin_el_window.setFixedWidth(90)
-        self.spin_el_window.setToolTip(
-            "Time window each row of the edge list covers, and part of its "
-            "filename ({db}_network_edgelist_6h.csv at 6 h).\n"
-            "\n"
-            "24 h gives one row per dyad per day; 1 h gives hourly resolution. "
-            "Windows are anchored to clock boundaries, so 24 h means real "
-            "calendar days rather than time since the recording started.\n"
-            "\n"
-            "The aggregation is lossless at any setting (every bout is counted "
-            "exactly once), so a fine window can be summed up to a coarser one "
-            "downstream and give identical totals. A bout is counted in the "
-            "window its START falls in; it is not split across a boundary.\n"
-            "\n"
-            "Does not affect the GBI, which is calculated independently.")
-        el_win_row.addWidget(self.spin_el_window)
-        el_win_row.addStretch()
-        self.el_window_widget = QWidget()
-        self.el_window_widget.setLayout(el_win_row)
-        self.el_window_widget.setVisible(self.chk_export_edgelist.isChecked())
-        export_layout.addWidget(self.el_window_widget)
+        # The GBI and the windowed edge list were REMOVED. Both were derived
+        # from the bouts above and neither survived contact with continuously
+        # tracked data: the edge list is a pivot table of the bouts, and the
+        # GBI is an asnipe input whose row-counting association indices assume
+        # discrete sampling periods of equal weight, which a 6 h huddle and a
+        # 2 s brush are not. Groups are recoverable from the dyadic bouts at
+        # full fidelity - see SOCIAL_OVERLAP_ANALYSIS.md for the recipe.
 
         self.chk_export_behavior = QCheckBox("Export Behavior Events CSV")
         self.chk_export_behavior.setChecked(False)
@@ -4288,17 +5630,24 @@ class UWBQuickVisualizationWindow(QWidget):
             "\n"
             "One row per DIRECTED behaviour bout - who did it, to whom, when, "
             "and for how long. Columns: behavior (chase), actor, target, "
-            "actor_sex, target_sex, dyad_type, Day, Date, start, stop, "
-            "duration_s.\n"
+            "actor_sex, target_sex, dyad_type, Day, Date, bout_start, "
+            "bout_stop, duration_s, n_frames, n_fixes.\n"
+            "\n"
+            "TIMES ARE REAL FIXES. bout_start/bout_stop are the first and last "
+            "fix the actor or target actually reported inside the bout, at "
+            "millisecond resolution, and duration_s is exactly their "
+            "difference. n_frames is how many 1 Hz classifier slots the state "
+            "held; n_fixes how many actor/target fixes back it (0 = classified "
+            "on held positions only, edges are the 1 Hz slots).\n"
             "\n"
             "This is the only place the direction is recorded. The ethogram "
             "raster shows that an animal WAS chasing; this shows WHOM it was "
-            "chasing. Proximity bouts, the edge list and the GBI are all "
-            "undirected contact and cannot express it.\n"
+            "chasing. The social overlap bouts are undirected contact and "
+            "cannot express it.\n"
             "\n"
             "HOW IT IS BUILT. The smoothed track is binned to a regular 1 Hz "
             "grid and classified in blocks with an overlap margin, exactly as "
-            "the ethogram is. A bout is attributed to the block its onset falls "
+            "the ethogram is (the grid is only the classifier's clock). A bout is attributed to the block its onset falls "
             "in, so one straddling a block boundary is counted exactly once. "
             "actor is the chaser; target is the animal chased.\n"
             "\n"
@@ -4309,6 +5658,89 @@ class UWBQuickVisualizationWindow(QWidget):
             "Contact is NOT included here - it is undirected and already "
             "exported, in full, as the proximity bouts file.")
         export_layout.addWidget(self.chk_export_behavior)
+
+        # Occupancy is an ANALYSIS, not a drawing. It is here rather than
+        # beside the preview's "Show regions of interest" checkbox because
+        # that one only decides what gets drawn: turning a region invisible
+        # must not silently stop measuring it, and measuring it must not force
+        # it onto every figure. The two questions are answered in different
+        # places on purpose.
+        #
+        # DRAWN REGIONS ONLY. Site-XML zones are no longer a second, parallel
+        # region source; import them into the ROI tool ("Import XML" beside
+        # the region list) and they are measured like anything else. One
+        # region pipeline, one set of outputs.
+        self.chk_export_roi_bouts = QCheckBox("Export ROI Bout Occupancy CSV")
+        self.chk_export_roi_bouts.setChecked(False)
+        self.chk_export_roi_bouts.setToolTip(ROI_BOUTS_TOOLTIP)
+        self.chk_export_roi_bouts.stateChanged.connect(
+            self.on_zone_occupancy_toggled)
+        export_layout.addWidget(self.chk_export_roi_bouts)
+
+        self.chk_export_roi_daily = QCheckBox("Export ROI Daily Summary CSV")
+        self.chk_export_roi_daily.setChecked(False)
+        self.chk_export_roi_daily.setToolTip(ROI_DAILY_TOOLTIP)
+        self.chk_export_roi_daily.stateChanged.connect(
+            self.on_zone_occupancy_toggled)
+        export_layout.addWidget(self.chk_export_roi_daily)
+
+        self.chk_export_weather = QCheckBox("Export Weather && Daylight CSVs")
+        self.chk_export_weather.setChecked(False)
+        self.chk_export_weather.setToolTip(
+            "FILES: {db}_weather.csv, {db}_daylight.csv and {db}_sky.csv "
+            "(needs the site's "
+            "latitude/longitude - Preview → Weather Settings…).\n"
+            "\n"
+            "WEATHER: every record of the selected weather and sunlight "
+            "sources over the recording, one row per source record, in SI "
+            "units: temp_c, rh_pct, dewpoint_c, wind_speed_ms, wind_dir_deg, "
+            "wind_gust_ms, pressure_hpa, precip_mm (per interval), "
+            "precip_rate_mmh, rain_mm and snowfall_cm (where the source "
+            "splits them), precip_type (rain / snow / mixed) with "
+            "precip_basis (reported, or estimated from wet-bulb or air "
+            "temperature), ghi_wm2 (global solar), "
+            "dni_wm2, dhi_wm2, par_wm2, uvb_mwm2, uv_index - blank where a "
+            "source does not measure it. Timestamp is the END of the "
+            "averaging interval (interval_s), in the trial timezone, with the "
+            "integer epoch-ms 'timestamp' beside it. sun_elevation_deg / "
+            "sun_azimuth_deg / sun_phase and moon_elevation_deg / "
+            "moon_illumination / moon_phase are computed at that time. Filter by "
+            "'source' when two sources are present. time_flag marks a "
+            "station time that DST made ambiguous.\n"
+            "\n"
+            "DAYLIGHT: one row per local day - sunrise, sunset, solar noon, "
+            "day length and civil/nautical/astronomical dawn and dusk, "
+            "computed from the coordinates (NOAA solar equations, ~1 min); "
+            "moonrise and moonset (~2 min); the moon's illuminated fraction "
+            "and phase at the midnight ending the date (the night after its "
+            "sunset); dark_h, the hours of the date with the sun below -6°; "
+            "and moonlit_dark_h, how many of those the moon was up.\n"
+            "\n"
+            "SKY: one row per minute - the condition the sky icon shows "
+            "(sky_state / sky_label: clear, partly cloudy, overcast, fog, "
+            "light rain, rain, heavy rain, snow, rain and snow, thunderstorm) "
+            "with sky_basis 'measured' or 'model' and sky_source. raining "
+            "and precip_rate_mmh come from the weather station's gauge "
+            "wherever it has a record (precip_source says which); "
+            "clear_sky_index and shaded_frac_15min are the measured-sunlight "
+            "evidence for daytime cloud; cloud_cover_pct_model and "
+            "weather_code_model are the model's, used for night cloud, "
+            "thunder and fog, which nothing here measures.\n"
+            "\n"
+            "Downloads are cached in the analysis folder's weather_cache and "
+            "their URLs, retrieval times and checksums are recorded in "
+            "fnt_config.json.")
+        self.chk_export_weather.stateChanged.connect(self._sync_weather_button)
+        self.chk_export_weather.clicked.connect(self._on_weather_toggle_clicked)
+        export_layout.addWidget(self.chk_export_weather)
+
+        self.lbl_occ_sources = QLabel("")
+        self.lbl_occ_sources.setWordWrap(True)
+        self.lbl_occ_sources.setStyleSheet("color: #9aa0a6; font-size: 10px;")
+        self.occ_source_widget = self.lbl_occ_sources
+        self.occ_source_widget.setVisible(False)
+        export_layout.addWidget(self.occ_source_widget)
+
 
         self.chk_save_plots = QCheckBox("Export Quick Plots")
         self.chk_save_plots.setChecked(False)  # off by default; opt in per run
@@ -4323,10 +5755,53 @@ class UWBQuickVisualizationWindow(QWidget):
         self.plot_types_widget = QWidget()
         plot_types_layout = QVBoxLayout()
         plot_types_layout.setContentsMargins(30, 0, 0, 0)
+
+        # Which ID names each animal in the figures. A setting rather than a
+        # prompt on export: queued and batch runs are unattended, and a
+        # question nobody is there to answer would stall them.
+        label_row = QHBoxLayout()
+        label_row.addWidget(QLabel("Label animals by:"))
+        self.combo_plot_label_type = QComboBox()
+        self.combo_plot_label_type.addItems(list(ID_DISPLAY_TYPES))
+        self.combo_plot_label_type.setCurrentText(SEX_ID)
+        self.combo_plot_label_type.setToolTip(
+            "Which ID names each animal in the exported figures - row labels, "
+            "titles, legends and axis ticks.\n"
+            "\n"
+            "\u2022 SexID: sex + configured ID (e.g. F9905)\n"
+            "\u2022 Name / Code: from Configure Identities (e.g. Hera / HER); an "
+            "animal without one falls back to its SexID\n"
+            "\u2022 HexID: the address printed on the tag (e.g. 2A)\n"
+            "\u2022 ShortID: the decimal tag number\n"
+            "\n"
+            "Figures only. File names and every exported CSV keep the SexID, "
+            "the key the analyses join on, so changing this never breaks a "
+            "table join or renames a file.")
+        label_row.addWidget(self.combo_plot_label_type, 1)
+        plot_types_layout.addLayout(label_row)
+
         self.plot_type_checkboxes = {}
         plot_types = [
             ("daily_paths", "Daily Paths per Tag",
              "One plot per tag showing XY trajectory for each day, color-coded by date"),
+            ("daily_path_grid", "Daily Paths \u2014 Grid (animals \u00d7 days)",
+             "FILE: {db}_DailyPathGrid.png\n"
+             "\n"
+             "One figure for the whole trial: every animal is a ROW, every day "
+             "a COLUMN, each cell that animal's track on that day. An animal "
+             "never wraps onto a second row, so the figure grows sideways with "
+             "the trial - a 20-day cohort is a wide image meant to be zoomed "
+             "into.\n"
+             "\n"
+             "Deliberately bare: no background image, no start/stop markers, a "
+             "thin line, no ticks. At this cell size that furniture hides the "
+             "track. Every cell shares one window (or your pinned XY range), so "
+             "cells are directly comparable; a dash marks a day with no data.\n"
+             "\n"
+             "Rows are coloured by sex (blue M, red F), ordered by SexID, and "
+             "labelled with the ID chosen under 'Label animals by' (SexID by "
+             "default). Use 'Daily Paths per Tag' instead when you want one "
+             "animal large, with the arena drawn behind it."),
             ("trajectory_overview", "Trajectory Overview",
              "All selected tags overlaid on a single plot with optional background image"),
             ("battery_levels", "Battery Levels",
@@ -4500,19 +5975,13 @@ class UWBQuickVisualizationWindow(QWidget):
             "FILE: {db}_Ethogram.png - TWO stacked rasters over a shared "
             "time axis, one row per animal in each.\n"
             "\n"
-            "LOCOMOTION: no data / inactive / moving.\n"
             "SOCIAL: no data / alone / contact / chased / chasing.\n"
             "\n"
-            "They are separate panels rather than one raster because a "
-            "single one has to choose: the previous version let a social "
-            "state overwrite the locomotor state, so an animal in contact "
-            "showed no locomotor state at all, and time spent ALONE was not "
-            "visible anywhere - it was just the locomotor colour showing "
-            "through. Split, each panel answers one question and the two "
-            "line up in time.\n"
+            "ALONE is a state in its own right — an animal that has a fix "
+            "and is doing nothing social — so time spent apart is readable "
+            "rather than being the absence of a colour.\n"
             "\n"
-            "THRESHOLDS ARE INHERITED FROM THE PREVIEW. Social radius, "
-            "inactive/moving speed split, chase "
+            "THRESHOLDS ARE INHERITED FROM THE PREVIEW. Social radius, chase "
             "distance/speed/angle/duration and heading lag are taken from "
             "the Behaviour Detection controls exactly as set there. Tune "
             "them in the preview until the overlay looks right, then "
@@ -4531,17 +6000,15 @@ class UWBQuickVisualizationWindow(QWidget):
             "is what keeps the pairwise (frames x animals x animals) "
             "geometry from exhausting memory on a multi-day trial.\n"
             "\n"
-            "STATES. Locomotor: inactive (speed at or below the still "
-            "threshold), moving (above it), no data. Social: contact "
-            "(social circles overlapping, i.e. centres within 2x the social "
-            "radius), chasing/chased. An animal carries at most one social "
-            "state per frame; where several qualify, the higher-precedence "
-            "one wins (being chased outranks merely touching).\n"
+            "STATES. Contact (social circles overlapping, i.e. centres "
+            "within 2x the social radius), chasing/chased, or alone. An "
+            "animal carries at most one social state per frame; where "
+            "several qualify, the higher-precedence one wins (being chased "
+            "outranks merely touching).\n"
             "\n"
             "RASTER. One row per animal, time along x. Each pixel covers "
-            "several seconds (printed in the title); within a pixel a "
-            "SOCIAL state takes precedence over the locomotor background, "
-            "so brief chases stay visible rather than "
+            "several seconds (printed in the title); within a pixel the "
+            "stronger state wins, so brief chases stay visible rather than "
             "being averaged away. This means the raster over-represents "
             "rare social events by design - read the time budget for true "
             "proportions.\n"
@@ -4687,6 +6154,14 @@ class UWBQuickVisualizationWindow(QWidget):
             return cb
 
         _anim_show_box(
+            'chk_anim_data_view', "Data View (live ROI counters)",
+            DATA_VIEW_TOOLTIP)
+        # Hidden until a region exists, and set HERE as well as in
+        # on_rois_changed: a freshly opened window has not had a region change
+        # yet, so without this the option would show on a trial with none.
+        self.chk_anim_data_view.setVisible(bool(getattr(self, 'rois', None)))
+
+        _anim_show_box(
             'chk_anim_show_trail', "Show trail",
             "Draw each animal's recent path behind its marker. Length is the "
             "Trail Length above, inherited from the preview.\n\n"
@@ -4695,7 +6170,7 @@ class UWBQuickVisualizationWindow(QWidget):
         _anim_show_box(
             'chk_anim_show_tag_id', "Show tag ID",
             "Label each marker with the animal's ID, in the same form the "
-            "preview uses (Display ID / HexID / ShortID).")
+            "preview uses (SexID / Name / Code / HexID / ShortID).")
         _anim_show_box(
             'chk_anim_show_behavior', "Show behavior detection",
             "Draw the behaviour overlays from the preview into the video: "
@@ -4706,11 +6181,6 @@ class UWBQuickVisualizationWindow(QWidget):
             "the same moments however fast it is rendered.\n\n"
             "This adds a classification pass over the animation's data before "
             "rendering starts.")
-        _anim_show_box(
-            'chk_anim_beh_locomotor', "Locomotor state (inactive / moving)",
-            "Write each animal's locomotor state under its ID, coloured as in "
-            "the preview. The inactive/moving split uses the same speed "
-            "threshold as the preview.", indent=18)
         _anim_show_box(
             'chk_anim_beh_social', "Social overlap",
             "Draw the dashed social-radius circle around each animal and join "
@@ -4728,15 +6198,35 @@ class UWBQuickVisualizationWindow(QWidget):
             "in both animals' state text.", indent=18)
         self.chk_anim_beh_displace.setChecked(DISPLACEMENT_ENABLED)
         self.chk_anim_beh_displace.setVisible(DISPLACEMENT_ENABLED)
+        _anim_show_box(
+            'chk_anim_show_weather', "Show weather",
+            "Print the weather line above the title for each frame - "
+            "precipitation first, then temperature, humidity, wind and "
+            "pressure - as the preview shows it (Weather Settings sources "
+            "and units). Offered when the preview's Show Weather is on.\n\n"
+            "If nothing has been fetched yet, the export fetches it (from "
+            "the cache when it can) before rendering.")
+        _anim_show_box(
+            'chk_anim_show_light', "Show light bar",
+            "Draw the day's sunlight strip across the top of the video with "
+            "the current moment marked, precipitation along its bottom edge, "
+            "the light and moon readout, and the moon's phase icon. Offered "
+            "when the preview's Show Light Bar is on.")
 
         speed_layout = QHBoxLayout()
         speed_layout.addWidget(QLabel("Animation Speed:"))
         self.combo_animation_speed = QComboBox()
-        self.combo_animation_speed.addItems(["1x", "5x", "15x", "30x", "60x", "120x", "240x"])
+        self.combo_animation_speed.addItems(
+            ["1x", "5x", "15x", "30x", "60x", "120x", "240x", "480x"])
         self.combo_animation_speed.setCurrentText("60x")
         self.combo_animation_speed.setToolTip(
             "How fast real time plays in the video. "
-            "80x means 80 seconds of tracking data per 1 second of video."
+            "80x means 80 seconds of tracking data per 1 second of video.\n\n"
+            "Each frame advances speed/FPS seconds, so at 480x and 20 fps one "
+            "frame is 24 s of tracking: a day becomes about 3 minutes of "
+            "video. Fast settings skip between frames rather than blurring "
+            "them together - a brief visit between two frames is not drawn, "
+            "though the trail still shows where the animal went."
         )
         speed_layout.addWidget(self.combo_animation_speed)
         animation_options_layout.addLayout(speed_layout)
@@ -4812,6 +6302,15 @@ class UWBQuickVisualizationWindow(QWidget):
         clip_row.addWidget(lbl_clip)
         clip_row.addStretch(1)
         animation_options_layout.addLayout(clip_row)
+
+        # A clip is not instant - it builds the Data View's trial-wide counters
+        # on the first run, classifies behaviour, then renders every frame -
+        # and until this appeared the button simply sat there looking dead.
+        self.lbl_clip_progress = QLabel("")
+        self.lbl_clip_progress.setStyleSheet(
+            "color: #6fa8dc; font-size: 9pt; margin-left: 4px;")
+        self.lbl_clip_progress.setVisible(False)
+        animation_options_layout.addWidget(self.lbl_clip_progress)
 
         # Full first, then the per-day breakdown beneath it: the whole-recording
         # video is the default output, and the daily option (with its day list)
@@ -5103,26 +6602,1000 @@ class UWBQuickVisualizationWindow(QWidget):
                 self.preview_canvas_3d = None
                 print(f"3D preview unavailable: {e}")
         self.preview_stack.setLayout(stack_layout)
-        layout.addWidget(self.preview_stack, 1)
 
-        # --- transport (scrubber only), directly under the map ---
-        self.slider_timeline = QSlider(Qt.Horizontal)
-        self.slider_timeline.setRange(0, 0)
-        self.slider_timeline.setToolTip(
-            "Scrub the whole recording. Drag, or use the ← / → arrow keys "
-            "(hold to scan) to step back and forth. Nothing is read while you "
-            "move — the chunk under the playhead loads once you stop.")
-        self.slider_timeline.valueChanged.connect(self.on_timeline_moved)
-        layout.addWidget(self.slider_timeline)
-
+        # Time, weather and light sit ABOVE the arena, where the exported
+        # video puts them.
         self.lbl_preview_time = QLabel("--")
         self.lbl_preview_time.setStyleSheet("color: #cccccc; font-family: Consolas, monospace; font-size: 10px;")
         self.lbl_preview_time.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.lbl_preview_time)
 
+        self.lbl_preview_weather = QLabel("")
+        self.lbl_preview_weather.setStyleSheet(
+            "color: #cccccc; font-family: Consolas, monospace; font-size: 10px;")
+        self.lbl_preview_weather.setAlignment(Qt.AlignCenter)
+        self.lbl_preview_weather.setWordWrap(True)
+        self.lbl_preview_weather.setTextFormat(Qt.RichText)
+        self.lbl_preview_weather.setVisible(False)
+        layout.addWidget(self.lbl_preview_weather)
+        self.lbl_preview_light = QLabel("")
+        self.lbl_preview_light.setStyleSheet(
+            "color: #cccccc; font-family: Consolas, monospace; font-size: 10px;")
+        self.lbl_preview_light.setAlignment(Qt.AlignCenter)
+        self.lbl_preview_light.setWordWrap(True)
+        self.lbl_preview_light.setVisible(False)
+        layout.addWidget(self.lbl_preview_light)
+
+        # The readout and the moon sit OUTSIDE the strip: anything drawn on it
+        # hides the light it describes, which is worst at dawn.
+        self.light_row = QWidget()
+        light_row = QHBoxLayout()
+        light_row.setContentsMargins(0, 0, 0, 0)
+        light_row.setSpacing(6)
+        self.sky_icon = SkyIcon()
+        self._sky_icon_state = None
+        light_row.addWidget(self.sky_icon)
+        self.light_bar = LightBar()
+        self.light_bar.setToolTip(
+            "Sunlight across the current local day (midnight to midnight); "
+            "red mark = playhead, ticks at 06, 12 and 18 h. Silver = moon up "
+            "at night. A band along the bottom marks precipitation: blue "
+            "rain, white snow, violet mixed - stronger for heavier.")
+        light_row.addWidget(self.light_bar, 1)
+        self.moon_icon = MoonIcon()
+        self.moon_icon.setToolTip(
+            "The moon's phase now, faded while it is below the horizon.")
+        light_row.addWidget(self.moon_icon)
+        self.light_row.setLayout(light_row)
+        self.light_row.setVisible(False)
+        layout.addWidget(self.light_row)
+
+        layout.addWidget(self.preview_stack, 1)
+
+        # --- transport, directly under the map ---
+        self.slider_timeline = QSlider(Qt.Horizontal)
+        self.slider_timeline.setRange(0, 0)
+        self.slider_timeline.setToolTip(
+            "Scrub the whole recording. Drag, or use the \u2190 / \u2192 arrow keys "
+            "(hold to scan) to step back and forth. Nothing is read while you "
+            "move \u2014 the chunk under the playhead loads once you stop.\n"
+            "\n"
+            "Or press Play below (Space) to run it forward at a chosen speed. "
+            "Dragging this slider, or an arrow key, takes the playhead back "
+            "and pauses playback.")
+        self.slider_timeline.valueChanged.connect(self.on_timeline_moved)
+        layout.addWidget(self.slider_timeline)
+
+        transport = QHBoxLayout()
+        transport.setContentsMargins(0, 0, 0, 0)
+        self.btn_preview_play = QPushButton("\u25b6 Play")
+        self.btn_preview_play.setFixedWidth(84)
+        self.btn_preview_play.setToolTip(
+            "Play the preview forward from the playhead. Space also "
+            "toggles it.\n"
+            "\n"
+            "Playback is driven by the CLOCK, not by the frame count: the "
+            "playhead is placed where it should be for the wall time that has "
+            "passed, and frames that could not be drawn in between are simply "
+            "skipped. Elapsed trial time is therefore correct at any speed - "
+            "a slow machine shows a choppier picture, not a slower one. That "
+            "is why the speed list is not capped.")
+        self.btn_preview_play.clicked.connect(self.toggle_preview_playback)
+        transport.addWidget(self.btn_preview_play)
+
+        transport.addWidget(QLabel("Speed:"))
+        self.combo_preview_speed = QComboBox()
+        for _mult in (0.5, 1, 2, 4, 8, 16, 30, 60, 120, 240, 480):
+            self.combo_preview_speed.addItem(
+                f"{_mult:g}x", float(_mult))
+        self.combo_preview_speed.setCurrentIndex(1)          # 1x
+        self.combo_preview_speed.setFixedWidth(76)
+        self.combo_preview_speed.setToolTip(
+            "How much trial time passes per second of watching. 1x is real "
+            "time; 60x covers an hour a minute.\n"
+            "\n"
+            "Changing this mid-playback re-anchors the clock at the current "
+            "playhead, so the speed changes from where you are rather than "
+            "jumping.\n"
+            "\n"
+            "High speeds outrun the chunk loader when the playhead leaves "
+            "what is cached; the picture holds until the next chunk arrives "
+            "and then catches up. The clock never drifts.")
+        self.combo_preview_speed.currentIndexChanged.connect(
+            self._on_preview_speed_changed)
+        transport.addWidget(self.combo_preview_speed)
+
+        self.lbl_preview_fps = QLabel("")
+        self.lbl_preview_fps.setStyleSheet(
+            "color: #9aa7b4; font-family: Consolas, monospace; font-size: 10px;")
+        self.lbl_preview_fps.setToolTip(
+            "Frames actually drawn per second, measured over the last second "
+            "of playback. This is what your machine sustains at the chosen "
+            "speed; below about 10 the motion reads as a slideshow even "
+            "though the elapsed time is still right.")
+        transport.addWidget(self.lbl_preview_fps)
+        transport.addStretch(1)
+
+        # Copy the view out for a slide or a figure panel. Sits at the right
+        # of the transport row, away from the playback controls, because it is
+        # something you do to a frame you have already found rather than part
+        # of finding it.
+        self.btn_copy_view = QPushButton(self._COPY_VIEW_LABEL)
+        self.btn_copy_view.setFixedWidth(96)
+        self.btn_copy_view.setToolTip(
+            "Copy the preview exactly as it stands — current frame, zoom, "
+            "trails, labels and behaviour overlays — to the clipboard as a "
+            f"PNG at {COPY_VIEW_DPI} dpi, ready to paste into a slide, a "
+            "document or a message.\n"
+            "\n"
+            "Rendered fresh from the scene, not captured from the screen, so "
+            "the copy is much sharper than the pane you are looking at: text, "
+            "markers and line widths are set in POINTS and keep their physical "
+            f"size, so {COPY_VIEW_DPI} dpi buys real detail rather than just "
+            "pixels. Surrounding whitespace is trimmed.\n"
+            "\n"
+            "The pixel count also scales with how wide you have made this "
+            "pane, so a very wide window is capped to keep the copy a sane "
+            "size — the log says when that happens.\n"
+            "\n"
+            "A loaded background image is the exception — it has whatever "
+            "resolution it was saved at, and rendering above that enlarges its "
+            "pixels. The tracks, markers, labels and regions drawn over it "
+            "stay sharp regardless.\n"
+            "\n"
+            "In the 3D view this can only copy what the GPU already drew, so "
+            "it comes out at screen resolution; switch to the 2D view for a "
+            "high-resolution copy.")
+        self.btn_copy_view.clicked.connect(self.copy_preview_view)
+        transport.addWidget(self.btn_copy_view)
+
+        layout.addLayout(transport)
+
+
         panel.setLayout(layout)
         panel.setMinimumWidth(520)
         return panel
+
+    _WEATHER_BUTTON_TIP = (
+        "Open the Weather Settings window: the site's latitude/longitude "
+        "(or a site profile), the weather and sunlight sources, display "
+        "units, and Fetch Weather. Available once Show Weather, Show Light "
+        "Bar or the weather export is ticked.")
+
+    WEATHER_UNITS = (("Metric (°C, m/s, hPa)", "metric"),
+                     ("US (°F, mph, inHg)", "us"))
+
+    def _build_weather_dialog(self):
+        """The Site & Weather controls, in a non-modal window."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Weather Settings")
+        dlg.setModal(False)
+        dlg.setMinimumWidth(680)
+        v = QVBoxLayout()
+        v.addWidget(self._build_site_weather_group())
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(dlg.hide)
+        v.addWidget(buttons)
+        dlg.setLayout(v)
+        self._weather_dialog = dlg
+        return dlg
+
+    def open_weather_settings(self):
+        """Show the Weather Settings window (it stays open while you scrub)."""
+        dlg = self._weather_dialog
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _sync_weather_button(self, *_):
+        """Weather Settings… is offered once weather is actually wanted."""
+        btn = getattr(self, 'btn_weather_settings', None)
+        if btn is None:
+            return
+        wanted = (self.chk_show_weather.isChecked()
+                  or self.chk_show_light_bar.isChecked()
+                  or (hasattr(self, 'chk_export_weather')
+                      and self.chk_export_weather.isChecked()))
+        btn.setEnabled(wanted)
+
+    def _on_weather_toggle_clicked(self, checked):
+        """A deliberate tick with no site set opens the settings straight away."""
+        if checked and not self.site_settings().has_location:
+            self.open_weather_settings()
+
+    def _build_site_weather_group(self):
+        """Site location plus the weather and sunlight sources.
+
+        FNT ships no site locations: the latitude/longitude are whatever the
+        user types here, or loads from a site profile kept with their own
+        data (an ``fnt_site.json`` in the trial's analysis folder is picked up
+        automatically). Everything downloaded is cached in that same folder,
+        so a re-run is reproducible and works offline.
+        """
+        group = QGroupBox("Site && Weather")
+        v = QVBoxLayout()
+
+        coords = QHBoxLayout()
+        coords.addWidget(QLabel("Lat:"))
+        self.edit_site_lat = QLineEdit()
+        self.edit_site_lat.setPlaceholderText("decimal °, N +")
+        self.edit_site_lat.setToolTip(
+            "Site latitude in decimal degrees (north positive), e.g. copied "
+            "from a map app.\n\nUsed for the sun's position (day, twilight, "
+            "night, sunrise/sunset), to pick the nearest SURFRAD station, and "
+            "as the Open-Meteo grid point. Saved in this trial's "
+            "fnt_config.json and in any site profile you save - nowhere else.")
+        coords.addWidget(self.edit_site_lat, 1)
+        coords.addWidget(QLabel("Lon:"))
+        self.edit_site_lon = QLineEdit()
+        self.edit_site_lon.setPlaceholderText("decimal °, E +, W −")
+        self.edit_site_lon.setToolTip(
+            "Site longitude in decimal degrees (east positive, WEST NEGATIVE - "
+            "the Americas are negative).")
+        coords.addWidget(self.edit_site_lon, 1)
+        v.addLayout(coords)
+        for edit in (self.edit_site_lat, self.edit_site_lon):
+            edit.editingFinished.connect(self._on_site_changed)
+
+        prof = QHBoxLayout()
+        btn_load = QPushButton("Load Site Profile…")
+        btn_load.setToolTip(
+            "Load a site profile (.json): location, sources and station URL.\n\n"
+            f"A profile saved as '{WX.SITE_PROFILE_NAME}' in a trial's "
+            "<database>_FNT_analysis folder is loaded automatically when that "
+            "database is opened and has no site set yet.")
+        btn_load.clicked.connect(self.load_site_profile)
+        prof.addWidget(btn_load)
+        btn_save = QPushButton("Save Site Profile…")
+        btn_save.setToolTip(
+            "Save the location and source settings as a reusable .json profile. "
+            f"By default it is written as '{WX.SITE_PROFILE_NAME}' in this "
+            "trial's <database>_FNT_analysis folder, where it is picked up "
+            "automatically and survives a folder clear. Profiles live with "
+            "your data, not in FNT.")
+        btn_save.clicked.connect(self.save_site_profile)
+        prof.addWidget(btn_save)
+        v.addLayout(prof)
+
+        form = QFormLayout()
+        self.combo_weather_source = QComboBox()
+        for key in WX.WEATHER_SOURCES:
+            self.combo_weather_source.addItem(WX.SOURCE_LABELS[key], key)
+        self.combo_weather_source.setToolTip(
+            "Where temperature, humidity, wind, pressure and rain come from.\n\n"
+            "• NOAA SURFRAD: the nearest station of NOAA's radiation network, "
+            "measured, 1-minute averages. Can be tens of km away - the "
+            "distance is shown below.\n"
+            "• Open-Meteo: a weather MODEL evaluated at the site, 15-minute "
+            "values (hourly ERA5 reanalysis where 15-minute data are not "
+            "available). Works anywhere; not a measurement.\n"
+            "• WeatherLink archive: daily text files a Davis weather station "
+            "publishes at a URL you enter (e.g. a campus station), usually "
+            "5-minute averages.\n\n"
+            "Every record is an average ending at its timestamp; the preview "
+            "and video show the record covering the current moment.")
+        form.addRow("Weather:", self.combo_weather_source)
+        self.combo_solar_source = QComboBox()
+        for key in WX.SOLAR_SOURCES:
+            self.combo_solar_source.addItem(WX.SOURCE_LABELS[key], key)
+        self.combo_solar_source.setToolTip(
+            "Where sunlight (global solar irradiance, W/m²) comes from - it "
+            "drives the Light Bar and the ghi_wm2 column.\n\n"
+            "• Computed: sun position only, no download. The light bar then "
+            "shows CLEAR-SKY light, so clouds are invisible.\n"
+            "• NOAA SURFRAD: measured 1-minute global, direct and diffuse "
+            "irradiance, plus PAR and UV-B, at the nearest station.\n"
+            "• Open-Meteo: modelled 15-minute irradiance at the site.\n\n"
+            "Sun elevation, twilight phase and sunrise/sunset are always "
+            "computed from the site's coordinates (NOAA solar equations).")
+        form.addRow("Sunlight:", self.combo_solar_source)
+        v.addLayout(form)
+        self.chk_model_supplement = QCheckBox(
+            "Fill gaps from the Open-Meteo model (labelled \"model\")")
+        self.chk_model_supplement.setChecked(True)
+        self.chk_model_supplement.setToolTip(
+            "Measured data always come first. With this on, the Open-Meteo "
+            "model is also fetched and used ONLY where the sources above "
+            "have no record, or for what no sensor here measures: cloud at "
+            "night, thunder and fog, for the sky icon. Anything taken from "
+            "the model is labelled 'model' in the preview, the video and "
+            "{db}_sky.csv.\n\n"
+            "Turn it off to show measurements only; the sky icon then "
+            "shows 'sky unknown' where nothing was measured.")
+        self.chk_model_supplement.stateChanged.connect(self._on_site_changed)
+        v.addWidget(self.chk_model_supplement)
+        self.combo_weather_source.currentIndexChanged.connect(self._on_site_changed)
+        self.combo_solar_source.currentIndexChanged.connect(self._on_site_changed)
+
+        # WeatherLink archive details: only meaningful for that source.
+        self._weatherlink_box = QGroupBox("WeatherLink station archive")
+        wl = QFormLayout()
+        self.edit_weatherlink_url = QLineEdit()
+        self.edit_weatherlink_url.setPlaceholderText(
+            "https://…/wxobs{date:%Y%m%d}.txt")
+        self.edit_weatherlink_url.setToolTip(
+            "URL of ONE day's WeatherLink text export, with {date:%Y%m%d} "
+            "where the date goes (Python date format codes). FNT fills in "
+            "each local date of the recording.\n\nThe file must be the "
+            "standard two-line-header WeatherLink table; column positions are "
+            "read from its header, so optional sensors (Solar Rad., UV) are "
+            "picked up when the station has them.")
+        self.edit_weatherlink_url.editingFinished.connect(self._on_site_changed)
+        wl.addRow("URL:", self.edit_weatherlink_url)
+        units = QHBoxLayout()
+        self.combo_wl_temp = QComboBox()
+        for key, text in (("auto", "Auto"), ("F", "°F"), ("C", "°C")):
+            self.combo_wl_temp.addItem(text, key)
+        self.combo_wl_wind = QComboBox()
+        self.combo_wl_wind.addItems(list(WX.WIND_UNITS))
+        self.combo_wl_rain = QComboBox()
+        self.combo_wl_rain.addItems(list(WX.RAIN_UNITS))
+        for lbl, combo in (("Temp", self.combo_wl_temp), ("Wind", self.combo_wl_wind),
+                           ("Rain", self.combo_wl_rain)):
+            units.addWidget(QLabel(lbl))
+            combo.setMinimumWidth(90)
+            units.addWidget(combo)
+            units.addSpacing(10)
+            combo.currentIndexChanged.connect(self._on_site_changed)
+        units.addStretch(1)
+        unit_tip = ("The units the STATION WRITES ITS FILE IN - not how FNT "
+                    "shows them (that is 'Show values in' below). WeatherLink "
+                    "files do not say, so these tell FNT how to read them; "
+                    "everything is converted to SI on import.\n\n"
+                    "Temp 'Auto' works it out from the file itself: only the "
+                    "right unit makes the file's dew point agree with its "
+                    "temperature and humidity. Choosing °F/°C by hand is "
+                    "checked the same way, and a contradiction is reported. "
+                    "Pressure (inHg vs mb/hPa) is detected from its values. "
+                    "Wind and rain units cannot be detected - check them "
+                    "against the station's own web page once.")
+        for c in (self.combo_wl_temp, self.combo_wl_wind, self.combo_wl_rain):
+            c.setToolTip(unit_tip)
+        wl.addRow("File units:", units)
+        self._weatherlink_box.setLayout(wl)
+        v.addWidget(self._weatherlink_box)
+
+        self.lbl_site_info = QLabel("")
+        self.lbl_site_info.setWordWrap(True)
+        self.lbl_site_info.setStyleSheet("color:#9aa7b4; font-size: 10px;")
+        v.addWidget(self.lbl_site_info)
+
+        disp = QHBoxLayout()
+        disp.addWidget(QLabel("Show values in:"))
+        self.combo_weather_units = QComboBox()
+        for text, key in self.WEATHER_UNITS:
+            self.combo_weather_units.addItem(text, key)
+        self.combo_weather_units.setToolTip(
+            "Units for the weather line in the preview and the video. "
+            "Exported CSVs are always SI (°C, m/s, hPa, mm, W/m²).")
+        self.combo_weather_units.currentIndexChanged.connect(
+            self._update_weather_display)
+        disp.addWidget(self.combo_weather_units, 1)
+        v.addLayout(disp)
+
+        self.chk_weather_autofetch = QCheckBox(
+            "Fetch automatically when a database is opened")
+        self.chk_weather_autofetch.setChecked(True)
+        self.chk_weather_autofetch.setToolTip(
+            "When a database is opened and a site is set, fetch the weather "
+            "for its whole recording without waiting for the button.\n\n"
+            "Cheap after the first time: cached files are reused and only "
+            "days that were still in progress when last fetched are "
+            "downloaded again - so a trial you export daily pulls one new "
+            "day. With no connection it falls back to the cache and says so.\n"
+            "\n"
+            "Turn it off to keep the tool entirely offline until you press "
+            "Fetch Weather.")
+        v.addWidget(self.chk_weather_autofetch)
+
+        fetch = QHBoxLayout()
+        self.btn_fetch_weather = QPushButton("Fetch Weather")
+        self.btn_fetch_weather.setToolTip(
+            "Download the selected weather and sunlight records for the "
+            "loaded database's whole recording period (selected tags), and "
+            "cache them in the analysis folder's weather_cache.\n\n"
+            "Needs an internet connection the first time; afterwards the "
+            "cache is used, and only days that were still in progress when "
+            "last fetched are downloaded again. SURFRAD posts each day about "
+            "a day later, so the most recent hours may be missing.")
+        self.btn_fetch_weather.clicked.connect(self.fetch_weather)
+        fetch.addWidget(self.btn_fetch_weather)
+        fetch.addStretch(1)
+        v.addLayout(fetch)
+        self.lbl_weather_status = QLabel("")
+        self.lbl_weather_status.setWordWrap(True)
+        v.addWidget(self.lbl_weather_status)
+
+        group.setLayout(v)
+        self._on_site_changed()
+        return group
+
+    def site_settings(self):
+        """The site/source settings shown in the Site & Weather group."""
+        return WX.SiteSettings.from_dict({
+            'name': self._site_name,
+            'latitude': self.edit_site_lat.text().strip() or None,
+            'longitude': self.edit_site_lon.text().strip() or None,
+            'weather_source': self.combo_weather_source.currentData(),
+            'solar_source': self.combo_solar_source.currentData(),
+            'weatherlink_url': self.edit_weatherlink_url.text().strip(),
+            'weatherlink_units': {
+                'temp': self.combo_wl_temp.currentData(),
+                'wind': self.combo_wl_wind.currentText(),
+                'rain': self.combo_wl_rain.currentText(),
+            },
+            'model_supplement': self.chk_model_supplement.isChecked(),
+        })
+
+    @staticmethod
+    def _site_key(settings):
+        d = settings.to_dict()
+        d.pop('name', None)
+        return json.dumps(d, sort_keys=True)
+
+    def apply_site_settings(self, settings):
+        """Show ``settings`` in the Site & Weather group."""
+        widgets = (self.edit_site_lat, self.edit_site_lon,
+                   self.combo_weather_source, self.combo_solar_source,
+                   self.edit_weatherlink_url, self.combo_wl_temp,
+                   self.combo_wl_wind, self.combo_wl_rain,
+                   self.chk_model_supplement)
+        for w in widgets:
+            w.blockSignals(True)
+        try:
+            self._site_name = settings.name or ""
+            self.edit_site_lat.setText(
+                "" if not np.isfinite(settings.latitude) else f"{settings.latitude:g}")
+            self.edit_site_lon.setText(
+                "" if not np.isfinite(settings.longitude) else f"{settings.longitude:g}")
+            for combo, key in ((self.combo_weather_source, settings.weather_source),
+                               (self.combo_solar_source, settings.solar_source)):
+                i = combo.findData(key)
+                combo.setCurrentIndex(max(i, 0))
+            self.edit_weatherlink_url.setText(settings.weatherlink_url)
+            u = settings.weatherlink_units
+            self.combo_wl_temp.setCurrentIndex(
+                max(self.combo_wl_temp.findData(u.get('temp', 'auto')), 0))
+            self.combo_wl_wind.setCurrentText(u.get('wind', 'mph'))
+            self.combo_wl_rain.setCurrentText(u.get('rain', 'in'))
+            self.chk_model_supplement.setChecked(bool(settings.model_supplement))
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
+        self._on_site_changed()
+
+    def _set_weather_status(self, text, color="#9aa7b4"):
+        self.lbl_weather_status.setText(text)
+        self.lbl_weather_status.setStyleSheet(f"color:{color}; font-size: 10px;")
+        btn = getattr(self, 'btn_weather_settings', None)
+        if btn is not None:
+            btn.setToolTip(self._WEATHER_BUTTON_TIP
+                           + (f"\n\nStatus: {text}" if text else ""))
+
+    def _on_site_changed(self, *_):
+        """Re-validate the site settings and drop anything fetched for others."""
+        s = self.site_settings()
+        lat_txt = self.edit_site_lat.text().strip()
+        lon_txt = self.edit_site_lon.text().strip()
+        bad = "border: 1px solid #d9534f;"
+        lat_ok = WX.valid_coordinates(lat_txt or 0, 0) if lat_txt else True
+        lon_ok = WX.valid_coordinates(0, lon_txt or 0) if lon_txt else True
+        self.edit_site_lat.setStyleSheet("" if lat_ok else bad)
+        self.edit_site_lon.setStyleSheet("" if lon_ok else bad)
+        self._weatherlink_box.setVisible(s.weather_source == 'weatherlink')
+
+        notes = []
+        if not s.has_location:
+            notes.append("Enter the site's latitude and longitude, or load a "
+                         "site profile, to use weather and sun position.")
+        else:
+            if s.name:
+                notes.append(f"Site: {s.name}")
+            if 'surfrad' in (s.weather_source, s.solar_source):
+                _code, name, dist = WX.nearest_surfrad(s.latitude, s.longitude)
+                note = f"Nearest SURFRAD station: {name}, {dist:.0f} km away."
+                if dist > 100:
+                    note += " That is far - its weather may not be the site's."
+                notes.append(note)
+        if s.weather_source == 'weatherlink':
+            err = WX.validate_url_template(s.weatherlink_url)
+            if err:
+                notes.append(f"WeatherLink URL: {err}.")
+        self.lbl_site_info.setText("\n".join(notes))
+
+        env = self.environment
+        if env is not None and self._site_key(env.settings) != self._site_key(s):
+            self.environment = None
+            self.weather_timeline = None
+            self._weather_summary = None
+            self._set_weather_status(
+                "Site or sources changed — press Fetch Weather.", "#e5c07b")
+        self._sun_timeline = None
+        self._light_day = None
+        self._update_weather_display()
+
+    def load_site_profile(self):
+        folder = self.analysis_dir_for_db()
+        start = (folder if folder and os.path.isdir(folder)
+                 else os.path.dirname(self.db_path) if self.db_path else "")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Site Profile", start,
+            "Site profile (*.json);;All Files (*.*)")
+        if not path:
+            return
+        try:
+            settings = WX.read_site_profile(path)
+        except Exception as e:
+            QMessageBox.warning(self, "Site Profile",
+                                f"Could not read {os.path.basename(path)}:\n{e}")
+            return
+        self.apply_site_settings(settings)
+        self.log_message(f"Site profile loaded: {os.path.basename(path)}"
+                         + (f" ({settings.name})" if settings.name else ""))
+
+    def save_site_profile(self):
+        settings = self.site_settings()
+        if not settings.has_location:
+            QMessageBox.information(
+                self, "Site Profile",
+                "Enter a valid latitude and longitude before saving a profile.")
+            return
+        default = WX.SITE_PROFILE_NAME
+        folder = self.analysis_dir_for_db()
+        if folder:
+            try:
+                os.makedirs(folder, exist_ok=True)
+                default = os.path.join(folder, WX.SITE_PROFILE_NAME)
+            except OSError:
+                pass
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Site Profile", default, "Site profile (*.json)")
+        if not path:
+            return
+        name, ok = QInputDialog.getText(
+            self, "Site Profile", "Name for this site (optional):",
+            text=settings.name)
+        if ok:
+            settings.name = name.strip()
+            self._site_name = settings.name
+        try:
+            WX.write_site_profile(path, settings)
+        except OSError as e:
+            QMessageBox.warning(self, "Site Profile", f"Could not save:\n{e}")
+            return
+        self.log_message(f"Site profile saved: {path}")
+
+    def _autoload_site_profile(self):
+        """Use the analysis folder's ``fnt_site.json`` when no site is set."""
+        folder = self.analysis_dir_for_db()
+        if not folder or self.site_settings().has_location:
+            return
+        path = os.path.join(folder, WX.SITE_PROFILE_NAME)
+        if not os.path.exists(path):
+            return
+        try:
+            settings = WX.read_site_profile(path)
+        except Exception as e:
+            self.log_message(f"Could not read {WX.SITE_PROFILE_NAME}: {e}")
+            return
+        self.apply_site_settings(settings)
+        self.log_message(f"Site profile loaded from {WX.SITE_PROFILE_NAME}"
+                         + (f" ({settings.name})" if settings.name else ""))
+
+    def trial_day_one(self):
+        """The recording's FIRST local calendar date - Day 1 everywhere.
+
+        Taken from the day list scanned on load (the whole database), so a
+        per-day video and a mid-trial preview frame agree with the Day column
+        in the exported CSVs. Falls back to the timeline's own start, and to
+        None when nothing is loaded.
+        """
+        days = sorted(getattr(self, 'daily_animation_day_checkboxes', {}) or {})
+        if days:
+            try:
+                return pd.Timestamp(days[0]).date()
+            except (ValueError, TypeError):
+                pass
+        bounds = getattr(self, '_preview_raw_bounds', None) or (
+            (self.preview_t0, self.preview_t1) if self.preview_t0 else None)
+        if bounds and bounds[0]:
+            return (pd.Timestamp(int(bounds[0]), unit='ms', tz='UTC')
+                    .tz_convert(self.combo_timezone.currentText()).date())
+        return None
+
+    def _weather_job(self, settings, offline=False):
+        """A worker callable: trial span from the database, then fetch.
+
+        Reads the span of the SELECTED tags (the whole recording when none are
+        ticked). Touches no widgets, so it is safe off the GUI thread.
+        """
+        db = self.current_indexed_db() or self.db_path
+        table = self.table_name
+        tags = [t for t, cb in self.tag_checkboxes.items() if cb.isChecked()]
+        raw = getattr(self, '_preview_raw_bounds', None)
+        tz = self.combo_timezone.currentText()
+        cache = os.path.join(self.analysis_dir_for_db(), WEATHER_CACHE_DIR)
+        db_path = self.db_path
+
+        def job():
+            if raw and not tags:
+                lo, hi = raw
+            else:
+                conn = connect_ro(db)
+                try:
+                    if tags:
+                        marks = ",".join("?" * len(tags))
+                        lo, hi = conn.execute(
+                            f"SELECT MIN(timestamp), MAX(timestamp) FROM {table} "
+                            f"WHERE shortid IN ({marks})", tags).fetchone()
+                    else:
+                        lo, hi = conn.execute(
+                            f"SELECT MIN(timestamp), MAX(timestamp) FROM {table}"
+                        ).fetchone()
+                finally:
+                    conn.close()
+            if lo is None or hi is None:
+                raise ValueError("the selected tags have no records")
+            msgs = []
+            env = WX.fetch_environment(
+                settings, tz, int(lo) * 1_000_000, int(hi) * 1_000_000, cache,
+                log=msgs.append, offline=offline)
+            return {'db_path': db_path, 'env': env, 'messages': msgs,
+                    'offline': offline}
+        return job
+
+    def fetch_weather(self):
+        """Fetch Weather button: download (or reuse) for the whole recording."""
+        s = self.site_settings()
+        if not s.has_location:
+            QMessageBox.information(
+                self, "Fetch Weather",
+                "Enter the site's latitude and longitude first (or load a "
+                "site profile).")
+            return
+        if not self.db_path or not self.table_name:
+            QMessageBox.information(
+                self, "Fetch Weather",
+                "Load a database first - weather is fetched for its "
+                "recording period.")
+            return
+        if s.weather_source == 'weatherlink':
+            err = WX.validate_url_template(s.weatherlink_url)
+            if err:
+                QMessageBox.warning(self, "Fetch Weather",
+                                    f"WeatherLink URL: {err}.")
+                return
+        if self._weather_fetching:
+            return
+        self._weather_fetching = True
+        self.btn_fetch_weather.setEnabled(False)
+        self._set_weather_status("Fetching weather…", "#9aa7b4")
+        self._start_db_query(self._weather_job(s), self._on_weather_fetched,
+                             self._on_weather_failed)
+
+    def _restore_weather_from_cache(self):
+        """Bring the weather up to date when a database is opened.
+
+        With auto-fetch on (the default) this is the same job the button
+        runs, so a trial that grew since the last export gets its new days
+        without anyone pressing anything; the cache means it is nearly free
+        for days already held. With it off, or in an unattended batch, only
+        the cache is read - the export step does its own fetching.
+        """
+        s = self.site_settings()
+        if (self.environment is not None or self._weather_fetching
+                or not s.has_location or not self.db_path or not self.table_name
+                or (s.weather_source == 'none' and s.solar_source == 'computed')):
+            return
+        auto = (getattr(self, 'chk_weather_autofetch', None) is not None
+                and self.chk_weather_autofetch.isChecked()
+                and not getattr(self, '_batch_active', False))
+        cache = os.path.join(self.analysis_dir_for_db(), WEATHER_CACHE_DIR)
+        key = (self.db_path, self._site_key(s))
+        if self._weather_restore_key == key:
+            return
+        if not auto and not os.path.isdir(cache):
+            return                      # nothing cached and not allowed to fetch
+        self._weather_restore_key = key
+        self._weather_fetching = True
+        if auto:
+            self._set_weather_status("Fetching weather for this trial…", "#9aa7b4")
+            self.log_message(
+                "Fetching weather for this recording (Weather Settings → "
+                "'Fetch automatically when a database is opened')…")
+        self._start_db_query(self._weather_job(s, offline=not auto),
+                             self._on_weather_fetched, self._on_weather_failed)
+
+    def _on_weather_fetched(self, res):
+        self._weather_fetching = False
+        self.btn_fetch_weather.setEnabled(True)
+        if res.get('db_path') != self.db_path:
+            return                      # the user moved on to another database
+        env = res['env']
+        if self._site_key(env.settings) != self._site_key(self.site_settings()):
+            self._set_weather_status(
+                "Settings changed while fetching — press Fetch Weather again.",
+                "#e5c07b")
+            return
+        self._install_environment(env, res.get('messages', ()),
+                                  quiet=res.get('offline', False))
+
+    def _on_weather_failed(self, err):
+        self._weather_fetching = False
+        self.btn_fetch_weather.setEnabled(True)
+        self._set_weather_status(f"Weather fetch failed: {err}", "#d9534f")
+        self.log_message(f"Weather fetch failed: {err}")
+
+    def _install_environment(self, env, messages=(), quiet=False):
+        """Adopt a fetched environment for the preview, video and export."""
+        self.environment = env
+        self.weather_timeline = env.timeline()
+        self._weather_summary = env.summary()
+        self._light_day = None
+        parts = []
+        in_role = {env.roles.get('weather'), env.roles.get('solar')}
+        for src, meta in env.meta.items():
+            n = self._weather_summary['sources'].get(src, {}).get('records', 0)
+            label = {'surfrad': f"SURFRAD {meta.get('station', '')}",
+                     'open_meteo': ("Open-Meteo" if src in in_role
+                                    else "Open-Meteo (gaps only)"),
+                     'open_meteo_sky': "Open-Meteo sky (model)",
+                     'weatherlink': "WeatherLink"}.get(src, src)
+            parts.append(f"{label}: {n:,} records")
+        wl = env.meta.get('weatherlink') or {}
+        if wl.get('temp_unit_used'):
+            parts.append(f"station temperatures read as °{wl['temp_unit_used']}"
+                         + (" (checked)" if wl.get('temp_unit_detected')
+                            == wl['temp_unit_used'] else ""))
+        head = ("✓ Weather from cache" if quiet else "✓ Weather ready")
+        status = head + (" — " + "; ".join(parts) if parts else
+                         " — sun position only")
+        mismatch = [w for w in env.warnings if w.startswith("UNIT MISMATCH")]
+        if mismatch:
+            self._set_weather_status("⚠ " + mismatch[0], "#d9534f")
+        else:
+            if env.warnings:
+                status += f"  ({len(env.warnings)} warning(s), see log)"
+            self._set_weather_status(status,
+                                     "#e5c07b" if env.warnings else "#5cb85c")
+        if not quiet:
+            for m in messages:
+                self.log_message(m)
+        self.log_message(status)
+        for w in env.warnings:
+            self.log_message(f"  ⚠ Weather: {w}")
+        self._update_weather_display()
+
+    def _display_timeline(self):
+        """The fetched timeline, or a sun-only one when only the site is set."""
+        if self.weather_timeline is not None:
+            return self.weather_timeline
+        s = self.site_settings()
+        if not s.has_location:
+            return None
+        key = (s.latitude, s.longitude)
+        if self._sun_timeline is None or self._sun_timeline[0] != key:
+            env = WX.Environment(
+                settings=WX.SiteSettings(latitude=s.latitude, longitude=s.longitude),
+                tz=self.combo_timezone.currentText(), start_ns=0, end_ns=0)
+            self._sun_timeline = (key, env.timeline())
+        return self._sun_timeline[1]
+
+    def _update_weather_display(self, *_):
+        """Weather line and light bar for the playhead."""
+        if not hasattr(self, 'lbl_preview_weather') or not hasattr(self, 'chk_show_weather'):
+            return
+        show_w = self.chk_show_weather.isChecked()
+        show_l = self.chk_show_light_bar.isChecked()
+        self.lbl_preview_weather.setVisible(show_w)
+        self.lbl_preview_light.setVisible(show_l)
+        self.light_row.setVisible(show_l)
+        if not (show_w or show_l):
+            return
+        tl = self._display_timeline()
+        if tl is None or self.preview_t0 is None:
+            self.lbl_preview_weather.setText(
+                "Weather: set the site in Weather Settings…" if tl is None else "")
+            self.lbl_preview_light.setText("")
+            self.light_bar.clear()
+            self.moon_icon.clear()
+            self.sky_icon.clear()
+            self._sky_icon_state = None
+            return
+        t_ns = int(self.preview_playhead_ms) * 1_000_000
+        state = tl.at(t_ns)
+        if show_w:
+            env = self.environment
+            if env is None:
+                txt = ("Weather: not fetched — press Fetch Weather "
+                       "(Weather Settings…)")
+            elif not env.roles.get('weather'):
+                txt = "Weather: no weather source selected"
+            else:
+                units = self.combo_weather_units.currentData()
+                txt = html.escape(WX.format_weather(state, units)
+                                  or "Weather: no record near this time")
+                pr = WX.format_precip(state, units)
+                if pr:
+                    kind = (state.get('weather') or {}).get('precip_type') or 'rain'
+                    col = {'rain': '#5aa0ff', 'snow': '#e8f1ff',
+                           'mixed': '#b89cff'}.get(kind, '#5aa0ff')
+                    esc = html.escape(pr)
+                    txt = txt.replace(
+                        esc, f"<b style='color:{col}'>{esc}</b>", 1)
+                if any(w.startswith("UNIT MISMATCH") for w in env.warnings):
+                    txt += ("  <b style='color:#d9534f'>⚠ temperature unit "
+                            "mismatch — see Weather Settings</b>")
+            self.lbl_preview_weather.setText(txt)
+        if show_l:
+            tz = self.combo_timezone.currentText()
+            day = pd.Timestamp(t_ns, tz='UTC').tz_convert(tz).normalize()
+            key = (day, id(tl))
+            if self._light_day != key:
+                nxt = (day.tz_localize(None) + pd.Timedelta(days=1)).tz_localize(
+                    tz, ambiguous=True, nonexistent='shift_forward')
+                n = int(max(96, min(480, self.light_bar.width() // 2)))
+                _t, levels, moon = tl.light_strip(day.value, nxt.value, n)
+                rate, kind = tl.precip_strip(day.value, nxt.value, n)
+                self.light_bar.set_day(
+                    levels, WX.light_rgb,
+                    [(h / 24.0, str(h)) for h in (6, 12, 18)], moon=moon,
+                    precip=[WX.precip_rgba(r, k) for r, k in zip(rate, kind)])
+                self._light_day = key
+                self._light_span = (day.value, nxt.value)
+            a, b = self._light_span
+            poly = (WX.moon_disc_polygon(state['moon_illumination'],
+                                         state['moon_waxing'], state['southern'])
+                    if np.isfinite(state['moon_illumination']) else None)
+            self.light_bar.set_now((t_ns - a) / max(b - a, 1), state['light'])
+            self.moon_icon.set_moon(poly, state.get('moon_up', True))
+            sky = tl.sky(t_ns)
+            sky_txt = WX.format_sky(sky)
+            if sky and sky['state'] != self._sky_icon_state:
+                self.sky_icon.set_shapes(WX.sky_icon_shapes(sky['state']))
+                self._sky_icon_state = sky['state']
+            self.sky_icon.setToolTip(self._sky_tooltip(sky))
+            self.lbl_preview_light.setText(
+                " · ".join(t for t in (sky_txt, WX.format_light(state)) if t))
+
+    _SKY_SOURCE_NAMES = {'weatherlink': "weather station", 'surfrad': "SURFRAD",
+                         'open_meteo': "Open-Meteo model",
+                         'open_meteo_sky': "Open-Meteo model"}
+
+    def _sky_tooltip(self, sky):
+        """What the sky icon shows now, and what it is based on."""
+        if not sky:
+            return ""
+        lines = [WX.SKY_LABELS.get(sky['state'], sky['state'])]
+        src = self._SKY_SOURCE_NAMES.get(sky.get('source'), sky.get('source') or "")
+        if sky.get('basis') == 'measured':
+            lines.append(f"Measured ({src}).")
+        elif sky.get('basis') == 'model':
+            lines.append(f"Modelled ({src}): nothing measured it here.")
+        else:
+            lines.append("No sky data for this time - only the sun's position.")
+        lines.append(
+            "\nRain comes from the station's gauge wherever it has a record; "
+            "daytime cloud from measured sunlight (how much of the time the "
+            "sun was shaded). Night cloud, thunder and fog are not measured "
+            "here and come from the model. The export writes it minute by "
+            "minute, with the evidence, to {db}_sky.csv.")
+        return "\n".join(lines)
+
+    def _fetch_environment_now(self, settings):
+        """Run the Fetch Weather job and wait for it, keeping the window live.
+
+        Used by the export steps, which need the records before they go on.
+        Adopts the result for the preview too. Returns the environment, or
+        None on failure or cancel.
+        """
+        box = {}
+        self._weather_fetching = True
+        self._start_db_query(self._weather_job(settings),
+                             lambda r: box.setdefault('res', r),
+                             lambda e: box.setdefault('err', e))
+        while not box and not self.export_cancelled:
+            QApplication.processEvents()
+            time.sleep(0.02)
+        self._weather_fetching = False
+        if 'err' in box:
+            self.log_message(f"Weather fetch failed: {box['err']}")
+            return None
+        if 'res' not in box:
+            return None
+        env = box['res']['env']
+        for m in box['res'].get('messages', ()):
+            self.log_message(m)
+        for w in env.warnings:
+            self.log_message(f"  ⚠ Weather: {w}")
+        if self._site_key(env.settings) == self._site_key(self.site_settings()):
+            self.environment = env
+            self.weather_timeline = env.timeline()
+            self._light_day = None
+        self._weather_summary = env.summary()
+        return env
+
+    def _export_weather(self, output_dir, db_name, skip_existing=False):
+        """Write {db}_weather.csv and {db}_daylight.csv. Returns False to abort."""
+        s = self.site_settings()
+        w_name, d_name = f'{db_name}_weather.csv', f'{db_name}_daylight.csv'
+        if not s.has_location:
+            self.log_message(
+                "Weather export skipped: set the site's latitude/longitude "
+                "in Preview → Weather Settings….")
+            return True
+        w_path = os.path.join(csv_output_dir(output_dir, create=True), w_name)
+        d_path = os.path.join(csv_output_dir(output_dir, create=True), d_name)
+        if skip_existing and os.path.exists(w_path) and os.path.exists(d_path):
+            self.log_message(f"Skipped (exists): {w_name}, {d_name}")
+            return True
+
+        env = self._fetch_environment_now(s)
+        if env is None:
+            return True
+
+        wf = WX.export_frame(env)
+        if len(wf):
+            dup = wf.duplicated(['source', 'timestamp']).sum()
+            mono = all(g['timestamp'].is_monotonic_increasing
+                       for _k, g in wf.groupby('source'))
+            rh = wf['rh_pct'].dropna()
+            temp = wf['temp_c'].dropna()
+            self.log_audit(w_name, [
+                (bool(dup == 0), "one record per source per timestamp"),
+                (bool(mono), "records are in time order within each source"),
+                (bool(((rh >= 0) & (rh <= 105)).all()),
+                 "relative humidity within 0-105%"),
+                (bool(((temp > -70) & (temp < 65)).all()),
+                 "air temperature within -70..65 °C"),
+                (True, "sources: " + ", ".join(
+                    f"{k} ({v:,})" for k, v in wf['source'].value_counts().items())),
+            ])
+            if not self.write_verified_csv(wf, w_path, self._WEATHER_NUMERIC_COLS):
+                return False
+            self.log_message(f"✓ Exported {w_name} ({len(wf):,} records)")
+        elif env.frames:
+            self.log_message(f"{w_name}: the selected sources returned no "
+                             "records for this recording.")
+        else:
+            self.log_message(f"{w_name} not written: no weather or sunlight "
+                             "source selected (sun position only).")
+
+        dl = WX.daylight_table(s.latitude, s.longitude,
+                               self.combo_timezone.currentText(),
+                               env.start_ns, env.end_ns)
+        for col in dl.columns:
+            if pd.api.types.is_datetime64_any_dtype(dl[col]):
+                dl[col] = dl[col].dt.round('s')
+        if not self.write_verified_csv(dl, d_path, ('Day', 'day_length_h',
+                                                    'max_elevation_deg')):
+            return False
+        self.log_message(f"✓ Exported {d_name} ({len(dl)} day(s))")
+
+        sky_name = f'{db_name}_sky.csv'
+        sky = WX.sky_frame(env)
+        if len(sky):
+            basis = sky['sky_basis'].replace('', 'unknown').value_counts()
+            self.log_audit(sky_name, [
+                (bool(sky['timestamp'].is_monotonic_increasing
+                      and not sky['timestamp'].duplicated().any()),
+                 "one row per minute, in time order"),
+                (bool(sky['sky_state'].isin(WX.SKY_STATES).all()),
+                 "every sky state is a known one"),
+                (bool((sky.loc[sky['raining'], 'sky_state'].isin(
+                    ('light_rain', 'rain', 'heavy_rain', 'snow', 'mixed',
+                     'thunderstorm'))).all()),
+                 "every raining minute is shown as precipitation"),
+                (True, "basis: " + ", ".join(
+                    f"{k} {100 * v / len(sky):.0f}%" for k, v in basis.items())),
+            ])
+            sky_path = os.path.join(csv_output_dir(output_dir, create=True),
+                                    sky_name)
+            if not self.write_verified_csv(sky, sky_path, self._SKY_NUMERIC_COLS):
+                return False
+            self.log_message(f"✓ Exported {sky_name} ({len(sky):,} minutes)")
+        self.save_config(output_dir)
+        return True
 
     def _build_preview_options_group(self):
         """All preview configuration, as a group for the left settings column.
@@ -5198,11 +7671,19 @@ class UWBQuickVisualizationWindow(QWidget):
         v.addWidget(self.lbl_background_status)
 
         self.chk_show_background = QCheckBox("Show background image")
-        self.chk_show_background.setChecked(True)
+        # OFF by default. The XML's embedded site map is a fallback background
+        # nobody asked for, and it is often a bare render that does not land on
+        # the surveyed frame — drawing it uninvited put a stray rectangle under
+        # every figure. Loading a floorplan yourself ticks this on.
+        self.chk_show_background.setChecked(False)
         self.chk_show_background.setToolTip(
-            "Toggle the loaded floorplan/background image in the LIVE PREVIEW "
-            "only, without unloading it. Exported plots and animations take "
-            "their layers from the dialog shown when you click Export.")
+            "Draw the site map under the tracks: the loaded floorplan image if "
+            "there is one, otherwise the map embedded in the site XML. Turning "
+            "it off hides it without unloading it.\n\n"
+            "Off by default; loading a floorplan turns it on. Use Background "
+            "alignment to register the image onto the anchors and tracks.\n\n"
+            "Exported plots and animations inherit this — what the preview "
+            "shows is what they draw. Greyed out when there is no image.")
         self.chk_show_background.stateChanged.connect(self.on_show_background_toggled)
         v.addWidget(self.chk_show_background)
 
@@ -5215,11 +7696,14 @@ class UWBQuickVisualizationWindow(QWidget):
         # XML; live values feed the preview AND exported plots/animation.
         self._bg_transform_box = QGroupBox("Background alignment")
         self._bg_transform_box.setToolTip(
-            "Rescale and reposition the loaded background image so it lines up "
-            "with the anchors and tracks. Scale is inches per pixel (larger = "
-            "bigger image); offsets shift the image's bottom-left corner in "
-            "metres. Defaults come from the site XML. Anchors/tracks use "
-            "absolute coordinates and never move.")
+            "Rescale and reposition the background so it lines up with the "
+            "anchors and tracks. Applies to the loaded floorplan, or to the "
+            "site map embedded in the XML when no floorplan is loaded. Scale is "
+            "inches per pixel (larger = bigger image); offsets shift the "
+            "image's bottom-left corner in metres. Defaults come from the site "
+            "XML. Anchors/tracks use absolute coordinates and never move, and "
+            "there is no rotation control — a rotated render can only be "
+            "approximated.")
         bg_tf = QGridLayout()
         bg_tf.setContentsMargins(6, 2, 6, 2)
         bg_tf.addWidget(QLabel("Scale (in/px):"), 0, 0)
@@ -5346,12 +7830,13 @@ class UWBQuickVisualizationWindow(QWidget):
 
         self.chk_show_anchors = QCheckBox("Show anchor positions")
         self.chk_show_anchors.setChecked(True)
-        self.chk_show_anchors.setEnabled(False)
+        self.chk_show_anchors.setEnabled(False)   # enabled once anchors are parsed
         self.chk_show_anchors.stateChanged.connect(self.on_show_background_toggled)
         self.chk_show_anchors.setToolTip(
-            "Draw UWB anchor/antenna positions as triangles in the LIVE PREVIEW "
-            "only. Exported plots/animations take their layers from the dialog "
-            "shown when you click Export. Anchors are parsed from the XML config."
+            "Draw the UWB anchor/antenna positions as triangles. Anchors are "
+            "parsed from the XML config.\n\n"
+            "Exported plots and animations inherit this — what the preview "
+            "shows is what they draw. Greyed out when the XML has no anchors."
         )
         v.addWidget(self.chk_show_anchors)
 
@@ -5359,10 +7844,150 @@ class UWBQuickVisualizationWindow(QWidget):
         self.chk_show_zones.setChecked(True)
         self.chk_show_zones.setEnabled(False)   # enabled once XML zones are parsed
         self.chk_show_zones.setToolTip(
-            "Draw the XML-derived zone polygons over the 2D preview, in their "
-            "authored colours. Preview only. Zones are parsed from the site XML.")
+            "Draw the XML-derived zone polygons in their authored colours.\n\n"
+            "Exported plots and animations inherit this — what the preview "
+            "shows is what they draw. Greyed out when the site XML defines no "
+            "zones.")
         self.chk_show_zones.stateChanged.connect(self.on_show_background_toggled)
         v.addWidget(self.chk_show_zones)
+
+        # ── Regions of interest ──────────────────────────────────────
+        # Drawn here rather than in Wiser because Wiser makes you place a zone
+        # against the raw fix stream, which is far too noisy to trace a real
+        # boundary from. Over the preview the smoothed track and the site map
+        # are both visible, and the view can be zoomed into the corner being
+        # placed.
+        self.chk_show_rois = QCheckBox("Show regions of interest")
+        self.chk_show_rois.setChecked(True)
+        self.chk_show_rois.setToolTip(
+            "Draw the regions you have marked out below.\n\n"
+            "These are yours, not the site XML's - they are stored in this "
+            "trial's fnt_config.json and never written back to the XML.\n\n"
+            "Exported plots and animations inherit this, so what the preview "
+            "shows is what they draw.")
+        self.chk_show_rois.stateChanged.connect(self.on_rois_changed)
+        v.addWidget(self.chk_show_rois)
+
+        self.roi_list = QListWidget()
+        self.roi_list.setToolTip(
+            "Every region drawn for this trial, with its corner count and "
+            "area. Select one to recolour it, change its line width, rename "
+            "it or delete it.\n"
+            "\n"
+            "DRAG A ROW to set precedence. Where regions overlap, a fix is "
+            "credited to whichever sits HIGHER in this list, and to that one "
+            "only. Drag a big containing region (an arena boundary, say) to "
+            "the bottom so the smaller regions inside it are counted first.\n"
+            "\n"
+            "Right-clicking a region in the preview itself offers the same "
+            "options plus Move, Modify points and Copy.")
+        self.roi_list.setMaximumHeight(96)
+        # Precedence IS list order, so the list is the control that sets it:
+        # drag a row and the region list is reordered to match. This replaced
+        # a pairwise "which of these two wins?" modal, which asked once per
+        # overlapping PAIR — unanswerable as a stream of yes/no questions once
+        # a containing region overlaps every other one.
+        self.roi_list.setDragDropMode(QAbstractItemView.InternalMove)
+        self.roi_list.setDefaultDropAction(Qt.MoveAction)
+        self.roi_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.roi_list.model().rowsMoved.connect(self._on_roi_rows_moved)
+        self.roi_list.currentRowChanged.connect(self._on_roi_selected)
+        self.roi_list.itemDoubleClicked.connect(lambda _i: self.rename_roi())
+        v.addWidget(self.roi_list)
+
+        # Says what the order MEANS, but only while it means something. With
+        # nothing overlapping, precedence changes no number and a standing
+        # instruction to drag rows would be noise.
+        self.lbl_roi_overlap = QLabel("")
+        self.lbl_roi_overlap.setStyleSheet("color: #9fb3c8; font-size: 9px;")
+        self.lbl_roi_overlap.setWordWrap(True)
+        self.lbl_roi_overlap.setVisible(False)
+        v.addWidget(self.lbl_roi_overlap)
+
+        roi_btns = QHBoxLayout()
+        self.btn_roi_draw = QPushButton("Draw new")
+        self.btn_roi_draw.setToolTip(
+            "Start a new region, then click in the preview to place its "
+            "corners.\n\n"
+            "WHILE DRAWING:\n"
+            "  left click - place a corner\n"
+            "  right click / Backspace - take the last one back\n"
+            "  scroll wheel - zoom about the cursor, so a corner can be "
+            "placed exactly\n"
+            "  middle drag - pan (the left button is placing corners)\n"
+            "  double click or Enter - close the polygon\n"
+            "  Esc - abandon it\n\n"
+            "Needs at least three corners; anything less is discarded.\n"
+            "\n"
+            "ONCE DRAWN: right-click a region in the preview for Move, Modify "
+            "points, Copy, Rename, Colour and Delete.")
+        self.btn_roi_draw.clicked.connect(self.start_roi_draw)
+        roi_btns.addWidget(self.btn_roi_draw)
+        self.btn_roi_rename = QPushButton("Rename")
+        self.btn_roi_rename.setToolTip(
+            "Rename the selected region. The name is what labels it in the "
+            "preview and in exported figures.")
+        self.btn_roi_rename.clicked.connect(self.rename_roi)
+        roi_btns.addWidget(self.btn_roi_rename)
+        self.btn_roi_delete = QPushButton("Delete")
+        self.btn_roi_delete.setToolTip(
+            "Remove the selected region from this trial.\n"
+            "\n"
+            "It goes from the preview, from exported plots and animations, "
+            "and from the occupancy outputs - a region that is not here is "
+            "not measured. The change is written to this trial's "
+            "fnt_config.json straight away, so it outlives the window; "
+            "re-drawing it is the only way back.\n"
+            "\n"
+            "Only this trial is affected. Regions are never shared between "
+            "trials, so deleting one here cannot touch another recording.")
+        self.btn_roi_delete.clicked.connect(self.delete_roi)
+        roi_btns.addWidget(self.btn_roi_delete)
+        self.btn_roi_import_xml = QPushButton("Import XML")
+        self.btn_roi_import_xml.setToolTip(ROI_IMPORT_XML_TOOLTIP)
+        # No trial is loaded yet, so there is nothing to import; the layer
+        # sync turns it on when an XML with zones arrives.
+        self.btn_roi_import_xml.setEnabled(bool(self.xml_zones))
+        self.btn_roi_import_xml.clicked.connect(self.import_xml_zones)
+        roi_btns.addWidget(self.btn_roi_import_xml)
+        for _b in (self.btn_roi_draw, self.btn_roi_rename, self.btn_roi_delete,
+                   self.btn_roi_import_xml):
+            _b.setStyleSheet("QPushButton { padding: 4px 8px; min-width: 0px; "
+                             "font-weight: normal; }")
+            _f = _b.font(); _f.setPointSize(8); _f.setBold(False); _b.setFont(_f)
+        v.addLayout(roi_btns)
+
+        roi_style = QHBoxLayout()
+        roi_style.addWidget(QLabel("Colour:"))
+        self.btn_roi_color = QPushButton("")
+        self.btn_roi_color.setFixedSize(34, 18)
+        self.btn_roi_color.setToolTip(
+            "Colour of the selected region - its outline, its label and its "
+            "wash. With none selected this sets the colour the next region "
+            "will be drawn in.")
+        self.btn_roi_color.clicked.connect(self.pick_roi_color)
+        roi_style.addWidget(self.btn_roi_color)
+        roi_style.addSpacing(8)
+        roi_style.addWidget(QLabel("Line:"))
+        self.spin_roi_width = QDoubleSpinBox()
+        self.spin_roi_width.setRange(0.5, 10.0)
+        self.spin_roi_width.setSingleStep(0.5)
+        self.spin_roi_width.setDecimals(1)
+        self.spin_roi_width.setValue(2.0)
+        self.spin_roi_width.setFixedWidth(64)
+        self.spin_roi_width.setToolTip(
+            "Outline width in points for the selected region, or for the next "
+            "one drawn when none is selected.")
+        self.spin_roi_width.valueChanged.connect(self._on_roi_width_changed)
+        roi_style.addWidget(self.spin_roi_width)
+        roi_style.addStretch(1)
+        v.addLayout(roi_style)
+
+        self.lbl_roi_hint = QLabel("")
+        self.lbl_roi_hint.setWordWrap(True)
+        self.lbl_roi_hint.setStyleSheet("color:#e5c07b; font-size: 9px;")
+        self.lbl_roi_hint.setVisible(False)
+        v.addWidget(self.lbl_roi_hint)
 
         # Show the tag's ID label above each marker, with a choice of ID format.
         tagid_row = QHBoxLayout()
@@ -5371,19 +7996,24 @@ class UWBQuickVisualizationWindow(QWidget):
         self.chk_show_tag_id.setToolTip(
             "Label each tag in the preview with its ID (above the marker). The "
             "label is tinted to the marker colour under 'Color by: Sex/ID'.")
-        self.chk_show_tag_id.stateChanged.connect(self.on_show_background_toggled)
+        self.chk_show_tag_id.stateChanged.connect(self.on_marker_style_changed)
         self.chk_show_tag_id.stateChanged.connect(self._sync_anim_show_options)
         tagid_row.addWidget(self.chk_show_tag_id)
         self.combo_tag_id_type = QComboBox()
-        self.combo_tag_id_type.addItems(["Display ID", "HexID", "ShortID"])
-        self.combo_tag_id_type.setCurrentText("Display ID")
+        self.combo_tag_id_type.addItems(list(ID_DISPLAY_TYPES))
+        self.combo_tag_id_type.setCurrentText(SEX_ID)
         self.combo_tag_id_type.setToolTip(
-            "Which ID to show:\n"
-            "• Display ID: sex + configured identity (e.g. M9627) — the label "
-            "used throughout the tool.\n"
+            "Which ID to show (the video's labels follow this too):\n"
+            "• SexID: sex + configured ID (e.g. F9905) — the key every export "
+            "and analysis uses.\n"
+            "• Name: the animal's name from Configure Identities (e.g. Hera).\n"
+            "• Code: the animal's short code from Configure Identities (e.g. HER).\n"
             "• HexID: the tag's short address in hexadecimal (e.g. 2A).\n"
-            "• ShortID: the decimal tag id as stored in the SQL database (e.g. 42).")
-        self.combo_tag_id_type.currentTextChanged.connect(self.on_show_background_toggled)
+            "• ShortID: the decimal tag id as stored in the SQL database (e.g. 42).\n"
+            "\n"
+            "An animal with no Name/Code configured falls back to its SexID; "
+            "a tag with no identity at all falls back to its HexID.")
+        self.combo_tag_id_type.currentTextChanged.connect(self.on_marker_style_changed)
         tagid_row.addWidget(self.combo_tag_id_type, 1)
         v.addLayout(tagid_row)
 
@@ -5392,8 +8022,137 @@ class UWBQuickVisualizationWindow(QWidget):
         self.chk_show_battery.setToolTip(
             "Show each tag's current battery voltage in small black text under "
             "its marker. Independent of 'Show Tag ID'. Off by default.")
-        self.chk_show_battery.stateChanged.connect(self.on_show_background_toggled)
+        self.chk_show_battery.stateChanged.connect(self.on_marker_style_changed)
         v.addWidget(self.chk_show_battery)
+
+        # Weather and sunlight for the playhead, from Site & Weather.
+        wx_row = QHBoxLayout()
+        self.chk_show_weather = QCheckBox("Show Weather")
+        self.chk_show_weather.setChecked(False)
+        self.chk_show_weather.setToolTip(
+            "Print the weather at the playhead under the timestamp: "
+            "temperature, humidity, wind, pressure and precipitation, from "
+            "the source chosen in Weather Settings… (press Fetch Weather "
+            "there first).\n\n"
+            "PRECIPITATION leads the line and is highlighted: RAIN, SNOW or "
+            "RAIN/SNOW with its rate. Open-Meteo reports rain and snowfall "
+            "separately; for a station the kind is estimated from the "
+            "wet-bulb temperature and marked (est.). A tipping-bucket gauge "
+            "only registers snow as it melts. SURFRAD has no precipitation "
+            "sensor.\n\n"
+            "Each value is the source's average for the interval containing "
+            "the moment shown (1 min SURFRAD, ~5 min WeatherLink, 15 min "
+            "Open-Meteo). A gap in the record is flagged with its age rather "
+            "than shown as current.")
+        self.chk_show_light_bar = QCheckBox("Show Light Bar")
+        self.chk_show_light_bar.setChecked(False)
+        self.chk_show_light_bar.setToolTip(
+            "A strip under the timestamp spanning the current local day, "
+            "brightening and darkening with the sunlight; the red mark is the "
+            "playhead. Measured irradiance when a sunlight source was fetched, "
+            "clear-sky from the sun's position otherwise, with a dim glow "
+            "through civil/nautical/astronomical twilight.\n\n"
+            "MOON: stretches of night with the moon up are tinted silver in "
+            "proportion to how full and how high it is, and the icon at the "
+            "right end shows the current phase (faded while the moon is "
+            "below the horizon). The readout gives its illuminated fraction, "
+            "phase name and elevation.\n\n"
+            "Needs only the site's latitude/longitude.")
+        for cb in (self.chk_show_weather, self.chk_show_light_bar):
+            cb.stateChanged.connect(self._update_weather_display)
+            cb.stateChanged.connect(self._sync_anim_show_options)
+            cb.stateChanged.connect(self._sync_weather_button)
+            cb.clicked.connect(self._on_weather_toggle_clicked)
+            wx_row.addWidget(cb)
+        wx_row.addStretch(1)
+        self.btn_weather_settings = QPushButton("Weather Settings…")
+        self.btn_weather_settings.setToolTip(self._WEATHER_BUTTON_TIP)
+        self.btn_weather_settings.setEnabled(False)
+        self.btn_weather_settings.clicked.connect(self.open_weather_settings)
+        wx_row.addWidget(self.btn_weather_settings)
+        v.addLayout(wx_row)
+
+        # Per-fix kinematics under the marker, measured on the track AS DRAWN:
+        # they follow the smoothing method, and "None" makes them the unsmoothed
+        # fixes. This means they are not what the velocity and jump thresholds
+        # see (those run before smoothing) — the summary line under those
+        # thresholds is the readout for that question.
+        self.chk_show_speed = QCheckBox("Display Speed (m/s)")
+        self.chk_show_speed.setChecked(False)
+        self.chk_show_speed.setToolTip(
+            "Show each tag's speed from its previous fix, under the marker, "
+            "over the real elapsed time between them.\n\n"
+            "Measured on the track as drawn, so it follows the smoothing "
+            "method — set that to None to read the unsmoothed fixes. Heavy "
+            "smoothing depresses these numbers substantially.\n\n"
+            "Blank at the first fix after a Time gap, which has no predecessor.")
+        self.chk_show_speed.stateChanged.connect(self.on_marker_style_changed)
+        v.addWidget(self.chk_show_speed)
+
+        self.chk_show_step = QCheckBox("Display Step Distance (m)")
+        self.chk_show_step.setChecked(False)
+        self.chk_show_step.setToolTip(
+            "Show how far each tag moved from its previous fix, under the "
+            "marker.\n\n"
+            "Measured on the track as drawn, so it follows the smoothing "
+            "method — set that to None to read the unsmoothed fixes.\n\n"
+            "Blank at the first fix after a Time gap, which has no predecessor.")
+        self.chk_show_step.stateChanged.connect(self.on_marker_style_changed)
+        v.addWidget(self.chk_show_step)
+
+        # Text colour for the per-tag readouts. The battery line used to be
+        # hard-coded black and the speed/step line followed the THEME - both of
+        # which assume the figure background is what sits behind the text. It
+        # is not: a floorplan image does, and a dark arena over a light theme
+        # put black text on a black background.
+        label_row = QHBoxLayout()
+        label_row.addWidget(QLabel("Label colour:"))
+        self.combo_label_color = QComboBox()
+        self.combo_label_color.addItem("Auto", None)
+        for _name, _hex in (("White", "#ffffff"), ("Black", "#000000"),
+                            ("Yellow", "#ffe066"), ("Cyan", "#4dd2ff"),
+                            ("Magenta", "#ff6ec7"), ("Green", "#2ea043"),
+                            ("Orange", "#ff9f40"), ("Grey", "#9fb3c8")):
+            self.combo_label_color.addItem(_name, _hex)
+        self.combo_label_color.setCurrentIndex(0)
+        self.combo_label_color.setFixedWidth(90)
+        self.combo_label_color.setToolTip(
+            "Colour of the per-tag readouts drawn under each marker: battery "
+            "voltage, speed and step distance.\n"
+            "\n"
+            "AUTO follows the light/dark theme, which is right over a plain "
+            "figure but not necessarily over a background image. Pick a "
+            "colour that reads against YOUR floorplan.\n"
+            "\n"
+            "The tag ID and the behaviour state keep their own colours - "
+            "those carry meaning (ID is tinted by 'Color by', state by which "
+            "behaviour fired) and overriding them would throw it away. Use "
+            "the outline below to keep them legible instead.\n"
+            "\n"
+            "Exported animations inherit this, so the video reads like the "
+            "preview.")
+        self.combo_label_color.currentIndexChanged.connect(
+            self.on_marker_style_changed)
+        label_row.addWidget(self.combo_label_color)
+        label_row.addSpacing(8)
+        self.chk_label_outline = QCheckBox("Outline")
+        self.chk_label_outline.setChecked(True)
+        self.chk_label_outline.setToolTip(
+            "Draw a thin contrasting halo around every per-tag label.\n"
+            "\n"
+            "This is what actually makes text survive an arbitrary background "
+            "image: the halo is the opposite of the text colour, so light "
+            "text gets a dark edge and dark text a light one, and neither can "
+            "vanish into whatever it happens to be drawn over.\n"
+            "\n"
+            "Applies to the tag ID and behaviour state as well as the "
+            "readouts, so the colour-coded text stays readable without losing "
+            "its colour coding.")
+        self.chk_label_outline.stateChanged.connect(
+            self.on_marker_style_changed)
+        label_row.addWidget(self.chk_label_outline)
+        label_row.addStretch(1)
+        v.addLayout(label_row)
 
         self.chk_show_tracking = QCheckBox("Show Tag Tracking Data")
         self.chk_show_tracking.setChecked(True)
@@ -5401,7 +8160,7 @@ class UWBQuickVisualizationWindow(QWidget):
             "Draw the tag position markers and trailing tracks in the LIVE "
             "PREVIEW. Turn off to inspect just the arena / background / anchors "
             "without any tracking data on top.")
-        self.chk_show_tracking.stateChanged.connect(self.on_show_background_toggled)
+        self.chk_show_tracking.stateChanged.connect(self.on_marker_style_changed)
         self.chk_show_tracking.stateChanged.connect(self._sync_anim_show_options)
         v.addWidget(self.chk_show_tracking)
 
@@ -5418,7 +8177,7 @@ class UWBQuickVisualizationWindow(QWidget):
             "Diameter (in points) of each tag's position marker in the preview. "
             "Set the same value in the animation export's 'Tag Icon Size' to "
             "make the video markers match what you see here.")
-        self.spin_tag_size.valueChanged.connect(self.on_show_background_toggled)
+        self.spin_tag_size.valueChanged.connect(self.on_marker_style_changed)
         tagsize_row.addWidget(self.spin_tag_size)
         tagsize_row.addStretch(1)
         v.addLayout(tagsize_row)
@@ -5452,6 +8211,22 @@ class UWBQuickVisualizationWindow(QWidget):
         disp_row.addStretch()
         v.addLayout(disp_row)
 
+        self.chk_preview_trail_points = QCheckBox("Show each fix along the trail")
+        self.chk_preview_trail_points.setStyleSheet("margin-left:18px;")
+        self.chk_preview_trail_points.setToolTip(
+            "Mark every surviving fix on the trail with a dot, instead of "
+            "drawing the path as a bare line.\n"
+            "\n"
+            "This is the honest view of what the thresholds left: the line "
+            "between two dots is drawn, not measured, so a long straight "
+            "stretch with no dots on it is a stretch where the fixes were "
+            "removed — a gap the eye otherwise reads as smooth travel.\n"
+            "\n"
+            "Covers the same span as Trail length above.")
+        self.chk_preview_trail_points.stateChanged.connect(
+            self.on_preview_trail_points_changed)
+        v.addWidget(self.chk_preview_trail_points)
+
 
         # Preview thresholding — independent of the Export thresholds, so you can
         # see the track with/without each applied AND tune the cutoff live. Each
@@ -5471,12 +8246,59 @@ class UWBQuickVisualizationWindow(QWidget):
         time_gap_layout.addStretch()
         v.addLayout(time_gap_layout)
 
+        # The three thresholds, laid out in the order apply_filters_to_data
+        # APPLIES them: Hampel first (the only one that survives a run of
+        # consecutive ghosts), then velocity, then jump. Reading the panel
+        # top to bottom is reading the pipeline in order, and the live
+        # figures underneath are counted the same way.
+        #
+        # Velocity and jump both test arrays computed before either runs, so
+        # swapping those two changes which line gets the credit, not what
+        # survives. Hampel genuinely must be first: it clears ghosts before
+        # the step tests can condemn the innocent fix that follows one.
+
+        pout_row = QHBoxLayout()
+        self.chk_preview_outlier = QCheckBox("Hampel threshold (remove >")
+        self.chk_preview_outlier.setChecked(True)
+        self.chk_preview_outlier.setToolTip(OUTLIER_FILTER_TOOLTIP)
+        self.chk_preview_outlier.stateChanged.connect(self.invalidate_preview_cache)
+        pout_row.addWidget(self.chk_preview_outlier)
+        self.spin_preview_outlier_sigma = QDoubleSpinBox()
+        self.spin_preview_outlier_sigma.setRange(1.0, 20.0)
+        self.spin_preview_outlier_sigma.setValue(6.0)
+        self.spin_preview_outlier_sigma.setDecimals(1)
+        self.spin_preview_outlier_sigma.setSingleStep(0.5)
+        self.spin_preview_outlier_sigma.setSuffix(" MAD)")
+        self.spin_preview_outlier_sigma.setToolTip(OUTLIER_SIGMA_TOOLTIP)
+        self.spin_preview_outlier_sigma.valueChanged.connect(
+            self.invalidate_preview_cache)
+        pout_row.addWidget(self.spin_preview_outlier_sigma)
+        pout_row.addWidget(QLabel("over"))
+        self.spin_preview_outlier_window = QSpinBox()
+        self.spin_preview_outlier_window.setRange(5, 501)
+        self.spin_preview_outlier_window.setSingleStep(2)
+        self.spin_preview_outlier_window.setValue(31)
+        self.spin_preview_outlier_window.setSuffix(" points")
+        self.spin_preview_outlier_window.setFixedWidth(90)
+        self.spin_preview_outlier_window.setToolTip(OUTLIER_WINDOW_TOOLTIP)
+        self.spin_preview_outlier_window.valueChanged.connect(
+            self.invalidate_preview_cache)
+        pout_row.addWidget(self.spin_preview_outlier_window)
+        pout_row.addStretch()
+        v.addLayout(pout_row)
+
         pvel_row = QHBoxLayout()
         self.chk_preview_velocity = QCheckBox("Velocity threshold (remove >")
         self.chk_preview_velocity.setChecked(True)
         self.chk_preview_velocity.setToolTip(
             "Apply a velocity threshold to the PREVIEW track. Toggle to compare "
-            "with/without; adjust the value to see the cutoff's effect live.")
+            "with/without; adjust the value to see the cutoff's effect live.\n"
+            "\n"
+            "RUNS SECOND, after the outlier threshold and before the jump "
+            "threshold, and only ever sees the fixes the one before it left. "
+            "The live figures underneath are counted the same way, so the "
+            "three percentages add up instead of each claiming the same wild "
+            "fix.")
         self.chk_preview_velocity.stateChanged.connect(self.invalidate_preview_cache)
         pvel_row.addWidget(self.chk_preview_velocity)
         self.spin_preview_velocity = QDoubleSpinBox()
@@ -5486,18 +8308,57 @@ class UWBQuickVisualizationWindow(QWidget):
         self.spin_preview_velocity.setDecimals(1)
         self.spin_preview_velocity.setSingleStep(0.1)
         self.spin_preview_velocity.setToolTip(
-            "Remove preview fixes whose speed from the previous fix exceeds this.")
+            "Remove preview fixes whose speed exceeds this.\n"
+            "\n"
+            "Speed is the distance from the previous fix divided by the "
+            "interval between them - but NOT the raw interval: it is floored "
+            "by the box below, because this system can report a millisecond "
+            "apart and dividing a few centimetres of noise by a millisecond "
+            "gives tens of m/s.\n"
+            "\n"
+            "Watch the live line underneath while you set this. If the fixes "
+            "it is cutting have a small median STEP, the threshold is "
+            "removing tightly spaced reports rather than fast movement, and "
+            "the time base below is the control to reach for.")
         self.spin_preview_velocity.valueChanged.connect(self.invalidate_preview_cache)
         pvel_row.addWidget(self.spin_preview_velocity)
         pvel_row.addStretch()
         v.addLayout(pvel_row)
+
+        # Minimum time base for the velocity threshold, right under it so the
+        # pair reads as one setting: "faster than X, measured over at least Y".
+        pvmin_row = QHBoxLayout()
+        pvmin_row.setContentsMargins(22, 0, 0, 0)
+        pvmin_row.addWidget(QLabel("measured over at least"))
+        self.spin_preview_velocity_min_dt = QDoubleSpinBox()
+        self.spin_preview_velocity_min_dt.setRange(0.0, 10.0)
+        self.spin_preview_velocity_min_dt.setDecimals(2)
+        self.spin_preview_velocity_min_dt.setSingleStep(0.05)
+        self.spin_preview_velocity_min_dt.setValue(0.50)
+        self.spin_preview_velocity_min_dt.setSuffix(" s")
+        self.spin_preview_velocity_min_dt.setFixedWidth(84)
+        self.spin_preview_velocity_min_dt.setToolTip(VELOCITY_MIN_DT_TOOLTIP)
+        self.spin_preview_velocity_min_dt.valueChanged.connect(
+            self.invalidate_preview_cache)
+        pvmin_row.addWidget(self.spin_preview_velocity_min_dt)
+        pvmin_row.addStretch()
+        v.addLayout(pvmin_row)
 
         pjump_row = QHBoxLayout()
         self.chk_preview_jump = QCheckBox("Jump threshold (remove >")
         self.chk_preview_jump.setChecked(True)
         self.chk_preview_jump.setToolTip(
             "Apply a distance-jump threshold to the PREVIEW track. Toggle to "
-            "compare with/without; adjust the value to see the cutoff's effect live.")
+            "compare with/without; adjust the value to see the cutoff's "
+            "effect live.\n"
+            "\n"
+            "RUNS LAST, on whatever the outlier and velocity thresholds left. "
+            "On its own it cannot contain a RUN of consecutive ghosts - it "
+            "measures the distance INTO each fix, so the second ghost looks "
+            "like a small step from the first and survives, while the honest "
+            "fix after the run is deleted in its place. That is what the "
+            "outlier threshold is for; this one is the backstop for a single "
+            "wild fix.")
         self.chk_preview_jump.stateChanged.connect(self.invalidate_preview_cache)
         pjump_row.addWidget(self.chk_preview_jump)
         self.spin_preview_jump = QDoubleSpinBox()
@@ -5508,11 +8369,85 @@ class UWBQuickVisualizationWindow(QWidget):
         self.spin_preview_jump.setSingleStep(0.1)
         self.spin_preview_jump.setToolTip(
             "Remove preview fixes that leap more than this distance from the "
-            "previous fix.")
+            "previous fix.\n"
+            "\n"
+            "A pure distance test, with no division by time, so unlike the "
+            "velocity threshold it is unaffected by how closely spaced the "
+            "reports are. Set it to the furthest an animal could actually "
+            "travel between two fixes.\n"
+            "\n"
+            "A fix after a long gap legitimately lands far away, so the "
+            "Time gap setting above splits the track first and no step is "
+            "measured across a dropout.")
         self.spin_preview_jump.valueChanged.connect(self.invalidate_preview_cache)
         pjump_row.addWidget(self.spin_preview_jump)
         pjump_row.addStretch()
         v.addLayout(pjump_row)
+
+        # Last in the column because it runs last: it can only test the
+        # joins that the three thresholds above create by removing points.
+        # is in execution order.
+        padj_row = QHBoxLayout()
+        self.chk_preview_adjacency = QCheckBox("Excursion threshold (drop runs <")
+        self.chk_preview_adjacency.setChecked(True)
+        self.chk_preview_adjacency.setToolTip(ADJACENCY_FILTER_TOOLTIP)
+        self.chk_preview_adjacency.stateChanged.connect(self.invalidate_preview_cache)
+        padj_row.addWidget(self.chk_preview_adjacency)
+        self.spin_preview_excursion = QDoubleSpinBox()
+        self.spin_preview_excursion.setRange(0.5, 120.0)
+        self.spin_preview_excursion.setDecimals(1)
+        self.spin_preview_excursion.setSingleStep(0.5)
+        self.spin_preview_excursion.setValue(5.0)
+        self.spin_preview_excursion.setSuffix(" s)")
+        self.spin_preview_excursion.setFixedWidth(84)
+        self.spin_preview_excursion.setToolTip(ADJACENCY_FILTER_TOOLTIP)
+        self.spin_preview_excursion.valueChanged.connect(
+            self.invalidate_preview_cache)
+        padj_row.addWidget(self.spin_preview_excursion)
+        padj_row.addStretch()
+        v.addLayout(padj_row)
+
+        # What the thresholds above would do, as a small read-only report.
+        # A QLabel wrapped this into an unreadable paragraph; a monospace box
+        # keeps the columns aligned so the three can be compared at a glance.
+        #
+        # NoFocus matters: a focusable text box would sit in the tab order and
+        # swallow the space bar, which is the preview's play/pause key.
+        # Computed BEFORE thresholding, so it can count the fixes that get
+        # removed — the surviving track can no longer show them.
+        self.lbl_step_stats = QPlainTextEdit()
+        self.lbl_step_stats.setReadOnly(True)
+        self.lbl_step_stats.setFocusPolicy(Qt.NoFocus)
+        self.lbl_step_stats.setFrameShape(QFrame.StyledPanel)
+        self.lbl_step_stats.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.lbl_step_stats.setFixedHeight(122)
+        self.lbl_step_stats.setStyleSheet(
+            "QPlainTextEdit { color: #9fb3c8; background-color: #232323; "
+            "border: 1px solid #3f3f3f; border-radius: 4px; "
+            "font-family: Consolas, 'DejaVu Sans Mono', monospace; "
+            "font-size: 9px; }")
+        self.lbl_step_stats.setToolTip(
+            "The distribution of step distances and speeds across the chunk in "
+            "view, and how many fixes each threshold removes from it.\n\n"
+            "Measured on the PRE-SMOOTHING coordinates and before any "
+            "thresholding, because that is what the three thresholds are "
+            "applied to — so it counts the fixes that get filtered out, which "
+            "the surviving track can no longer show. It therefore does not "
+            "follow the smoothing method, unlike the per-tag readouts.\n\n"
+            "ONE LINE PER THRESHOLD, in the order they are applied - outlier, "
+            "then velocity, then jump - each counting only the fixes the ones "
+            "before it left. So the three counts add up to the total removed "
+            "rather than each claiming the same wild fix, and moving one "
+            "threshold changes what the ones after it have left to find. Each "
+            "line also says what the fixes it cut actually looked like, which "
+            "is how you tell a threshold that is catching ghosts from one "
+            "that is eating real movement.\n"
+            "\n"
+            "THE LAST LINE is the one to judge a setting by: how many fixes "
+            "survive, and the largest step into a surviving fix against what "
+            "it was before. That second number is what the smoother would "
+            "otherwise have had to chase.")
+        v.addWidget(self.lbl_step_stats)
 
         # Smoothing method: how the live track is drawn — None (actual fixes) or
         # a smoothing method, so you can compare before committing to export.
@@ -5625,20 +8560,6 @@ class UWBQuickVisualizationWindow(QWidget):
             self._beh_groups.append((checkbox, holder))
             return hl
 
-        # Locomotor
-        self.chk_beh_locomotor = QCheckBox("Locomotor state (inactive / moving)")
-        self.chk_beh_locomotor.setChecked(True)
-        self.chk_beh_locomotor.stateChanged.connect(self.render_preview_frame)
-        self.chk_beh_locomotor.stateChanged.connect(self._sync_anim_show_options)
-        bl.addWidget(self.chk_beh_locomotor)
-        gl = _beh_group(self.chk_beh_locomotor)
-        row, self.spin_still_speed = _beh_spin(
-            "Inactive below:", 0.0, 5.0, 0.005, 0.005, 4, " m/s",
-            "At or below this speed a tag reads as inactive; above it, moving. "
-            "Should sit above the position-noise floor - see the speed summary "
-            "below.")
-        gl.addLayout(row)
-
         # Social overlap
         self.chk_beh_social = QCheckBox("Social overlap")
         self.chk_beh_social.setChecked(True)
@@ -5653,7 +8574,15 @@ class UWBQuickVisualizationWindow(QWidget):
         row, self.spin_social_radius = _beh_spin(
             "Social radius:", 0.01, 5.0, 0.25, 0.05, 2, " m",
             "Radius of each animal's social circle. Overlap (contact) occurs "
-            "when two circles intersect, i.e. centre-to-centre <= 2x this.")
+            "when two circles intersect, i.e. centre-to-centre <= 2x this.\n"
+            "\n"
+            "This is the single source of truth for contact across every social "
+            "product: the Social Overlap Bouts CSV, the GBI and the edge list "
+            "are all computed at centre-to-centre <= 2x this radius.")
+        # Keep the hidden export mirror (centre-to-centre threshold) in step as
+        # soon as the radius changes, so the UI, fnt_config.json and the
+        # exported data can never disagree about the contact criterion.
+        self.spin_social_radius.valueChanged.connect(self._sync_export_from_preview)
         lab_col = QLabel("colour:")
         lab_col.setStyleSheet("font-size: 9px;")
         row.insertWidget(2, lab_col)
@@ -5900,7 +8829,13 @@ class UWBQuickVisualizationWindow(QWidget):
         # so the arrow keys resume scrubbing. Without this, focus left in a
         # spinbox in the settings column keeps swallowing the arrows, and the
         # only way to get scrubbing back is to click the slider itself.
-        if event.type() == QEvent.MouseButtonPress:
+        #
+        # EXCEPT while a region is being drawn or edited. Placing a corner is a
+        # click in the preview pane, so this rule moved focus to the slider on
+        # the very first corner and Enter never reached the canvas again - the
+        # canvas key handler was correct all along, it simply never got the
+        # key.
+        if event.type() == QEvent.MouseButtonPress and not self._roi_busy():
             panel = getattr(self, 'preview_panel', None)
             if panel is not None and isinstance(obj, QWidget):
                 node = obj
@@ -5911,6 +8846,42 @@ class UWBQuickVisualizationWindow(QWidget):
                     node = node.parentWidget()
             # never consume the click - panning and slider drags still need it
 
+        # Closing a polygon must not depend on where focus happens to sit, so
+        # the keys are read here rather than only on the focused canvas.
+        if event.type() == QEvent.KeyPress and self._roi_busy():
+            canvas = self.preview_canvas_2d
+            key = event.key()
+            if key in (Qt.Key_Return, Qt.Key_Enter):
+                if canvas._roi_mode:
+                    canvas.finish_roi()     # close from the last corner to the first
+                else:
+                    canvas.end_roi_edit()
+                return True
+            if key == Qt.Key_Escape:
+                if canvas._roi_mode:
+                    canvas.cancel_roi()
+                else:
+                    canvas.end_roi_edit()
+                return True
+            if key in (Qt.Key_Backspace, Qt.Key_Delete) and canvas._roi_mode:
+                canvas.undo_roi_point()
+                return True
+
+        # Space is play/pause, on the same terms as the arrows: not while a
+        # value editor has focus, and not while a button does either - there
+        # Space is that button's own activation and stealing it would make the
+        # keyboard unusable.
+        if (event.type() == QEvent.KeyPress
+                and event.key() == Qt.Key_Space
+                and getattr(self, '_preview_active', False)
+                and self.slider_timeline.maximum() > 0):
+            from PyQt5.QtWidgets import QAbstractButton
+            fw = QApplication.focusWidget()
+            if not isinstance(fw, (QAbstractSpinBox, QLineEdit, QComboBox,
+                                   QAbstractButton)):
+                self.toggle_preview_playback()
+                return True
+
         if (event.type() == QEvent.KeyPress
                 and event.key() in (Qt.Key_Left, Qt.Key_Right)
                 and getattr(self, '_preview_active', False)
@@ -5919,6 +8890,8 @@ class UWBQuickVisualizationWindow(QWidget):
             editing = isinstance(fw, (QAbstractSpinBox, QLineEdit))
             combo_open = isinstance(fw, QComboBox) and fw.view().isVisible()
             if not editing and not combo_open:
+                # Stepping by hand takes the playhead back from playback.
+                self.stop_preview_playback()
                 delta = -1 if event.key() == Qt.Key_Left else 1
                 self.slider_timeline.setValue(int(np.clip(
                     self.slider_timeline.value() + delta,
@@ -6098,6 +9071,7 @@ class UWBQuickVisualizationWindow(QWidget):
         """Rebuild arena geometry for the selected view mode and offsets."""
         if not hasattr(self, "combo_arena") or not hasattr(self, "chk_show_anchors"):
             return
+        self._sync_layer_toggles()
         mode = self.combo_view_mode.currentText()
         dx = self.spin_arena_dx.value()
         dy = self.spin_arena_dy.value()
@@ -6174,11 +9148,19 @@ class UWBQuickVisualizationWindow(QWidget):
         #     shown UPRIGHT, north at top, exactly as the file looks
         #   • the canvas expands the view to include the whole image so it is
         #     never clipped by the data-fit arena bounds
-        # Honour the show/hide toggle: only hand the canvas an image when the
-        # user has the background enabled.
-        show_bg = self.background_image is not None and self.chk_show_background.isChecked()
-        self.preview_canvas_2d.background_image = self.background_image if show_bg else None
-        self.preview_canvas_2d.bg_extent = self._bg_placed_extent() if show_bg else None
+        # ONE source for the background, the same one the exports use
+        # (_context_bg_source): the loaded floorplan if there is one, else the
+        # XML's embedded site map. Routed through the canvas's background_image
+        # rather than the arena's own map_image so that (a) the site map shows
+        # in every view mode, not only "XML (site map)", and (b) the show/hide
+        # toggle governs it — an export must never draw a map the preview
+        # silently withheld.
+        arena.map_image = None
+        arena.map_extent = None
+        bg_image, bg_extent = self._context_bg_source()
+        show_bg = bg_image is not None and self.chk_show_background.isChecked()
+        self.preview_canvas_2d.background_image = bg_image if show_bg else None
+        self.preview_canvas_2d.bg_extent = list(bg_extent) if show_bg else None
         if self.preview_canvas_3d is not None:
             self.preview_canvas_3d.set_arena(arena)
         self.render_preview_frame()
@@ -6215,6 +9197,8 @@ class UWBQuickVisualizationWindow(QWidget):
     # nothing; only where you stop is fetched, on a background thread.
     MAX_CACHED_CHUNKS = 6
     SCRUB_DEBOUNCE_MS = 70
+    # Longest a continuous drag or a held arrow key goes without a read.
+    SCRUB_MAX_WAIT_S = 0.30
 
     def preview_time_bounds(self, selected_tags):
         """(min_ts, max_ts) epoch-ms across the selected tags, or None."""
@@ -6441,6 +9425,33 @@ class UWBQuickVisualizationWindow(QWidget):
         start = self.preview_t0 + idx * c
         return start, start + c
 
+    def _preview_is_indexed(self):
+        """True when preview reads come off the fast indexed copy.
+
+        Reads against the ORIGINAL database are full table scans — there is no
+        index on (shortid, timestamp) in a Wiser export — so a 10-minute chunk
+        costs seconds to minutes instead of a fraction of a second. The copy is
+        rebuilt whenever the source changes, so a database re-downloaded daily
+        spends the first minutes of every session on the slow path.
+        """
+        return bool(self.preview_db_path) and self.preview_db_path != self.db_path
+
+    def _loading_status_text(self):
+        """Status line for a pending chunk, naming anything making it slow.
+
+        A slow load looks exactly like a hang: the clock and the weather line
+        keep updating (both are local arithmetic) while the animals stay frozen
+        at the last resident frame. Saying why turns that into a wait.
+        """
+        why = []
+        if not self._preview_is_indexed():
+            why.append("no fast index yet")
+        if getattr(self, 'exporting', False):
+            why.append("an export is reading the same database")
+        if why:
+            return "Loading… (" + ", ".join(why) + " — this may take a while)"
+        return "Loading…"
+
     def _resident_chunk_for(self, ts_ms):
         """Index of the cached chunk whose span contains ``ts_ms``, else None.
 
@@ -6458,7 +9469,15 @@ class UWBQuickVisualizationWindow(QWidget):
 
         ``_request_chunk`` no-ops for anything already cached or in flight, so
         calling this on every chunk switch is cheap and self-limiting.
+
+        Skipped while reads are slow: without the index each prefetch is another
+        full scan of a multi-GB table, and two of them compete for the same disk
+        as the chunk the user is actually waiting on — warming the neighbours
+        makes the current position land later, not sooner. Same during an
+        export, which streams the whole table and already owns the I/O.
         """
+        if not self._preview_is_indexed() or getattr(self, 'exporting', False):
+            return
         for nb in (idx + 1, idx - 1):
             if (nb >= 0 and nb not in self.preview_cache
                     and nb not in self.preview_inflight):
@@ -6520,7 +9539,7 @@ class UWBQuickVisualizationWindow(QWidget):
 
         if make_current:
             self.preview_pending_current = idx
-            self.lbl_preview_status.setText("Loading…")
+            self.lbl_preview_status.setText(self._loading_status_text())
 
         loader = PreviewChunkLoader(self.preview_db_path or self.db_path,
                                     self.table_name, tags, load_start, end, idx)
@@ -6560,6 +9579,21 @@ class UWBQuickVisualizationWindow(QWidget):
             self.preview_pending_current = None
             self.lbl_preview_status.setText(f"Load failed: {err}")
 
+    def _chunk_is_wanted(self, idx):
+        """Is a delivered chunk still worth processing?
+
+        The chunk the playhead sits in and its two neighbours are; anything
+        else the user has already scrubbed past. Measured on VT-P002: a single
+        drag across the timeline delivered 88 chunks of which 87 were stale,
+        and processing them cost 23 s of main-thread time — the drag itself
+        should have taken 3. That is what froze the animals in place while the
+        clock kept ticking, since the clock is a label and the scene is not.
+        """
+        if idx == self.preview_pending_current:
+            return True
+        here = self._chunk_index_for(self.preview_playhead_ms)
+        return abs(idx - here) <= 1
+
     def _on_chunk_loaded(self, idx, df):
         """Process a delivered slice on the main thread and cache it.
 
@@ -6567,6 +9601,11 @@ class UWBQuickVisualizationWindow(QWidget):
         read the settings widgets directly, and they are a negligible share of
         the cost (the SQL read dominates).
         """
+        if not self._chunk_is_wanted(idx):
+            # Drop it unprocessed: the playhead has moved on, and paying ~0.3 s
+            # of main-thread time for a chunk that will never be drawn is
+            # exactly the work that starves the one the user is waiting for.
+            return
         try:
             frames = self._process_chunk(df, idx) if df is not None and len(df) else None
         except Exception as e:
@@ -6594,16 +9633,42 @@ class UWBQuickVisualizationWindow(QWidget):
         timeline is linear in wall-clock time, so a position can land in dead
         air. Rather than showing an empty scene, find the next sample and move
         the playhead there.
+
+        The search runs on a worker: MIN/MAX over the tag set is instant on the
+        indexed copy but two full scans of a multi-GB original, and on the GUI
+        thread that froze the whole window — once per empty chunk — exactly
+        where a recording gap makes empty chunks most likely.
         """
         tags = self.selected_preview_tags()
         start, _ = self._chunk_bounds(idx)
-        try:
-            conn = connect_ro(self.preview_db_path or self.db_path)
-            nxt = self._nearest_sample_ts(conn, tags, start)
-            conn.close()
-        except Exception:
-            nxt = None
+        db = self.preview_db_path or self.db_path
+        table = self.table_name
+        self.lbl_preview_status.setText("No samples here — looking for the next data…")
 
+        def _search():
+            conn = connect_ro(db)
+            try:
+                return {'idx': idx, 'start': start, 'table': table,
+                        'ts': self._nearest_sample_ts(conn, tags, start)}
+            finally:
+                conn.close()
+
+        self._start_db_query(_search, self._on_gap_search_done,
+                             self._on_gap_search_failed)
+
+    def _on_gap_search_done(self, res):
+        """Move the playhead to the samples the gap search found."""
+        # Stale if the table changed, the preview was torn down, or the user
+        # scrubbed elsewhere while the scan ran — a newer position owns the
+        # playhead and must not be yanked back to this one.
+        if not getattr(self, '_preview_active', False):
+            return
+        if res['table'] != self.table_name:
+            return
+        if self._chunk_index_for(self.preview_playhead_ms) != res['idx']:
+            return
+
+        idx, start, nxt = res['idx'], res['start'], res['ts']
         if nxt is None or self._chunk_index_for(nxt) == idx:
             self.lbl_preview_status.setText("No samples here — try elsewhere on the timeline.")
             return
@@ -6614,6 +9679,10 @@ class UWBQuickVisualizationWindow(QWidget):
         self.preview_playhead_ms = nxt
         self._sync_timeline_to_playhead()
         self._request_chunk(self._chunk_index_for(nxt), make_current=True)
+
+    def _on_gap_search_failed(self, err):
+        self.log_message(f"Could not locate nearest samples: {err}")
+        self.lbl_preview_status.setText("No samples here — try elsewhere on the timeline.")
 
     def get_preview_smoothing_method(self):
         """Smoothing method for the LIVE preview (its own 'Smoothing method'
@@ -6632,54 +9701,88 @@ class UWBQuickVisualizationWindow(QWidget):
         info = (self.tag_identities or {}).get(tag)
         if not info:
             return None, None
-        # A bound on 'Follow data' is not applied at all; only an
-        # explicitly limited one trims.
+        # A bound on Auto is not applied at all; only an
+        # explicitly limited (Manual) one trims.
         start_manual = IdentityAssignmentDialog._mode_of(info, 'start') == 'manual'
         stop_manual = IdentityAssignmentDialog._mode_of(info, 'stop') == 'manual'
         if not start_manual and not stop_manual:
             return None, None
+        _loc = self._localize_wall_time
+        return (_loc(info['start_time'], tz) if start_manual and 'start_time' in info else None,
+                _loc(info['stop_time'], tz) if stop_manual and 'stop_time' in info else None)
 
-        def _loc(value):
-            try:
-                ts = pd.Timestamp(value)
-            except (ValueError, TypeError):
-                return None
-            if ts is pd.NaT:
-                return None
-            if ts.tzinfo is not None:
-                return ts.tz_convert(tz)
-            try:
-                return ts.tz_localize(tz)
-            except Exception:
-                # Nonexistent (spring forward) or ambiguous (fall back) local
-                # time: take the first valid reading rather than failing.
-                return ts.tz_localize(tz, ambiguous=True, nonexistent='shift_forward')
+    @staticmethod
+    def _localize_wall_time(value, tz):
+        """A stored local wall-clock string as a tz-aware Timestamp, or None."""
+        try:
+            ts = pd.Timestamp(value)
+        except (ValueError, TypeError):
+            return None
+        if ts is pd.NaT:
+            return None
+        if ts.tzinfo is not None:
+            return ts.tz_convert(tz)
+        try:
+            return ts.tz_localize(tz)
+        except Exception:
+            # Nonexistent (spring forward) or ambiguous (fall back) local
+            # time: take the first valid reading rather than failing.
+            return ts.tz_localize(tz, ambiguous=True, nonexistent='shift_forward')
 
-        return (_loc(info['start_time']) if start_manual and 'start_time' in info else None,
-                _loc(info['stop_time']) if stop_manual and 'stop_time' in info else None)
+    def _tag_off_intervals(self, tag, tz):
+        """The tag's off-animal intervals as merged, tz-aware (start, stop).
 
-    def _trim_to_tag_window(self, data, tag, tz):
-        """Drop fixes outside the tag's active window set in Configure Identities.
+        Set per tag in Configure Identities for a tag that came off its animal
+        and went back on (see identities.off_intervals). Unparseable entries
+        are skipped rather than failing the chunk or the export.
+        """
+        info = (self.tag_identities or {}).get(tag)
+        pairs = []
+        for item in off_intervals(info):
+            a = self._localize_wall_time(item['start'], tz)
+            b = self._localize_wall_time(item['stop'], tz)
+            if a is not None and b is not None:
+                pairs.append((a, b))
+        return merge_intervals(pairs)
 
-        Those Start/Stop pickers are a data-trimming control, not just
-        metadata: a tag deployed late, recovered early, or swapped mid-trial
-        must contribute nothing outside its window. Applied identically to the
-        preview, the occupancy heatmap and every export, so what the preview
-        shows is what the exported files contain.
+    def _trim_tag(self, data, tag, tz):
+        """Drop what the tag's identity record excludes, counted by reason.
+
+        Two controls from Configure Identities, applied together:
+
+          * Start/Stop - the deployment. A tag deployed late, recovered
+            early, or swapped mid-trial contributes nothing outside it.
+          * Off-animal intervals - holes inside the deployment, where the tag
+            was reporting but not on the animal (a head cap off in the nest).
+
+        Applied identically to the preview, the occupancy heatmap and every
+        export, so what the preview shows is what the exported files contain.
+        The removed stretch becomes a gap, and the filters and smoother
+        already split a track at gaps, so nothing is interpolated across it.
 
         ``data`` must already carry a tz-aware 'Timestamp' column. Returns
-        (trimmed_data, n_removed).
+        (trimmed_data, n_outside_window, n_off_animal).
         """
         start, stop = self._tag_window(tag, tz)
-        if start is None and stop is None:
-            return data, 0
-        before = len(data)
-        keep = pd.Series(True, index=data.index)
+        holes = self._tag_off_intervals(tag, tz)
+        if start is None and stop is None and not holes:
+            return data, 0, 0
+        in_window = pd.Series(True, index=data.index)
         if start is not None:
-            keep &= data['Timestamp'] >= start
+            in_window &= data['Timestamp'] >= start
         if stop is not None:
-            keep &= data['Timestamp'] <= stop
-        return data[keep], before - int(keep.sum())
+            in_window &= data['Timestamp'] <= stop
+        off = pd.Series(inside_intervals(data['Timestamp'], holes)
+                        if holes else False, index=data.index)
+        keep = in_window & ~off
+        n_window = int((~in_window).sum())
+        n_off = int((in_window & off).sum())
+        return data[keep], n_window, n_off
+
+    def _trim_to_tag_window(self, data, tag, tz):
+        """``_trim_tag`` with the two counts summed: (trimmed_data, n_removed)."""
+        data, n_window, n_off = self._trim_tag(data, tag, tz)
+        return data, n_window + n_off
 
     def _process_chunk(self, df, idx=None):
         """Filter, smooth and bin one slice into frame arrays, or None if empty.
@@ -6691,7 +9794,410 @@ class UWBQuickVisualizationWindow(QWidget):
         merged = self._processed_slice(df)
         if merged is None:
             return None
-        return self._build_preview_frames(merged, self.selected_preview_tags(), idx)
+        frames = self._build_preview_frames(merged, self.selected_preview_tags(), idx)
+        if frames is not None:
+            # Travels WITH the chunk: a prefetched neighbour also runs through
+            # _processed_slice, so a pool left on the window would describe some
+            # other chunk than the one on screen.
+            frames['step_pool'] = self._preview_step_pool
+        return frames
+
+    def analysis_dir_for(self, db_path=None):
+        """The <db>_FNT_analysis folder for a database, or None."""
+        db_path = db_path or self.db_path
+        if not db_path:
+            return None
+        d = os.path.dirname(db_path)
+        name = os.path.splitext(os.path.basename(db_path))[0]
+        return os.path.join(d, f"{name}_FNT_analysis")
+
+    def confirm_clear_analysis_folder(self, db_path=None, parent=None):
+        """Show what a clear would delete and ask. True if the user agrees.
+
+        Deliberately a second prompt even when the conflict dialog already
+        offered the choice: that dialog lists what the EXPORT will write, which
+        is a different set from what a clear will REMOVE, and the difference is
+        exactly where the surprises live.
+        """
+        folder = self.analysis_dir_for(db_path)
+        if not folder or not os.path.isdir(folder):
+            QMessageBox.information(
+                parent or self, "Nothing to clear",
+                "This trial has no analysis folder yet.")
+            return False
+        removable, kept, unknown = classify_analysis_folder(folder)
+        if not removable:
+            QMessageBox.information(
+                parent or self, "Nothing to clear",
+                f"{os.path.basename(folder)} holds no previous exports.")
+            return False
+
+        total = sum(sz for _n, sz, _d in removable)
+        lines = [f"Delete {len(removable)} item(s) from "
+                 f"{os.path.basename(folder)}, freeing {human_bytes(total)}?",
+                 ""]
+        for name, sz, is_dir in removable[:14]:
+            lines.append(f"   {'[folder] ' if is_dir else ''}{name}"
+                         f"   ({human_bytes(sz)})")
+        if len(removable) > 14:
+            lines.append(f"   ...and {len(removable) - 14} more")
+        if kept:
+            lines.append("")
+            lines.append("KEPT: " + ", ".join(n for n, _s, _d in kept))
+        if unknown:
+            # The one case worth a person's attention: files FNT did not write.
+            lines.append("")
+            lines.append("NOT WRITTEN BY FNT - these would be deleted too:")
+            for name, _sz, _d in unknown[:8]:
+                lines.append(f"   {name}")
+        lines.append("")
+        lines.append("This cannot be undone, and the smoothed CSV will have to "
+                     "be re-derived from the database.")
+
+        box = QMessageBox(parent or self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Clear & Re-export")
+        box.setText("\n".join(lines))
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+        box.setDefaultButton(QMessageBox.Cancel)
+        return box.exec_() == QMessageBox.Yes
+
+    def clear_previous_exports(self):
+        """The standalone Clear & Re-export action (not the export path).
+
+        Exists separately because the conflict dialog only opens when a file
+        the CURRENT export produces already exists. Change which products you
+        export and the old ones become orphans that dialog never mentions - so
+        there has to be a way to ask for a clean folder directly.
+        """
+        if not self.db_path:
+            QMessageBox.warning(self, "No Database",
+                                "Load a database first.")
+            return
+        if not self.confirm_clear_analysis_folder():
+            return
+        folder = self.analysis_dir_for()
+        removed, freed, failures = clear_analysis_folder(
+            folder, log=self.log_message)
+        # The fast index survives, but the preview may hold file handles into
+        # products that no longer exist.
+        self.invalidate_preview_cache()
+        self._export_scope_key = None
+        if failures:
+            QMessageBox.warning(
+                self, "Clear & Re-export",
+                f"Removed {removed} item(s), {human_bytes(freed)} freed.\n\n"
+                f"{len(failures)} could not be removed (open in another "
+                f"program?):\n" + "\n".join(failures[:6]))
+        else:
+            QMessageBox.information(
+                self, "Clear & Re-export",
+                f"Removed {removed} item(s) and freed {human_bytes(freed)}.\n\n"
+                f"Run an export to rebuild the folder.")
+
+    def export_scope_points(self):
+        """(tags, points) that an export would actually process, or None.
+
+        The denominator the threshold report should be judged against. NOT the
+        row count of the raw database: it is the number of points left after
+        the tag configuration is applied - only the ticked tags, and only the
+        rows inside each tag's active start/stop window. That is the population
+        the export will see, so it is the one a removal percentage means
+        something against.
+
+        Counted on the INDEXED preview copy, whose (shortid, timestamp) index
+        makes each per-tag window a covering-index range scan: about a second
+        for 17 tags over 24.7 M rows, against ~35 s on the raw database, which
+        has no indexes at all. Returns None rather than blocking when that copy
+        is not built yet.
+
+        Cached against the tags and their windows, because that is the only
+        thing that changes it - moving a threshold does not.
+        """
+        tags = sorted(t for t, cb in self.tag_checkboxes.items() if cb.isChecked())
+        if not tags or not self.table_name:
+            return None
+        tz = pytz.timezone(self.combo_timezone.currentText())
+        windows, holes = {}, {}
+        for t in tags:
+            try:
+                start, stop = self._tag_window(t, tz)
+            except Exception:
+                start, stop = None, None
+            windows[t] = (
+                int(start.timestamp() * 1000) if start is not None else None,
+                int(stop.timestamp() * 1000) if stop is not None else None)
+            try:
+                holes[t] = tuple((int(a.timestamp() * 1000), int(b.timestamp() * 1000))
+                                 for a, b in self._tag_off_intervals(t, tz))
+            except Exception:
+                holes[t] = ()
+        key = (self.db_path, self.table_name, tuple(tags),
+               tuple(sorted(windows.items())), tuple(sorted(holes.items())))
+        if getattr(self, '_export_scope_key', None) == key:
+            return self._export_scope_value
+
+        path = self.current_indexed_db()
+        if not path:
+            return None            # no fast index yet; do not stall the GUI
+        total = 0
+        try:
+            conn = connect_ro(path)
+            try:
+                for t in tags:
+                    lo, hi = windows[t]
+                    q = f"SELECT COUNT(*) FROM {self.table_name} WHERE shortid = ?"
+                    args = [t]
+                    if lo is not None:
+                        q += " AND timestamp >= ?"; args.append(lo)
+                    if hi is not None:
+                        q += " AND timestamp <= ?"; args.append(hi)
+                    total += conn.execute(q, args).fetchone()[0]
+                    # Off-animal holes, clipped to the window. Already merged,
+                    # so no row is subtracted twice.
+                    for a, b in holes[t]:
+                        a = a if lo is None else max(a, lo)
+                        b = b if hi is None else min(b, hi)
+                        if b >= a:
+                            total -= conn.execute(
+                                f"SELECT COUNT(*) FROM {self.table_name} "
+                                f"WHERE shortid = ? AND timestamp BETWEEN ? AND ?",
+                                [t, a, b]).fetchone()[0]
+            finally:
+                conn.close()
+        except Exception as e:
+            self.log_message(f"Could not count the export scope: {e}")
+            return None
+
+        self._export_scope_key = key
+        self._export_scope_value = (len(tags), total)
+        return self._export_scope_value
+
+    def _update_step_stats_label(self):
+        """Say what the velocity/jump thresholds do to the chunk in view.
+
+        Counts are reproduced the way apply_filters_to_data applies them: both
+        quantities are measured once on the raw track, the velocity cut runs
+        first, and the jump cut then runs on what is left.
+        """
+        if not hasattr(self, 'lbl_step_stats'):
+            return
+        pool = getattr(self, '_preview_step_pool', None)
+        if not pool:
+            self.lbl_step_stats.setPlainText("")
+            return
+        if len(pool) < 7:                  # a chunk cached before the rewrite
+            self.lbl_step_stats.setPlainText("")
+            return
+        step, speed, gap, dev, px, py, pgrp = pool
+        ok = np.isfinite(step)
+        step, speed = step[ok], speed[ok]
+        gap, dev = gap[ok], dev[ok]
+        px, py, pgrp = px[ok], py[ok], pgrp[ok]
+        if not len(step):
+            self.lbl_step_stats.setPlainText("")
+            return
+        n = len(step)
+        pct = lambda k: 100.0 * k / n if n else 0.0
+        min_dt = self.spin_preview_velocity_min_dt.value()
+        # Recompute the speed at the CURRENT time base, so moving the floor
+        # re-prices the velocity cut in front of the user.
+        with np.errstate(divide='ignore', invalid='ignore'):
+            eff_speed = step / np.maximum(gap, min_dt if min_dt else 1e-9)
+
+        def _median(a, mask=None):
+            v = a if mask is None else a[mask]
+            v = v[np.isfinite(v)]
+            return float(np.median(v)) if v.size else float('nan')
+
+        def _si(v):
+            """Big counts, readably: 18,243,551 -> 18.2 M."""
+            if v >= 1e6:
+                return f"{v / 1e6:.1f} M"
+            if v >= 1e4:
+                return f"{v / 1e3:.0f} k"
+            return f"{v:,}"
+
+        # Applied in the order apply_filters_to_data applies them, each seeing
+        # only what the one before it left: the counts add up to the total
+        # removed instead of triple-counting the same wild point.
+        on_o = self.chk_preview_outlier.isChecked()
+        on_v = self.chk_preview_velocity.isChecked()
+        on_j = self.chk_preview_jump.isChecked()
+        sig = self.spin_preview_outlier_sigma.value()
+        win = int(self.spin_preview_outlier_window.value())
+        vthr = self.spin_preview_velocity.value()
+        jthr = self.spin_preview_jump.value()
+        cut_o = (dev > sig) & np.isfinite(dev) if on_o else np.zeros(n, bool)
+        cut_v = (eff_speed > vthr) & ~cut_o if on_v else np.zeros(n, bool)
+        cut_j = (step > jthr) & ~cut_o & ~cut_v if on_j else np.zeros(n, bool)
+        # The excursion pass, run here for real rather than described. It is
+        # the LAST filter and it works on what the other three left behind, so
+        # reporting the first three alone understates the export badly - on a
+        # tag with a long run of bad fixes this pass removes more than all of
+        # them together.
+        first_pass = ~(cut_o | cut_v | cut_j)
+        # Gated exactly as the EXPORT gates it (see apply_filters_to_data):
+        # excursion re-tests the joins that velocity and jump removals create,
+        # so with both of those off it has no test to apply and never runs.
+        # A row here in that case would promise a pass the export skips.
+        on_a = self.chk_preview_adjacency.isChecked() and (on_v or on_j)
+        if on_a and n > 2:
+            # A seconds clock rebuilt from the intervals the pool carries.
+            # resolve_adjacency only ever differences times WITHIN a group, so
+            # a single running clock is enough - the group boundaries it must
+            # not cross are handed to it separately.
+            _newgrp = np.empty(n, bool)
+            _newgrp[0] = True
+            _newgrp[1:] = pgrp[1:] != pgrp[:-1]
+            pt = np.cumsum(np.where(_newgrp, 0.0, np.nan_to_num(gap, nan=0.0)))
+            adj_keep, _n_adj, adj_converged = resolve_adjacency(
+                pt, px, py, first_pass, group=pgrp,
+                v_thresh=vthr if on_v else None, min_dt=min_dt,
+                j_thresh=jthr if on_j else None,
+                max_excursion_s=self.spin_preview_excursion.value())
+            cut_a = first_pass & ~adj_keep
+        else:
+            cut_a = np.zeros(n, bool)
+            adj_converged = True
+        kept = first_pass & ~cut_a
+        # What the surviving track is supposed to respect. With the jump
+        # threshold off there is no claim to check, so nothing is flagged.
+        worst_step_limit = jthr if on_j else float('inf')
+
+        lines = []
+        # The population an export would actually process. Absent until the
+        # fast index exists, and the report says so rather than quietly
+        # falling back to the window count and mislabelling it.
+        scope = self.export_scope_points()
+        if scope:
+            n_tags, n_pts = scope
+            lines.append("EXPORT SCOPE  after tag configuration")
+            lines.append("  {} tags \u00b7 {:,} points inside their active windows"
+                         .format(n_tags, n_pts))
+        else:
+            lines.append("EXPORT SCOPE  unavailable until the fast index is built")
+        lines.append("")
+
+        lines.append("THRESHOLDS  measured on the {:,} points in view".format(n))
+        rows = []
+        if on_o:
+            rows.append(("Hampel", "> {:g} MAD over {:,} pts".format(sig, win),
+                         cut_o,
+                         "median {:.1f} MAD out, {:.2f} m off track".format(
+                             _median(dev, cut_o), _median(step, cut_o))))
+        if on_v:
+            # Without this tail a large percentage reads as "the animal
+            # teleported a lot", when at this reporting rate it usually means
+            # the interval was short: a 10 cm step in 30 ms is 3 m/s.
+            rows.append(("Velocity",
+                         "> {:g} m/s over \u2265{:g} s".format(vthr, min_dt),
+                         cut_v,
+                         "median {:.2f} m in {:.3f} s".format(
+                             _median(step, cut_v), _median(gap, cut_v))))
+        if on_j:
+            rows.append(("Jump", "> {:g} m".format(jthr), cut_j,
+                         "median {:.2f} m".format(_median(step, cut_j))))
+        if on_a:
+            # Says what it DOES, not what it is named: these points survived
+            # the three tests above and only became impossible once their
+            # neighbours were removed and the track closed up around them.
+            rows.append(("Excursion",
+                         "runs < {:g} s stranded by the above".format(
+                             self.spin_preview_excursion.value()),
+                         cut_a,
+                         "re-tested after removal closed the gaps"))
+        if not rows:
+            lines.append("  none enabled \u2014 every point is kept")
+        else:
+            for name, spec, mask, tail in rows:
+                lines.append("  {:<10} {:<34} {:>7,} removed ({:>5.1f}%)   {}"
+                             .format(name, spec, int(mask.sum()),
+                                     pct(mask.sum()),
+                                     tail if mask.any() else ""))
+            lines.append("  " + "-" * 64)
+            keep_pct = pct(kept.sum())
+            tail = ""
+            if scope:
+                # An estimate, and labelled as one: this is one window's
+                # removal rate carried across the whole recording, and a quiet
+                # night need not resemble an active afternoon.
+                tail = "  \u2192 est. {} of {} points".format(
+                    _si(int(round(scope[1] * keep_pct / 100.0))), _si(scope[1]))
+            lines.append("  keeps {:,} of {:,} in view ({:.1f}%){}".format(
+                int(kept.sum()), n, keep_pct, tail))
+            worst_before = float(step.max())
+            # Measured on the track that is LEFT, not on the old step into
+            # each survivor. Those differ exactly where a run of bad fixes is
+            # partly removed: the survivor's original neighbour is gone, so it
+            # inherits a distant one, and that stride appears in neither the
+            # removed set nor the old figure.
+            sx, sy, sg = px[kept], py[kept], pgrp[kept]
+            if sx.size > 1:
+                same = sg[1:] == sg[:-1]      # never step across two tags
+                left = np.hypot(np.diff(sx), np.diff(sy))[same]
+                worst_after = float(left.max()) if left.size else float('nan')
+            else:
+                worst_after = float('nan')
+            lines.append("  largest step REMAINING in the track {:.2f} m "
+                         "(largest before filtering {:.2f} m)"
+                         .format(worst_after, worst_before))
+            if np.isfinite(worst_after) and worst_after > worst_step_limit:
+                if on_a:
+                    # Excursion IS the re-test, so when it is on and a long
+                    # stride survives, that is the filter declining to delete
+                    # rather than nobody having looked.
+                    lines.append(
+                        "     ⚠ exceeds the {:.2f} m jump threshold. Excursion "
+                        "re-tested this join and did NOT cut it: the run is "
+                        "longer than {:g} s, so it is treated as a real "
+                        "relocation, not a glitch. Raise the excursion seconds "
+                        "to remove longer runs.".format(
+                            worst_step_limit,
+                            self.spin_preview_excursion.value()))
+                else:
+                    lines.append(
+                        "     ⚠ exceeds the {:.2f} m jump threshold — removing "
+                        "a point makes its neighbours adjacent, and with "
+                        "Excursion OFF that new step is never re-tested. Tick "
+                        "Excursion threshold to test it.".format(
+                            worst_step_limit))
+            if on_a and not adj_converged:
+                lines.append(
+                    "     ⚠ excursion did not settle within its pass limit — "
+                    "the track may still contain an untested join")
+        lines.append("")
+        lines.append("IN VIEW  reporting every {:.2f} s (median) \u00b7 steps: "
+                     "half below {:.2f} m, 99th {:.2f} m, largest {:.2f} m"
+                     .format(_median(gap), float(np.percentile(step, 50)),
+                             float(np.percentile(step, 99)), float(step.max())))
+        # rstrip: a threshold that removed nothing has no explanatory tail, and
+        # the column padding would otherwise leave the line trailing spaces.
+        self.lbl_step_stats.setPlainText(
+            "\n".join(line.rstrip() for line in lines))
+
+    def _step_columns(self, g, prefix='', x_col=None, y_col=None):
+        """Add per-fix step distance / speed to one tag's frame.
+
+        Grouped by the Time gap setting so no step is measured across a battery
+        restart, and the first fix of each group stays NaN rather than reading
+        zero. ``x_col``/``y_col`` default to the SMOOTHED track when it exists,
+        so the marker readout describes the track actually drawn — select
+        "None" as the smoothing method and it describes the unsmoothed fixes.
+        The threshold summary passes the pre-smoothing columns explicitly,
+        because that is what the thresholds are applied to.
+        """
+        x_col = x_col or ('smoothed_x' if 'smoothed_x' in g.columns else 'location_x')
+        y_col = y_col or ('smoothed_y' if 'smoothed_y' in g.columns else 'location_y')
+        gap = self.spin_time_gap.value()
+        dt = g['Timestamp'].diff().dt.total_seconds()
+        grp = (dt.fillna(0) > gap).cumsum()
+        x, y = g[x_col], g[y_col]
+        step = np.hypot(x - x.groupby(grp).shift(), y - y.groupby(grp).shift())
+        g[prefix + 'step_m'] = step
+        with np.errstate(divide='ignore', invalid='ignore'):
+            g[prefix + 'speed_ms'] = step / dt.where(dt > 0)
+        return g
 
     def _processed_slice(self, df):
         """One raw time slice, trimmed/thresholded/smoothed, in long form.
@@ -6708,10 +10214,21 @@ class UWBQuickVisualizationWindow(QWidget):
         # user can compare the track with/without each threshold live.
         use_vel = self.chk_preview_velocity.isChecked()
         use_jump = self.chk_preview_jump.isChecked()
-        do_filter = use_vel or use_jump
+        use_out = self.chk_preview_outlier.isChecked()
+        do_filter = use_vel or use_jump or use_out
 
         chunks = []
-        for tag, g in df.groupby('shortid', sort=False):
+        # Pre-filter step/speed for every fix in view, kept BEFORE thresholding
+        # drops anything: the whole point of the summary is to show the fixes a
+        # threshold would remove, which the surviving rows can no longer show.
+        pre_step, pre_speed, pre_gap, pre_dev = [], [], [], []
+        # Coordinates and a per-tag id travel with them, so the read-out can
+        # measure the track thresholding actually LEAVES. Removing a point
+        # makes its neighbours adjacent, and that new step is not in pre_step -
+        # which is why the old figure could report 0.93 m for a track holding
+        # a 7.22 m stride.
+        pre_x, pre_y, pre_grp = [], [], []
+        for _gi, (tag, g) in enumerate(df.groupby('shortid', sort=False)):
             g = g.copy()
             g['Timestamp'] = pd.to_datetime(
                 g['timestamp'], unit='ms', origin='unix', utc=True).dt.tz_convert(tz)
@@ -6730,18 +10247,46 @@ class UWBQuickVisualizationWindow(QWidget):
             # smooth (see _filter_and_smooth: thresholding velocity on the
             # smoothed track was tried and produced a jumpy result).
             # collect_stats=False: preview scrubbing must not overwrite the
-            # figures an export writes into runSummary.csv. Preview uses its own
+            # filter_stats an export records in fnt_config.json. Preview uses its own
             # Smoothing Window / units so the effect can be tuned live,
             # independent of the Export Options values.
+            g = self._step_columns(g, prefix='pre_', x_col='raw_x', y_col='raw_y')
+            pre_step.append(g['pre_step_m'].to_numpy(float))
+            pre_speed.append(g['pre_speed_ms'].to_numpy(float))
+            # The interval itself, rather than inferring it from step/speed:
+            # a fix that did not move has speed 0 and no recoverable interval.
+            _dt = g['Timestamp'].diff().dt.total_seconds().to_numpy(float)
+            pre_gap.append(_dt)
+            pre_dev.append(hampel_deviation(
+                g['raw_x'].to_numpy(float), g['raw_y'].to_numpy(float),
+                window=self.spin_preview_outlier_window.value()))
+            pre_x.append(g['raw_x'].to_numpy(float))
+            pre_y.append(g['raw_y'].to_numpy(float))
+            pre_grp.append(np.full(len(g), _gi, dtype=np.int32))
             g = self._filter_and_smooth(
                 g, smoothing_method, collect_stats=False,
                 velocity=use_vel, jump=use_jump,
                 velocity_thresh=self.spin_preview_velocity.value(),
                 jump_thresh=self.spin_preview_jump.value(),
                 window=self.spin_preview_window.value(),
-                units=self.combo_preview_window_units.currentText())
+                units=self.combo_preview_window_units.currentText(),
+                outlier=use_out,
+                outlier_window=self.spin_preview_outlier_window.value(),
+                outlier_sigma=self.spin_preview_outlier_sigma.value(),
+                velocity_min_dt=self.spin_preview_velocity_min_dt.value(),
+                adjacency=self.chk_preview_adjacency.isChecked(),
+                excursion_s=self.spin_preview_excursion.value())
             if len(g):
-                chunks.append(g)
+                # Re-measure on the SURVIVING, SMOOTHED fixes: the marker
+                # readout describes the track actually drawn, whose steps both
+                # span whatever thresholding removed and follow the smoothing.
+                chunks.append(self._step_columns(g))
+        self._preview_step_pool = (
+            (np.concatenate(pre_step), np.concatenate(pre_speed),
+             np.concatenate(pre_gap), np.concatenate(pre_dev),
+             np.concatenate(pre_x), np.concatenate(pre_y),
+             np.concatenate(pre_grp))
+            if pre_step else None)
         if not chunks:
             return None
         return pd.concat(chunks, ignore_index=True)
@@ -6798,6 +10343,19 @@ class UWBQuickVisualizationWindow(QWidget):
         # Battery voltage per tag on the same grid, forward-filled so the reading
         # persists between the tag's sparse fixes. None when the table carries no
         # battery column. 'last' per bin (battery varies slowly, so any fix does).
+        # Raw step distance / speed per fix, forward-filled like the battery so
+        # the label persists on a held marker instead of blinking.
+        def _readout(col):
+            if col not in df.columns:
+                return None
+            pv = df.pivot_table(index='tbin', columns='shortid', values=col,
+                                aggfunc='last')
+            pv = pv.reindex(columns=cols).reindex(grid)
+            return pd.DataFrame(pv.to_numpy(float)).ffill().to_numpy()
+
+        STEP = _readout('step_m')
+        SPEED = _readout('speed_ms')
+
         if 'battery_voltage' in df.columns:
             pb = df.pivot_table(index='tbin', columns='shortid',
                                 values='battery_voltage', aggfunc='last')
@@ -6819,11 +10377,12 @@ class UWBQuickVisualizationWindow(QWidget):
             t_end = int(times[-1].timestamp() * 1000)
 
         return dict(x=X, y=Y, xf=XF, yf=YF, raw_x=RX, raw_y=RY, batt=BAT,
-                    times=times,
+                    step=STEP, speed=SPEED, times=times,
                     tags=cols, hz=hz, t_start=t_start, t_end=t_end,
                     nbytes=X.nbytes + Y.nbytes + XF.nbytes + YF.nbytes
                            + RX.nbytes + RY.nbytes
-                           + (BAT.nbytes if BAT is not None else 0))
+                           + sum(a.nbytes for a in (BAT, STEP, SPEED)
+                                 if a is not None))
 
     # Default preview marker colours: blue for male, red for female. Tags with
     # no configured identity default to male (matching the codebase's
@@ -6848,26 +10407,15 @@ class UWBQuickVisualizationWindow(QWidget):
             return np.array([cmap(i % 20) for i in range(len(tags))], dtype=float)
         return np.array([self._NEUTRAL] * len(tags), dtype=float)   # None
 
-    def _preview_tag_labels(self, tags, id_type="Display ID"):
-        """One label per tag in the requested format.
+    def _preview_tag_labels(self, tags, id_type=SEX_ID):
+        """One label per tag in the requested format (see identities.tag_label).
 
-        • Display ID: sex + identity (e.g. 'M9627'), matching the network /
-          proximity labels; falls back to HexID when no identity is configured.
-        • HexID: the tag's short address in hex (e.g. '2A').
-        • ShortID: the decimal tag id from the SQL database.
+        SexID / Name / Code / HexID / ShortID. Name and Code fall back to the
+        SexID for an animal without one, and SexID falls back to the HexID for
+        a tag with no identity configured.
         """
-        labels = []
-        for tag in tags:
-            if id_type == "ShortID":
-                labels.append(str(tag))
-            elif id_type == "HexID":
-                labels.append(hex(tag).upper().replace('0X', ''))
-            else:  # Display ID (SexID)
-                info = self.tag_identities.get(tag, {}) or {}
-                sex, ident = info.get('sex', ''), info.get('identity', '')
-                labels.append(f"{sex}{ident}" if (sex and ident)
-                              else hex(tag).upper().replace('0X', ''))
-        return labels
+        return [tag_label(tag, self.tag_identities.get(tag), id_type)
+                for tag in tags]
 
     def on_preview_smoothing_changed(self, *_):
         """Preview smoothing method changed: show/hide the preview Smoothing
@@ -6896,6 +10444,17 @@ class UWBQuickVisualizationWindow(QWidget):
         if getattr(self, '_preview_active', False):
             self.preview_trail_timer.start(400)
 
+    def on_preview_trail_points_changed(self, *_):
+        """Dots on/off: a pure redraw, with no reason to reload anything.
+
+        The fixes are already in the frame the trail is drawn from; only
+        whether they are marked changes.
+        """
+        canvas = getattr(self, 'preview_canvas_2d', None)
+        if canvas is not None:
+            canvas.show_trail_points = self.chk_preview_trail_points.isChecked()
+        self.render_preview_frame()
+
     def on_preview_color_changed(self, *_):
         """Recolour the preview without reloading chunks (colour is cheap)."""
         if getattr(self, 'preview_tags', None) is not None and len(self.preview_tags):
@@ -6913,6 +10472,10 @@ class UWBQuickVisualizationWindow(QWidget):
         self.preview_xf, self.preview_yf = c["xf"], c["yf"]
         self.preview_raw_x, self.preview_raw_y = c["raw_x"], c["raw_y"]
         self.preview_batt = c.get("batt")
+        self.preview_step = c.get("step")
+        self.preview_speed = c.get("speed")
+        self._preview_step_pool = c.get("step_pool")
+        self._update_step_stats_label()
         self.preview_times = c["times"]
         self.preview_hz = c["hz"]
         self.preview_colors = self._preview_tag_colors(self.preview_tags)
@@ -6941,7 +10504,23 @@ class UWBQuickVisualizationWindow(QWidget):
         """
         if self._timeline_guard or self.preview_t0 is None:
             return
-        self.preview_playhead_ms = self.preview_t0 + int(value) * 1000
+        # A drag or an arrow key is the user taking over; playback stops rather
+        # than fighting them for the playhead.
+        if self._playing and not self._playback_seeking:
+            self.stop_preview_playback()
+        self.seek_preview_ms(self.preview_t0 + int(value) * 1000)
+
+    def seek_preview_ms(self, ms):
+        """Move the playhead to an absolute time and show it.
+
+        Split out of the slider handler because playback needs sub-second
+        steps: the preview runs at up to 5 Hz while the slider's unit is one
+        second, so driving playback through the slider would quantise it to
+        whole seconds and drop four frames in five.
+        """
+        if self.preview_t0 is None:
+            return
+        self.preview_playhead_ms = int(ms)
         self._update_time_label()
         # If the playhead is inside ANY resident chunk, redraw instantly — it is
         # just an array index, no DB read. Because we prefetch the neighbouring
@@ -6953,14 +10532,28 @@ class UWBQuickVisualizationWindow(QWidget):
                 self._show_chunk(resident)   # also warms the new neighbours
             else:
                 self.render_preview_frame()
-        elif not self.preview_scrub_timer.isActive():
-            # Not resident: throttle a background load. Testing isActive() rather
-            # than restarting guarantees the timer still fires while the arrow
-            # key auto-repeats, so a sustained hold keeps advancing instead of
-            # starving the loader until the key is released.
-            self.preview_scrub_timer.start(self.SCRUB_DEBOUNCE_MS)
+        else:
+            if self.preview_pending_current is not None:
+                # Still waiting on a read: re-state why, so a long load reads as
+                # a wait rather than a dead window while the clock ticks on.
+                self.lbl_preview_status.setText(self._loading_status_text())
+            # Not resident: throttle a background load. Restarting the timer
+            # on every move is a true debounce — a drag issues ONE read, where
+            # a free-running tick issued one per 70 ms and buried the main
+            # thread in results for positions already scrubbed past. The
+            # deadline keeps a sustained hold (arrow-key auto-repeat, a slow
+            # continuous drag) advancing rather than waiting for release.
+            now = time.monotonic()
+            if self._scrub_deadline is None:
+                self._scrub_deadline = now + self.SCRUB_MAX_WAIT_S
+            if now >= self._scrub_deadline:
+                self.preview_scrub_timer.stop()
+                self._on_scrub_settled()
+            else:
+                self.preview_scrub_timer.start(self.SCRUB_DEBOUNCE_MS)
 
     def _on_scrub_settled(self):
+        self._scrub_deadline = None
         self._request_chunk(self._chunk_index_for(self.preview_playhead_ms),
                             make_current=True)
 
@@ -6979,7 +10572,11 @@ class UWBQuickVisualizationWindow(QWidget):
         ts = pd.Timestamp(self.preview_playhead_ms, unit='ms', tz='UTC').tz_convert(
             pytz.timezone(self.combo_timezone.currentText()))
         cached = "" if self.preview_current_chunk in self.preview_cache else "  (loading…)"
-        self.lbl_preview_time.setText(f"{ts:%Y-%m-%d %H:%M:%S}{cached}")
+        day_one = self.trial_day_one()
+        day = (f"Day {(ts.date() - day_one).days + 1} · "
+               if day_one is not None else "")
+        self.lbl_preview_time.setText(f"{day}{ts:%Y-%m-%d %H:%M:%S}{cached}")
+        self._update_weather_display()
 
     def _frame_index(self):
         """Index into the active chunk for the current playhead time."""
@@ -7026,6 +10623,20 @@ class UWBQuickVisualizationWindow(QWidget):
             self.spin_velocity_threshold.setValue(self.spin_preview_velocity.value())
             self.chk_jump_filter.setChecked(self.chk_preview_jump.isChecked())
             self.spin_jump_threshold.setValue(self.spin_preview_jump.value())
+            # The Hampel threshold and the velocity time base belong here too.
+            # Leaving them out did not fall back to the preview's values - it
+            # silently exported whatever the hidden widgets last held, so a
+            # trial previewed with Hampel on and a 0.5 s time base exported
+            # with neither. Every threshold the preview owns must be mirrored.
+            self.chk_outlier_filter.setChecked(self.chk_preview_outlier.isChecked())
+            self.spin_outlier_window.setValue(self.spin_preview_outlier_window.value())
+            self.spin_outlier_sigma.setValue(self.spin_preview_outlier_sigma.value())
+            self.spin_velocity_min_dt.setValue(
+                round(self.spin_preview_velocity_min_dt.value(), 2))
+            self.chk_adjacency_filter.setChecked(
+                self.chk_preview_adjacency.isChecked())
+            self.spin_excursion_s.setValue(
+                round(self.spin_preview_excursion.value(), 1))
             self.combo_smoothing.setCurrentText(self.combo_preview_smoothing.currentText())
             self.spin_rolling_window.setValue(self.spin_preview_window.value())
             self.combo_window_units.setCurrentText(
@@ -7051,12 +10662,1135 @@ class UWBQuickVisualizationWindow(QWidget):
         except Exception:
             pass
 
+    # ── Regions of interest ─────────────────────────────────────────────
+    def selected_roi(self):
+        """The ROI currently highlighted in the list, or None."""
+        i = self.roi_list.currentRow()
+        return self.rois[i] if 0 <= i < len(self.rois) else None
+
+    def _refresh_roi_list(self, keep=None):
+        """Rebuild the list rows, restoring the selection where possible."""
+        from fnt.uwb import uwb_roi as ROI
+
+        row = self.roi_list.currentRow() if keep is None else keep
+        # Where regions overlap, the list ORDER decides which one an animal is
+        # credited to, so the order stops being cosmetic and has to be shown.
+        # With no overlaps it means nothing, and numbering every row would be
+        # noise, so the prefix appears exactly when it starts to matter.
+        overlaps = ROI.overlapping_pairs(self.rois)
+        entangled = {i for pair in overlaps for i in pair}
+        # A full clear()/addItem() rebuild moves rows too, so far as the model
+        # is concerned. Suppress the reorder handler for the duration or the
+        # rebuild would reorder the very list it is rendering.
+        self._roi_reordering = True
+        self.roi_list.blockSignals(True)
+        self.roi_list.clear()
+        for i, r in enumerate(self.rois):
+            text = ROI.describe_roi(r)
+            if overlaps:
+                text = f"{i + 1} · {text}"
+                if i in entangled:
+                    text += "  ⬚ overlaps"
+            item = QListWidgetItem(text)
+            item.setForeground(QColor(r.get("color", ROI.DEFAULT_ROI_COLOR)))
+            # The region's position at render time. A drop reorders the ROWS;
+            # reading these back gives the new order without having to reason
+            # about Qt's source/destination index conventions.
+            item.setData(Qt.UserRole, i)
+            # Rows reorder; they are not editable text and cannot accept a drop
+            # INTO them (which would delete the row being dropped on).
+            item.setFlags((item.flags() | Qt.ItemIsDragEnabled)
+                          & ~Qt.ItemIsDropEnabled)
+            if i in entangled:
+                item.setToolTip(
+                    "This region overlaps another. A fix inside both is "
+                    "credited to whichever appears FIRST in this list, and to "
+                    "that one only — it is never counted twice.\n"
+                    "\n"
+                    "Drag this row up or down to change that.")
+            self.roi_list.addItem(item)
+        if 0 <= row < len(self.rois):
+            self.roi_list.setCurrentRow(row)
+        self.roi_list.blockSignals(False)
+        self._roi_reordering = False
+        if hasattr(self, 'lbl_roi_overlap'):
+            n = len(overlaps)
+            self.lbl_roi_overlap.setText(
+                f"{n} region pair{'s' if n != 1 else ''} overlap. A fix inside "
+                f"both goes to the one higher in the list — drag a row to "
+                f"change which." if n else "")
+            self.lbl_roi_overlap.setVisible(bool(n))
+        self._sync_roi_style_controls()
+        self.btn_roi_rename.setEnabled(bool(self.rois))
+        self.btn_roi_delete.setEnabled(bool(self.rois))
+
+    def _on_roi_rows_moved(self, *_args):
+        """Reorder self.rois to match rows the user dragged, and persist it.
+
+        Precedence is list position, so this drag IS the setting: whatever ends
+        up higher is tested first. The new order is read back from each row's
+        stored original index rather than computed from the signal's arguments,
+        because Qt reports a destination row measured BEFORE the moved row is
+        taken out, and an off-by-one there would silently mis-order regions.
+        """
+        if getattr(self, '_roi_reordering', False):
+            return
+        # A canvas move/edit holds its region by INDEX, which this is about to
+        # invalidate. End it first, keeping the shape as it stands, rather than
+        # letting the next mouse move drag a different region's corner.
+        canvas = getattr(self, 'preview_canvas_2d', None)
+        if canvas is not None and getattr(canvas, '_roi_action', None):
+            canvas.end_roi_edit()
+        order = []
+        for row in range(self.roi_list.count()):
+            src = self.roi_list.item(row).data(Qt.UserRole)
+            if isinstance(src, int) and 0 <= src < len(self.rois):
+                order.append(src)
+        if sorted(order) != list(range(len(self.rois))):
+            # The rows no longer describe the list (a rebuild raced the drop).
+            # Re-render from the model rather than reordering from bad indices.
+            self._refresh_roi_list()
+            return
+        moved = self.roi_list.currentRow()
+        self.rois = [self.rois[i] for i in order]
+        self._refresh_roi_list(keep=moved)
+        self.on_rois_changed()
+        self.write_live_config()
+        names = ", ".join(str(r.get('name', '')) for r in self.rois)
+        self.log_message(f"Region precedence is now: {names}")
+
+    def _sync_roi_style_controls(self):
+        """Point the colour swatch and width box at the current selection.
+
+        With nothing selected they show the style the NEXT region will be
+        drawn in, so the controls always mean something. This only READS
+        ``_roi_next_color``: writing the selection back into it would make
+        every new region inherit the colour of whichever row happened to be
+        highlighted, instead of taking the next free one from the palette.
+        """
+        from fnt.uwb import uwb_roi as ROI
+
+        roi = self.selected_roi()
+        colour = (roi or {}).get("color") or self._pending_roi_color()
+        width = (roi or {}).get("linewidth", self.spin_roi_width.value())
+        self.btn_roi_color.setStyleSheet(
+            f"QPushButton {{ background-color: {colour}; border: 1px solid "
+            f"#888888; border-radius: 3px; min-width: 0px; }}")
+        self.spin_roi_width.blockSignals(True)
+        self.spin_roi_width.setValue(float(width))
+        self.spin_roi_width.blockSignals(False)
+
+    def _on_roi_selected(self, _row=None):
+        self._sync_roi_style_controls()
+
+    def _on_roi_width_changed(self, value):
+        roi = self.selected_roi()
+        if roi is not None:
+            roi["linewidth"] = float(value)
+            self.on_rois_changed()
+
+    def _pending_roi_color(self):
+        """The colour the next region will be drawn in.
+
+        A colour the user picked with nothing selected, otherwise the first
+        palette entry no existing region is using.
+        """
+        from fnt.uwb import uwb_roi as ROI
+
+        return getattr(self, "_roi_next_color", None) or ROI.next_roi_color(self.rois)
+
+    def pick_roi_color(self):
+        """Recolour the selected region, or choose the colour for the next."""
+        roi = self.selected_roi()
+        start = QColor((roi or {}).get("color") or self._pending_roi_color())
+        picked = QColorDialog.getColor(start, self, "Region colour")
+        if not picked.isValid():
+            return
+        if roi is not None:
+            roi["color"] = picked.name()
+        else:
+            # Nothing selected, so the pick is for the region about to be drawn.
+            self._roi_next_color = picked.name()
+        self._refresh_roi_list()
+        self.on_rois_changed()
+
+    def start_roi_draw(self):
+        """Hand the preview's left button over to placing corners."""
+        canvas = getattr(self, "preview_canvas_2d", None)
+        if canvas is None:
+            return
+        if getattr(canvas, "_roi_mode", False):
+            canvas.cancel_roi()             # the button doubles as Cancel
+            return
+        canvas.begin_roi(self._pending_roi_color(), self.spin_roi_width.value())
+        canvas.setFocus()                   # so Enter and Esc reach the canvas
+        self.btn_roi_draw.setText("Cancel")
+        self.lbl_roi_hint.setVisible(True)
+        self._on_roi_draft(0)
+
+    def _on_roi_draft(self, n):
+        """Keep the hint honest about what the next click will do."""
+        need = max(0, 3 - n)
+        self.lbl_roi_hint.setText(
+            f"Placing corners: {n} so far"
+            + (f", {need} more needed" if need else " \u2014 ready to close")
+            + ".  Left click places \u00b7 right click undoes \u00b7 scroll "
+              "zooms \u00b7 middle-drag pans \u00b7 double-click or Enter "
+              "closes \u00b7 Esc cancels.")
+
+    def _on_roi_completed(self, points):
+        """A finished polygon becomes a named region."""
+        from fnt.uwb import uwb_roi as ROI
+
+        self._end_roi_draw_ui()
+        name = ROI.unique_roi_name(self.rois)
+        self.rois.append(ROI.make_roi(name, points, self._pending_roi_color(),
+                                      self.spin_roi_width.value()))
+        # The pick is spent. Clearing it sends the next region back to the
+        # palette, so drawing two in a row gives two distinguishable colours
+        # without a trip to the picker.
+        self._roi_next_color = None
+        self._refresh_roi_list(keep=len(self.rois) - 1)
+        self.roi_list.setCurrentRow(len(self.rois) - 1)
+        self.log_message(
+            f"Added region '{name}': {len(points)} corners, "
+            f"{ROI.polygon_area(points):.2f} m\u00b2")
+        self.on_rois_changed()
+        self.write_live_config()
+        # A new region lands at the BOTTOM, so it cannot silently take
+        # precedence over anything already drawn. Where it overlaps, the list
+        # says so and the row can be dragged up.
+        self._announce_roi_overlaps(self.rois[-1])
+
+    def _data_view_signature(self):
+        """What the cached Data View series depend on.
+
+        Deliberately narrow: the series are a function of which animals, which
+        regions, and how the track was filtered and smoothed. The animation's
+        own settings (speed, fps, trail) change none of it, so re-rendering a
+        clip at a different speed must not pay for the trial pass again.
+        """
+        from fnt.uwb import uwb_roi as ROI
+
+        return (
+            self.db_path, self.table_name,
+            tuple(sorted(self.selected_preview_tags())),
+            tuple((r.get('name'), ROI.polygon_area(r.get('points')))
+                  for r in (self.rois or [])),
+            self.combo_smoothing.currentText(),
+            self.spin_rolling_window.value(), self.combo_window_units.currentText(),
+            self.chk_velocity_filter.isChecked(), self.spin_velocity_threshold.value(),
+            self.spin_velocity_min_dt.value(),
+            self.chk_jump_filter.isChecked(), self.spin_jump_threshold.value(),
+            self.chk_outlier_filter.isChecked(), self.spin_outlier_window.value(),
+            self.spin_outlier_sigma.value(),
+            self.spin_proximity_threshold.value(),
+            self.combo_timezone.currentText(),
+        )
+
+    def invalidate_data_view_cache(self):
+        self._data_view_cache = None
+
+    def _data_view_tag_frames(self):
+        """Yield (tag, processed frame) one tag at a time.
+
+        ``self.data`` only exists once an EXPORT has built it, so relying on it
+        made the panel silently vanish from the interactive 10 s clip - the
+        payload raised, the caller downgraded, and the video rendered without
+        it. The counters are trial-relative, so the source has to be the whole
+        recording either way.
+
+        One tag at a time on purpose: the processed trial is the size of the
+        smoothed CSV, and holding it whole is the shape of the out-of-memory
+        crashes this pipeline has produced before. Each tag's bouts are taken
+        and its frame dropped.
+        """
+        if self.data is not None and not self.data.empty:
+            id_col = 'shortid' if 'shortid' in self.data.columns else 'ID'
+            for tag in sorted(self.data[id_col].unique()):
+                yield tag, self.data[self.data[id_col] == tag]
+            return
+
+        tags = list(self.selected_preview_tags())
+        if not tags:
+            raise RuntimeError("no tags selected")
+        db = self.current_indexed_db() or self.preview_db_path or self.db_path
+        if not db:
+            raise RuntimeError("no database loaded")
+        self.log_message(
+            f"  Data View: no export in memory — reading {len(tags)} tag(s) "
+            f"from {os.path.basename(db)}.")
+        # _processed_slice publishes the threshold read-out's sample as a side
+        # effect. That read-out describes the chunk IN VIEW and says so, so a
+        # trial-wide pass must not leave its numbers behind.
+        saved_pool = getattr(self, '_preview_step_pool', None)
+        conn = connect_ro(db)
+        try:
+            cols = processing_select_clause(conn, self.table_name)
+            for tag in tags:
+                if self.export_cancelled:
+                    raise RuntimeError("cancelled")
+                raw = pd.read_sql_query(
+                    f"SELECT {cols} FROM {self.table_name} WHERE shortid = ? "
+                    f"ORDER BY timestamp", conn, params=(tag,))
+                if not len(raw):
+                    continue
+                raw, _ = collapse_multi_solutions(raw)
+                frame = self._processed_slice(raw)
+                del raw
+                if frame is not None and len(frame):
+                    yield tag, frame
+                del frame
+        finally:
+            conn.close()
+            self._preview_step_pool = saved_pool
+
+    def build_data_view_payload(self, force=False):
+        """Trial-wide cumulative series for the animation's Data View panel.
+
+        Built over the WHOLE trial regardless of which clip is being rendered,
+        because the counters are trial-relative: scrubbing to the end and
+        rendering ten seconds has to show the trial's real totals, not the
+        clip's. That makes the first build expensive on a long recording, so
+        it is cached against everything it depends on and reused.
+        """
+        from fnt.uwb import dataview as DV
+        from fnt.uwb import roi_bouts as RB
+        from fnt.uwb import spatial_metrics as SM
+
+        sig = self._data_view_signature()
+        cached = getattr(self, '_data_view_cache', None)
+        if not force and cached is not None and cached[0] == sig:
+            return cached[1]
+
+        rois = list(self.rois or [])
+        if not rois:
+            raise RuntimeError("no regions of interest drawn")
+
+        t_all = time.time()
+        self.log_message(
+            "Data View: building trial-wide counters — this reads the whole "
+            "recording once, then is reused for every clip.")
+        QApplication.processEvents()
+
+        names = [r.get('name', f'ROI {i + 1}') for i, r in enumerate(rois)]
+
+        # Bouts are gathered per ANIMAL, not per tag, and the curves are built
+        # once at the end. Two tags can carry the same ID - a lost tag replaced
+        # mid-trial is deliberately one animal - and building a series per tag
+        # would let the second tag's curve REPLACE the first's, silently
+        # discarding everything the animal did before the swap.
+        animals, seen = [], set()
+        by_animal = {}
+        n = 0
+        for tag, sub in self._data_view_tag_frames():
+            n += 1
+            if self.export_cancelled:
+                raise RuntimeError("cancelled")
+            info = (self.tag_identities or {}).get(tag) or {}
+            label = f"{info.get('sex', '')}{info.get('identity', tag)}" or str(tag)
+            x_col = 'smoothed_x' if 'smoothed_x' in sub.columns else 'location_x'
+            y_col = 'smoothed_y' if 'smoothed_y' in sub.columns else 'location_y'
+            sub = sub.sort_values('Timestamp')
+            ts = sub['Timestamp']
+            t_s = ts.values.astype('datetime64[ns]').astype('int64') / 1e9
+            zi = SM.assign_zones(sub[x_col].values, sub[y_col].values, rois)
+            # ONE definition of a visit, shared with the exported bout CSV.
+            # The panel exists to be checked against that file, so it must not
+            # hold a second opinion: region_bouts is the same segmentation and
+            # the same duration rule (span, with a lone fix credited 1 s), and
+            # calling it here is what stops the two drifting apart. Crediting
+            # each fix its sampling interval instead - what this used to do -
+            # ran exactly one second per visit ahead of the CSV.
+            t_ns = ts.values.astype('datetime64[ns]').astype('int64')
+            for r_i, t0, t1, secs, _n in RB.region_bouts(
+                    zi, t_ns, max_gap_s=self.roi_bout_max_gap_s()):
+                by_animal.setdefault((label, r_i), []).append(
+                    (t0 / 1e9, t1 / 1e9, secs))
+            if label not in seen:
+                seen.add(label)
+                animals.append(label)
+            self.log_message(f"  Data View: tag {n} — {label} "
+                             f"({len(sub):,} fixes)")
+            QApplication.processEvents()
+
+        # Rows read top to bottom, so they are ordered for a reader rather
+        # than left in tag order - which is the order the shortids happen to
+        # sit in and looks jumbled beside the IDs it displays.
+        animals.sort(key=DV.natural_key)
+
+        occupancy = {}
+        for label in animals:
+            for r in range(len(rois)):
+                occupancy[(label, r)] = DV.CumulativeSeries.from_bouts(
+                    by_animal.get((label, r), []))
+
+        # No social overlap. Recomputing proximity for a preview would give
+        # the trial a SECOND opinion on who was together and for how long,
+        # competing with the exported bouts - and detecting that kind of
+        # disagreement is what this panel is for. _data_view_overlaps() is
+        # kept, and DataViewPanel still renders either dyad view, for whenever
+        # the exported bouts are wanted here.
+        payload = {
+            'animals': animals,
+            'roi_names': names,
+            'occupancy': occupancy,
+            'overlaps': {},
+            'dyad_mode': 'none',
+            'text_color': '#e6e6e6',
+            'bg_color': '#1b1b1b',
+        }
+        self._data_view_cache = (sig, payload)
+        self.log_message(
+            f"Data View ready: {len(animals)} animals x {len(names)} regions "
+            f"({time.time() - t_all:.1f}s).")
+        return payload
+
+    def _data_view_overlaps(self):
+        """Dyad overlap series, taken from the exported proximity bouts.
+
+        The panel must not hold a second opinion about who was together and
+        for how long. So it does not measure proximity at all: it reads the
+        very rows that become ``_SocialOverlapBouts.csv``.
+
+        Preferred source is the exported FILE, when this trial has one - then
+        the cells are provably the file's own numbers, with no chance of a
+        parameter drifting between the two. Failing that (an interactive clip
+        rendered before anything has been exported) the same detector is run
+        on the same data, which produces the same rows.
+        """
+        from fnt.uwb import dataview as DV
+        from fnt.uwb.proximity_detection import detect_proximity_bouts
+
+        tz = self.combo_timezone.currentText()
+        folder = self.analysis_dir_for()
+        db_name = (os.path.splitext(os.path.basename(self.db_path))[0]
+                   if self.db_path else None)
+        if folder and db_name:
+            path = os.path.join(csv_output_dir(folder),
+                                f'{db_name}_SocialOverlapBouts.csv')
+            if os.path.exists(path):
+                try:
+                    bouts = pd.read_csv(path)
+                    self.log_message(
+                        f"  Data View: dyad counters read from "
+                        f"{os.path.basename(path)} ({len(bouts)} bouts).")
+                    return DV.series_from_bouts(
+                        DV.overlap_bouts_from_frame(bouts, tz))
+                except Exception as e:
+                    self.log_message(
+                        f"  Data View: could not read {os.path.basename(path)} "
+                        f"({e}); recomputing.")
+
+        if self.data is None or self.data.empty:
+            # Proximity is pairwise, so unlike occupancy it cannot be done a
+            # tag at a time - it needs every animal's track at once, which is
+            # the whole trial in memory. Not worth doing for a 10 s clip, and
+            # not worth risking the memory for. The ROI half still works.
+            self.log_message(
+                "  Data View: dyad counters need the proximity bouts, which "
+                "only an export produces — showing ROI occupancy only. Run an "
+                "export (or one with Social Overlap Bouts ticked) and the "
+                "dyad grid fills in.")
+            return {}
+
+        self.log_message(
+            "  Data View: no exported bouts yet — running the same proximity "
+            "detector the export uses.")
+        QApplication.processEvents()
+        _events, bouts = detect_proximity_bouts(
+            self.data,
+            threshold=float(self.spin_proximity_threshold.value()),
+            gap_s=5,
+            tag_identities=self.tag_identities,
+            log_callback=None)
+        return DV.series_from_bouts(DV.overlap_bouts_from_frame(bouts, tz))
+
+    def _announce_roi_overlaps(self, roi):
+        """Log which regions ``roi`` overlaps and who currently wins.
+
+        This replaced a modal that asked, per overlapping PAIR, which region
+        took precedence. With a containing region — an arena boundary — every
+        other region overlaps it, so that modal asked once per pair and then
+        again from the other side, which is unanswerable as a stream of yes/no
+        questions. Precedence is one ordering over the whole list, so it is set
+        by dragging the list into that order; this only reports the state.
+        """
+        from fnt.uwb import uwb_roi as ROI
+
+        if getattr(self, '_batch_active', False) or roi is None:
+            return
+        try:
+            index = next(i for i, r in enumerate(self.rois) if r is roi)
+        except StopIteration:
+            return
+        others = [self.rois[j if i == index else i].get('name', '')
+                  for i, j in ROI.overlapping_pairs(self.rois, only=index)]
+        if not others:
+            return
+        name = roi.get('name', '')
+        winners = [n for n in others
+                   if next(i for i, r in enumerate(self.rois)
+                           if r.get('name', '') == n) < index]
+        note = (f"  '{name}' overlaps {', '.join(others)}. "
+                + (f"Shared area goes to {', '.join(winners)} "
+                   f"(higher in the list)."
+                   if winners else
+                   f"'{name}' takes the shared area (higher in the list)."))
+        self.log_message(note + " Drag a row to change that.")
+
+    def _on_roi_cancelled(self):
+        self._end_roi_draw_ui()
+
+    def _end_roi_draw_ui(self):
+        self.btn_roi_draw.setText("Draw new")
+        self.lbl_roi_hint.setVisible(False)
+
+    def rename_roi(self):
+        roi = self.selected_roi()
+        if roi is None:
+            return
+        name, ok = QInputDialog.getText(self, "Rename region", "Name:",
+                                        text=roi.get("name", ""))
+        if not ok or not name.strip():
+            return
+        roi["name"] = name.strip()
+        self._refresh_roi_list()
+        self.on_rois_changed()
+        self.write_live_config()
+
+    def delete_roi(self):
+        roi = self.selected_roi()
+        if roi is None:
+            return
+        # Never leave the canvas mid-drag on a region that is about to vanish.
+        self.preview_canvas_2d.end_roi_edit()
+        if QMessageBox.question(
+                self, "Delete region",
+                f"Delete '{roi.get('name', '')}'?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        row = self.roi_list.currentRow()
+        self.rois.pop(row)
+        self.log_message(f"Deleted region '{roi.get('name', '')}'")
+        self._refresh_roi_list(keep=min(row, len(self.rois) - 1))
+        self.on_rois_changed()
+        self.write_live_config()
+
+    # The XML's own fallback when a zone carries no colour of its own. Every
+    # zone then arrives the same grey, which is useless for telling eight of
+    # them apart in the preview, so those fall back to the ROI palette.
+    XML_ZONE_DEFAULT_COLOR = '#888888'
+
+    def import_xml_zones(self):
+        """Copy the site XML's zones in as ordinary drawn regions.
+
+        The occupancy products measure drawn regions only, so this is the one
+        route from an authored zone to a statistic. It is a COPY, taken once:
+        nothing here is written back to the XML, and an imported region is
+        thereafter indistinguishable from one drawn by hand — editable,
+        reorderable and deletable, and stored in the trial's fnt_config.json.
+
+        Re-importing is safe. A zone whose name is already in the list is
+        skipped rather than duplicated or overwritten, so pressing the button
+        twice cannot silently discard an edited boundary.
+        """
+        from fnt.uwb import uwb_roi as ROI
+
+        zones = list(self.xml_zones or [])
+        if not zones:
+            QMessageBox.information(
+                self, "No XML zones",
+                "This trial's site XML defines no zones to import.\n\n"
+                "Zones come from the XML that sits beside the database. If "
+                "you expected some, check that the XML loaded — the preview's "
+                "'Show zone coordinates' toggle is greyed out when it did "
+                "not.")
+            return
+
+        taken = {str(r.get('name', '')).strip().lower() for r in self.rois}
+        fresh = [z for z in zones
+                 if str(z.get('name', '')).strip().lower() not in taken]
+        skipped = len(zones) - len(fresh)
+        if not fresh:
+            QMessageBox.information(
+                self, "Already imported",
+                f"All {len(zones)} XML zone(s) are already in the region "
+                f"list, so there is nothing to import.\n\n"
+                f"Delete a region first if you want to take a fresh copy of "
+                f"that zone from the XML.")
+            return
+
+        msg = (f"Import {len(fresh)} zone(s) from the site XML as regions of "
+               f"interest?")
+        if skipped:
+            msg += (f"\n\n{skipped} more are already in the list by name and "
+                    f"will be left alone.")
+        msg += ("\n\nThey become ordinary regions: edit, rename, recolour or "
+                "delete them freely. The XML is not modified.")
+        if QMessageBox.question(self, "Import XML zones", msg,
+                                QMessageBox.Yes | QMessageBox.No,
+                                QMessageBox.Yes) != QMessageBox.Yes:
+            return
+
+        # Held by identity, not position: resolving an overlap reorders the
+        # list, so the indices collected here would not survive the first
+        # answer.
+        added = []
+        for z in fresh:
+            try:
+                pts = np.asarray(z.get('points'), dtype=float).reshape(-1, 2)
+            except (TypeError, ValueError):
+                continue
+            if len(pts) < ROI.MIN_ROI_POINTS or not np.isfinite(pts).all():
+                self.log_message(
+                    f"  Skipped zone '{z.get('name', '')}': not a usable "
+                    f"polygon.")
+                continue
+            color = str(z.get('color') or '').strip()
+            if not color or color.lower() == self.XML_ZONE_DEFAULT_COLOR:
+                color = ROI.next_roi_color(self.rois + added)
+            roi = ROI.make_roi(z.get('name') or
+                               ROI.unique_roi_name(self.rois + added),
+                               pts, color, self.spin_roi_width.value())
+            added.append(roi)
+        if not added:
+            self.log_message("No XML zones were usable as regions.")
+            return
+
+        # Smallest first, so a region CONTAINED in another is tested before the
+        # one containing it. Authored sites routinely carry an arena boundary
+        # drawn around every other zone; appended in XML order it would swallow
+        # all of them, and every fix would be credited to the arena. Area order
+        # makes the common case right on arrival, and any row can still be
+        # dragged. Only the imported block is sorted — regions already in the
+        # list keep the precedence the user gave them.
+        added.sort(key=lambda r: ROI.polygon_area(r['points']))
+        self.rois.extend(added)
+        for roi in added:
+            self.log_message(
+                f"Imported zone '{roi['name']}' as a region: "
+                f"{len(roi['points'])} corners, "
+                f"{ROI.polygon_area(roi['points']):.2f} m²")
+        self.log_message(
+            f"✓ Imported {len(added)} XML zone(s) as regions"
+            + (f"; {skipped} already present were skipped." if skipped
+               else "."))
+        self._refresh_roi_list(keep=len(self.rois) - 1)
+        self.roi_list.setCurrentRow(len(self.rois) - 1)
+        self.on_rois_changed()
+        self.write_live_config()
+        # One line, not one per zone: authored sites overlap heavily (every
+        # zone against the arena boundary), and ten restatements of the same
+        # rule is the noise version of the modal this replaced.
+        pairs = ROI.overlapping_pairs(self.rois)
+        if pairs:
+            first = self.rois[0].get('name', '')
+            self.log_message(
+                f"  {len(pairs)} region pair(s) overlap. Regions were ordered "
+                f"smallest first, so the shared area goes to the smaller one "
+                f"(here '{first}' outranks everything below it). Drag a row in "
+                f"the region list to change the precedence.")
+
+    def on_rois_changed(self):
+        """Push the current regions to the preview and refresh the list text."""
+        canvas = getattr(self, "preview_canvas_2d", None)
+        if canvas is not None:
+            canvas.set_rois(self.rois, self.chk_show_rois.isChecked())
+        # The "Show regions of interest" toggle greys out when there is
+        # nothing to show, like the other layer toggles, and the occupancy
+        # source list gains or loses the drawn-regions option with it.
+        self._sync_layer_toggles()
+        # The Data View counts time in regions, so with none drawn it is not
+        # an option that happens to be unavailable - it is not an option at
+        # all. Hidden rather than greyed, matching the two ROI export boxes,
+        # which gate on the same thing.
+        if hasattr(self, 'chk_anim_data_view'):
+            has_rois = bool(self.rois)
+            self.chk_anim_data_view.setVisible(has_rois)
+            if not has_rois:
+                # Cleared as well as hidden: unlike the ROI export settings
+                # this one is not carried in fnt_config.json, so there is no
+                # inherited intent to preserve - and a hidden box left ticked
+                # would ask the renderer for a panel with nothing to count.
+                self.chk_anim_data_view.setChecked(False)
+        if hasattr(self, 'chk_export_roi_bouts'):
+            self.on_zone_occupancy_toggled()
+        # The row text carries the corner count and area, so a width or colour
+        # change does not need it rebuilt - but a rename or a new region does.
+        if self.roi_list.count() != len(self.rois):
+            self._refresh_roi_list()
+
+    def show_roi_menu(self, index):
+        """Right-click menu for the region under the cursor."""
+        if not (0 <= index < len(self.rois)):
+            return
+        roi = self.rois[index]
+        self.roi_list.setCurrentRow(index)      # so the panel agrees with the menu
+
+        menu = QMenu(self)
+        menu.addSection(roi.get("name", "Region"))
+        act_move = menu.addAction("Move")
+        act_move.setToolTip("Drag the whole region to a new place.")
+        act_edit = menu.addAction("Modify points")
+        act_edit.setToolTip("Drag individual corners to reshape it.")
+        act_copy = menu.addAction("Copy")
+        act_copy.setToolTip(
+            "Duplicate it just to the right, ready to drag into place.")
+        menu.addSeparator()
+        act_rename = menu.addAction("Rename...")
+        act_colour = menu.addAction("Colour...")
+        menu.addSeparator()
+        act_delete = menu.addAction("Delete")
+
+        chosen = menu.exec_(QCursor.pos())
+        if chosen is None:
+            return
+        if chosen is act_move:
+            self.start_roi_move(index)
+        elif chosen is act_edit:
+            self.start_roi_modify(index)
+        elif chosen is act_copy:
+            self.copy_roi(index)
+        elif chosen is act_rename:
+            self.rename_roi()
+        elif chosen is act_colour:
+            self.pick_roi_color()
+        elif chosen is act_delete:
+            self.delete_roi()
+
+    def start_roi_move(self, index=None):
+        index = self.roi_list.currentRow() if index is None else index
+        if not (0 <= index < len(self.rois)):
+            return
+        self.preview_canvas_2d.begin_roi_move(index)
+        self._show_roi_edit_hint(
+            f"Moving '{self.rois[index].get('name', '')}': drag it anywhere "
+            "\u00b7 scroll zooms \u00b7 middle-drag pans \u00b7 Enter, Esc or "
+            "right-click finishes.")
+
+    def start_roi_modify(self, index=None):
+        index = self.roi_list.currentRow() if index is None else index
+        if not (0 <= index < len(self.rois)):
+            return
+        self.preview_canvas_2d.begin_roi_edit(index)
+        self._show_roi_edit_hint(
+            f"Reshaping '{self.rois[index].get('name', '')}': drag a corner "
+            "\u00b7 scroll zooms \u00b7 middle-drag pans \u00b7 Enter, Esc or "
+            "right-click finishes.")
+
+    def copy_roi(self, index=None):
+        """Duplicate a region just to the right, already in move mode.
+
+        Offset rather than placed on top of the original, because two
+        identical polygons at the same coordinates are indistinguishable and
+        the copy would look like nothing happened. Move mode starts straight
+        away: the reason to copy a region is to put the same shape somewhere
+        else, so the next thing wanted is always the drag.
+        """
+        from fnt.uwb import uwb_roi as ROI
+
+        index = self.roi_list.currentRow() if index is None else index
+        if not (0 <= index < len(self.rois)):
+            return
+        src = self.rois[index]
+        pts = np.asarray(src.get("points"), dtype=float).reshape(-1, 2)
+        # Copying "Nest 1" should give "Nest 2", not "Nest 1 1", so a trailing
+        # index on the source name is dropped before a fresh one is chosen.
+        base = re.sub(r"\s+\d+$", "", str(src.get("name", "ROI"))) or "ROI"
+        # A quarter of its own width reads as "next to it" for a big region
+        # and for a small one alike; the floor keeps a tiny region from
+        # landing back on itself.
+        offset = max(0.25 * float(pts[:, 0].max() - pts[:, 0].min()), 0.2)
+        name = ROI.unique_roi_name(self.rois, base=base)
+        copy = ROI.make_roi(name, pts + (offset, 0.0),
+                            src.get("color"), src.get("linewidth"))
+        self.rois.append(copy)
+        self._refresh_roi_list(keep=len(self.rois) - 1)
+        self.log_message(
+            f"Copied '{src.get('name', '')}' to '{name}' "
+            f"({offset:.2f} m to the right) \u2014 drag it into place.")
+        self.on_rois_changed()
+        self.write_live_config()
+        self.start_roi_move(len(self.rois) - 1)
+
+    def on_roi_edited(self, index):
+        """A region was dragged or reshaped: keep the panel and file in step."""
+        if not (0 <= index < len(self.rois)):
+            return
+        self._refresh_roi_list(keep=index)
+        self.on_rois_changed()
+        self.write_live_config()
+
+    def _show_roi_edit_hint(self, text):
+        self.lbl_roi_hint.setText(text)
+        self.lbl_roi_hint.setVisible(True)
+
+    def _on_roi_edit_ended(self):
+        from fnt.uwb import uwb_roi as ROI
+
+        roi = self.selected_roi()
+        if roi is not None:
+            self.log_message(
+                f"Region '{roi.get('name', '')}' now covers "
+                f"{ROI.polygon_area(roi['points']):.2f} m\u00b2")
+        self.lbl_roi_hint.setVisible(False)
+        self._refresh_roi_list()
+        self.write_live_config()
+        # Only once the drag has FINISHED. A copy is deliberately dropped on
+        # top of its source and then dragged clear, so reporting mid-move would
+        # name an overlap the user is in the middle of removing.
+        if roi is not None:
+            self._announce_roi_overlaps(roi)
+
+    def _roi_busy(self):
+        """Is the preview mid-region - placing corners, moving, or editing?"""
+        canvas = getattr(self, 'preview_canvas_2d', None)
+        return bool(canvas is not None
+                    and (canvas._roi_mode or canvas._roi_action))
+
+    def _wire_roi_canvas(self):
+        """Connect the preview canvas's ROI signals, once."""
+        canvas = getattr(self, "preview_canvas_2d", None)
+        if canvas is None or getattr(self, "_roi_canvas_wired", False):
+            return
+        canvas.roi_draft_changed.connect(self._on_roi_draft)
+        canvas.roi_completed.connect(self._on_roi_completed)
+        canvas.roi_cancelled.connect(self._on_roi_cancelled)
+        canvas.roi_context_requested.connect(self.show_roi_menu)
+        canvas.roi_edited.connect(self.on_roi_edited)
+        canvas.roi_edit_ended.connect(self._on_roi_edit_ended)
+        self._roi_canvas_wired = True
+        canvas.set_rois(self.rois, self.chk_show_rois.isChecked())
+
+    # -- region occupancy --------------------------------------------------- #
+    # Two independent sets of polygons, deliberately never merged into one:
+    #   'zone' - authored in the Wiser site XML
+    #   'roi'  - drawn by the user over the preview
+    # They have different provenance and routinely overlap (an ROI is often
+    # drawn to correct a zone), so a single column would have to invent a
+    # precedence rule and would silently lose one of the two answers. Within a
+    # set, assign_zones tests in order and the first match wins.
+    # Each entry is (column, source attribute, the checkbox that selects it).
+    # Drawn regions ONLY. Site-XML zones were a second, parallel region
+    # source with its own column and its own outputs; they are now imported
+    # into the ROI list instead ("Import XML"), so there is one pipeline and
+    # one set of files. Within a set, assign_zones tests in order and the
+    # first match wins, which is what makes precedence a list position.
+    REGION_SETS = (('roi', 'rois', None),)
+
+    def region_sets(self, selected_only=True):
+        """The region sets to measure, as (column, list of regions).
+
+        A set appears only if it has polygons AND its source is selected.
+        ``selected_only=False`` ignores the checkboxes and reports what the
+        trial HAS, which is what the availability messages need.
+        """
+        out = []
+        for column, attr, chk_name in self.REGION_SETS:
+            # chk_name is None for a set with no source checkbox of its own:
+            # drawn regions are measured whenever the export is ticked, since
+            # there is no longer a second source to choose between.
+            if selected_only and chk_name:
+                chk = getattr(self, chk_name, None)
+                if chk is not None and not chk.isChecked():
+                    continue
+            regions = [r for r in (getattr(self, attr, None) or [])
+                       if _polygon_len(r) >= 3]
+            if regions:
+                out.append((column, regions))
+        return out
+
+    def on_zone_occupancy_toggled(self, _state=None):
+        """Show the ROI exports only once there are regions to measure.
+
+        HIDDEN, not greyed, when nothing is drawn: these two files measure
+        time spent in drawn regions, so with none drawn they are not an option
+        that happens to be unavailable, they are not an option at all. They
+        appear the moment a region is drawn or imported.
+
+        The CHECKED state is deliberately left alone while hidden. These are
+        analysis settings that ride along in fnt_config.json and are inherited
+        between trials, so clearing them here would silently turn ROI export
+        off for every later trial that DOES have regions.
+        """
+        regions = self.region_sets()
+        have_regions = bool(regions)
+        for cb in (self.chk_export_roi_bouts, self.chk_export_roi_daily):
+            cb.setVisible(have_regions)
+
+        # With the boxes gone there is nothing for the note to qualify, so it
+        # goes too; it only ever says what the visible boxes will measure.
+        on = have_regions and (self.chk_export_roi_bouts.isChecked()
+                               or self.chk_export_roi_daily.isChecked())
+        self.occ_source_widget.setVisible(on)
+        if on:
+            n = sum(len(r) for _c, r in regions)
+            self.lbl_occ_sources.setText(f"Measuring {n} drawn region(s).")
+
+    def annotate_regions(self, frame, sets):
+        """Add a name column per region set to ``frame``, in place.
+
+        A fix outside every region in a set gets the empty string rather than
+        NaN, so the CSV column reads as a category and not as missing data -
+        being outside is an observation, not a gap.
+
+        Returns {column: zone_idx array} so the caller can compute occupancy
+        without paying for the point-in-polygon test twice.
+        """
+        from fnt.uwb import spatial_metrics as SM
+
+        x_col = 'smoothed_x' if 'smoothed_x' in frame.columns else 'location_x'
+        y_col = 'smoothed_y' if 'smoothed_y' in frame.columns else 'location_y'
+        idx = {}
+        for column, regions in sets:
+            names = np.array([r.get('name', f'{column} {i + 1}')
+                              for i, r in enumerate(regions)] + [''], dtype=object)
+            zi = SM.assign_zones(frame[x_col].values, frame[y_col].values, regions)
+            idx[column] = zi
+            # -1 (outside) indexes the sentinel '' appended above.
+            frame[column] = names[zi]
+        return idx
+
+    def animal_label(self, tag):
+        """The configured animal's SexID, e.g. M9001.
+
+        Every social and region statistic is keyed on this, not on the tag:
+        once tags are assigned to animals, two tags mapping to one identity
+        are one animal. Matches the label the bouts CSV uses.
+        """
+        info = self.tag_identities.get(tag) or {}
+        sex = str(info.get('sex', 'M') or 'M')[:1].upper()
+        identity = info.get('identity') or f'Tag{tag}'
+        return f"{sex}{identity}"
+
+    def region_bout_rows(self, frame, tag, sets, idx=None):
+        """One row per visit: a run of consecutive fixes inside one region.
+
+        Strict by design. A single fix outside the region ends the bout, and
+        the next fix back inside starts a new one; so does a recording gap
+        longer than the Time gap setting (``roi_bout_max_gap_s``) — nothing is
+        bridged and no duration is rounded. A lone fix inside a region reports identical
+        start and stop and 0.0 s (roi_bouts.LONE_READ_S), because its real
+        span cannot be observed; n_reads = 1 marks it.
+
+        Bouts are never split at midnight; ``Day`` is the day the bout
+        STARTED. The daily summary does its own splitting.
+        """
+        from fnt.uwb import roi_bouts as RB
+
+        if frame.empty:
+            return []
+        if idx is None:
+            idx = self.annotate_regions(frame, sets)
+        ts = frame['Timestamp']
+        tz = getattr(ts.dt, 'tz', None)
+        # Back to wall-clock in the recording's own timezone, the way every
+        # other exported bout time reads. The int64 round trip is what keeps
+        # the millisecond edges exact.
+        t_ns = ts.values.astype('datetime64[ns]').astype('int64')
+        naive = tz is None
+
+        def _stamp(ns):
+            t = pd.Timestamp(int(ns), unit='ns')
+            return t if naive else t.tz_localize('UTC').tz_convert(tz)
+
+        label = self.animal_label(tag)
+        rows = []
+        for column, regions in sets:
+            names = [r.get('name', f'{column} {i + 1}')
+                     for i, r in enumerate(regions)]
+            for r_i, t0, t1, secs, n_reads in RB.region_bouts(
+                    idx[column], t_ns, max_gap_s=self.roi_bout_max_gap_s()):
+                rows.append({
+                    'SexID': label,
+                    'ROI': names[r_i],
+                    'bout_start': _stamp(t0),
+                    'bout_stop': _stamp(t1),
+                    'duration_s': secs,
+                    'n_reads': int(n_reads),
+                })
+        return rows
+
+
+    @staticmethod
+    def _tracked_distance_m(x, y, t_ns):
+        """Path length in metres, ignoring steps that bridge a dropout.
+
+        A gap is not travel: the animal did not teleport across the minutes a
+        tag was silent, and counting the jump would add distance that never
+        happened. A step is dropped when the interval it spans exceeds ten
+        times the typical one - the same rule ``zone_intervals`` uses to stop
+        a dropout being billed as dwell time.
+
+        The test is on the RAW interval, not on the capped one: capped
+        intervals are clipped TO the threshold, so comparing against their
+        maximum marks every step in an evenly sampled track as a gap and
+        returns zero.
+        """
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+        if len(x) < 2:
+            return 0.0
+        step = np.hypot(np.diff(x), np.diff(y))
+        good = np.isfinite(step)
+        gaps = np.diff(np.asarray(t_ns, dtype='int64')) / 1e9
+        if len(gaps) == len(step):
+            positive = gaps[gaps > 0]
+            typical = float(np.median(positive)) if positive.size else 0.0
+            good &= gaps <= max(typical * 10.0, 1.0)
+        return float(step[good].sum())
+
+    def db_name(self):
+        """This trial's name: the database filename without its extension."""
+        if not self.db_path:
+            return ''
+        return os.path.splitext(os.path.basename(self.db_path))[0]
+
+    def log_audit(self, title, results):
+        """Log a product's self-check. Returns True if everything held.
+
+        Written so a clean export reads as a short list of ticks and a broken
+        one is impossible to skim past: a failure is prefixed, capitalised and
+        repeated in a summary line. These files feed statistics run days later,
+        where a silent error looks like biology.
+
+        ``results`` may be a callable, which is how a caller hands over the
+        checks WITHOUT risking the export on them: a bug in a check must never
+        cost the user the file it was verifying. A check that raises is
+        reported as an unrunnable check, not propagated.
+        """
+        if callable(results):
+            try:
+                results = results()
+            except Exception as e:
+                self.log_message(
+                    f"  ⚠ {title}: the self-check could not run ({e!r}). The "
+                    f"file itself is written and unaffected — this is a fault "
+                    f"in the CHECK, not evidence about the data.")
+                return False
+        bad = [m for ok, m in results if not ok]
+        self.log_message(f"  {title} — self-check:")
+        for ok, msg in results:
+            self.log_message(f"    {'✓' if ok else '✗ FAILED:'} {msg}")
+        if bad:
+            self.log_message(
+                f"  ⚠ {title}: {len(bad)} CHECK(S) FAILED — do NOT analyse "
+                f"this file until the cause is understood.")
+        return not bad
+
+    def write_roi_bout_csv(self, rows, output_dir, db_name,
+                           skip_existing=False):
+        """Publish the per-visit bout list. Returns the path, or None."""
+        from fnt.uwb import roi_bouts as RB
+
+        fname = f'{db_name}_ROI_bout_occupancy.csv'
+        path = os.path.join(csv_output_dir(output_dir, create=True), fname)
+        if not rows:
+            self.log_message(
+                "ROI occupancy: no animal entered a drawn region \u2014 "
+                "nothing to write.")
+            return None
+        if skip_existing and os.path.exists(path):
+            self.log_message(f"Skipped (exists): {fname}")
+            return path
+
+        # One animal may carry two tags. Union their visits so a replacement
+        # tag cannot bill the same minute twice.
+        rows = RB.merge_animal_bouts(rows)
+        df = pd.DataFrame(rows)
+        day0 = df['bout_start'].dt.normalize().min()
+        df['Day'] = (df['bout_start'].dt.normalize() - day0).dt.days + 1
+        df['_k'] = df['SexID'].map(RB.natural_animal_key)
+        df = (df.sort_values(['_k', 'Day', 'bout_start'], kind='mergesort')
+                .drop(columns='_k').reset_index(drop=True))
+        df = df[['SexID', 'Day', 'ROI', 'bout_start', 'bout_stop', 'duration_s',
+                 'n_reads']]
+        # Audited on the FINISHED frame, not on the rows that build it: the
+        # checks cover Day and the row order, which do not exist until here.
+        self.log_audit(fname, lambda: RB.audit_bouts(df))
+        df.to_csv(path, index=False)
+        self.log_message(
+            f"\u2713 Exported {fname} ({len(df)} bout(s), "
+            f"{df['SexID'].nunique()} animal(s), {df['ROI'].nunique()} region(s))")
+        # Per-region time, so a region nobody used \u2014 or one drawn so large it
+        # swallowed the trial \u2014 is visible here rather than in R a week later.
+        per = (df.groupby('ROI')['duration_s'].agg(['count', 'sum'])
+                 .sort_values('sum', ascending=False))
+        for roi, r in per.iterrows():
+            self.log_message(f"      {roi}: {int(r['count']):,} visit(s), "
+                             f"{r['sum'] / 3600:,.2f} h")
+        return path
+
+    def write_roi_daily_summary_csv(self, rows, output_dir, db_name,
+                                    skip_existing=False):
+        """Publish the per-region-per-day ownership table. Path, or None."""
+        from fnt.uwb import roi_bouts as RB
+
+        fname = f'{db_name}_ROI_DailySummary.csv'
+        path = os.path.join(csv_output_dir(output_dir, create=True), fname)
+        if not rows:
+            return None
+        if skip_existing and os.path.exists(path):
+            self.log_message(f"Skipped (exists): {fname}")
+            return path
+
+        merged = RB.merge_animal_bouts(rows)
+        summary = RB.daily_summary(merged)
+        if not summary:
+            return None
+        # Audited against the very bouts it was derived from, so the
+        # reconciliation is checked on this trial's own numbers rather than
+        # assumed from the code being correct.
+        self.log_audit(fname, lambda: RB.audit_daily(summary, merged))
+        df = pd.DataFrame(summary)
+        df.to_csv(path, index=False)
+        self.log_message(
+            f"\u2713 Exported {fname} ({len(df)} row(s), "
+            f"{df['ROI'].nunique()} region(s) over {df['Day'].nunique()} day(s))")
+        return path
+
+    def roi_bout_max_gap_s(self):
+        """The longest recording gap a ROI bout may span: the Time gap setting,
+        so a visit breaks exactly where the track's segments do (see
+        roi_bouts.MAX_GAP_S for why a bout must not bridge an outage)."""
+        from fnt.uwb import roi_bouts as RB
+        spin = getattr(self, 'spin_time_gap', None)
+        return float(spin.value()) if spin is not None else RB.MAX_GAP_S
+
+    def region_bouts_from_csv(self, csv_path, sets, selected_tags=None):
+        """Re-derive ROI bouts from an existing smoothed CSV.
+
+        Only reached when the per-tag processing loop did not run - a batch
+        retry reusing a verified CSV. Reads in chunks and only the columns the
+        assignment needs, so a 15 M-row file does not have to fit in memory.
+        """
+        head = pd.read_csv(csv_path, nrows=0)
+        coord = (['smoothed_x', 'smoothed_y']
+                 if 'smoothed_x' in head.columns else ['location_x', 'location_y'])
+        want = ['shortid', 'timestamp', 'Timestamp'] + coord
+        frames = {}
+        for chunk in pd.read_csv(csv_path, low_memory=False, chunksize=2_000_000,
+                                 usecols=[c for c in want if c in head.columns]):
+            chunk['Timestamp'] = smoothed_csv_timestamps(
+                chunk, self.combo_timezone.currentText())
+            for tag, g in chunk.groupby('shortid', sort=False):
+                if selected_tags and tag not in selected_tags:
+                    continue
+                frames.setdefault(tag, []).append(g)
+        rows = []
+        for tag in sorted(frames):
+            g = pd.concat(frames.pop(tag)).sort_values('Timestamp')
+            rows.extend(self.region_bout_rows(g, tag, sets,
+                                              idx=self.annotate_regions(g, sets)))
+        return rows
+
+
     def _behavior_params(self):
         """Current detection thresholds straight from the preview controls."""
         from fnt.uwb.behavior_detection import BehaviorParams
         return BehaviorParams(
             social_radius=self.spin_social_radius.value(),
-            still_speed=self.spin_still_speed.value(),
             chase_distance=self.spin_chase_distance.value(),
             chase_speed=self.spin_chase_speed.value(),
             chase_angle_deg=self.spin_chase_angle.value(),
@@ -7100,21 +11834,19 @@ class UWBQuickVisualizationWindow(QWidget):
                 self.lbl_speed_pcts.setText("")
             return None
         res = self._behavior_results()
-        if res is None or idx >= len(res["locomotor"]):
+        if res is None or idx >= len(res["social"]):
             return None
         from fnt.uwb import behavior_detection as bd
 
         show_social = self.chk_beh_social.isChecked()
-        show_loco = self.chk_beh_locomotor.isChecked()
         show_chase = self.chk_beh_chase.isChecked()
         show_displace = self.chk_beh_displace.isChecked()
 
-        loc = res["locomotor"][idx]
         # Derive the displayed social state from the raw masks rather than
         # masking the collapsed array: chase outranks contact in the collapsed
         # state, so blanking chase there would also hide a contact that is
         # genuinely happening underneath it.
-        n_tags = len(loc)
+        n_tags = res["social"].shape[1]
         chase_f = res["chase"][idx]
         contact_f = res["contact"][idx]
         soc = np.full(n_tags, bd.SOC_NONE, dtype=np.int8)
@@ -7170,29 +11902,15 @@ class UWBQuickVisualizationWindow(QWidget):
                     seen.add((min(i, j), max(i, j)))
                     links.append((i, j, circle_col))
 
-        # Combined "locomotion - social" label, e.g. "moving - chasing".
-        # Either half is dropped when its behaviour is switched off or absent,
-        # so a lone animal simply reads "moving".
+        # Social state only. An animal doing nothing social reads as nothing,
+        # rather than as the locomotor label that used to fill the gap.
         states = []
         state_parts = []
         for t in range(n_tags):
-            loco_txt = ""
-            if show_loco and loc[t] != bd.LOC_NODATA:
-                loco_txt = bd.LOCOMOTOR_LABELS[loc[t]]
             soc_txt = bd.SOCIAL_LABELS.get(soc[t], "") if soc[t] != bd.SOC_NONE else ""
-            text = " - ".join(part for part in (loco_txt, soc_txt) if part)
-            loco_col = bd.STATE_COLORS.get(loc[t], "#cccccc")
             soc_col = bd.SOCIAL_COLORS.get(soc[t], "#cccccc")
-            # Each half keeps its own colour; the canvas paints the separator
-            # white so the two read as distinct facts rather than one phrase.
-            parts = []
-            if loco_txt:
-                parts.append((loco_txt, loco_col))
-            if soc_txt:
-                parts.append((soc_txt, soc_col))
-            state_parts.append(parts)
-            colour = soc_col if soc[t] != bd.SOC_NONE else loco_col
-            states.append((text, colour))
+            state_parts.append([(soc_txt, soc_col)] if soc_txt else [])
+            states.append((soc_txt, soc_col))
 
         pct, msg = bd.speed_summary(res["velocity"], res["have_fix"],
                                     self._behavior_params())
@@ -7225,6 +11943,9 @@ class UWBQuickVisualizationWindow(QWidget):
         # Live marker size (diameter, points); see UWBPreview2D.update_frame.
         if hasattr(self, "spin_tag_size"):
             backend.tag_size = self.spin_tag_size.value()
+        if hasattr(self, "combo_label_color"):
+            backend.label_color = self.combo_label_color.currentData()
+            backend.label_outline = self.chk_label_outline.isChecked()
 
         # "Show Tag Tracking Data" off: draw an empty frame so only the arena /
         # background / anchors remain (no markers, no trails).
@@ -7266,21 +11987,222 @@ class UWBQuickVisualizationWindow(QWidget):
             if batt is not None and idx < len(batt):
                 batteries = batt[idx]
 
+        # Speed / step distance share one line under the marker: the stack
+        # already carries ID, behaviour state and voltage, and two more rows
+        # collide as soon as two animals are in contact.
+        readouts = None
+        parts = []
+        for cb, attr, fmt in ((self.chk_show_speed, "preview_speed", "{:.3f} m/s"),
+                              (self.chk_show_step, "preview_step", "{:.2f} m")):
+            arr = getattr(self, attr, None)
+            if cb.isChecked() and arr is not None and idx < len(arr):
+                parts.append((arr[idx], fmt))
+        if parts:
+            readouts = []
+            for i in range(len(x)):
+                bits = [fmt.format(a[i]) for a, fmt in parts
+                        if i < len(a) and np.isfinite(a[i])]
+                readouts.append(" · ".join(bits) if bits else None)
+
         behavior = self._behavior_overlay(idx)
         backend.update_frame(x, y, colors, tracks=tracks, raw_pts=None,
                              labels=labels, batteries=batteries,
-                             behavior=behavior)
+                             readouts=readouts, behavior=behavior)
         self._update_time_label()
 
-    # -- transport --------------------------------------------------------- #
-    def stop_preview_playback(self):
-        """No-op holdover from the old playback engine (kept for call sites).
+    def copy_preview_view(self):
+        """Put a high-resolution PNG of the current view on the clipboard."""
+        backend = self._preview_backend()
+        if not hasattr(backend, "render_png"):
+            self.log_message("This view cannot be copied.")
+            return
+        dpi = COPY_VIEW_DPI
 
-        Playback was removed; the preview is now scrub-only. If a stray timer
-        ever exists it is stopped, but none is created anymore.
-        """
+        # Playback and a render fight over the same figure: the render swaps
+        # the canvas to the export dpi and rebuilds the blit cache underneath,
+        # which a timer tick landing mid-way would draw against. Hold the
+        # playhead for the duration and hand it back afterwards.
+        was_playing = bool(getattr(self, "_playing", False))
+        if was_playing:
+            self.stop_preview_playback()
+
+        self.btn_copy_view.setEnabled(False)
+        QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
+        try:
+            png = backend.render_png(dpi=dpi)
+        except Exception as e:
+            self.log_message(f"Could not copy the view: {type(e).__name__}: {e}")
+            QMessageBox.warning(self, "Copy View",
+                                f"Could not render the view:\n\n{e}")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.btn_copy_view.setEnabled(True)
+            if was_playing:
+                self.start_preview_playback()
+
+        if png is None:
+            # The pane is showing the "load a database" hint, or a 3D view that
+            # has never painted. Copying would mean inventing a picture.
+            self.log_message("Nothing to copy yet — the preview has no frame on screen.")
+            return
+        img = QImage.fromData(png, "PNG")
+        if img.isNull():
+            self.log_message("Could not copy the view: the render did not decode.")
+            return
+
+        # Two flavours on the clipboard, because pasting targets disagree:
+        # Office and most native apps take the generic image (a DIB), while
+        # browsers, Slack and image editors prefer the PNG itself and keep its
+        # exact pixels. Setting both lets each take what it understands.
+        md = QMimeData()
+        md.setImageData(img)
+        md.setData("image/png", QByteArray(png))
+        QApplication.clipboard().setMimeData(md)
+
+        used = getattr(backend, "rendered_dpi", None)
+        if used is None:
+            note = " at screen resolution (3D — use the 2D view to render higher)"
+        elif used < dpi - 0.5:
+            # The pane is wide enough that the asked-for dpi would have blown
+            # past the render cap; say so rather than quietly under-delivering.
+            note = (f" at {used:.0f} dpi — {dpi} was capped to keep the image "
+                    f"under {int(MAX_RENDER_MP)} megapixels")
+        else:
+            note = f" at {dpi} dpi"
+        self.log_message(
+            f"Copied preview to clipboard: {img.width()}x{img.height()} px{note}")
+
+        # One owned timer, restarted per click. An anonymous singleShot per
+        # click meant a second click inside the window captured "Copied" as the
+        # label to restore, and the button kept that text for good.
+        self.btn_copy_view.setText("Copied ✓")
+        if getattr(self, "_copy_view_timer", None) is None:
+            self._copy_view_timer = QTimer(self)
+            self._copy_view_timer.setSingleShot(True)
+            self._copy_view_timer.timeout.connect(
+                lambda: self.btn_copy_view.setText(self._COPY_VIEW_LABEL))
+        self._copy_view_timer.start(1200)
+
+    # -- transport --------------------------------------------------------- #
+    # ── playback ──────────────────────────────────────────────────────────
+    # Redraws per second to AIM for. Drawing faster than this buys nothing on
+    # a normal display, and a machine that cannot reach it simply draws fewer
+    # frames - the trial clock is unaffected either way.
+    PLAYBACK_FPS = 25
+
+    def playback_speed(self):
+        """Trial seconds per wall second, from the transport's Speed box."""
+        try:
+            return float(self.combo_preview_speed.currentData() or 1.0)
+        except (TypeError, ValueError):
+            return 1.0
+
+    def toggle_preview_playback(self):
+        if self._playing:
+            self.stop_preview_playback()
+        else:
+            self.start_preview_playback()
+
+    def start_preview_playback(self):
+        """Begin playing forward from the playhead."""
+        if not getattr(self, '_preview_active', False):
+            return
+        if self.preview_t0 is None or self.slider_timeline.maximum() <= 0:
+            return
+        # Parked at the end, Play means "watch it again" rather than nothing.
+        if self.slider_timeline.value() >= self.slider_timeline.maximum():
+            self._playback_seeking = True
+            self.slider_timeline.setValue(0)
+            self._playback_seeking = False
+        if self.preview_timer is None:
+            self.preview_timer = QTimer(self)
+            # Single-shot and re-armed at the END of each tick: the next frame
+            # is never queued until this one has been drawn, so a slow render
+            # cannot pile up a backlog of timer events and freeze the window.
+            self.preview_timer.setSingleShot(True)
+            self.preview_timer.timeout.connect(self._playback_tick)
+        self._playing = True
+        self._anchor_playback()
+        self._play_frames = 0
+        self._play_fps_t0 = time.perf_counter()
+        self.btn_preview_play.setText("\u23f8 Pause")
+        self.lbl_preview_fps.setText("")
+        self.preview_timer.start(0)
+
+    def stop_preview_playback(self):
+        """Pause playback and leave the playhead where it is."""
+        self._playing = False
         if self.preview_timer is not None:
             self.preview_timer.stop()
+        if hasattr(self, 'btn_preview_play'):
+            self.btn_preview_play.setText("\u25b6 Play")
+            self.lbl_preview_fps.setText("")
+
+    def _anchor_playback(self):
+        """Peg the wall clock to the current playhead.
+
+        Every tick derives the playhead from the time since this anchor, so
+        re-anchoring is how a speed change or a seek takes effect without the
+        playhead jumping: the new rate applies from here on.
+        """
+        self._play_wall0 = time.perf_counter()
+        self._play_media0 = (self.preview_playhead_ms - self.preview_t0) / 1000.0
+
+    def _on_preview_speed_changed(self, *_):
+        if self._playing:
+            self._anchor_playback()
+
+    def _playback_tick(self):
+        """Place the playhead where the wall clock says it should be.
+
+        Deliberately NOT "advance by one frame": accumulating a fixed step per
+        tick makes the trial clock run at whatever rate the machine can render,
+        which is what made the old playback useless above about 4x. Deriving
+        the position from elapsed wall time instead means a slow render costs a
+        DROPPED FRAME, not lost time - 60x is 60x on any machine, it just looks
+        choppier on a slower one. That is why the Speed list needs no cap.
+        """
+        if not self._playing or self.preview_t0 is None:
+            return
+        started = time.perf_counter()
+        elapsed = started - self._play_wall0
+        target_s = self._play_media0 + elapsed * self.playback_speed()
+        end_s = float(self.slider_timeline.maximum())
+
+        if target_s >= end_s:
+            self._playback_seeking = True
+            self.slider_timeline.setValue(int(end_s))
+            self.seek_preview_ms(self.preview_t0 + int(end_s * 1000))
+            self._playback_seeking = False
+            self.stop_preview_playback()
+            self.log_message("Preview playback reached the end of the recording.")
+            return
+
+        # Sub-second precision for the actual frame; the slider follows as a
+        # position indicator, guarded so it does not seek back on us.
+        self._playback_seeking = True
+        self.seek_preview_ms(self.preview_t0 + int(target_s * 1000))
+        self._sync_timeline_to_playhead()
+        self._playback_seeking = False
+
+        # Achieved rate, refreshed about once a second. This is what the
+        # machine actually sustains - the number the user needs to judge a
+        # speed by, rather than a cap guessed in advance.
+        self._play_frames += 1
+        since = started - self._play_fps_t0
+        if since >= 1.0:
+            self.lbl_preview_fps.setText(f"{self._play_frames / since:.0f} fps")
+            self._play_frames = 0
+            self._play_fps_t0 = started
+
+        if not self._playing:      # a seek during the render may have paused us
+            return
+        # Re-arm for the remainder of this frame's budget; 0 when the render
+        # already overran it, so a slow machine free-runs instead of sleeping.
+        budget_ms = 1000.0 / self.PLAYBACK_FPS
+        spent_ms = (time.perf_counter() - started) * 1000.0
+        self.preview_timer.start(int(max(0.0, budget_ms - spent_ms)))
 
     def _context_bg_source(self):
         """(image, extent) for the 'background' layer of main-thread figures.
@@ -7325,36 +12247,86 @@ class UWBQuickVisualizationWindow(QWidget):
         except Exception as e:
             self.log_message(f"Warning: could not export site-map image: {e}")
 
-    def _prompt_plot_layers(self):
-        """Prompt for the spatial context layers; update self.plot_layers.
+    def _layer_sources(self):
+        """Which spatial context layers actually have data behind them.
 
-        Shared by the Export button and the Occupancy / Last-Known buttons so
-        every spatial output asks the same question each time. Returns True to
-        proceed, False if the user cancelled. If no layer is available, sets all
-        layers off and proceeds without a dialog.
-
-        'Background image' is offered when the user has loaded one (via Load
-        Background) or the site XML carries an embedded map (used as a fallback).
+        'Background' counts a user-loaded floorplan (via Load Background) OR the
+        site XML's embedded map, which is the fallback both the preview and the
+        exports draw when no image was loaded.
         """
-        has_background = (self.background_image is not None
-                          or self.xml_map_image is not None)
-        has_zones = bool(self.xml_zones) or (
-            self.arena_zones is not None and not self.arena_zones.empty)
-        has_anchors = bool(self.anchor_positions)
-        if not (has_background or has_zones or has_anchors):
-            self.plot_layers = {'background': False, 'zones': False, 'anchors': False}
-            return True
-        dlg = PlotLayersDialog(has_background, has_zones, has_anchors,
-                               defaults=self.plot_layers, parent=self)
-        if dlg.exec_() != QDialog.Accepted:
-            return False
-        self.plot_layers = dlg.get_layers()
-        self.log_message(
-            "Plot/animation layers — "
-            f"background: {'on' if self.plot_layers['background'] else 'off'}, "
-            f"zones: {'on' if self.plot_layers['zones'] else 'off'}, "
-            f"anchors: {'on' if self.plot_layers['anchors'] else 'off'}")
-        return True
+        return {
+            'background': (self.background_image is not None
+                           or self.xml_map_image is not None),
+            'zones': bool(self.xml_zones) or (
+                self.arena_zones is not None and not self.arena_zones.empty),
+            'anchors': bool(self.anchor_positions),
+            'rois': bool(self.rois),
+        }
+
+    def _sync_layer_toggles(self):
+        """Grey out the preview layer toggles that have no data behind them.
+
+        The checked state is left alone — a toggle greyed out because the XML
+        has not been parsed yet must come back the way the user left it, not
+        cleared. `plot_layers_from_preview` resolves checked-but-unavailable to
+        off, the same way `_anim_show` does for the animation rows.
+        """
+        have = self._layer_sources()
+        for attr, key in (('chk_show_background', 'background'),
+                          ('chk_show_zones', 'zones'),
+                          ('chk_show_anchors', 'anchors'),
+                          ('chk_show_rois', 'rois')):
+            cb = getattr(self, attr, None)
+            if cb is not None:
+                cb.setEnabled(have[key])
+        # Importing zones needs zones, and this runs whenever the XML is
+        # parsed or cleared, so the button follows the same signal the
+        # "Show zone coordinates" toggle does.
+        btn = getattr(self, 'btn_roi_import_xml', None)
+        if btn is not None:
+            btn.setEnabled(bool(self.xml_zones))
+            if not self.xml_zones:
+                btn.setToolTip(
+                    "This trial's site XML defines no zones to import.\n\n"
+                    "Draw regions with 'Draw new' instead — the occupancy "
+                    "outputs measure drawn regions only.")
+            else:
+                btn.setToolTip(ROI_IMPORT_XML_TOOLTIP)
+
+    def plot_layers_from_preview(self, announce=True):
+        """Take the spatial context layers straight from the preview toggles.
+
+        STRICT INHERITANCE: exported plots and animations draw the background,
+        zones and anchors exactly as the preview has them — there is no separate
+        per-export choice to get out of step with what you were looking at. A
+        layer with no data behind it resolves to off however its toggle sits.
+
+        Sets and returns self.plot_layers, which is what the exports read and
+        what get_config_dict captures for a queued job.
+        """
+        have = self._layer_sources()
+
+        def _on(attr, key):
+            cb = getattr(self, attr, None)
+            return bool(cb is not None and cb.isChecked() and have[key])
+
+        self.plot_layers = {
+            'background': _on('chk_show_background', 'background'),
+            'zones': _on('chk_show_zones', 'zones'),
+            'anchors': _on('chk_show_anchors', 'anchors'),
+            # Whether regions are DRAWN. Whether they are MEASURED is
+            # Export Zone/ROI Occupancy CSV, and the two never consult
+            # each other.
+            'rois': _on('chk_show_rois', 'rois'),
+        }
+        if announce:
+            self.log_message(
+                "Plot/animation layers, inherited from the preview — "
+                f"background: {'on' if self.plot_layers['background'] else 'off'}, "
+                f"zones: {'on' if self.plot_layers['zones'] else 'off'}, "
+                f"anchors: {'on' if self.plot_layers['anchors'] else 'off'}, "
+                f"regions: {'on' if self.plot_layers['rois'] else 'off'}")
+        return self.plot_layers
 
     # -- quick snapshot plot ---------------------------------------------- #
     def plot_last_known_locations(self):
@@ -7373,9 +12345,8 @@ class UWBQuickVisualizationWindow(QWidget):
             QMessageBox.warning(self, "No Tags", "Select at least one tag first")
             return
 
-        # Ask which context layers to draw (background/zones/anchors).
-        if not self._prompt_plot_layers():
-            return
+        # Background/zones/anchors come from the preview, as drawn.
+        self.plot_layers_from_preview()
 
         try:
             tz = pytz.timezone(self.combo_timezone.currentText())
@@ -7423,7 +12394,8 @@ class UWBQuickVisualizationWindow(QWidget):
             bg_image, bg_extent = self._context_bg_source()
             draw_context_layers(
                 ax, self.plot_layers, bg_image=bg_image, bg_extent=bg_extent,
-                zones_xml=self.xml_zones, anchors=self.anchor_positions)
+                zones_xml=self.xml_zones, anchors=self.anchor_positions,
+                rois=self.rois)
 
             cmap = plt.get_cmap('tab20')
             for i, (shortid, (x, y, ts)) in enumerate(sorted(latest.items())):
@@ -7495,9 +12467,8 @@ class UWBQuickVisualizationWindow(QWidget):
             QMessageBox.warning(self, "No Tags", "Select at least one tag first")
             return
 
-        # Ask which context layers to draw (zones/anchors overlay the heatmap).
-        if not self._prompt_plot_layers():
-            return
+        # Zones/anchors overlay the heatmap, as the preview has them.
+        self.plot_layers_from_preview()
 
         db = self.current_indexed_db() or self.preview_db_path or self.db_path
         tz = pytz.timezone(self.combo_timezone.currentText())
@@ -7654,8 +12625,10 @@ class UWBQuickVisualizationWindow(QWidget):
             draw_context_layers(
                 ax, {'background': False,
                      'zones': self.plot_layers.get('zones'),
-                     'anchors': self.plot_layers.get('anchors')},
-                zones_xml=self.xml_zones, anchors=self.anchor_positions)
+                     'anchors': self.plot_layers.get('anchors'),
+                     'rois': self.plot_layers.get('rois')},
+                zones_xml=self.xml_zones, anchors=self.anchor_positions,
+                rois=self.rois)
             ax.set_title(lab, fontsize=10)
             ax.set_xlabel("X Position (m)", fontsize=8)
             ax.set_ylabel("Y Position (m)", fontsize=8)
@@ -7928,8 +12901,25 @@ class UWBQuickVisualizationWindow(QWidget):
             f"is more reliable than recovery."
             f"{recover_hint}")
 
-    def _on_index_ready(self, src_path, path):
+    def _retire_index_builder(self):
+        """Release the finished index builder, outside its own signal.
+
+        The builder emits done/failed from inside its run(), so clearing the
+        last reference here destroys a QThread that has not returned yet -
+        which Qt aborts the process for (SIGABRT, exit code 6), killing the
+        tool the moment a large index finished. Same deferred release the
+        chunk loaders and metadata workers use.
+        """
+        w = self.preview_index_builder
+        if w is None:
+            return
+        if not w.isFinished():
+            QTimer.singleShot(50, self._retire_index_builder)
+            return
         self.preview_index_builder = None
+
+    def _on_index_ready(self, src_path, path):
+        self._retire_index_builder()
         self._hide_busy()   # balanced with the _show_busy at build start
         if not self._index_build_is_current(src_path):
             # The user moved to another database while this was building. The
@@ -7949,7 +12939,7 @@ class UWBQuickVisualizationWindow(QWidget):
         # in content, so they stay valid — only future reads get faster.
 
     def _on_index_failed(self, src_path, err):
-        self.preview_index_builder = None
+        self._retire_index_builder()
         self._hide_busy()   # balanced with the _show_busy at build start
         if not self._index_build_is_current(src_path):
             return
@@ -8016,7 +13006,26 @@ class UWBQuickVisualizationWindow(QWidget):
         self.bg_offset_y = 0.0
         self.xml_maps = []
         self.arena_zones = None
+        self.rois = []
+        # The list on screen still holds the outgoing trial's regions.
+        # Clear it here rather than in the config loader, because a
+        # trial with no config file never reaches the loader's restore.
+        if hasattr(self, 'roi_list'):
+            self._refresh_roi_list(keep=-1)
+            self.on_rois_changed()
         self.anchor_positions = []
+
+        # Weather belongs to a trial's span and site; the next trial brings
+        # its own (config or fnt_site.json).
+        self.environment = None
+        self.weather_timeline = None
+        self._weather_summary = None
+        self._sun_timeline = None
+        self._light_day = None
+        self._weather_restore_key = None
+        if hasattr(self, 'edit_site_lat'):
+            self.apply_site_settings(WX.SiteSettings())
+            self._set_weather_status("")
 
         # Drop all cached preview chunks so nothing leaks across databases. The
         # pane stays visible but goes inert until the new database's tags load.
@@ -8040,6 +13049,8 @@ class UWBQuickVisualizationWindow(QWidget):
         self.preview_x = self.preview_y = None
         self.preview_xf = self.preview_yf = None
         self.preview_raw_x = self.preview_raw_y = None
+        self.preview_step = self.preview_speed = None
+        self._preview_step_pool = None
         self.preview_batt = None
         self.preview_times = None
         self.preview_tags = []
@@ -8047,18 +13058,29 @@ class UWBQuickVisualizationWindow(QWidget):
         self.xml_zones = []
         self.xml_map_image = None
         self.xml_map_extent = None
+        self.xml_map_px = None
+        self.xml_map_scale = None
         self._sync_bg_transform_controls()
+        # Nothing is parsed yet, so no layer has data behind it; the next XML
+        # parse / config load re-offers whatever this database actually has.
+        self._sync_layer_toggles()
         if hasattr(self, 'slider_timeline'):
             self._timeline_guard = True
             self.slider_timeline.setRange(0, 0)
             self._timeline_guard = False
             self.lbl_preview_status.setText("Load a database and select tags to preview")
             self.lbl_preview_time.setText("--")
+            self.lbl_preview_weather.setText("")
+            self.lbl_preview_light.setText("")
+            self.light_bar.clear()
+            self.moon_icon.clear()
             self._update_cache_label()
             self._set_index_status("Fast index: not built", "#cccccc")
             self.preview_canvas_2d.clear()
             if self.preview_canvas_3d is not None:
                 self.preview_canvas_3d.clear()
+
+        self.pending_animation_days = None
 
         # Reset pending table name
         if hasattr(self, 'pending_table_name'):
@@ -8090,12 +13112,21 @@ class UWBQuickVisualizationWindow(QWidget):
         self.chk_export_smoothed_csv.setChecked(True)
         self.chk_proximity_detection.setChecked(True)
         self.spin_proximity_threshold.setValue(0.5)
-        self.chk_export_gbi.setChecked(False)
-        self.chk_export_edgelist.setChecked(False)
+        self.chk_export_roi_bouts.setChecked(False)
+        self.chk_export_roi_daily.setChecked(False)
+        self.chk_outlier_filter.setChecked(True)
+        self.spin_outlier_window.setValue(31)
+        self.spin_outlier_sigma.setValue(6.0)
+        self.spin_velocity_min_dt.setValue(0.50)
+        self.chk_preview_outlier.setChecked(True)
+        self.spin_preview_outlier_window.setValue(31)
+        self.spin_preview_outlier_sigma.setValue(6.0)
+        self.spin_preview_velocity_min_dt.setValue(0.50)
         self.chk_export_behavior.setChecked(False)
         self.on_social_network_toggled()
         self.chk_save_plots.setChecked(False)
         self.chk_save_svg.setChecked(False)
+        self.combo_plot_label_type.setCurrentText(SEX_ID)
         for cb in self.plot_type_checkboxes.values():
             cb.setChecked(True)
         self.chk_save_animation.setChecked(False)
@@ -8110,8 +13141,10 @@ class UWBQuickVisualizationWindow(QWidget):
         # Preview display defaults
         self.chk_show_tracking.setChecked(True)
         self.chk_show_tag_id.setChecked(False)
-        self.combo_tag_id_type.setCurrentText("Display ID")
+        self.combo_tag_id_type.setCurrentText(SEX_ID)
         self.spin_tag_size.setValue(10)
+        self.combo_label_color.setCurrentIndex(0)      # Auto
+        self.chk_label_outline.setChecked(True)
         self.chk_show_battery.setChecked(False)
 
         # Reset background image label
@@ -8121,6 +13154,58 @@ class UWBQuickVisualizationWindow(QWidget):
         # Reset show anchor positions checkbox
         if hasattr(self, 'chk_show_anchors'):
             self.chk_show_anchors.setChecked(False)
+
+    # ---- Recent databases ---------------------------------------------- #
+    @staticmethod
+    def _recent_databases():
+        vals = QSettings("FNT", "UWB").value(RECENT_DATABASES_KEY, [], type=list)
+        return [str(v) for v in (vals or []) if v]
+
+    def _remember_recent_database(self, path):
+        path = os.path.abspath(path)
+        key = os.path.normcase(path)
+        recent = [p for p in self._recent_databases()
+                  if os.path.normcase(p) != key]
+        recent.insert(0, path)
+        QSettings("FNT", "UWB").setValue(RECENT_DATABASES_KEY,
+                                         recent[:MAX_RECENT_DATABASES])
+
+    def _rebuild_recent_db_menu(self):
+        """Refill the Open Recent menu (on every show, so (not found) is live)."""
+        menu = self.menu_recent_db
+        menu.clear()
+        recent = self._recent_databases()
+        if not recent:
+            empty = menu.addAction("(no recent databases)")
+            empty.setEnabled(False)
+            return
+        for path in recent:
+            found = os.path.exists(path)
+            folder = os.path.basename(os.path.dirname(path)) or os.path.dirname(path)
+            text = f"{os.path.basename(path)}   —   {folder}"
+            if not found:
+                text += "   (not found)"
+            elif self.db_path and os.path.normcase(os.path.abspath(self.db_path)) \
+                    == os.path.normcase(path):
+                text += "   (open)"
+            act = menu.addAction(text)
+            act.setToolTip(path)
+            act.setEnabled(found)
+            act.triggered.connect(
+                lambda _checked=False, p=path: self._open_recent_database(p))
+        menu.addSeparator()
+        clear = menu.addAction("Clear Recent")
+        clear.triggered.connect(self._clear_recent_databases)
+
+    def _open_recent_database(self, path):
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "Database Not Found",
+                                f"This database is no longer at:\n{path}")
+            return
+        self._load_database_path(path)
+
+    def _clear_recent_databases(self):
+        QSettings("FNT", "UWB").setValue(RECENT_DATABASES_KEY, [])
 
     def select_database(self):
         """Select a SQLite database via a file dialog, then load it."""
@@ -8140,6 +13225,10 @@ class UWBQuickVisualizationWindow(QWidget):
         'selected_tags', 'tag_identities',
         'background_image_path', 'background_scale_inpx', 'background_offset_m',
         'arena_zones', 'xml_config', 'sitemap',
+        # Regions were traced over THIS trial's arena and background; copying
+        # them onto another trial would place boundaries that were never drawn
+        # there.
+        'rois', 'show_rois',
         'fnt_version', 'run_timestamp',
     })
     # Preview keys in the same category (nested under config['preview']).
@@ -8256,6 +13345,8 @@ class UWBQuickVisualizationWindow(QWidget):
 
             self.db_path = file_path
             self.lbl_db.setText(f"Selected: {os.path.basename(file_path)}")
+            if not batch:
+                self._remember_recent_database(file_path)
 
             # Reset all settings to defaults before loading new config
             self.reset_to_defaults()
@@ -8263,6 +13354,7 @@ class UWBQuickVisualizationWindow(QWidget):
             # Load config BEFORE populating combo_table, so that pending_tag_selection
             # is set before on_table_selected() triggers tag checkbox creation
             config_loaded = self.load_config_if_exists()
+            self._autoload_site_profile()
             if config_loaded:
                 self.lbl_config_status.setText("Loaded previous fnt_config.json file.")
                 self.lbl_config_status.setVisible(True)
@@ -8558,8 +13650,6 @@ class UWBQuickVisualizationWindow(QWidget):
                     self.arena_zones = pd.DataFrame(zone_data)
                     num_zones = len(self.arena_zones['zone'].unique())
                     self.log_message(f"Parsed {num_zones} zones with {len(zone_data)} coordinate points from XML")
-                    if hasattr(self, 'chk_show_zones'):
-                        self.chk_show_zones.setEnabled(True)
                 else:
                     self.log_message("No valid zone coordinates found in XML")
             else:
@@ -8591,7 +13681,6 @@ class UWBQuickVisualizationWindow(QWidget):
 
             if self.anchor_positions:
                 self.log_message(f"Parsed {len(self.anchor_positions)} anchor positions from XML")
-                self.chk_show_anchors.setEnabled(True)
             else:
                 self.log_message("No anchor positions found in XML")
 
@@ -8601,6 +13690,8 @@ class UWBQuickVisualizationWindow(QWidget):
             # any other dialect.
             self.xml_map_image = None
             self.xml_map_extent = None
+            self.xml_map_px = None
+            self.xml_map_scale = None
             self.xml_maps = []
             for elem in root.iter():
                 if elem.tag not in ('Map', 'BackgroundImage', 'Image'):
@@ -8624,8 +13715,16 @@ class UWBQuickVisualizationWindow(QWidget):
                     if self.xml_map_image is None:
                         # First decodable map drives the XML site view.
                         self.xml_map_image = img
-                        # origin='upper' when drawn, so y runs top-down from h_m
-                        self.xml_map_extent = (0.0, w_m, 0.0, h_m)
+                        self.xml_map_px = (w_px, h_px)
+                        self.xml_map_scale = px_scale
+                        # With no floorplan loaded, the map owns the manual
+                        # transform: seed it from the map's OWN scale so the
+                        # alignment box reads a real number and can nudge the
+                        # map onto the surveyed frame. A scale already restored
+                        # from the config is a saved nudge — leave it alone.
+                        if self.background_image is None and not self.bg_scale:
+                            self.bg_scale = px_scale
+                        self._recompute_xml_map_extent()
                     map_label = elem.get('name') or ''
                     map_label = f" '{map_label}'" if map_label else ''
                     self.log_message(
@@ -8636,6 +13735,11 @@ class UWBQuickVisualizationWindow(QWidget):
 
             if self.xml_map_image is None:
                 self.log_message("No embedded background image found in XML")
+
+            # One pass over the layer toggles now that zones, anchors and the
+            # site map are all known: each is offered only if this XML actually
+            # carries it, whatever the previous database had.
+            self._sync_layer_toggles()
 
             # Set last: a parse that threw part-way leaves the marker unset so
             # the next call retries rather than trusting half-filled state.
@@ -8722,6 +13826,43 @@ class UWBQuickVisualizationWindow(QWidget):
         self.bg_width_meters = w_px * self.bg_scale * 0.0254
         self.bg_height_meters = h_px * self.bg_scale * 0.0254
 
+    def _xml_map_owns_transform(self):
+        """True when the manual transform is placing the XML site map.
+
+        A loaded floorplan takes precedence as the drawn background, so it owns
+        the transform; the XML map only owns it when there is no loaded image.
+        """
+        return self.background_image is None and self.xml_map_image is not None
+
+    def _recompute_xml_map_extent(self):
+        """Place the XML site map, honouring the manual transform when it owns it.
+
+        The map's authored scale (the <Map scale=...> attribute) is its default,
+        but that render need not land on the surveyed zone/anchor frame — the
+        arena it draws can be inset and rotated relative to the survey. Scale and
+        offset let the drawn map be registered onto that frame; rotation is not
+        offered, so a rotated render can only be approximated.
+
+        Writes self.xml_map_extent, which every consumer reads: the preview
+        background, the exported figures, the axis fit, and the extent recorded
+        in the exported site map's config entry.
+        """
+        if self.xml_map_image is None or not self.xml_map_px:
+            self.xml_map_extent = None
+            return
+        w_px, h_px = self.xml_map_px
+        if self._xml_map_owns_transform():
+            scale = self.bg_scale or self.xml_map_scale or self.xml_scale or 1.0
+            x0, y0 = self.bg_offset_x, self.bg_offset_y
+        else:
+            # A loaded image owns the transform, so the map falls back to the
+            # placement the XML authored for it.
+            scale = self.xml_map_scale or self.xml_scale or 1.0
+            x0 = y0 = 0.0
+        # origin='upper' when drawn, so y runs top-down from the top edge.
+        self.xml_map_extent = (x0, x0 + w_px * scale * 0.0254,
+                               y0, y0 + h_px * scale * 0.0254)
+
     def _bg_placed_extent(self):
         """(x0, x1, y0, y1) metres for the loaded background, honouring offsets.
 
@@ -8767,6 +13908,9 @@ class UWBQuickVisualizationWindow(QWidget):
         matched = self._default_bg_scale(img_width_px, img_height_px, file_path)
         self.bg_scale = matched if matched else 1.0
         self._recompute_bg_size()
+        # This image now owns the transform, so the XML map (no longer drawn)
+        # falls back to the placement the XML authored for it.
+        self._recompute_xml_map_extent()
         if matched:
             self.log_message(
                 f"✓ Background {source}: {name} "
@@ -8782,13 +13926,20 @@ class UWBQuickVisualizationWindow(QWidget):
         self.btn_remove_background.setEnabled(True)
         self._sync_bg_transform_controls()
 
+        # The background layer is off by default, so picking a file deliberately
+        # has to turn it on — loading an image and seeing nothing happen is not
+        # a defensible interaction. An auto-loaded or config-restored image does
+        # NOT flip it: that would overrule a saved 'off' the user chose.
+        if source == "loaded" and getattr(self, 'chk_show_background', None) is not None:
+            self.chk_show_background.setChecked(True)
+
         self._log_background_alignment()
 
-        # Switch the live preview to 2D (the only view that shows the
-        # background) and redraw so the floorplan appears immediately.
+        # Redraw so the floorplan appears immediately. Every view mode draws it
+        # now (the canvas takes one background from _context_bg_source), so the
+        # view no longer has to be forced to 2D to see what was just loaded.
+        self._sync_layer_toggles()
         if self._preview_active:
-            if self.combo_view_mode.currentText() != self.VIEW_2D:
-                self.combo_view_mode.setCurrentText(self.VIEW_2D)
             self.refresh_preview_arena()
         return True
 
@@ -8802,6 +13953,12 @@ class UWBQuickVisualizationWindow(QWidget):
         image ends up the wrong physical size even though its corner still sits
         at (0, 0). Comparing the image extent to the anchor bounding box makes
         that visible and suggests the scale that would fit.
+
+        The comparison is only DIAGNOSTIC when the anchors ring the tracked
+        area. On a rig whose anchors sit on a wall set back from the arena the
+        span exceeds the image by design, so a verdict is offered only when
+        both axes are off by the same factor - the signature of a real scale
+        error, which is uniform and therefore preserves aspect.
         """
         if self.background_image is None:
             return
@@ -8840,16 +13997,53 @@ class UWBQuickVisualizationWindow(QWidget):
                 rx = self.bg_width_meters / span_x
                 ry = self.bg_height_meters / span_y
                 self.log_message(
-                    f"  Image / anchor-span ratio: x={rx:.2f}, y={ry:.2f} "
-                    "(≈1.0–1.3 expected; far from 1 = image mis-scaled)")
-                if self.bg_scale:
-                    # Scale that would make the image span exactly the anchor
-                    # bbox (the true arena is a bit larger, so nudge from here).
+                    f"  Image / anchor-span ratio: x={rx:.2f}, y={ry:.2f}")
+                # A SCALE error is uniform, so it preserves aspect and moves
+                # both ratios together. Only then can one 'Bg scale' value fix
+                # it, and only then is suggesting one honest. Ratios that
+                # DISAGREE mean the image and the anchor box are different
+                # shapes, which a single scale cannot reconcile - and the
+                # ordinary cause is anchors mounted off the tracked area
+                # (a wall set back from the arena), where the span SHOULD
+                # exceed the image and nothing is wrong.
+                agree = abs(rx - ry) <= 0.15 * max(rx, ry)
+                if agree and not (0.9 <= rx <= 1.4):
                     self.log_message(
-                        f"  Scale to fit image to anchor span: x≈"
-                        f"{self.bg_scale / rx:.4f}, y≈{self.bg_scale / ry:.4f} in/px "
-                        f"(current {self.bg_scale:.4f}) — set via the Preview "
-                        "'Bg scale' control")
+                        "  Both axes are off by the same factor, which is what "
+                        "a mis-scaled image looks like (a re-rendered floorplan "
+                        "at a different resolution).")
+                    if self.bg_scale:
+                        self.log_message(
+                            f"  Scale to fit the anchor span: "
+                            f"≈{self.bg_scale / rx:.4f} in/px (current "
+                            f"{self.bg_scale:.4f}) — set via the Preview "
+                            "'Bg scale' control. The arena is usually a little "
+                            "larger than the anchor box, so nudge up from there.")
+                elif agree:
+                    self.log_message(
+                        "  Consistent on both axes and close to 1 — the "
+                        "image scale agrees with the anchors.")
+                else:
+                    # Deliberately NO scale suggestion here: the two axes want
+                    # different numbers, so any single one is wrong, and
+                    # entering it would break an alignment that may be correct.
+                    self.log_message(
+                        "  The axes disagree, so this is NOT a uniform scale "
+                        "error and no single 'Bg scale' can fix it. Expected "
+                        "when the anchors are not mounted around the tracked "
+                        "area — a wall set back from the arena makes the "
+                        "span exceed the image legitimately. Only treat it as "
+                        "a fault if your anchors DO ring the tracked area.")
+                if ext:
+                    out = []
+                    if ax0 < ext[0] or ax1 > ext[1]:
+                        out.append("x")
+                    if ay0 < ext[2] or ay1 > ext[3]:
+                        out.append("y")
+                    if out:
+                        self.log_message(
+                            f"  Anchors fall outside the image on {'/'.join(out)}"
+                            f" — expected if they are mounted off the arena.")
         else:
             self.log_message("  No anchors parsed — cannot cross-check the image scale.")
 
@@ -8885,9 +14079,13 @@ class UWBQuickVisualizationWindow(QWidget):
         self.background_image_path = None
         self.bg_width_meters = None
         self.bg_height_meters = None
-        self.bg_scale = None
+        # Hand the transform back to the XML site map, which becomes the active
+        # background again: seed its own scale rather than leaving None behind.
+        self.bg_scale = (self.xml_map_scale or self.xml_scale
+                         if self.xml_map_image is not None else None)
         self.bg_offset_x = 0.0
         self.bg_offset_y = 0.0
+        self._recompute_xml_map_extent()
         self.lbl_background_status.setText("No background image loaded")
         self.lbl_background_status.setStyleSheet("color: #666666; font-style: italic; font-size: 9px;")
         self.btn_remove_background.setEnabled(False)
@@ -8896,6 +14094,9 @@ class UWBQuickVisualizationWindow(QWidget):
         if self.preview_canvas_2d is not None:
             self.preview_canvas_2d.background_image = None
             self.preview_canvas_2d.bg_extent = None
+        # The XML's embedded site map may still stand behind the layer, so let
+        # the refresh below decide what the background toggle now offers.
+        self._sync_layer_toggles()
         if self._preview_active:
             self.refresh_preview_arena()
 
@@ -8904,18 +14105,39 @@ class UWBQuickVisualizationWindow(QWidget):
         if self._preview_active:
             self.refresh_preview_arena()
 
+    def on_marker_style_changed(self, _value=None):
+        """Redraw the tags without rebuilding the scene behind them.
+
+        Marker size, tag IDs, battery/speed/step readouts and the tracking
+        toggle all change per-FRAME artists only. Routing them through the
+        arena rebuild re-rendered the background, the zones and the anchors to
+        move a dot - and, until set_arena learned to recognise an unchanged
+        framing, threw away the user's zoom every time the icon size was
+        nudged.
+        """
+        if self._preview_active:
+            self.render_preview_frame()
+
     def _sync_bg_transform_controls(self):
         """Push the current scale/offset onto the spinboxes without re-firing.
 
-        Enables the control group only when a background image is loaded. Signals
-        are blocked so seeding the widgets does not trigger a redraw loop.
+        Enabled whenever there is a background to place — a loaded floorplan OR
+        the XML's own site map. The scale shown is the one actually in force for
+        that image, never a placeholder: a disabled 1.0000 sitting under a map
+        drawn at 0.299 in/px reads as a wrong number rather than an absent one.
+        Signals are blocked so seeding the widgets does not trigger a redraw
+        loop.
         """
         if not hasattr(self, 'spin_bg_scale'):
             return   # controls not built yet (early call during startup)
-        have_img = self.background_image is not None
+        have_img = (self.background_image is not None
+                    or self.xml_map_image is not None)
+        effective = self.bg_scale
+        if not effective and self._xml_map_owns_transform():
+            effective = self.xml_map_scale or self.xml_scale
         for w in (self.spin_bg_scale, self.spin_bg_offx, self.spin_bg_offy):
             w.blockSignals(True)
-        self.spin_bg_scale.setValue(self.bg_scale if self.bg_scale else 1.0)
+        self.spin_bg_scale.setValue(effective if effective else 1.0)
         self.spin_bg_offx.setValue(self.bg_offset_x)
         self.spin_bg_offy.setValue(self.bg_offset_y)
         for w in (self.spin_bg_scale, self.spin_bg_offx, self.spin_bg_offy):
@@ -8928,27 +14150,37 @@ class UWBQuickVisualizationWindow(QWidget):
 
         Re-sizes the background from the new scale, shifts it by the new offset,
         and refreshes the live preview so the user sees the alignment update as
-        they nudge. No-op when no image is loaded.
+        they nudge. Applies to whichever background is active — the loaded
+        floorplan, or the XML site map when no floorplan is loaded.
         """
-        if self.background_image is None:
+        if self.background_image is None and self.xml_map_image is None:
             return
         self.bg_scale = self.spin_bg_scale.value()
         self.bg_offset_x = self.spin_bg_offx.value()
         self.bg_offset_y = self.spin_bg_offy.value()
         self._recompute_bg_size()
+        self._recompute_xml_map_extent()
         if self._preview_active:
             self.refresh_preview_arena()
 
     def reset_bg_transform(self):
-        """Restore scale to the XML default (matched to this image) and offset to 0."""
-        if self.background_image is None:
+        """Restore scale to the XML default for the active background, offset to 0.
+
+        For a loaded floorplan that is the scale of the embedded render it
+        matches; for the XML site map it is the scale the XML authored for it.
+        """
+        if self.background_image is not None:
+            h_px, w_px = self.background_image.shape[:2]
+            matched = self._default_bg_scale(w_px, h_px, self.background_image_path)
+        elif self.xml_map_image is not None:
+            matched = self.xml_map_scale or self.xml_scale
+        else:
             return
-        h_px, w_px = self.background_image.shape[:2]
-        matched = self._default_bg_scale(w_px, h_px, self.background_image_path)
         self.bg_scale = matched if matched else 1.0
         self.bg_offset_x = 0.0
         self.bg_offset_y = 0.0
         self._recompute_bg_size()
+        self._recompute_xml_map_extent()
         self._sync_bg_transform_controls()
         self.log_message(
             f"Background transform reset to XML: scale {self.bg_scale:.4f} in/px, "
@@ -9063,6 +14295,26 @@ class UWBQuickVisualizationWindow(QWidget):
         self.lbl_rolling_window.setVisible(False)
         self.combo_window_units.setVisible(False)
 
+    def plot_label_type(self):
+        """The 'Label animals by' choice, logging any animal it can't honour.
+
+        Name and Code are optional per animal and fall back to the SexID, so a
+        half-filled roster would quietly mix the two on one figure. Say which
+        animals will read differently rather than let it look like a bug.
+        """
+        kind = normalize_id_type(self.combo_plot_label_type.currentText())
+        if kind in (NAME, CODE) and self.tag_identities:
+            key = 'name' if kind == NAME else 'code'
+            missing = sorted({
+                f"{info.get('sex', '')}{info.get('identity', '')}"
+                for info in self.tag_identities.values()
+                if info and not str(info.get(key, '') or '').strip()})
+            if missing:
+                self.log_message(
+                    f"Plot labels: {kind} is not set for {', '.join(missing)} "
+                    f"- labelled by SexID instead.")
+        return kind
+
     def on_save_plots_toggled(self):
         """Handle save plots checkbox toggle"""
         enabled = self.chk_save_plots.isChecked()
@@ -9075,15 +14327,12 @@ class UWBQuickVisualizationWindow(QWidget):
         self.proximity_threshold_widget.setVisible(False)  # inherited from the preview
 
     def on_social_network_toggled(self):
-        """Show the edge-list window only when the edge list is requested.
+        """Keep the proximity threshold row hidden.
 
-        The GBI has no sub-options: it is calculated independently of the
-        window, so ticking it changes nothing here. The proximity threshold
-        row stays hidden either way - it is inherited from the preview's
-        social radius.
+        It is inherited from the preview's social radius, never set here. The
+        edge-list window control this method also used to manage went with the
+        edge list itself.
         """
-        if hasattr(self, 'el_window_widget'):
-            self.el_window_widget.setVisible(self.chk_export_edgelist.isChecked())
         if hasattr(self, 'proximity_threshold_widget'):
             self.proximity_threshold_widget.setVisible(False)
 
@@ -9164,6 +14413,23 @@ class UWBQuickVisualizationWindow(QWidget):
             cb.toggled.connect(self._sync_all_days_checkbox)
             self.daily_animation_day_checkboxes[date_str] = cb
             self.daily_days_layout_inner.addWidget(cb)
+
+        # A saved/queued selection, now that the dates exist. Dates the trial
+        # no longer has are dropped; a selection matching nothing at all is
+        # ignored rather than leaving every day unticked.
+        pending = getattr(self, 'pending_animation_days', None)
+        self.pending_animation_days = None
+        if pending is not None:
+            wanted = {str(d) for d in pending}
+            if any(d in wanted for d in self.daily_animation_day_checkboxes):
+                for d, cb in self.daily_animation_day_checkboxes.items():
+                    cb.blockSignals(True)
+                    cb.setChecked(d in wanted)
+                    cb.blockSignals(False)
+                self.log_message(
+                    f"Daily animation days restored from the saved settings: "
+                    f"{len(wanted & set(self.daily_animation_day_checkboxes))}"
+                    f" of {len(self.daily_animation_day_checkboxes)} day(s).")
         self._sync_all_days_checkbox()
 
     def on_all_days_clicked(self):
@@ -9265,13 +14531,17 @@ class UWBQuickVisualizationWindow(QWidget):
             conn.close()
 
         out = {}
+
+        # To the millisecond, matching IdentityAssignmentDialog.TIME_FMT. The
+        # source is epoch ms, so the precision was always there and was simply
+        # being truncated away. %f gives microseconds; the last three digits of
+        # a value built from ms are always zero, so slicing them is exact.
+        def _fmt(ms):
+            return (pd.Timestamp(ms, unit='ms', tz='UTC').tz_convert(tz)
+                      .strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])
+
         for tag, (lo, hi) in raw.items():
-            out[tag] = {
-                'start': pd.Timestamp(lo, unit='ms', tz='UTC').tz_convert(tz)
-                           .strftime('%Y-%m-%d %H:%M:%S'),
-                'end': pd.Timestamp(hi, unit='ms', tz='UTC').tz_convert(tz)
-                         .strftime('%Y-%m-%d %H:%M:%S'),
-            }
+            out[tag] = {'start': _fmt(lo), 'end': _fmt(hi)}
         return out
 
     def open_identity_dialog(self):
@@ -9493,29 +14763,6 @@ class UWBQuickVisualizationWindow(QWidget):
             self.populate_animation_days_from_list(res['days'])
             self.log_message(f"Found {len(res['days'])} unique days in database")
     
-    def load_unique_days_from_database(self):
-        """Load unique days from database without loading full data"""
-        if not self.db_path or not self.table_name:
-            return
-        
-        try:
-            conn = connect_ro(self.db_path)
-            # Query for distinct dates
-            query = f"""
-                SELECT DISTINCT date(datetime(timestamp/1000, 'unixepoch'), 'localtime') as date
-                FROM {self.table_name}
-                ORDER BY date
-            """
-            df = pd.read_sql_query(query, conn)
-            conn.close()
-            
-            if len(df) > 0:
-                self.populate_animation_days_from_list(df['date'].tolist())
-                self.log_message(f"Found {len(df)} unique days in database")
-            
-        except Exception as e:
-            self.log_message(f"Could not load unique days: {str(e)}")
-    
     def update_tag_selection(self):
         """Update tag checkboxes"""
         for cb in self.tag_checkboxes.values():
@@ -9534,22 +14781,13 @@ class UWBQuickVisualizationWindow(QWidget):
                     item.widget().deleteLater()
             self.tag_layout.removeItem(self.tag_buttons_layout)
         
+        if hasattr(self, 'btn_tag_stats'):
+            self.btn_tag_stats.deleteLater()
         if hasattr(self, 'btn_assign_identities'):
             self.btn_assign_identities.deleteLater()
         
         for tag in self.available_tags:
-            hex_id = hex(tag).upper().replace('0X', '')
-            # Show HexID with identity info only if user has configured it
-            if tag in self.tag_identities:
-                info = self.tag_identities[tag]
-                sex = info.get('sex', '')
-                identity = info.get('identity', '')
-                if sex and identity:
-                    cb = QCheckBox(f"HexID {hex_id} ({sex}, {identity})")
-                else:
-                    cb = QCheckBox(f"HexID {hex_id}")
-            else:
-                cb = QCheckBox(f"HexID {hex_id}")
+            cb = QCheckBox(self._tag_checkbox_text(tag))
             cb.setChecked(True)
             cb.stateChanged.connect(self.update_identity_button_state)
             # The preview's frame columns and its timeline range both derive
@@ -9582,6 +14820,29 @@ class UWBQuickVisualizationWindow(QWidget):
         )
         self.btn_assign_identities.setStyleSheet("QPushButton { padding: 4px 8px; font-size: 10px; }")
         self.tag_layout.addWidget(self.btn_assign_identities)
+
+        # What rate each tag is ACTUALLY pinging at. The profile is written on
+        # the tag's label and nowhere in the data, so this is the only way to
+        # catch a mis-flashed tag before it costs a trial.
+        self.btn_tag_stats = QPushButton("Tag Statistics...")
+        self.btn_tag_stats.clicked.connect(self.open_tag_stats)
+        self.btn_tag_stats.setEnabled(False)
+        self.btn_tag_stats.setStyleSheet(
+            "QPushButton { padding: 4px 8px; font-size: 10px; }")
+        self.btn_tag_stats.setToolTip(
+            "Measure each tag's ping rate and battery from the recording "
+            "itself: the profile it is really running (10/1, 4/1, 1/1), its "
+            "typical and peak rate, whether it ever drops to its rest mode, "
+            "and how fast the battery is going.\n"
+            "\n"
+            "Worth a look at the start of every trial: a tag flashed with the "
+            "wrong profile samples its animal several times more (or less) "
+            "often than the others, which is a confound before it is a dead "
+            "battery. Nothing in the data says so otherwise.\n"
+            "\n"
+            "Reads the fast indexed copy when there is one; otherwise it "
+            "scans the table once.")
+        self.tag_layout.addWidget(self.btn_tag_stats)
         
         # Whose tags these are. Anything that must not act on the previous
         # trial's widgets can compare this against (db_path, table_name);
@@ -9592,6 +14853,9 @@ class UWBQuickVisualizationWindow(QWidget):
         # Apply pending tag selection from loaded config
         self.apply_pending_tag_selection()
 
+        # A trial fetched before comes back from its cache, without a network.
+        QTimer.singleShot(0, self._restore_weather_from_cache)
+
         # Update identity button state
         self.update_identity_button_state()
 
@@ -9601,25 +14865,103 @@ class UWBQuickVisualizationWindow(QWidget):
         if not self._preview_active and self.selected_preview_tags():
             self.activate_preview()
 
+    def open_tag_stats(self):
+        """Measure every tag's rate profile and battery, then show the table."""
+        if not self.db_path or not self.table_name:
+            QMessageBox.warning(self, "No Database", "Load a database first.")
+            return
+        if getattr(self, '_tag_stats_running', False):
+            return
+        from fnt.uwb import tag_stats as TS
+        indexed = self.current_indexed_db()
+        db = indexed or self.preview_db_path or self.db_path
+        table = self.table_name
+        tags = sorted(self.tag_checkboxes) or None
+        has_index = bool(indexed)
+        self._tag_stats_running = True
+        self.btn_tag_stats.setEnabled(False)
+        self.btn_tag_stats.setText("Measuring…")
+        self.log_message(
+            "Measuring tag ping rates"
+            + (" from the fast indexed copy…" if has_index
+               else " (no fast index yet, so the table is scanned once)…"))
+
+        def job():
+            conn = connect_ro(db)
+            try:
+                return TS.tag_rate_stats(conn, table, tags=tags,
+                                         has_index=has_index)
+            finally:
+                conn.close()
+
+        self._start_db_query(job, self._on_tag_stats, self._on_tag_stats_failed)
+
+    def _on_tag_stats(self, stats):
+        self._tag_stats_running = False
+        self.btn_tag_stats.setEnabled(True)
+        self.btn_tag_stats.setText("Tag Statistics...")
+        if stats is None or not len(stats):
+            self.log_message("Tag statistics: no pings found for the selected tags.")
+            return
+        labels = {}
+        for tag in stats['shortid']:
+            info = self.tag_identities.get(int(tag)) or {}
+            sex, ident = info.get('sex'), info.get('identity')
+            name = info.get('name')
+            label = f"{str(sex)[:1].upper()}{ident}" if sex and ident else ""
+            labels[int(tag)] = (f"{label} {name}".strip() if name else label) or "—"
+        db_name = os.path.splitext(os.path.basename(self.db_path))[0]
+        for _i, r in stats.iterrows():
+            self.log_message(
+                f"  {r['HexID']}  {labels.get(int(r['shortid']), '') or '-':<16} "
+                f"median {r['median_hz']:>6.2f} Hz | peak {r['peak_hz']:>5.1f} | "
+                f"quiet {r['slow_hz']:>5.2f} | common gap "
+                f"{int(r['modal_gap_ms']):>5} ms | {int(r['pings']):>10,} pings"
+                + (f" — {r['note']}" if r['note'] else ""))
+        TagStatsDialog(stats, labels, self.combo_timezone.currentText(),
+                       db_name, parent=self).exec_()
+
+    def _on_tag_stats_failed(self, err):
+        self._tag_stats_running = False
+        self.btn_tag_stats.setEnabled(True)
+        self.btn_tag_stats.setText("Tag Statistics...")
+        if is_corruption_error(err):
+            self.report_corrupt_database(err)
+            return
+        self.log_message(f"Could not measure tag statistics: {err}")
+
     def update_identity_button_state(self):
         """Enable Configure Identities button if any tag is selected"""
         any_selected = any(cb.isChecked() for cb in self.tag_checkboxes.values())
         self.btn_assign_identities.setEnabled(any_selected)
+        if hasattr(self, 'btn_tag_stats'):
+            # Measurable as soon as there are tags: it reads the recording,
+            # not the selection, and is most useful before anything is set up.
+            self.btn_tag_stats.setEnabled(bool(self.tag_checkboxes)
+                                          and not getattr(self, '_tag_stats_running', False))
     
+    def _tag_checkbox_text(self, tag):
+        """'HexID 2A (F, 9905) - Hera [HER]': identity shown only once configured.
+
+        Name and Code are appended when set, so the tag list is where you can
+        see at a glance which animals the roster covers.
+        """
+        text = f"HexID {hex(tag).upper().replace('0X', '')}"
+        info = self.tag_identities.get(tag) or {}
+        sex, identity = info.get('sex', ''), info.get('identity', '')
+        if sex and identity:
+            text += f" ({sex}, {identity})"
+        name = str(info.get('name', '') or '').strip()
+        code = str(info.get('code', '') or '').strip()
+        if name or code:
+            text += " \u2014 " + " ".join(
+                p for p in (name, f"[{code}]" if code else "") if p)
+        return text
+
     def update_tag_labels(self):
-        """Update tag checkbox labels to reflect sex and ID information"""
+        """Update tag checkbox labels to reflect sex, ID, name and code."""
         for tag, cb in self.tag_checkboxes.items():
-            hex_id = hex(tag).upper().replace('0X', '')
-            if tag in self.tag_identities:
-                info = self.tag_identities[tag]
-                sex = info.get('sex', '')
-                identity = info.get('identity', '')
-                if sex and identity:
-                    cb.setText(f"HexID {hex_id} ({sex}, {identity})")
-                else:
-                    cb.setText(f"HexID {hex_id}")
-            else:
-                cb.setText(f"HexID {hex_id}")
+            cb.setText(self._tag_checkbox_text(tag))
     
     def select_all_tags(self):
         """Select all tags"""
@@ -9684,7 +15026,10 @@ class UWBQuickVisualizationWindow(QWidget):
 
     def _filter_and_smooth(self, data, smoothing_method, *, collect_stats=True,
                            velocity=None, jump=None, velocity_thresh=None,
-                           jump_thresh=None, window=None, units=None):
+                           jump_thresh=None, window=None, units=None,
+                           outlier=None, outlier_window=None,
+                           outlier_sigma=None, velocity_min_dt=None,
+                           adjacency=None, excursion_s=None):
         """Threshold, then smooth (the original order).
 
         BOTH the velocity and jump thresholds run on the raw coordinates BEFORE
@@ -9694,11 +15039,16 @@ class UWBQuickVisualizationWindow(QWidget):
         """
         use_vel = self.chk_velocity_filter.isChecked() if velocity is None else velocity
         use_jmp = self.chk_jump_filter.isChecked() if jump is None else jump
+        use_out = (self.chk_outlier_filter.isChecked()
+                   if outlier is None else outlier)
 
-        if (use_vel or use_jmp) and len(data):
+        if (use_vel or use_jmp or use_out) and len(data):
             data = self.apply_filters_to_data(
                 data, collect_stats=collect_stats, velocity=use_vel, jump=use_jmp,
-                velocity_thresh=velocity_thresh, jump_thresh=jump_thresh)
+                velocity_thresh=velocity_thresh, jump_thresh=jump_thresh,
+                outlier=use_out, outlier_window=outlier_window,
+                outlier_sigma=outlier_sigma, velocity_min_dt=velocity_min_dt,
+                adjacency=adjacency, excursion_s=excursion_s)
         if smoothing_method != "None" and len(data):
             data = self.apply_smoothing_to_data(data, smoothing_method,
                                                 window=window, units=units)
@@ -9706,7 +15056,10 @@ class UWBQuickVisualizationWindow(QWidget):
 
     def apply_filters_to_data(self, data, collect_stats=True, velocity=None, jump=None,
                               velocity_thresh=None, jump_thresh=None,
-                              x_col='location_x', y_col='location_y'):
+                              x_col='location_x', y_col='location_y',
+                              outlier=None, outlier_window=None,
+                              outlier_sigma=None, velocity_min_dt=None,
+                              adjacency=None, excursion_s=None):
         """Apply velocity and jump thresholding with time-window grouping.
 
         ``velocity``/``jump`` override whether each threshold is applied and
@@ -9719,9 +15072,12 @@ class UWBQuickVisualizationWindow(QWidget):
         """
         use_velocity = self.chk_velocity_filter.isChecked() if velocity is None else velocity
         use_jump = self.chk_jump_filter.isChecked() if jump is None else jump
+        use_outlier = (self.chk_outlier_filter.isChecked()
+                       if outlier is None else outlier)
         initial_count = len(data)
         removed_velocity = 0
         removed_jump = 0
+        removed_outlier = 0
         
         # Make explicit copy at start to avoid any SettingWithCopyWarning
         data = data.copy()
@@ -9729,10 +15085,11 @@ class UWBQuickVisualizationWindow(QWidget):
         # Calculate time differences and group by time gaps (prevents filtering across battery restarts)
         time_gap_threshold = self.spin_time_gap.value()
         data['time_diff'] = data.groupby('shortid')['Timestamp'].diff().fillna(pd.Timedelta(seconds=0)).dt.total_seconds()
-        data['time_diff_s'] = np.ceil(data['time_diff']).astype(int)
-        data['tw_group'] = data.groupby('shortid')['time_diff_s'].apply(
-            lambda x: (x > time_gap_threshold).cumsum()
-        ).reset_index(level=0, drop=True)
+        # Compared at full resolution. (The old ceil-to-whole-seconds step
+        # gave the same groups for an integer threshold, but only by accident
+        # of the spin box's type.)
+        data['tw_group'] = (data['time_diff'] > time_gap_threshold).groupby(
+            data['shortid']).cumsum()
         
         # Calculate distance and velocity within time window groups, on the
         # requested coordinate columns (raw for jump, smoothed for velocity).
@@ -9742,7 +15099,44 @@ class UWBQuickVisualizationWindow(QWidget):
             (data[xc] - data.groupby(['shortid', 'tw_group'])[xc].shift())**2 +
             (data[yc] - data.groupby(['shortid', 'tw_group'])[yc].shift())**2
         )
-        data['velocity'] = data['distance'] / data['time_diff']
+        # A minimum time base. The raw interval can be a millisecond, and
+        # dividing by it turns a few centimetres of positional noise into
+        # tens of m/s - so an unfloored velocity threshold mostly measures how
+        # closely spaced the reports were, not how fast the animal moved.
+        min_dt = (self.spin_velocity_min_dt.value()
+                  if velocity_min_dt is None else velocity_min_dt)
+        data['velocity'] = data['distance'] / np.maximum(
+            data['time_diff'], float(min_dt) if min_dt else 0.0).replace(
+                0, np.nan)
+
+        # Spatial-outlier pass FIRST. It is the only one of the three that
+        # survives a run of consecutive ghosts, and clearing them here stops
+        # the step-based tests below from deleting the GOOD fix that follows a
+        # ghost (they measure the distance INTO a fix, so a ghost condemns its
+        # innocent successor as well).
+        if use_outlier:
+            win = (self.spin_outlier_window.value()
+                   if outlier_window is None else outlier_window)
+            sig = (self.spin_outlier_sigma.value()
+                   if outlier_sigma is None else outlier_sigma)
+            before_outlier = len(data)
+            keep = hampel_keep(
+                data[xc].values, data[yc].values, window=win, n_sigma=sig,
+                group=data.groupby(['shortid', 'tw_group']).ngroup().values)
+            data = data[keep].copy()
+            removed_outlier = before_outlier - len(data)
+            if removed_outlier > 0 and collect_stats:
+                self.log_message(
+                    f"  Removed {removed_outlier} spatial outliers "
+                    f"(>{sig:g} MAD of a {int(win)}-sample local median)")
+            # Steps and speeds describe the track, and the track just changed.
+            data['distance'] = np.sqrt(
+                (data[xc] - data.groupby(['shortid', 'tw_group'])[xc].shift())**2 +
+                (data[yc] - data.groupby(['shortid', 'tw_group'])[yc].shift())**2
+            )
+            data['velocity'] = data['distance'] / np.maximum(
+                data['time_diff'], float(min_dt) if min_dt else 0.0).replace(
+                    0, np.nan)
 
         # Apply velocity filtering if enabled
         if use_velocity:
@@ -9751,8 +15145,9 @@ class UWBQuickVisualizationWindow(QWidget):
             before_velocity = len(data)
             data = data[(data['velocity'] <= velocity_threshold) | (data['velocity'].isna())].copy()
             removed_velocity = before_velocity - len(data)
-            if removed_velocity > 0:
-                self.log_message(f"  Removed {removed_velocity} points with velocity > {velocity_threshold} m/s")
+            if removed_velocity > 0 and collect_stats:
+                self.log_message(f"  Removed {removed_velocity} points with "
+                                 f"velocity > {velocity_threshold:g} m/s")
         else:
             removed_velocity = 0
 
@@ -9764,18 +15159,56 @@ class UWBQuickVisualizationWindow(QWidget):
             data['is_jump'] = (data['distance'] > jump_threshold)
             data = data[~data['is_jump']].copy()
             removed_jump = before_jump - len(data)
-            if removed_jump > 0:
-                self.log_message(f"  Removed {removed_jump} points with distance jump > {jump_threshold} m")
+            if removed_jump > 0 and collect_stats:
+                self.log_message(f"  Removed {removed_jump} points with "
+                                 f"distance jump > {jump_threshold:g} m")
         else:
             removed_jump = 0
         
+        # Everything above measured each point against its neighbour in the
+        # ORIGINAL sequence and applied one mask. Removal changes who is
+        # adjacent to whom, and a run of bad fixes loses only its first and
+        # last members that way - the interior survives, joined to the real
+        # track by a stride nothing has looked at. Re-test what is left.
+        removed_adjacency = 0
+        use_adj = (self.chk_adjacency_filter.isChecked()
+                   if adjacency is None else adjacency)
+        exc_s = (self.spin_excursion_s.value()
+                 if excursion_s is None else excursion_s)
+        if use_adj and (use_velocity or use_jump) and len(data) > 2:
+            _t = (data['Timestamp'].values.astype('datetime64[ns]')
+                  .astype('int64') / 1e9)
+            _keep = np.ones(len(data), dtype=bool)
+            _keep, removed_adjacency, _converged = resolve_adjacency(
+                _t, data[xc].values, data[yc].values, _keep,
+                group=data.groupby(['shortid', 'tw_group']).ngroup().values,
+                v_thresh=velocity_threshold if use_velocity else None,
+                min_dt=min_dt, max_excursion_s=exc_s,
+                j_thresh=jump_threshold if use_jump else None)
+            if removed_adjacency:
+                data = data[_keep].copy()
+                if collect_stats:
+                    self.log_message(
+                        f"  Removed {removed_adjacency} points that only became "
+                        f"impossible once their neighbours were removed")
+                    if not _converged:
+                        self.log_message(
+                            "    ⚠ discontinuities remain — a displaced run "
+                            "that is too long, or one whose removal would not "
+                            "make the track continuous, is reported rather "
+                            "than deleted. See the threshold read-out.")
+
         # Clean up temporary columns
-        data = data.drop(columns=['time_diff', 'time_diff_s', 'tw_group', 'distance', 'velocity'], errors='ignore')
+        data = data.drop(columns=['time_diff', 'tw_group', 'distance', 'velocity'], errors='ignore')
         if 'is_jump' in data.columns:
             data = data.drop(columns=['is_jump'])
         
         final_count = len(data)
-        if initial_count != final_count:
+        # Only an export narrates itself. The preview re-filters every tag on
+        # every scrub and every spinbox step, and logging each one buried the
+        # run in thousands of identical lines; the live figures belong in the
+        # threshold read-out, which is where the preview already puts them.
+        if initial_count != final_count and collect_stats:
             self.log_message(f"  Total filtered: {initial_count - final_count} points ({100*(initial_count-final_count)/initial_count:.1f}%)")
         
         # Accumulate stats for the run summary. This runs once per tag during
@@ -9787,8 +15220,15 @@ class UWBQuickVisualizationWindow(QWidget):
             s = getattr(self, 'filter_stats', None) or {}
             self.filter_stats = {
                 'initial_count': s.get('initial_count', 0) + initial_count,
+                'removed_outlier': s.get('removed_outlier', 0) + removed_outlier,
                 'removed_velocity': s.get('removed_velocity', 0) + removed_velocity,
                 'removed_jump': s.get('removed_jump', 0) + removed_jump,
+                # Counted separately, because these points passed every
+                # threshold on their own and only became impossible once
+                # their neighbours went. Folding them into the jump count
+                # would say the jump threshold caught something it did not.
+                'removed_adjacency': (s.get('removed_adjacency', 0)
+                                      + removed_adjacency),
                 'final_count': s.get('final_count', 0) + final_count,
                 'tags_processed': s.get('tags_processed', 0) + 1,
             }
@@ -9861,32 +15301,51 @@ class UWBQuickVisualizationWindow(QWidget):
             'velocity_threshold': self.spin_velocity_threshold.value(),
             'jump_filter': self.chk_jump_filter.isChecked(),
             'jump_threshold': self.spin_jump_threshold.value(),
+            'outlier_filter': self.chk_outlier_filter.isChecked(),
+            'outlier_window': self.spin_outlier_window.value(),
+            'outlier_sigma': self.spin_outlier_sigma.value(),
+            'velocity_min_dt': self.spin_velocity_min_dt.value(),
+            'adjacency_filter': self.chk_adjacency_filter.isChecked(),
+            'excursion_s': self.spin_excursion_s.value(),
             'time_gap': self.spin_time_gap.value(),
             'smoothing_method': self.combo_smoothing.currentText(),
-            'rolling_window': self.spin_rolling_window.value(),
-            # EWMA span is always in samples and ignores the units control (which
-            # is hidden for EWMA, so its combo keeps a stale value). Serialize
-            # "Samples" here so the saved config matches what was actually applied.
-            'rolling_window_units': (
-                'Samples'
-                if self.combo_smoothing.currentText() == "Forward-Backward Exponentially Weighted Moving Average"
-                else self.combo_window_units.currentText()),
+            # rolling_window / rolling_window_units are null unless the method
+            # really has a window; EWMA's parameter is written as
+            # smoothing_span instead. See smoothing_window_fields.
+            **smoothing_window_fields(
+                self.combo_smoothing.currentText(),
+                self.spin_rolling_window.value(),
+                self.combo_window_units.currentText(),
+                window_key='rolling_window', units_key='rolling_window_units'),
             'show_anchors': self.chk_show_anchors.isChecked(),
             'show_tracking': self.chk_show_tracking.isChecked(),
             'show_tag_id': self.chk_show_tag_id.isChecked(),
             'tag_id_type': self.combo_tag_id_type.currentText(),
             'preview_tag_size': self.spin_tag_size.value(),
+            'label_color': self.combo_label_color.currentData(),
+            'label_outline': self.chk_label_outline.isChecked(),
             'show_battery': self.chk_show_battery.isChecked(),
             'export_raw_csv': self.chk_export_raw_csv.isChecked(),
             'export_smoothed_csv': self.chk_export_smoothed_csv.isChecked(),
             'proximity_detection': self.chk_proximity_detection.isChecked(),
             'proximity_threshold': self.spin_proximity_threshold.value(),
-            'export_gbi': self.chk_export_gbi.isChecked(),
-            'export_edgelist': self.chk_export_edgelist.isChecked(),
+            # Analysis settings, so they ARE inherited between trials -
+            # unlike the regions themselves, which belong to one arena.
+            'export_roi_bouts': self.chk_export_roi_bouts.isChecked(),
+            'export_roi_daily': self.chk_export_roi_daily.isChecked(),
             'export_behavior_events': self.chk_export_behavior.isChecked(),
-            'edgelist_window_h': self.spin_el_window.value(),
+            'export_weather': self.chk_export_weather.isChecked(),
+            # Where the trial was recorded and which weather/sunlight sources
+            # were used. Typed by the user or loaded from their own profile.
+            'site': self.site_settings().to_dict(),
+            'weather_display_units': self.combo_weather_units.currentData(),
+            'weather_autofetch': self.chk_weather_autofetch.isChecked(),
+            # What the last fetch actually retrieved: station, distance,
+            # record counts, and every file's URL, retrieval time and sha256.
+            'weather_sources': self._weather_summary,
             'save_plots': self.chk_save_plots.isChecked(),
             'save_svg': self.chk_save_svg.isChecked(),
+            'plot_label_type': normalize_id_type(self.combo_plot_label_type.currentText()),
             'plot_types': {k: cb.isChecked() for k, cb in self.plot_type_checkboxes.items()},
             'save_animation': self.chk_save_animation.isChecked(),
             'animation_trail': self.spin_animation_trail.value(),
@@ -9901,16 +15360,23 @@ class UWBQuickVisualizationWindow(QWidget):
                     ('chk_anim_show_trail', 'trail'),
                     ('chk_anim_show_tag_id', 'tag_id'),
                     ('chk_anim_show_behavior', 'behavior'),
-                    ('chk_anim_beh_locomotor', 'locomotor'),
                     ('chk_anim_beh_social', 'social'),
                     ('chk_anim_beh_chase', 'chase'),
-                    ('chk_anim_beh_displace', 'displace'))
+                    ('chk_anim_beh_displace', 'displace'),
+                    ('chk_anim_show_weather', 'weather'),
+                    ('chk_anim_show_light', 'light'))
                 if hasattr(self, attr)},
             'animation_speed': self.combo_animation_speed.currentText(),
             'animation_fps': self.combo_animation_fps.currentText(),
             'color_by': self.combo_color_by.currentText(),
             'video_quality': self.combo_video_quality.currentText(),
             'daily_animations': self.chk_daily_animations.isChecked(),
+            # WHICH days were ticked. Without this a queued job reloaded the
+            # trial, rebuilt the day list with every box ticked (the default)
+            # and rendered all of them - ignoring the two days the user chose.
+            'daily_animation_days': [d for d, cb in
+                                     self.daily_animation_day_checkboxes.items()
+                                     if cb.isChecked()],
             'full_animation': self.chk_full_animation.isChecked(),
             'tag_identities': self.tag_identities,
             'plot_layers': dict(self.plot_layers),
@@ -9923,9 +15389,18 @@ class UWBQuickVisualizationWindow(QWidget):
             'background_scale_inpx': self.bg_scale,
             'background_offset_m': [float(self.bg_offset_x), float(self.bg_offset_y)],
             'arena_zones': self.arena_zones.to_dict('records') if self.arena_zones is not None else None,
+            # Regions the user drew over the preview. Theirs, not the XML's,
+            # and stored here so they travel with the trial's analysis folder.
+            'rois': uwb_roi.rois_to_json(self.rois),
+            'show_rois': self.chk_show_rois.isChecked(),
             # Anchor/antenna positions, zones, scale and map extent from the
             # site XML (all in meters); None when no XML was detected.
             'xml_config': self.xml_config_summary(),
+            # Outcome of this run's threshold filtering, summed across every
+            # tag processed (previously the only non-redundant content of
+            # runSummary.csv). None until an export has actually filtered.
+            'filter_stats': (dict(self.filter_stats)
+                             if getattr(self, 'filter_stats', None) else None),
             # Live-preview display/analysis settings. Nested under one key so
             # they are clearly NOT part of the export's reproducibility record —
             # nothing here affects exported data — while still surviving a
@@ -9945,6 +15420,13 @@ class UWBQuickVisualizationWindow(QWidget):
         'velocity_threshold': ('spin_preview_velocity', 'value'),
         'jump_filter': ('chk_preview_jump', 'checked'),
         'jump_threshold': ('spin_preview_jump', 'value'),
+        'outlier_filter': ('chk_preview_outlier', 'checked'),
+        'outlier_window': ('spin_preview_outlier_window', 'value'),
+        'outlier_sigma': ('spin_preview_outlier_sigma', 'value'),
+        'velocity_min_dt': ('spin_preview_velocity_min_dt', 'value'),
+        'adjacency_filter': ('chk_preview_adjacency', 'checked'),
+        'excursion_s': ('spin_preview_excursion', 'value'),
+        'trail_points': ('chk_preview_trail_points', 'checked'),
         'color_by': ('combo_preview_color', 'text'),
         'dark_mode': ('chk_preview_dark', 'checked'),
         'trail_seconds': ('spin_preview_trail', 'value'),
@@ -9959,6 +15441,10 @@ class UWBQuickVisualizationWindow(QWidget):
         'show_tag_id': ('chk_show_tag_id', 'checked'),
         'tag_id_type': ('combo_tag_id_type', 'text'),
         'show_battery': ('chk_show_battery', 'checked'),
+        'show_speed': ('chk_show_speed', 'checked'),
+        'show_step': ('chk_show_step', 'checked'),
+        'show_weather': ('chk_show_weather', 'checked'),
+        'show_light_bar': ('chk_show_light_bar', 'checked'),
         'time_gap': ('spin_time_gap', 'value'),
         # Pinned drawing window. Persisted here because it now governs the
         # exports too, so a trial must reopen framed the way it was exported.
@@ -9971,12 +15457,10 @@ class UWBQuickVisualizationWindow(QWidget):
         # exported ethogram, so a trial must reopen with the thresholds it
         # was tuned and exported with.
         'show_behavior': ('chk_show_behavior', 'checked'),
-        'beh_locomotor': ('chk_beh_locomotor', 'checked'),
         'beh_social': ('chk_beh_social', 'checked'),
         'beh_chase': ('chk_beh_chase', 'checked'),
         'beh_displace': ('chk_beh_displace', 'checked'),
         'social_radius': ('spin_social_radius', 'value'),
-        'still_speed': ('spin_still_speed', 'value'),
         'chase_distance': ('spin_chase_distance', 'value'),
         'chase_speed': ('spin_chase_speed', 'value'),
         'chase_angle_deg': ('spin_chase_angle', 'value'),
@@ -9987,6 +15471,10 @@ class UWBQuickVisualizationWindow(QWidget):
         'displace_winner_speed': ('spin_displace_winner_speed', 'value'),
         'displace_leave_distance': ('spin_displace_leave', 'value'),
         'displace_window_s': ('spin_displace_window', 'value'),
+        # NOTE: Copy View renders at the fixed COPY_VIEW_DPI and so has nothing
+        # to persist. Configs written while it was a dropdown carry a
+        # 'copy_view_dpi' key; the apply loop ignores keys it has no widget
+        # for, so those load without complaint.
         # NOTE: the preview tag marker size persists separately as the
         # top-level 'preview_tag_size' key (kept for config compatibility).
     }
@@ -10004,6 +15492,13 @@ class UWBQuickVisualizationWindow(QWidget):
                 out[key] = w.value()
             else:
                 out[key] = w.isChecked()
+        # The preview's window control is the same dual-purpose spinbox the
+        # export's is, and the units combo beside it is hidden for EWMA - so
+        # the raw values would claim a window and a unit that the method never
+        # used. Rewrite them the way the export block does.
+        out.update(smoothing_window_fields(
+            out.get('smoothing'), out.get('window'), out.get('window_units'),
+            window_key='window', units_key='window_units'))
         return out
 
     # Pre-consolidation config keys -> the preview widget that now owns them.
@@ -10083,6 +15578,8 @@ class UWBQuickVisualizationWindow(QWidget):
             val = cfg[key]
             try:
                 if kind == 'text':
+                    if attr == 'combo_tag_id_type':
+                        val = normalize_id_type(val)   # 'Display ID' -> 'SexID'
                     if w.findText(str(val)) >= 0:
                         w.setCurrentText(str(val))
                 elif kind == 'value':
@@ -10091,6 +15588,15 @@ class UWBQuickVisualizationWindow(QWidget):
                     w.setChecked(bool(val))
             except Exception:
                 continue
+        # The window/span, after the generic pass: a null 'window' is skipped
+        # above, so the value has to come from 'smoothing_span' (or, for a
+        # config written before the split, from 'window' itself).
+        span = smoothing_window_value(cfg, window_key='window')
+        if span is not None and getattr(self, 'spin_preview_window', None):
+            try:
+                self.spin_preview_window.setValue(span)
+            except Exception:
+                pass
         if not DISPLACEMENT_ENABLED:
             # Trials configured before displacement was parked have
             # beh_displace: true saved. Honouring it would put a hidden
@@ -10201,10 +15707,15 @@ class UWBQuickVisualizationWindow(QWidget):
                 if index >= 0:
                     self.combo_smoothing.setCurrentIndex(index)
             
-            if 'rolling_window' in config:
-                self.spin_rolling_window.setValue(config['rolling_window'])
+            # Null when the method has no window (EWMA / Savitzky-Golay), so
+            # neither of these can be fed to a widget unchecked: setValue(None)
+            # raises, and this sits inside the loader's single try - one null
+            # would abort the load and silently drop every setting after it.
+            span = smoothing_window_value(config, window_key='rolling_window')
+            if span is not None:
+                self.spin_rolling_window.setValue(span)
 
-            if 'rolling_window_units' in config:
+            if config.get('rolling_window_units'):
                 idx = self.combo_window_units.findText(config['rolling_window_units'])
                 if idx >= 0:
                     self.combo_window_units.setCurrentIndex(idx)
@@ -10220,6 +15731,42 @@ class UWBQuickVisualizationWindow(QWidget):
             
             if 'jump_threshold' in config:
                 self.spin_jump_threshold.setValue(config['jump_threshold'])
+
+            # A trial configured before the outlier threshold existed was not
+            # filtered by it, and one configured before the velocity time base
+            # existed divided by the RAW interval. Re-running either has to
+            # reproduce what it produced, so an absent key means OFF here
+            # rather than the new default - the defaults apply to new work.
+            if 'outlier_filter' in config:
+                self.chk_outlier_filter.setChecked(bool(config['outlier_filter']))
+                self.chk_preview_outlier.setChecked(bool(config['outlier_filter']))
+            else:
+                self.chk_outlier_filter.setChecked(False)
+                self.chk_preview_outlier.setChecked(False)
+                self.log_message(
+                    "This config predates the outlier threshold, so it is off "
+                    "for this trial (re-running it reproduces what it "
+                    "produced). Tick it to adopt the new default.")
+            for key, wid, pwid in (
+                    ('outlier_window', self.spin_outlier_window,
+                     self.spin_preview_outlier_window),
+                    ('outlier_sigma', self.spin_outlier_sigma,
+                     self.spin_preview_outlier_sigma)):
+                if config.get(key) is not None:
+                    wid.setValue(type(wid.value())(config[key]))
+                    pwid.setValue(type(pwid.value())(config[key]))
+            # A trial configured before the excursion pass existed was not
+            # cleaned by it, so an absent key means OFF - re-running has to
+            # reproduce what it produced. New work gets the default.
+            _adj = bool(config.get('adjacency_filter', False))
+            self.chk_adjacency_filter.setChecked(_adj)
+            self.chk_preview_adjacency.setChecked(_adj)
+            if config.get('excursion_s') is not None:
+                self.spin_excursion_s.setValue(float(config['excursion_s']))
+                self.spin_preview_excursion.setValue(float(config['excursion_s']))
+            _min_dt = float(config.get('velocity_min_dt') or 0.0)
+            self.spin_velocity_min_dt.setValue(_min_dt)
+            self.spin_preview_velocity_min_dt.setValue(_min_dt)
             
             if 'time_gap' in config:
                 self.spin_time_gap.setValue(config['time_gap'])
@@ -10230,12 +15777,21 @@ class UWBQuickVisualizationWindow(QWidget):
             if 'show_tag_id' in config:
                 self.chk_show_tag_id.setChecked(config['show_tag_id'])
             if 'tag_id_type' in config:
-                i = self.combo_tag_id_type.findText(config['tag_id_type'])
+                i = self.combo_tag_id_type.findText(
+                    normalize_id_type(config['tag_id_type']))
                 if i >= 0:
                     self.combo_tag_id_type.setCurrentIndex(i)
 
             if 'preview_tag_size' in config:
                 self.spin_tag_size.setValue(config['preview_tag_size'])
+            if 'label_color' in config:
+                # Matched on the stored hex, not the index, so reordering or
+                # adding a colour later cannot silently repoint old configs.
+                want = config['label_color']
+                idx = self.combo_label_color.findData(want)
+                self.combo_label_color.setCurrentIndex(max(0, idx))
+            if 'label_outline' in config:
+                self.chk_label_outline.setChecked(bool(config['label_outline']))
 
             # Live-preview display/analysis settings (nested; see
             # get_preview_config). Absent in configs written before this key
@@ -10253,6 +15809,12 @@ class UWBQuickVisualizationWindow(QWidget):
             if 'show_battery' in config:
                 self.chk_show_battery.setChecked(config['show_battery'])
 
+            if isinstance(config.get('daily_animation_days'), list):
+                # Applied when the day list is built (the dates are not known
+                # until the database has been scanned).
+                self.pending_animation_days = [str(d) for d
+                                               in config['daily_animation_days']]
+
             if 'animation_tag_size' in config:
                 self.spin_anim_tag_size.setValue(config['animation_tag_size'])
 
@@ -10263,10 +15825,11 @@ class UWBQuickVisualizationWindow(QWidget):
                 for attr, name in (('chk_anim_show_trail', 'trail'),
                                    ('chk_anim_show_tag_id', 'tag_id'),
                                    ('chk_anim_show_behavior', 'behavior'),
-                                   ('chk_anim_beh_locomotor', 'locomotor'),
                                    ('chk_anim_beh_social', 'social'),
                                    ('chk_anim_beh_chase', 'chase'),
-                                   ('chk_anim_beh_displace', 'displace')):
+                                   ('chk_anim_beh_displace', 'displace'),
+                                   ('chk_anim_show_weather', 'weather'),
+                                   ('chk_anim_show_light', 'light')):
                     cb = getattr(self, attr, None)
                     if cb is not None and name in saved_layers:
                         on = bool(saved_layers[name])
@@ -10274,6 +15837,18 @@ class UWBQuickVisualizationWindow(QWidget):
                         # A saved 'off' is a deliberate clear, so re-syncing
                         # from the preview must not turn it back on.
                         cb._user_cleared = not on
+
+            if 'export_weather' in config:
+                self.chk_export_weather.setChecked(bool(config['export_weather']))
+            if isinstance(config.get('site'), dict):
+                self.apply_site_settings(WX.SiteSettings.from_dict(config['site']))
+            if 'weather_autofetch' in config:
+                self.chk_weather_autofetch.setChecked(
+                    bool(config['weather_autofetch']))
+            if config.get('weather_display_units'):
+                i = self.combo_weather_units.findData(config['weather_display_units'])
+                if i >= 0:
+                    self.combo_weather_units.setCurrentIndex(i)
 
             if 'export_raw_csv' in config:
                 self.chk_export_raw_csv.setChecked(config['export_raw_csv'])
@@ -10289,25 +15864,33 @@ class UWBQuickVisualizationWindow(QWidget):
                     k: bool(config['plot_layers'].get(k, DEFAULT_PLOT_LAYERS[k]))
                     for k in DEFAULT_PLOT_LAYERS}
 
+            # 'export_zone_occupancy' is the pre-split key: one checkbox
+            # wrote both of the retired occupancy files. It now seeds both new
+            # ROI products, so a config saved before the split still exports
+            # something rather than silently nothing.
+            if 'export_zone_occupancy' in config:
+                _occ = bool(config['export_zone_occupancy'])
+                self.chk_export_roi_bouts.setChecked(_occ)
+                self.chk_export_roi_daily.setChecked(_occ)
+            if 'export_roi_bouts' in config:
+                self.chk_export_roi_bouts.setChecked(
+                    bool(config['export_roi_bouts']))
+            if 'export_roi_daily' in config:
+                self.chk_export_roi_daily.setChecked(
+                    bool(config['export_roi_daily']))
+            self.on_zone_occupancy_toggled()
             if 'proximity_detection' in config:
                 self.chk_proximity_detection.setChecked(config['proximity_detection'])
 
             if 'proximity_threshold' in config:
                 self.spin_proximity_threshold.setValue(config['proximity_threshold'])
 
-            # 'export_social_network' is the pre-split key: one checkbox used
-            # to drive both files, so an old config restores both.
-            if 'export_social_network' in config:
-                self.chk_export_gbi.setChecked(config['export_social_network'])
-                self.chk_export_edgelist.setChecked(config['export_social_network'])
-            if 'export_gbi' in config:
-                self.chk_export_gbi.setChecked(config['export_gbi'])
-            if 'export_edgelist' in config:
-                self.chk_export_edgelist.setChecked(config['export_edgelist'])
+            # 'export_social_network', 'export_gbi', 'export_edgelist' and
+            # 'edgelist_window_h' are read from older configs and ignored: the
+            # GBI and the edge list were removed, and both were derivable from
+            # the bouts file that remains.
             if 'export_behavior_events' in config:
                 self.chk_export_behavior.setChecked(config['export_behavior_events'])
-            if 'edgelist_window_h' in config:
-                self.spin_el_window.setValue(float(config['edgelist_window_h']))
             self.on_social_network_toggled()
     
             if 'save_plots' in config:
@@ -10315,6 +15898,10 @@ class UWBQuickVisualizationWindow(QWidget):
 
             if 'save_svg' in config:
                 self.chk_save_svg.setChecked(config['save_svg'])
+
+            if 'plot_label_type' in config:
+                self.combo_plot_label_type.setCurrentText(
+                    normalize_id_type(config['plot_label_type']))
 
             if 'plot_types' in config:
                 for key, value in config['plot_types'].items():
@@ -10386,29 +15973,51 @@ class UWBQuickVisualizationWindow(QWidget):
                 elif os.path.exists(os.path.join(db_dir, os.path.basename(bg_path))):
                     resolved = os.path.join(db_dir, os.path.basename(bg_path))
 
-                if resolved and self._apply_background_image(resolved, source="restored"):
-                    # Honour a saved manual transform (overrides the XML default).
-                    saved_scale = config.get('background_scale_inpx')
-                    saved_off = config.get('background_offset_m')
-                    if saved_scale:
-                        self.bg_scale = float(saved_scale)
-                    if saved_off and len(saved_off) == 2:
-                        self.bg_offset_x = float(saved_off[0])
-                        self.bg_offset_y = float(saved_off[1])
-                    if saved_scale or saved_off:
-                        self._recompute_bg_size()
-                        self._sync_bg_transform_controls()
-                        self.log_message(
-                            f"Restored background transform: scale {self.bg_scale:.4f} in/px, "
-                            f"offset ({self.bg_offset_x:.2f}, {self.bg_offset_y:.2f}) m")
-                elif not resolved:
+                if resolved:
+                    self._apply_background_image(resolved, source="restored")
+                else:
                     self.log_message(f"Warning: Saved background image not found: {bg_path}")
+
+            # Honour a saved manual transform (overrides the XML default). Kept
+            # outside the image block above because the transform now places the
+            # XML site map too, so a nudge made with no floorplan loaded has to
+            # survive the reload as well.
+            saved_scale = config.get('background_scale_inpx')
+            saved_off = config.get('background_offset_m')
+            if saved_scale:
+                self.bg_scale = float(saved_scale)
+            if saved_off and len(saved_off) == 2:
+                self.bg_offset_x = float(saved_off[0])
+                self.bg_offset_y = float(saved_off[1])
+            # Every config carries a [0, 0] offset, so only say something when
+            # the trial was actually nudged away from the XML default.
+            if saved_scale or self.bg_offset_x or self.bg_offset_y:
+                self._recompute_bg_size()
+                self._recompute_xml_map_extent()
+                self._sync_bg_transform_controls()
+                scale_txt = f"{self.bg_scale:.4f} in/px" if self.bg_scale else "XML default"
+                self.log_message(
+                    f"Restored background transform: scale {scale_txt}, "
+                    f"offset ({self.bg_offset_x:.2f}, {self.bg_offset_y:.2f}) m")
             
             # Note: selected_tags will be loaded after tags are populated from table
             if 'selected_tags' in config:
                 self.pending_tag_selection = config['selected_tags']
             
             # Load zone data if present
+            if 'rois' in config:
+                self.rois = uwb_roi.rois_from_json(config.get('rois'))
+                if self.rois:
+                    self.log_message(
+                        f"Loaded {len(self.rois)} region(s) of interest from "
+                        f"config: {', '.join(r['name'] for r in self.rois)}")
+                self._refresh_roi_list(keep=-1)
+            if 'show_rois' in config:
+                self.chk_show_rois.blockSignals(True)
+                self.chk_show_rois.setChecked(bool(config['show_rois']))
+                self.chk_show_rois.blockSignals(False)
+            self.on_rois_changed()
+
             if 'arena_zones' in config and config['arena_zones'] is not None:
                 self.arena_zones = pd.DataFrame(config['arena_zones'])
                 if not self.arena_zones.empty:
@@ -10417,6 +16026,11 @@ class UWBQuickVisualizationWindow(QWidget):
                     self.log_message(f"Loaded {num_zones} zones with {num_points} coordinate points from config")
             
             self.log_message(f"Loaded previous configuration from {config_path}")
+
+            # A config can carry zones (and a background path) for a trial whose
+            # site XML is missing, so re-offer the layers those restored sources
+            # support rather than leaving them greyed out.
+            self._sync_layer_toggles()
 
             # Update tag labels if identities were loaded
             if self.tag_identities and self.tag_checkboxes:
@@ -10472,7 +16086,7 @@ class UWBQuickVisualizationWindow(QWidget):
                 if reply == QMessageBox.Yes:
                     moved = 0
                     if loose_plots:
-                        os.makedirs(plots_subdir, exist_ok=True)
+                        ensure_dir(plots_subdir)
                         for plot_file in loose_plots:
                             src = os.path.join(analysis_dir, plot_file)
                             dst = os.path.join(plots_subdir, plot_file)
@@ -10482,7 +16096,7 @@ class UWBQuickVisualizationWindow(QWidget):
                             except Exception as move_err:
                                 self.log_message(f"Warning: Could not move {plot_file}: {move_err}")
                     if loose_animations:
-                        os.makedirs(animations_subdir, exist_ok=True)
+                        ensure_dir(animations_subdir)
                         for anim_file in loose_animations:
                             src = os.path.join(analysis_dir, anim_file)
                             dst = os.path.join(animations_subdir, anim_file)
@@ -10584,6 +16198,12 @@ class UWBQuickVisualizationWindow(QWidget):
         speed_text = self.combo_animation_speed.currentText()
         all_cbs = self.daily_animation_day_checkboxes
         days = [d for d, cb in all_cbs.items() if cb.isChecked()]
+        # Day N is the trial's Nth day, not the Nth box ticked: exporting only
+        # days 6-7 used to write them as Day1/Day2, which collided with the
+        # real days 1-2 on the next run and made an incremental export
+        # unreadable.
+        trial_days = list(all_cbs.keys())
+        day_numbers = {d: i + 1 for i, d in enumerate(trial_days)}
         gen_daily = self.chk_daily_animations.isChecked()
         return {
             'trailing_window': self.spin_animation_trail.value(),
@@ -10597,27 +16217,29 @@ class UWBQuickVisualizationWindow(QWidget):
             'all_days_selected': (gen_daily and len(all_cbs) > 0
                                   and len(days) == len(all_cbs)),
             'selected_days': days,
+            'trial_days': trial_days,
+            'day_numbers': day_numbers,
             'video_quality': self.combo_video_quality.currentText(),
             'tag_size': self.spin_anim_tag_size.value(),
             'show_battery': self.chk_show_battery_export.isChecked(),
+            # Inherited straight from the preview's display toggles, like the
+            # battery line: the video labels what the preview labels.
+            'show_speed': self.chk_show_speed.isChecked(),
+            'show_step': self.chk_show_step.isChecked(),
+            # Inherited from the preview like the rest of the display choices:
+            # the video's labels read the way the ones you tuned do.
+            'label_color': self.combo_label_color.currentData(),
+            'label_outline': self.chk_label_outline.isChecked(),
+            # Which ID the labels show (SexID / Name / Code / HexID /
+            # ShortID), frozen with the rest so a queued render can't change.
+            'tag_id_type': normalize_id_type(self.combo_tag_id_type.currentText()),
+            'weather_units': self.combo_weather_units.currentData(),
+            'gap_s': self.spin_time_gap.value(),
             'layers': self.anim_layer_flags(),
             'animation_tags': (list(self._animation_tags)
                                if self._animation_tags else None),
             'use_identities': bool(self.tag_identities),
         }
-
-    def _edgelist_filename(self, db_name):
-        """Edge-list filename, stamped with the aggregation window.
-
-        The window changes what the rows MEAN (one per dyad per day at 24 h,
-        per hour at 1 h), so two runs at different settings are different
-        products rather than versions of one file. Putting the window in the
-        name lets them coexist in the analysis folder, and stops a re-run at
-        a new window from silently overwriting the old one.
-        """
-        # ':g' keeps whole hours clean (6h, not 6.0h) while still allowing
-        # a fractional window (1.5h).
-        return f'{db_name}_network_edgelist_{self.spin_el_window.value():g}h.csv'
 
     def _export_behavior_events(self, csv_path, selected_tags):
         """Directed chase/displacement bouts from the exported smoothed CSV.
@@ -10665,10 +16287,11 @@ class UWBQuickVisualizationWindow(QWidget):
         ('chk_anim_show_trail', 'chk_show_tracking'),
         ('chk_anim_show_tag_id', 'chk_show_tag_id'),
         ('chk_anim_show_behavior', 'chk_show_behavior'),
-        ('chk_anim_beh_locomotor', 'chk_beh_locomotor'),
         ('chk_anim_beh_social', 'chk_beh_social'),
         ('chk_anim_beh_chase', 'chk_beh_chase'),
         ('chk_anim_beh_displace', 'chk_beh_displace'),
+        ('chk_anim_show_weather', 'chk_show_weather'),
+        ('chk_anim_show_light', 'chk_show_light_bar'),
     )
 
     def _anim_show(self, name):
@@ -10697,7 +16320,7 @@ class UWBQuickVisualizationWindow(QWidget):
                 cb.setChecked(True)
         # The behaviour sub-rows are meaningless without their master.
         master = self._anim_show('chk_anim_show_behavior')
-        for name in ('chk_anim_beh_locomotor', 'chk_anim_beh_social',
+        for name in ('chk_anim_beh_social',
                      'chk_anim_beh_chase', 'chk_anim_beh_displace'):
             cb = getattr(self, name, None)
             preview = getattr(self, dict(self._ANIM_SHOW_LINKS)[name], None)
@@ -10711,10 +16334,11 @@ class UWBQuickVisualizationWindow(QWidget):
             'trail': self._anim_show('chk_anim_show_trail'),
             'tag_id': self._anim_show('chk_anim_show_tag_id'),
             'behavior': self._anim_show('chk_anim_show_behavior'),
-            'locomotor': self._anim_show('chk_anim_beh_locomotor'),
             'social': self._anim_show('chk_anim_beh_social'),
             'chase': self._anim_show('chk_anim_beh_chase'),
             'displace': self._anim_show('chk_anim_beh_displace'),
+            'weather': self._anim_show('chk_anim_show_weather'),
+            'light': self._anim_show('chk_anim_show_light'),
         }
 
     def _animation_behavior(self, data, tags, flags=None):
@@ -10732,7 +16356,7 @@ class UWBQuickVisualizationWindow(QWidget):
         if not flags.get('behavior'):
             return None
         want = {name: bool(flags.get(name))
-                for name in ('locomotor', 'social', 'chase', 'displace')}
+                for name in ('social', 'chase', 'displace')}
         if not any(want.values()):
             return None
 
@@ -10752,7 +16376,7 @@ class UWBQuickVisualizationWindow(QWidget):
         data, remap = worker.merge_tag_data(data)
         if remap:
             tags = [t for t in tags if t not in remap]
-        grid, loc, soc, _events, links = worker._behavior_classification(
+        grid, _have, soc, _events, links = worker._behavior_classification(
             data, tags, hz=hz, collect_links=True)
         if grid is None:
             return None
@@ -10791,54 +16415,12 @@ class UWBQuickVisualizationWindow(QWidget):
             'circle_color': circle_col,
             'grid': grid,
             'tags': list(tags),
-            'loc': loc if want['locomotor'] else None,
             'soc': soc_shown,
             'links': links,
             'link_colors': link_colors,
-            # LOC_NODATA maps to nothing: the preview leaves an unrecorded
-            # animal unlabelled rather than writing "no data" over it.
-            'state_labels': {
-                'loc': {bd.LOC_INACTIVE: bd.LOCOMOTOR_LABELS[bd.LOC_INACTIVE],
-                        bd.LOC_MOVING: bd.LOCOMOTOR_LABELS[bd.LOC_MOVING]},
-                'soc': dict(bd.SOCIAL_LABELS)},
-            'state_colors': {'loc': dict(bd.STATE_COLORS),
-                             'soc': dict(bd.SOCIAL_COLORS)},
+            'state_labels': {'soc': dict(bd.SOCIAL_LABELS)},
+            'state_colors': {'soc': dict(bd.SOCIAL_COLORS)},
         }
-
-    def _export_social_network(self, events, bouts, output_dir, db_name, *,
-                               write_gbi, write_edgelist, skip_existing):
-        """Write the requested social-network CSVs.
-
-        ``events`` = per-second pairwise distances, which the chain-rule GBI
-        is built from; ``bouts`` = pairwise proximity bouts, which the edge
-        list aggregates. Both come from proximity detection, so every network
-        product inherits the same social-radius threshold the preview draws -
-        but the two files are computed from different inputs and either can
-        be requested without the other.
-        """
-        from fnt.uwb import social_network as SN
-
-        outputs = []
-        if write_gbi:
-            self.log_message("Building chain-rule GBI from per-second distances...")
-            outputs.append((f'{db_name}_network_GBI.csv',
-                            SN.build_gbi(events, self.tag_identities,
-                                         gap_s=5, min_group=2)))
-        if write_edgelist:
-            window_h = self.spin_el_window.value()
-            self.log_message(
-                f"Aggregating proximity bouts into a {window_h:g} h edge list...")
-            outputs.append((self._edgelist_filename(db_name),
-                            SN.build_edgelist(bouts, self.tag_identities,
-                                              window_hours=window_h)))
-        for fname, df in outputs:
-            path = os.path.join(output_dir, fname)
-            if skip_existing and os.path.exists(path):
-                self.log_message(f"Skipped (exists): {fname}")
-            else:
-                df.to_csv(path, index=False)
-                self.log_message(f"✓ Exported {fname} ({len(df)} rows)")
-
 
     # Seconds of VIDEO in a preview clip. Deliberately a video duration and
     # not a data duration: it is what the user is about to sit and watch, and
@@ -10869,6 +16451,20 @@ class UWBQuickVisualizationWindow(QWidget):
         start = int(getattr(self, "preview_playhead_ms", 0) or self.preview_t0)
         start = max(int(self.preview_t0), min(start, int(self.preview_t1) - span_ms))
         return start, start + span_ms
+
+    def set_clip_progress(self, text):
+        """Show, or with '' hide, the line under the Preview button.
+
+        Pumps the event loop: the clip renders on the GUI thread, so without
+        this the label would only repaint once the render it is describing had
+        already finished.
+        """
+        lbl = getattr(self, 'lbl_clip_progress', None)
+        if lbl is None:
+            return
+        lbl.setText(text or "")
+        lbl.setVisible(bool(text))
+        QApplication.processEvents()
 
     def preview_animation_clip(self):
         """Render a few seconds of the animation and play it in a window.
@@ -10910,6 +16506,9 @@ class UWBQuickVisualizationWindow(QWidget):
             f"{stamp.strftime('%Y-%m-%d %H:%M:%S')} at {speed_text}...")
         prev_cursor = self.cursor()
         self.setCursor(Qt.WaitCursor)
+        # Same inheritance the real export uses, so the clip is drawn over the
+        # arena on screen rather than whatever a previous export left behind.
+        self.plot_layers_from_preview(announce=False)
         # The adapter reads the frozen snapshot; take one now so the clip uses
         # exactly what is on screen, and put back whatever was there after.
         prev_snapshot = getattr(self, "_anim_settings", None)
@@ -10937,6 +16536,8 @@ class UWBQuickVisualizationWindow(QWidget):
             finally:
                 conn.close()
 
+            raw, _ = collapse_multi_solutions(raw, log=self.log_message,
+                                              label="clip")
             data = self._processed_slice(raw) if len(raw) else None
             if data is None or data.empty:
                 QMessageBox.information(
@@ -10962,6 +16563,8 @@ class UWBQuickVisualizationWindow(QWidget):
             axis_limits = self.xy_range() or uwb_animation.compute_axis_limits(
                 data[data['Timestamp'] >= stamp], self.plot_layers, bg_extent)
 
+            self.set_clip_progress("Building preview clip…")
+            self._clip_rendering = True
             path = self.create_animation_frames(
                 data, tmp_dir, frame_interval,
                 self._anim_settings["trailing_window"], fps,
@@ -10987,6 +16590,7 @@ class UWBQuickVisualizationWindow(QWidget):
                          f"with the current export settings."),
                 parent=self)
             self.log_message("Preview clip ready.")
+            self.set_clip_progress("")
             dlg.exec_()
         except Exception as e:
             self.log_message(f"\u2717 Preview clip failed: {e}")
@@ -10996,6 +16600,8 @@ class UWBQuickVisualizationWindow(QWidget):
             self.export_cancelled = prev_cancelled
             self._anim_settings = prev_snapshot
             shutil.rmtree(tmp_dir, ignore_errors=True)
+            self._clip_rendering = False
+            self.set_clip_progress("")
             if hasattr(self, "progress_bar"):
                 self.progress_bar.setValue(0)
             if hasattr(self, "lbl_export_progress"):
@@ -11100,6 +16706,100 @@ class UWBQuickVisualizationWindow(QWidget):
             return default_temp_dir
         return None
 
+    def _batch_anim_temp_dir(self, db_dir, db_name):
+        """Temp-frames folder for a batch render: the run's chosen folder, else
+        a ``temp_frames`` folder inside animation_Tracking -- never
+        animation_Tracking itself, because the render deletes this folder when
+        it finishes and would take the finished videos with it."""
+        return (getattr(self, '_batch_temp_frames_dir', None)
+                or os.path.join(db_dir, f"{db_name}_FNT_analysis",
+                                'animation_Tracking', 'temp_frames'))
+
+    @staticmethod
+    def _describe_missing_days(gaps, day_numbers, fps, speed_text, limit=8):
+        """'Day 3 (2026-09-17) and Day 5 (2026-09-19) have no video at 30 fps / 240x'."""
+        named = [f"Day {day_numbers.get(d, '?')} ({d})" for d in gaps[:limit]]
+        more = f" and {len(gaps) - limit} more" if len(gaps) > limit else ""
+        return (", ".join(named) + more
+                + f" ha{'s' if len(gaps) == 1 else 've'} no video at "
+                  f"{fps} fps / {speed_text}")
+
+    def _ask_about_missing_days(self, gaps, day_numbers, fps, speed_text,
+                                generate_daily):
+        """What to do when the full video cannot be stitched from whole days.
+
+        Returns 'render_missing', 'scratch' or 'skip_full'. A video named
+        "the full trial" that silently omits day 3 is the one outcome worth
+        interrupting for, so this asks instead of choosing. Unattended runs
+        (the Export Queue) cannot ask: they render the missing days and
+        stitch, which gives the same video as a full render for the cost of
+        the days that are actually missing.
+        """
+        detail = self._describe_missing_days(gaps, day_numbers, fps, speed_text)
+        if (getattr(self, '_batch_active', False)
+                or getattr(self, '_saved_dialogs', None) is not None):
+            self.log_message(
+                f"⚠ Full animation: {detail}. Rendering the missing day(s) "
+                f"and stitching (unattended run).")
+            return 'render_missing'
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Days Missing From the Full Animation")
+        box.setText("The full animation cannot be stitched from the daily "
+                    "videos: not every day of the trial has one.")
+        box.setInformativeText(
+            f"{detail}.\n\n"
+            f"Daily videos are only reused when they were rendered at the "
+            f"same speed and frame rate, so a day rendered at another speed "
+            f"counts as missing here.")
+        render_btn = box.addButton(f"Render the {len(gaps)} Missing Day(s), Then Stitch",
+                                   QMessageBox.AcceptRole)
+        scratch_btn = box.addButton("Render the Full Video From Scratch",
+                                    QMessageBox.ActionRole)
+        skip_btn = box.addButton("Skip the Full Video", QMessageBox.RejectRole)
+        render_btn.setToolTip(
+            "Render only the days that are missing, then stitch every day "
+            "into the full video. Cheapest, and the result covers the whole "
+            "trial."
+            + ("" if generate_daily else
+               "\n\nNote: this also writes those daily videos, which this "
+               "export did not otherwise ask for."))
+        scratch_btn.setToolTip(
+            "Ignore the daily videos and render the whole trial again in one "
+            "pass. Same result, but it re-renders every day.")
+        skip_btn.setToolTip(
+            "Write only the daily videos selected for this export and leave "
+            "the full video alone - useful when you want to add the missing "
+            "days first.")
+        box.setDefaultButton(render_btn)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is scratch_btn:
+            return 'scratch'
+        if clicked is skip_btn:
+            return 'skip_full'
+        return 'render_missing'
+
+    @staticmethod
+    def _video_frame_size(path):
+        """(width, height) of a video without decoding it, or None.
+
+        Daily videos from different exports can differ in size - a change of
+        video quality, or the weather band being switched on - and a writer
+        opened at the first file's size silently drops every frame that does
+        not match. Checked before stitching rather than discovered afterwards
+        in a video that is missing days.
+        """
+        try:
+            cap = cv2.VideoCapture(path)
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cap.release()
+            return (w, h) if w and h else None
+        except Exception:
+            return None
+
     def _concat_videos_cv2(self, paths, out_path):
         """Concatenate same-resolution/fps MP4s into one, frame by frame (cv2).
 
@@ -11140,7 +16840,7 @@ class UWBQuickVisualizationWindow(QWidget):
             # Resolve animations output directory
             if animations_dir is None:
                 animations_dir = os.path.join(output_dir, 'animation_Tracking')
-            os.makedirs(animations_dir, exist_ok=True)
+            ensure_dir(animations_dir)
 
             # Temp-frames folder was chosen up-front when Export was clicked
             # (see _prompt_animation_temp_dir); fall back to the default if the
@@ -11194,9 +16894,79 @@ class UWBQuickVisualizationWindow(QWidget):
 
             generate_daily = s['generate_daily']
             generate_full = s.get('generate_full', not generate_daily)
-            all_days = s.get('all_days_selected', False)
             db_name = os.path.splitext(os.path.basename(self.db_path))[0]
-            daily_paths = []   # final daily video paths in day order (for concat)
+            day_numbers = s.get('day_numbers') or {}
+            trial_days = s.get('trial_days') or list(s.get('selected_days') or [])
+
+            def _daily_video_path(date_str):
+                """Where this day's video lives, whoever rendered it.
+
+                The name carries the TRIAL day number, the date, the fps and
+                the speed, so a file from an earlier export is only reused
+                when it was rendered at the same settings.
+                """
+                n = day_numbers.get(date_str, trial_days.index(date_str) + 1
+                                    if date_str in trial_days else 1)
+                return os.path.join(
+                    animations_dir,
+                    f"{db_name}_Animation_Day{n}_{date_str}_{fps}fps_{speed_text}.mp4")
+
+            rendered_days = []   # days this run actually produced
+            selected_days = list(s['selected_days']) if generate_daily else []
+            force_full_render = False
+
+            # A day the Start/Stop trim leaves empty can never have a video, so
+            # it is not a gap in the full video. VC-T006's day 11 (3/2, after
+            # its 3/1 12:52 cut) used to count as missing, which threw away the
+            # ten daily videos and re-rendered the whole span in one 195,000-
+            # frame pass (it died two-fifths of the way through).
+            if trial_days and not anim_data.empty:
+                have = set(pd.Series(anim_data['Timestamp'].dt.normalize().unique())
+                           .dt.strftime('%Y-%m-%d'))
+                empty_days = [d for d in trial_days if d not in have]
+                if empty_days:
+                    self.log_message(
+                        "No tracking data on "
+                        + ", ".join(f"Day {day_numbers.get(d, '?')} ({d})"
+                                    for d in empty_days)
+                        + " after the Start/Stop trim: left out of the full animation.")
+                    trial_days = [d for d in trial_days if d in have]
+                    selected_days = [d for d in selected_days if d in have]
+
+            # A full video is meant to be the WHOLE trial. Before rendering
+            # anything, check that every day will have a video at THESE
+            # settings - the ones already on disk plus the ones about to be
+            # rendered - and say so up front rather than quietly producing a
+            # full video with a day missing from the middle of it.
+            if generate_full:
+                covered = set(selected_days) | {
+                    d for d in trial_days if os.path.exists(_daily_video_path(d))}
+                gaps = [d for d in trial_days if d not in covered]
+                if gaps:
+                    choice = self._ask_about_missing_days(
+                        gaps, day_numbers, fps, speed_text, generate_daily)
+                    if choice == 'skip_full':
+                        generate_full = False
+                        self.log_message(
+                            "Full animation skipped: "
+                            + self._describe_missing_days(gaps, day_numbers, fps,
+                                                          speed_text))
+                    elif choice == 'scratch':
+                        force_full_render = True
+                        self.log_message(
+                            "Full animation will be rendered from scratch ("
+                            + self._describe_missing_days(gaps, day_numbers, fps,
+                                                          speed_text) + ").")
+                    else:                      # 'render_missing'
+                        order = {d: i for i, d in enumerate(trial_days)}
+                        selected_days = sorted(set(selected_days) | set(gaps),
+                                               key=lambda d: order.get(d, 0))
+                        generate_daily = True
+                        self.log_message(
+                            "Rendering the missing day(s) as well, then "
+                            "stitching: "
+                            + ", ".join(f"Day {day_numbers.get(d, '?')}"
+                                        for d in gaps))
 
             # ONE set of axis limits, spanning the whole recording, used by
             # every render below. Letting each daily video compute its own
@@ -11215,15 +16985,20 @@ class UWBQuickVisualizationWindow(QWidget):
 
             # ---- Daily animations (one per selected day) ----
             if generate_daily:
-                selected_days = s['selected_days']
                 if not selected_days:
                     self.log_message("⚠ No days selected for daily animations")
                 else:
-                    self.log_message(f"Generating {len(selected_days)} daily animations...")
+                    self.log_message(
+                        f"Generating {len(selected_days)} daily animation(s): "
+                        + ", ".join(f"Day {day_numbers.get(d, '?')}"
+                                    for d in selected_days))
                     for day_idx, date_str in enumerate(selected_days):
                         if self.export_cancelled:
                             return
-                        self.log_message(f"Processing Day {day_idx + 1}/{len(selected_days)}: {date_str}")
+                        day_no = day_numbers.get(date_str, day_idx + 1)
+                        self.log_message(
+                            f"Processing Day {day_no} ({day_idx + 1} of "
+                            f"{len(selected_days)} selected): {date_str}")
                         data_tz = anim_data['Timestamp'].dt.tz
                         date_obj = pd.to_datetime(date_str).date()
                         day_start = (pd.Timestamp(date_obj, tz=data_tz) if data_tz is not None
@@ -11238,35 +17013,83 @@ class UWBQuickVisualizationWindow(QWidget):
                             day_data, temp_frames_dir, frame_interval, trailing_window,
                             fps, color_by, s['use_identities'],
                             total_export_steps, current_export_step,
-                            day_suffix=f"_Day{day_idx + 1}_{date_str}", speed_text=speed_text,
+                            day_suffix=f"_Day{day_no}_{date_str}", speed_text=speed_text,
                             axis_limits=axis_limits)
                         if video_path and not self.export_cancelled:
-                            final_video_path = os.path.join(
-                                animations_dir,
-                                f"{db_name}_Animation_Day{day_idx + 1}_{date_str}_{fps}fps_{speed_text}.mp4")
+                            final_video_path = _daily_video_path(date_str)
                             if os.path.exists(final_video_path):
-                                self.log_message(f"⚠ Day {day_idx + 1} animation already exists, skipping: {os.path.basename(final_video_path)}")
+                                self.log_message(f"⚠ Day {day_no} animation already exists, skipping: {os.path.basename(final_video_path)}")
                             elif os.path.exists(video_path):
                                 shutil.move(video_path, final_video_path)
-                                self.log_message(f"✓ Day {day_idx + 1} animation saved: {final_video_path}")
+                                self.log_message(f"✓ Day {day_no} animation saved: {final_video_path}")
                             if os.path.exists(final_video_path):
-                                daily_paths.append(final_video_path)
+                                rendered_days.append(date_str)
 
             # ---- Full animation (whole recording), after the dailies ----
             if generate_full and not self.export_cancelled:
                 full_path = os.path.join(animations_dir, f"{db_name}_Animation_{fps}fps_{speed_text}.mp4")
-                if os.path.exists(full_path):
+                # Every day of the trial that has a video at THESE settings,
+                # whether this run made it or an earlier day's export did.
+                # This is what makes the daily workflow work: render day 7
+                # today, and the full video is rebuilt from days 1-7 without
+                # re-rendering the six that are already on disk.
+                on_disk, missing = [], []
+                for d in trial_days:
+                    p = _daily_video_path(d)
+                    (on_disk if os.path.exists(p) else missing).append(d)
+                reused = [d for d in on_disk if d not in rendered_days]
+                can_stitch = bool(on_disk) and not missing and not force_full_render
+                if can_stitch:
+                    sizes = {self._video_frame_size(_daily_video_path(d))
+                             for d in on_disk}
+                    sizes.discard(None)
+                    if len(sizes) > 1:
+                        can_stitch = False
+                        self.log_message(
+                            "⚠ The daily videos were rendered at different "
+                            f"frame sizes ({', '.join(f'{w}x{h}' for w, h in sorted(sizes))}); "
+                            "rendering the full animation from scratch instead.")
+                if (getattr(self, '_export_skip_existing', False)
+                        and os.path.exists(full_path)):
                     self.log_message(f"⚠ Full animation already exists, skipping: {os.path.basename(full_path)}")
-                elif generate_daily and all_days and len(daily_paths) >= 1:
-                    # Every day was rendered — just stitch the daily videos together.
-                    self.lbl_export_progress.setText("Concatenating daily animations into the full video...")
+                elif can_stitch:
+                    self.lbl_export_progress.setText("Stitching daily animations into the full video...")
                     QApplication.processEvents()
-                    self.log_message(f"Building full animation by concatenating {len(daily_paths)} daily animation(s)...")
-                    if self._concat_videos_cv2(daily_paths, full_path):
-                        self.log_message(f"✓ Full animation saved (concatenated dailies): {os.path.basename(full_path)}")
+                    self.log_message(
+                        f"Building the full animation from {len(on_disk)} daily "
+                        f"video(s): {len(rendered_days)} rendered now, "
+                        f"{len(reused)} reused from earlier exports"
+                        + (f" (Day {day_numbers.get(reused[0], '?')}"
+                           f"–Day {day_numbers.get(reused[-1], '?')})" if reused else ""))
+                    # Written aside and swapped in, so a failure half way
+                    # through leaves the previous full video intact.
+                    staged = full_path + '.partial.mp4'
+                    if self._concat_videos_cv2(
+                            [_daily_video_path(d) for d in on_disk], staged):
+                        os.replace(staged, full_path)
+                        self.log_message(
+                            f"✓ Full animation rebuilt from the daily videos: "
+                            f"{os.path.basename(full_path)}")
                     else:
-                        self.log_message("⚠ Concatenation failed; full animation not produced")
+                        try:
+                            if os.path.exists(staged):
+                                os.remove(staged)
+                        except OSError:
+                            pass
+                        self.log_message("⚠ Stitching failed; the previous full animation was left as it was")
                 else:
+                    if missing and generate_daily:
+                        self.log_message(
+                            f"Full animation: {len(missing)} day(s) have no video at "
+                            f"these settings ({', '.join('Day ' + str(day_numbers.get(d, '?')) for d in missing[:6])}"
+                            + (", …" if len(missing) > 6 else "")
+                            + ") — rendering the whole span instead. Tick those days to "
+                              "stitch instead of re-rendering.")
+                    if os.path.exists(full_path):
+                        try:
+                            os.remove(full_path)
+                        except OSError:
+                            pass
                     # No dailies, or only a subset — render the full span from scratch.
                     self.log_message("Generating full animation frames (this may take a while)...")
                     video_path = self.create_animation_frames(
@@ -11336,6 +17159,8 @@ class UWBQuickVisualizationWindow(QWidget):
             if beh_tags:
                 self.log_message(
                     "Classifying behaviour for the animation overlay...")
+                if getattr(self, '_clip_rendering', False):
+                    self.set_clip_progress("Building preview: classifying behaviour…")
                 try:
                     behavior = self._animation_behavior(data, beh_tags, layers_on)
                 except Exception as e:
@@ -11350,6 +17175,13 @@ class UWBQuickVisualizationWindow(QWidget):
         video_output_path = os.path.join(output_dir, video_filename)
 
         def _progress(i, total):
+            # The clip renders on the GUI thread with no progress bar of its
+            # own, so it gets the line under the Preview button. Every frame,
+            # not every tenth: a clip is ~300 frames and the point is to look
+            # alive.
+            if getattr(self, '_clip_rendering', False):
+                self.set_clip_progress(
+                    f"Building preview: frame {i + 1} / {total}")
             if i % 10 == 0 or i == total - 1:
                 pct = int(((current_export_step - 1) + (i + 1) / max(1, total)) / max(1, total_export_steps) * 100)
                 self.progress_bar.setValue(pct)
@@ -11367,19 +17199,65 @@ class UWBQuickVisualizationWindow(QWidget):
                     self.log_message(f"Rendering frame {i+1}/{total}...")
                 QApplication.processEvents()
 
+        data_view = None
+        if self.chk_anim_data_view.isChecked():
+            if getattr(self, '_clip_rendering', False):
+                self.set_clip_progress("Building preview: Data View counters…")
+            try:
+                data_view = self.build_data_view_payload()
+            except Exception as e:
+                # Same downgrade rule as the behaviour overlay: a missing
+                # panel is worth far less than the video.
+                self.log_message(f"Warning: Data View skipped ({e})")
+
+        environment = None
+        if layers_on.get('weather') or layers_on.get('light'):
+            site = self.site_settings()
+            wants_sources = not (site.weather_source == 'none'
+                                 and site.solar_source == 'computed')
+            if (site.has_location and wants_sources and self.environment is None
+                    and self.db_path and self.table_name):
+                if getattr(self, '_clip_rendering', False):
+                    self.set_clip_progress("Building preview: fetching weather…")
+                self.log_message("Fetching weather for the animation overlay...")
+                self._fetch_environment_now(site)
+            environment = self._display_timeline()
+            if environment is None:
+                self.log_message(
+                    "Weather/light overlay skipped: no site latitude/longitude "
+                    "(Weather Settings).")
+            elif layers_on.get('weather') and self.environment is None:
+                self.log_message(
+                    "Weather line skipped: no weather records (check the "
+                    "source in Weather Settings); the light bar uses the "
+                    "sun's position only.")
+
         return uwb_animation.render_animation(
             data, video_output_path,
             frame_interval=frame_interval, trailing_window=trailing_window, fps=fps,
             dpi=dpi, speed_text=speed_text,
             layers=self.plot_layers, bg_image=bg_image, bg_extent=bg_extent,
-            arena_zones=self.arena_zones, anchors=self.anchor_positions,
+            zones_xml=self.xml_zones, arena_zones=self.arena_zones,
+            anchors=self.anchor_positions, rois=self.rois,
             tag_identities=self.tag_identities, use_custom_identities=use_custom_identities,
+            id_type=s.get('tag_id_type', SEX_ID),
             color_by=color_by, marker_size=s['tag_size'],
-            show_battery=s['show_battery'], axis_limits=axis_limits,
+            show_battery=s['show_battery'],
+            show_speed=s.get('show_speed', False),
+            show_step=s.get('show_step', False),
+            label_color=s.get('label_color'),
+            label_outline=s.get('label_outline', True),
+            gap_s=s.get('gap_s', 60.0), axis_limits=axis_limits,
             behavior=behavior,
             show_trail=layers_on.get('trail', True),
             show_labels=layers_on.get('tag_id', True),
-            time_range=time_range,
+            time_range=time_range, data_view=data_view,
+            day_one=self.trial_day_one(),
+            environment=environment,
+            show_weather=bool(layers_on.get('weather')
+                              and self.environment is not None),
+            show_light=bool(layers_on.get('light')),
+            weather_units=s.get('weather_units', 'metric'),
             is_cancelled=lambda: self.export_cancelled,
             progress=_progress, log=self.log_message,
         )
@@ -11414,11 +17292,11 @@ class UWBQuickVisualizationWindow(QWidget):
 
         # Make ALL interactive decisions NOW, at add-to-queue time, so the batch
         # run itself never blocks on a dialog. (1) Plot/animation spatial layers
-        # — sets self.plot_layers, which get_config_dict captures below.
+        # — taken from the preview as it stands NOW and frozen into the job by
+        # get_config_dict below, so later preview fiddling cannot change what a
+        # queued trial renders.
         if save_plots or save_animation:
-            if not self._prompt_plot_layers():
-                self.log_message("Add to queue cancelled at layer selection.")
-                return
+            self.plot_layers_from_preview()
 
         self._sync_export_from_preview()
 
@@ -11433,9 +17311,20 @@ class UWBQuickVisualizationWindow(QWidget):
             dlg = ExportConflictDialog(all_conflicting, all_new, parent=self)
             result = dlg.exec_()
             if result not in (ExportConflictDialog.SKIP, ExportConflictDialog.OVERWRITE,
-                              ExportConflictDialog.NEW_FOLDER):
+                              ExportConflictDialog.NEW_FOLDER,
+                              ExportConflictDialog.CLEAR):
                 self.log_message("Add to queue cancelled at overwrite prompt.")
                 return
+            # Confirmed HERE rather than at run time: a batch is started and
+            # left alone, and a destructive prompt appearing an hour in would
+            # stall the queue behind a dialog nobody is watching.
+            if result == ExportConflictDialog.CLEAR:
+                if not self.confirm_clear_analysis_folder():
+                    self.log_message("Add to queue cancelled at the clear prompt.")
+                    return
+                self.log_message(
+                    "  This job will CLEAR its analysis folder before "
+                    "exporting (confirmed now; it will not ask again).")
             conflict_choice = result
 
         job = {
@@ -11452,10 +17341,17 @@ class UWBQuickVisualizationWindow(QWidget):
         # defines them. The plot is skipped at the very end of the plot run,
         # so without this the queue looks like it is going to produce it.
         zone_cb = self.plot_type_checkboxes.get('zone_occupancy')
-        if zone_cb is not None and zone_cb.isChecked() and not self.xml_zones:
+        if (zone_cb is not None and zone_cb.isChecked()
+                and self.chk_save_plots.isChecked() and not self.region_sets()):
             self.log_message(
-                "  Note: Zone Occupancy is ticked but this site XML defines no "
-                "zones — that plot will be skipped for this trial.")
+                "  Note: Zone Occupancy is ticked but no regions are drawn "
+                "for this trial, so that plot will be skipped.")
+        if ((self.chk_export_roi_bouts.isChecked()
+             or self.chk_export_roi_daily.isChecked())
+                and not self.region_sets()):
+            self.log_message(
+                "  Note: an ROI occupancy CSV is ticked but no regions are "
+                "drawn for this trial, so no occupancy file will be written.")
         self.log_message(
             f"Added to queue: {os.path.basename(self.db_path)} "
             f"(table {self.table_name}, {n_tags} tag(s); layers + overwrite choices captured)")
@@ -11479,9 +17375,9 @@ class UWBQuickVisualizationWindow(QWidget):
             if cfg.get('save_plots'): outs.append('plots')
             if cfg.get('save_animation'): outs.append('anim')
             if cfg.get('proximity_detection'): outs.append('prox')
-            if cfg.get('export_gbi'): outs.append('GBI')
-            if cfg.get('export_edgelist'): outs.append('EL')
             if cfg.get('export_behavior_events'): outs.append('behav')
+            if cfg.get('export_roi_bouts'): outs.append('ROIbouts')
+            if cfg.get('export_roi_daily'): outs.append('ROIdaily')
             ntags = len(cfg.get('selected_tags', []))
             summary = f"{ntags} tags · {', '.join(outs) or 'no outputs'}"
             self.batch_list.addItem(
@@ -11560,12 +17456,25 @@ class UWBQuickVisualizationWindow(QWidget):
             # trial's animation.
             it.pop('data_failed', None)
 
-        # Two-phase plan: every trial's DATA products (CSVs, proximity, social
-        # network, plots) run first, for the whole queue; only then do the video
-        # renders. A tracking animation takes hours while the CSVs take minutes,
-        # so this gets every trial's data out in the first hour instead of
-        # trickling one trial per day.
+        # THREE-phase plan, ordered by how long a pass takes and how much of
+        # it you need first: every trial's CSVs, then every trial's plots, then
+        # the video renders. Each pass covers the WHOLE queue before the next
+        # begins.
+        #
+        # The point is that a slow product for trial 1 must not delay a fast
+        # product for trial 8. Animations take hours and plots take minutes
+        # while the CSVs take less; running them trial-by-trial trickles one
+        # complete trial out per day, whereas this has every trial's numbers on
+        # disk in the first hour and every trial's figures shortly after.
+        #
+        # Plots sit in the middle rather than with the data because they are
+        # rendered, not computed: they cost real time, they are re-runnable
+        # from the smoothed CSV alone, and a failure in one must not hold up
+        # another trial's CSVs.
         self._batch_plan = [(i, 'data') for i in range(len(self._batch_items))]
+        plot_idx = [i for i, it in enumerate(self._batch_items)
+                    if (it.get('config') or {}).get('save_plots')]
+        self._batch_plan += [(i, 'plots') for i in plot_idx]
         anim_idx = [i for i, it in enumerate(self._batch_items)
                     if (it.get('config') or {}).get('save_animation')
                     or (it.get('config') or {}).get('social_animation')]
@@ -11598,7 +17507,7 @@ class UWBQuickVisualizationWindow(QWidget):
 
     # Config keys too bulky to be worth pasting into a bug report, replaced by
     # a one-line summary. Everything else is written out in full.
-    _LOG_SUMMARISE_KEYS = ('arena_zones', 'xml_config', 'tag_identities')
+    _LOG_SUMMARISE_KEYS = ('arena_zones', 'xml_config', 'tag_identities', 'rois')
 
     def _loggable_config(self, cfg):
         """A copy of a job's config with the bulky keys reduced to a summary.
@@ -11615,23 +17524,30 @@ class UWBQuickVisualizationWindow(QWidget):
             if key == 'tag_identities':
                 # Keep the part that changes behaviour (which tags, and their
                 # active windows); drop nothing else of consequence.
-                # The MODE, not just the timestamp. A bound on Follow data
+                # The MODE, not just the timestamp. A bound on Auto
                 # keeps its last-seen value in `stop_time` purely for display -
                 # it trims nothing - so printing the bare timestamp made an
                 # untrimmed tag look like it was being cut off at a stale date.
                 def _bound(v, which):
                     mode = IdentityAssignmentDialog._mode_of(v, which)
                     if mode != 'manual':
-                        return 'follows data'
+                        return 'auto'
                     return v.get(f'{which}_time', '-')
+
+                def _holes(v):
+                    n = len(off_intervals(v))
+                    return f" (+{n} off-animal interval{'s' if n != 1 else ''})" if n else ""
 
                 out[key] = {
                     str(t): (f"{v.get('sex', '?')}{v.get('identity', '?')} "
-                             f"{_bound(v, 'start')} → {_bound(v, 'stop')}")
+                             f"{_bound(v, 'start')} → {_bound(v, 'stop')}{_holes(v)}")
                     for t, v in (value or {}).items()}
             elif key == 'arena_zones':
                 names = sorted({r.get('zone') for r in value if isinstance(r, dict)})
                 out[key] = f"<{len(names)} zone(s): {', '.join(n for n in names if n)}>"
+            elif key == 'rois':
+                out[key] = "<{} region(s): {}>".format(
+                    len(value), ', '.join(str(r.get('name', '')) for r in value))
             else:
                 out[key] = f"<{type(value).__name__} omitted from the log>"
         return out
@@ -11709,22 +17625,25 @@ class UWBQuickVisualizationWindow(QWidget):
         self._batch_phase = phase
         it = self._batch_items[job_idx]
 
-        # A trial whose data pass failed has no smoothed CSV to render from.
-        if phase == 'animation' and it.get('data_failed'):
+        # A trial whose data pass failed has no smoothed CSV for either of
+        # the later passes to render from.
+        if phase in ('plots', 'animation') and it.get('data_failed'):
             self.log_message(
-                f"Skipping animation for {os.path.basename(it['path'])} "
+                f"Skipping {phase} for {os.path.basename(it['path'])} "
                 f"— its data pass failed in this run.")
             # Must still read as a failure: overwriting it with a neutral
             # 'skipped' string lost the fact that the trial failed at all,
             # and the end-of-run summary then counted it as nothing.
-            it['status'] = 'Failed (data) \u2014 animation skipped'
+            it['status'] = f'Failed (data) \u2014 {phase} skipped'
             self._refresh_batch_list()
             self._batch_plan_pos += 1
             self._batch_step_running = False
             QTimer.singleShot(0, self._batch_step)
             return
 
-        it['status'] = 'Processing data' if phase == 'data' else 'Rendering animation'
+        it['status'] = {'data': 'Processing data',
+                        'plots': 'Generating plots',
+                        'animation': 'Rendering animation'}[phase]
         self._batch_frame_cur = 0
         self._batch_frame_total = 0
         self._batch_stage = ''
@@ -11733,23 +17652,33 @@ class UWBQuickVisualizationWindow(QWidget):
         self._update_batch_progress()
         self.log_message(
             f"BATCH [{self._batch_plan_pos + 1}/{len(self._batch_plan)}] "
-            f"({'data' if phase == 'data' else 'animation'}): "
+            f"({phase}): "
             f"{os.path.basename(it['path'])} — starting worker process")
 
-        # Split the captured settings into the two phases.
+        # Split the captured settings across the three passes. Each pass turns
+        # OFF what the other two own, so no product is computed twice and a
+        # re-run of one pass cannot quietly overwrite another's output.
         cfg = dict(it.get('config') or {})
+        DATA_PRODUCTS = ('export_raw_csv', 'proximity_detection',
+                         'export_roi_bouts', 'export_roi_daily',
+                         'export_behavior_events')
         if phase == 'data':
-            # Everything except the video renders.
+            # The numbers only: no figures, no video.
+            cfg['save_plots'] = False
             cfg['save_animation'] = False
             cfg['social_animation'] = False
+        elif phase == 'plots':
+            # Figures only, drawn from the smoothed CSV the data pass wrote.
+            for key in DATA_PRODUCTS:
+                cfg[key] = False
+            cfg['save_animation'] = False
+            cfg['social_animation'] = False
+            cfg['save_plots'] = True
         else:
-            # Renders only — the data products already exist from the data pass.
-            cfg['export_raw_csv'] = False
+            # Renders only — every other product already exists on disk.
+            for key in DATA_PRODUCTS:
+                cfg[key] = False
             cfg['save_plots'] = False
-            cfg['proximity_detection'] = False      # bouts CSV already written
-            cfg['export_gbi'] = False               # GBI already written
-            cfg['export_edgelist'] = False          # edge list already written
-            cfg['export_behavior_events'] = False   # behaviour events already written
 
         # Frozen builds can't run `python -m`; fall back to the in-process path
         # so the queue still works (without crash isolation).
@@ -11765,13 +17694,13 @@ class UWBQuickVisualizationWindow(QWidget):
             'path': it['path'],
             'table': it.get('table'),
             'config': cfg,
-            'conflict_choice': it.get('conflict_choice', ExportConflictDialog.OVERWRITE),
+            'conflict_choice': self._phase_conflict_choice(it, phase),
             'temp_frames_dir': getattr(self, '_batch_temp_frames_dir', None),
             # The animation pass renders from the CSV the data pass wrote.
             # The animation pass always reuses what the data pass wrote;
             # a data retry reuses it only when this run already verified
             # it (see _smoothed_csv_is_fresh).
-            'reuse_smoothed': (phase == 'animation'
+            'reuse_smoothed': (phase in ('plots', 'animation')
                                or bool(it.get('reuse_smoothed'))),
         }
         job_dir = tempfile.mkdtemp(prefix='fnt_batch_')
@@ -11819,10 +17748,27 @@ class UWBQuickVisualizationWindow(QWidget):
         self._batch_log_pos = 0
         QTimer.singleShot(500, self._batch_poll_export)
 
+    def _phase_conflict_choice(self, it, phase):
+        """This job's conflict choice, as the given pass should see it.
+
+        CLEAR belongs to the DATA pass alone. Every pass runs in its own
+        worker process, so a downgrade applied inside a worker dies with it -
+        the plots pass would start fresh, see CLEAR again, and delete the CSVs
+        the data pass had just written. The decision therefore has to be made
+        here, in the parent, where the plan lives.
+
+        Only CLEAR is rewritten; SKIP and NEW_FOLDER keep whatever behaviour
+        they already had across passes.
+        """
+        choice = it.get('conflict_choice', ExportConflictDialog.OVERWRITE)
+        if choice == ExportConflictDialog.CLEAR and phase != 'data':
+            return ExportConflictDialog.OVERWRITE
+        return choice
+
     def _batch_run_in_process(self, it, cfg=None, phase='data'):
         """Fallback for frozen builds: export in this process (no isolation)."""
         self._pending_config_override = cfg if cfg is not None else it.get('config')
-        self._batch_reuse_smoothed = (phase == 'animation'
+        self._batch_reuse_smoothed = (phase in ('plots', 'animation')
                                       or bool(it.get('reuse_smoothed')))
         if not self._load_database_path(it['path']):
             it['status'] = 'Failed'
@@ -11836,7 +17782,7 @@ class UWBQuickVisualizationWindow(QWidget):
         if not any(cb.isChecked() for cb in self.tag_checkboxes.values()):
             for cb in self.tag_checkboxes.values():
                 cb.setChecked(True)
-        self._batch_conflict_choice = it.get('conflict_choice', ExportConflictDialog.OVERWRITE)
+        self._batch_conflict_choice = self._phase_conflict_choice(it, phase)
         self._batch_proc = None
         self.export_data()
         QTimer.singleShot(300, self._batch_poll_export)
@@ -11920,7 +17866,8 @@ class UWBQuickVisualizationWindow(QWidget):
         phase = getattr(self, '_batch_phase', 'data')
         self.lbl_batch_progress.setText(
             f"Step {done + 1} of {total_steps}  ·  {name}  ·  "
-            f"{'data products' if phase == 'data' else 'animation render'}")
+            + {'data': 'data products', 'plots': 'plots',
+               'animation': 'animation render'}.get(phase, phase))
 
         detail = getattr(self, '_batch_stage', '') or ''
         if tot:
@@ -11969,8 +17916,25 @@ class UWBQuickVisualizationWindow(QWidget):
 
         it = self._batch_items[self._batch_index]
         phase = getattr(self, '_batch_phase', 'data')
-        has_anim = bool((it.get('config') or {}).get('save_animation')
-                        or (it.get('config') or {}).get('social_animation'))
+        cfg_of = it.get('config') or {}
+        has_anim = bool(cfg_of.get('save_animation')
+                        or cfg_of.get('social_animation'))
+        has_plots = bool(cfg_of.get('save_plots'))
+
+        def _queued_after(done_phase):
+            """Status for a finished pass, naming whatever is still owed.
+
+            The queue row is the only place a part-finished trial explains
+            itself, so it says what is still to come rather than a bare
+            'Done' that would read as complete.
+            """
+            if done_phase == 'data' and has_plots:
+                return 'Data ✓ — plots queued'
+            if done_phase == 'plots' and has_anim:
+                return 'Plots ✓ — animation queued'
+            if done_phase == 'data' and has_anim:
+                return 'Data ✓ — animation queued'
+            return 'Done'
 
         # A worker that stopped because Stop Batch killed it did not fail -
         # nothing went wrong, the user changed their mind. Calling it a failure
@@ -11978,8 +17942,11 @@ class UWBQuickVisualizationWindow(QWidget):
         # disk was summarised as "Failed (animation)" because an hour into the
         # render someone pressed stop.
         if self._batch_stop_requested:
-            it['status'] = ('Data ✓ (animation cancelled)'
-                            if phase == 'animation' and it.get('data_ok')
+            # A trial whose earlier passes finished keeps that in its
+            # status: the pass in flight was cancelled, the CSVs were not.
+            it['status'] = (f'Data ✓ ({phase} cancelled)'
+                            if phase in ('plots', 'animation')
+                            and it.get('data_ok')
                             else f'Cancelled ({phase})')
             self.log_message(
                 f"BATCH {os.path.basename(it['path'])} [{phase}]: "
@@ -12032,9 +17999,11 @@ class UWBQuickVisualizationWindow(QWidget):
             if phase == 'data':
                 it['data_failed'] = True
         elif phase == 'data':
-            # Data products are on disk now; the render (if any) comes later.
+            # The numbers are on disk; figures and renders come later.
             it['data_ok'] = True
-            it['status'] = 'Data ✓ — animation queued' if has_anim else 'Done'
+            it['status'] = _queued_after('data')
+        elif phase == 'plots':
+            it['status'] = _queued_after('plots')
         else:
             it['status'] = 'Done'
         self.log_message(f"BATCH {os.path.basename(it['path'])} [{phase}]: {it['status']}")
@@ -12089,6 +18058,26 @@ class UWBQuickVisualizationWindow(QWidget):
             return True
         return (rc & 0xFFFFFFFF) >= 0xC0000000
 
+    # Statuses that mean "still owed something" — a batch that stops has to
+    # rewrite every one of them, or a row sits reading 'Rendering animation'
+    # forever. Kept as data so adding a pass cannot silently miss one.
+    _CANCELLABLE_STATUSES = frozenset({
+        'Queued', 'Loading', 'Running',
+        'Processing data', 'Generating plots', 'Rendering animation',
+        'Data ✓ — plots queued', 'Data ✓ — animation queued',
+        'Plots ✓ — animation queued',
+    })
+
+    # What each of those becomes when the trial's data pass HAD finished:
+    # name the pass that was lost rather than a vague 'remaining passes'.
+    _CANCELLED_AS = {
+        'Generating plots': 'Data ✓ (plots cancelled)',
+        'Rendering animation': 'Data ✓ (animation cancelled)',
+        'Data ✓ — plots queued': 'Data ✓ (plots cancelled)',
+        'Data ✓ — animation queued': 'Data ✓ (animation cancelled)',
+        'Plots ✓ — animation queued': 'Plots ✓ (animation cancelled)',
+    }
+
     def _batch_retries_left(self, it, phase):
         cap = self.spin_batch_retries.value() if hasattr(self, 'spin_batch_retries') else 0
         used = self._batch_attempts.get((self._batch_index, phase), 1) - 1
@@ -12108,13 +18097,16 @@ class UWBQuickVisualizationWindow(QWidget):
         self._restore_dialogs()   # before the summary box, and re-enable normal UI dialogs
         for it in self._batch_items:
             status = str(it['status'])
-            if (status in ('Queued', 'Loading', 'Running', 'Processing data',
-                           'Rendering animation', 'Data ✓ — animation queued')
+            if (status in self._CANCELLABLE_STATUSES
                     or status.startswith('Retrying')):
                 # A trial whose data pass finished keeps that in its status:
-                # its animation was cancelled, its CSVs and plots were not.
-                it['status'] = ('Data ✓ (animation cancelled)'
-                                if it.get('data_ok') else 'Cancelled')
+                # the later passes were cancelled, its CSVs were not. Which
+                # pass was outstanding is read off the status it was showing,
+                # so the row still says what was lost.
+                it['status'] = (
+                    self._CANCELLED_AS.get(status,
+                                           'Data ✓ (remaining passes cancelled)')
+                    if it.get('data_ok') else 'Cancelled')
         self._refresh_batch_list()
         # Every item lands in exactly one bucket, and anything unrecognised
         # is reported rather than dropped - a status that matched none of
@@ -12189,7 +18181,21 @@ class UWBQuickVisualizationWindow(QWidget):
     _SMOOTHED_NUMERIC_COLS = ('shortid', 'timestamp', 'location_x', 'location_y',
                               'smoothed_x', 'smoothed_y')
 
-    def verify_smoothed_csv(self, path, chunksize=2_000_000):
+    #: Columns of the social-overlap bouts CSV that must parse as numbers.
+    _BOUTS_NUMERIC_COLS = ('Day', 'duration_s', 'mean_distance', 'n_reads')
+
+    #: Columns of the behaviour-events CSV that must parse as numbers.
+    _BEHAVIOR_NUMERIC_COLS = ('Day', 'duration_s', 'n_frames', 'n_fixes')
+
+    #: Columns of the weather CSV that must parse as numbers.
+    _WEATHER_NUMERIC_COLS = ('timestamp', 'interval_s', *WX.FIELDS,
+                             'sun_elevation_deg', 'sun_azimuth_deg')
+    _SKY_NUMERIC_COLS = ('timestamp', 'precip_rate_mmh', 'precip_rate_15min_mmh',
+                         'clear_sky_index', 'shaded_frac_15min',
+                         'cloud_cover_pct_model', 'weather_code_model',
+                         'sun_elevation_deg')
+
+    def verify_smoothed_csv(self, path, chunksize=2_000_000, numeric_cols=None):
         """Check every numeric column of the written CSV actually parses.
 
         This exists because a written value was once observed to come back as
@@ -12204,6 +18210,10 @@ class UWBQuickVisualizationWindow(QWidget):
         strings. Catching it here names the file, the line and the value, and
         lets the batch retry the trial - a re-run usually writes it cleanly.
 
+        ``numeric_cols`` defaults to the smoothed CSV's columns; pass another
+        tuple to check a different file with the same machinery. Only columns
+        actually present are checked, so one list can cover several layouts.
+
         Returns (ok, list_of_problem_strings).
         """
         problems = []
@@ -12211,7 +18221,8 @@ class UWBQuickVisualizationWindow(QWidget):
             cols = list(pd.read_csv(path, nrows=0).columns)
         except Exception as e:
             return False, [f"could not read the header: {e}"]
-        check = [c for c in self._SMOOTHED_NUMERIC_COLS if c in cols]
+        check = [c for c in (numeric_cols or self._SMOOTHED_NUMERIC_COLS)
+                 if c in cols]
         if not check:
             return True, []
 
@@ -12238,16 +18249,24 @@ class UWBQuickVisualizationWindow(QWidget):
         line0 = 1                       # 1-based, after the header
         try:
             for chunk in pd.read_csv(path, usecols=check, dtype=str,
-                                     chunksize=chunksize):
+                                     chunksize=chunksize, index_col=False):
                 for col in check:
                     raw = chunk[col]
-                    bad = raw[pd.to_numeric(raw, errors='coerce').isna() & raw.notna()]
-                    for pos, value in list(bad.items())[:3]:
+                    # Locate the bad cells by POSITION in the chunk, never by
+                    # index label: a file whose header lost a column comes back
+                    # with a string index, and naming a line from that would
+                    # fail with a TypeError instead of reporting the value.
+                    mask = (pd.to_numeric(raw, errors='coerce').isna()
+                            & raw.notna()).to_numpy()
+                    values = raw.to_numpy()
+                    at = np.flatnonzero(mask)
+                    for off in at[:3]:
                         problems.append(
-                            f"line {line0 + pos + 1:,}, column '{col}': {value!r}")
-                    if len(bad) > 3:
+                            f"line {line0 + int(off) + 1:,}, column '{col}': "
+                            f"{values[off]!r}")
+                    if len(at) > 3:
                         problems.append(
-                            f"  ...and {len(bad) - 3} more bad value(s) in '{col}'")
+                            f"  ...and {len(at) - 3} more bad value(s) in '{col}'")
                 line0 += len(chunk)
                 if len(problems) > 12:
                     problems.append("  (stopping the scan; enough evidence)")
@@ -12255,6 +18274,128 @@ class UWBQuickVisualizationWindow(QWidget):
         except Exception as e:
             return False, [f"scan failed: {e}"]
         return (not problems), problems
+
+    #: An object column with at most this many distinct values is treated as a
+    #: vocabulary (animal labels, sexes, dyad types, dates) and round-tripped
+    #: exactly. Above it a column is free text — timestamps, mostly — and is
+    #: checked by parsing instead, since re-rendering may differ harmlessly.
+    _VOCAB_MAX_UNIQUE = 64
+
+    def verify_written_frame(self, df, path, numeric_cols=()):
+        """Compare a CSV on disk against the frame that produced it.
+
+        ``verify_smoothed_csv`` catches a mangled number. This adds the checks
+        that only make sense when the source frame is still in hand: the file
+        has to have the same number of rows, the same columns in the same
+        order, and — for every short-vocabulary column — no value that was not
+        in the frame. A stray byte in an animal label invents an animal that
+        no downstream join will match, so it has to fail here, loudly.
+
+        Returns (ok, list_of_problem_strings).
+        """
+        # Shape first, and only then the values. A file whose header lost a
+        # column still parses — pandas just promotes a column to the index —
+        # and the numeric scan would then report nonsense about the wrong
+        # column instead of the one plain fact that explains everything.
+        try:
+            back = pd.read_csv(path, dtype=str, keep_default_na=False,
+                               index_col=False)
+        except Exception as e:
+            return False, [f"could not read it back: {e}"]
+
+        if list(back.columns) != list(df.columns):
+            return False, [f"columns on disk {list(back.columns)} do not match "
+                           f"the frame {list(df.columns)}"]
+        if len(back) != len(df):
+            return False, [f"{len(back):,} row(s) on disk, {len(df):,} written "
+                           f"— the file is truncated or duplicated"]
+
+        ok, problems = self.verify_smoothed_csv(path, numeric_cols=numeric_cols)
+        if not ok:
+            return False, problems
+
+        for col in df.columns:
+            if pd.api.types.is_numeric_dtype(df[col]):
+                continue                       # already parsed above
+            # A missing value is written as an empty cell, but astype(str)
+            # renders it 'NaT' / 'None' / 'nan'. Compared as text, every
+            # legitimately missing value - a day with no moonrise - read as
+            # a stray value and aborted the whole export.
+            missing = df[col].isna().to_numpy()
+            want = df[col].astype(str).where(~missing, '')
+            if want.nunique() > self._VOCAB_MAX_UNIQUE:
+                # Free text (timestamps): re-rendering can differ legitimately,
+                # so require only that it still parses as the time it was.
+                if pd.api.types.is_datetime64_any_dtype(df[col]):
+                    # format='ISO8601', not inference. str(Timestamp) drops
+                    # trailing zero microseconds, so to_csv emits a column of
+                    # MIXED precision - '...:56.123000-06:00' for most rows and
+                    # '...:56-06:00' for the few that land on a whole second.
+                    # Since pandas 2.0 to_datetime guesses one format from the
+                    # FIRST element and coerces everything else to NaT, so the
+                    # whole-second rows were being reported as corruption and
+                    # the export aborted on a file that was perfectly good.
+                    bad = (pd.to_datetime(back[col], format='ISO8601',
+                                          errors='coerce').isna()
+                           & ~missing)        # a NaT written stays empty
+                    if bad.any():
+                        first = back[col][bad].iloc[0]
+                        problems.append(
+                            f"column '{col}': {int(bad.sum()):,} value(s) are "
+                            f"no longer a time, e.g. {first!r}")
+                continue
+            stray = set(back[col]) - set(want)
+            if stray:
+                problems.append(
+                    f"column '{col}': value(s) on disk that were never "
+                    f"written: {sorted(stray)[:3]}")
+        return (not problems), problems
+
+    def write_verified_csv(self, df, path, numeric_cols=()):
+        """Write an analysis CSV, and read it back before publishing it.
+
+        The smoothed CSV has been verified since this machine was first caught
+        corrupting a pandas write. These files go through the same formatter
+        onto the same disk, so they need the same protection — and their own
+        self-checks cannot provide it, because those run on the DataFrame and
+        so cannot see damage introduced AFTER the check, on the way to disk.
+
+        Writes to ``path + '.partial'`` and renames only once the bytes on
+        disk read back intact, so a fault can never leave behind a half-written
+        file that looks complete. Returns True when the file was published;
+        on failure the export is stopped so the batch retries the trial.
+        """
+        name = os.path.basename(path)
+        partial = path + '.partial'
+        try:
+            df.to_csv(partial, index=False)
+            ok, problems = self.verify_written_frame(df, partial, numeric_cols)
+        except Exception as e:
+            ok, problems = False, [f"the write itself failed: {e}"]
+
+        if ok:
+            os.replace(partial, path)
+            self.log_message(f"  ✓ {name} verified on disk "
+                             f"({len(df):,} row(s), {len(df.columns)} columns)")
+            return True
+
+        self.log_message(f"✗ {name} did NOT verify — what landed on disk is "
+                         f"not what was written:")
+        for p in problems:
+            self.log_message(f"    {p}")
+        self.log_message(
+            "  Nothing in FNT writes such a value, so this is the file being "
+            "corrupted between formatting and disk. Aborting rather than "
+            "publishing it; a re-run usually writes it cleanly.")
+        try:
+            if os.path.exists(partial):
+                os.remove(partial)
+        except OSError as exc:
+            self.log_message(f"  ⚠ could not remove {name}.partial: {exc}")
+        self._last_export_failed = True
+        self._export_output_corrupt = True
+        self.stop_export()
+        return False
 
     def _predict_export_conflicts(self):
         """Predict output files and split into (conflicting, new) vs. what's on disk.
@@ -12279,8 +18420,6 @@ class UWBQuickVisualizationWindow(QWidget):
         # DELETED the freshly written CSV before the render could reuse it.
         export_smoothed_csv = not getattr(self, '_batch_reuse_smoothed', False)
         detect_proximity = self.chk_proximity_detection.isChecked()
-        export_gbi = self.chk_export_gbi.isChecked()
-        export_edgelist = self.chk_export_edgelist.isChecked()
         social_animation = False   # social-network animation was removed
         save_animation = self.chk_save_animation.isChecked()
         save_plots = self.chk_save_plots.isChecked()
@@ -12304,13 +18443,18 @@ class UWBQuickVisualizationWindow(QWidget):
         if export_smoothed_csv:
             predicted_files.append(f'{db_name}_smoothed.csv')
         if detect_proximity:
-            predicted_files.append(f'{db_name}_proximity_bouts.csv')
-        if export_edgelist:
-            predicted_files.append(self._edgelist_filename(db_name))
-        if export_gbi:
-            predicted_files.append(f'{db_name}_network_GBI.csv')
+            predicted_files.append(f'{db_name}_SocialOverlapBouts.csv')
         if self.chk_export_behavior.isChecked():
             predicted_files.append(f'{db_name}_behavior_events.csv')
+        if not getattr(self, '_batch_reuse_smoothed', False):
+            if self.chk_export_roi_bouts.isChecked():
+                predicted_files.append(f'{db_name}_ROI_bout_occupancy.csv')
+            if self.chk_export_roi_daily.isChecked():
+                predicted_files.append(f'{db_name}_ROI_DailySummary.csv')
+        if self.chk_export_weather.isChecked():
+            predicted_files.append(f'{db_name}_weather.csv')
+            predicted_files.append(f'{db_name}_daylight.csv')
+            predicted_files.append(f'{db_name}_sky.csv')
 
         predicted_sna_files = []   # social-network animation was removed
 
@@ -12319,9 +18463,11 @@ class UWBQuickVisualizationWindow(QWidget):
             fps = anim['fps']
             speed_text = anim['speed_text']
             if anim['generate_daily']:
+                nums = anim.get('day_numbers') or {}
                 for day_idx, date_str in enumerate(anim['selected_days']):
+                    day_no = nums.get(date_str, day_idx + 1)
                     predicted_animation_files.append(
-                        f'{db_name}_Animation_Day{day_idx + 1}_{date_str}_{fps}fps_{speed_text}.mp4')
+                        f'{db_name}_Animation_Day{day_no}_{date_str}_{fps}fps_{speed_text}.mp4')
             if anim.get('generate_full', not anim['generate_daily']):
                 predicted_animation_files.append(f'{db_name}_Animation_{fps}fps_{speed_text}.mp4')
 
@@ -12352,7 +18498,12 @@ class UWBQuickVisualizationWindow(QWidget):
                 for tag in selected_tags:
                     _add_with_svg(predicted_plot_files, f'{db_name}_MCP_{_tag_suffix(tag)}')
                 _add_with_svg(predicted_plot_files, f'{db_name}_MCP_Overview')
-            if plot_types.get('zone_occupancy', False):
+            # Only when there is something to measure. The plot skips itself
+            # with no drawn regions, and predicting it anyway made Overwrite
+            # DELETE the previous run's figure for a pass that then wrote no
+            # replacement - the analysis folder losing a good plot to a
+            # re-export that never regenerated it.
+            if plot_types.get('zone_occupancy', False) and self.region_sets():
                 _add_with_svg(predicted_plot_files, f'{db_name}_ZoneOccupancy')
             if plot_types.get('ethogram', False):
                 _add_with_svg(predicted_plot_files, f'{db_name}_Ethogram')
@@ -12367,7 +18518,14 @@ class UWBQuickVisualizationWindow(QWidget):
 
         all_conflicting, all_new = [], []
         for f in predicted_files:
-            (all_conflicting if os.path.exists(os.path.join(base_output_dir, f)) else all_new).append((f, ""))
+            # export_csv_path finds it in csvs/ or, for a trial exported
+            # before that subfolder existed, at the top level - so an old
+            # layout still reports its conflicts instead of looking untouched
+            # and being silently written alongside.
+            here = export_csv_path(base_output_dir, f)
+            where = (CSV_SUBDIR if os.path.dirname(here).endswith(CSV_SUBDIR)
+                     else "")
+            (all_conflicting if os.path.exists(here) else all_new).append((f, where))
         for f in predicted_plot_files:
             (all_conflicting if os.path.exists(os.path.join(plots_subdir, f)) else all_new).append((f, "plots"))
         for f in predicted_animation_files:
@@ -12387,6 +18545,11 @@ class UWBQuickVisualizationWindow(QWidget):
 
         # Initialize export state
         self.export_cancelled = False
+        # Both render on the GUI thread, so a playing preview would fight the
+        # export for it and make an already long job longer.
+        if self._playing:
+            self.stop_preview_playback()
+            self.log_message("Preview playback paused for the export.")
         self._last_export_failed = False  # set by error handlers; read by the batch queue
         self._plot_working_files = []  # defensive: normally stays empty now
         self.exporting = True
@@ -12400,7 +18563,16 @@ class UWBQuickVisualizationWindow(QWidget):
         # interactive — so clicking the controls mid-export can't change a render
         # already queued. Everything downstream reads this snapshot, not widgets.
         self._anim_settings = self._snapshot_anim_settings()
-        
+
+        # Pull the preview's live values onto the hidden export mirrors BEFORE
+        # reading any of them. The preview is the single source of truth, but
+        # its widgets are wired only to redraw (e.g. Social radius ->
+        # render_preview_frame), so without this the mirrors can still hold the
+        # values from whenever they were last synced — and the proximity/social
+        # products would silently be computed at a stale contact threshold
+        # while fnt_config.json recorded the new one.
+        self._sync_export_from_preview()
+
         # Gather export settings
         db_dir = os.path.dirname(self.db_path)
         db_filename = os.path.basename(self.db_path)
@@ -12415,31 +18587,30 @@ class UWBQuickVisualizationWindow(QWidget):
 
         detect_proximity = self.chk_proximity_detection.isChecked()
         proximity_threshold = self.spin_proximity_threshold.value()
-        export_gbi = self.chk_export_gbi.isChecked()
-        export_edgelist = self.chk_export_edgelist.isChecked()
         export_behavior = self.chk_export_behavior.isChecked()
-        export_social_network = export_gbi or export_edgelist
+        export_roi_bouts = self.chk_export_roi_bouts.isChecked()
+        export_roi_daily = self.chk_export_roi_daily.isChecked()
+        export_zone_occupancy = export_roi_bouts or export_roi_daily
+        export_weather = self.chk_export_weather.isChecked()
         social_animation = False   # social-network animation was removed
         # Frozen at export start so mid-export clicks can't change them.
 
         if not (export_raw_csv or export_smoothed_csv or save_plots
-                or save_animation or detect_proximity or export_social_network
-                or export_behavior
-                or social_animation):
+                or save_animation or detect_proximity
+                or export_zone_occupancy or export_behavior
+                or export_weather or social_animation):
             QMessageBox.warning(self, "No Export Selected", "Please select at least one export option (CSV, Plots, or Animation)")
             return
 
         batch = getattr(self, '_batch_active', False)
 
-        # --- Spatial layer choice for plots/animation ---
-        # Interactively: prompt for the context layers when there is spatial
-        # output. In a batch this was chosen at add-to-queue time and is already
-        # in self.plot_layers (restored from the job's captured config), so no
-        # prompt here. Cancelling the dialog aborts the whole export.
+        # --- Spatial layers for plots/animation ---
+        # Interactively: inherited from the preview toggles, so the export draws
+        # the arena you were just looking at. In a batch they were frozen at
+        # add-to-queue time and are already in self.plot_layers (restored from
+        # the job's captured config), so the preview is not consulted here.
         if (save_plots or save_animation) and not batch:
-            if not self._prompt_plot_layers():
-                self.log_message("Export cancelled at layer selection.")
-                return
+            self.plot_layers_from_preview()
 
         # --- Animation temp-frames location ---
         # Interactively: ask up-front so the user can start and walk away. In a
@@ -12448,9 +18619,7 @@ class UWBQuickVisualizationWindow(QWidget):
         self._anim_temp_frames_dir = None
         if save_animation:
             if batch:
-                self._anim_temp_frames_dir = (
-                    getattr(self, '_batch_temp_frames_dir', None)
-                    or os.path.join(db_dir, f"{db_name}_FNT_analysis", 'animation_Tracking'))
+                self._anim_temp_frames_dir = self._batch_anim_temp_dir(db_dir, db_name)
             else:
                 _anim_dir = os.path.join(db_dir, f"{db_name}_FNT_analysis", 'animation_Tracking')
                 self._anim_temp_frames_dir = self._prompt_animation_temp_dir(_anim_dir)
@@ -12473,6 +18642,35 @@ class UWBQuickVisualizationWindow(QWidget):
 
         skip_existing = False
         output_dir = base_output_dir
+        # The animation step runs from a different method and needs to know
+        # whether this run is in "leave existing files alone" mode.
+        self._export_skip_existing = False
+
+        # Clear & Re-export, when that is this job's standing choice. Handled
+        # BEFORE and OUTSIDE the conflict branch for two reasons: a folder can
+        # hold orphans with nothing conflicting at all (the case the conflict
+        # dialog cannot see), and the clear must happen exactly ONCE per trial.
+        # With the three-pass plan, running it again before the plots pass
+        # would delete the CSVs the data pass had just written.
+        if (getattr(self, '_batch_active', False)
+                and getattr(self, '_batch_conflict_choice', None)
+                == ExportConflictDialog.CLEAR):
+            if getattr(self, '_batch_phase', 'data') == 'data':
+                self.log_message(
+                    f"Clear & Re-export: emptying "
+                    f"{os.path.basename(base_output_dir)} before this trial.")
+                _rm, _freed, _fail = clear_analysis_folder(
+                    base_output_dir, log=self.log_message)
+                for _f in _fail:
+                    self.log_message(f"  \u26a0 could not remove {_f}")
+            else:
+                self.log_message(
+                    "Clear & Re-export already ran in this trial's data pass; "
+                    "this pass writes into the folder it left.")
+            # Whatever is in the folder now was written by THIS run, so the
+            # ordinary replace-what-I-produce rule is the right one from here.
+            self._batch_conflict_choice = ExportConflictDialog.OVERWRITE
+            all_conflicting, all_new = self._predict_export_conflicts()
 
         if all_conflicting:
             if getattr(self, '_batch_active', False):
@@ -12486,6 +18684,7 @@ class UWBQuickVisualizationWindow(QWidget):
 
             if result == ExportConflictDialog.SKIP:
                 skip_existing = True
+                self._export_skip_existing = True
                 output_dir = base_output_dir
             elif result == ExportConflictDialog.OVERWRITE:
                 skip_existing = False
@@ -12506,6 +18705,21 @@ class UWBQuickVisualizationWindow(QWidget):
                         os.remove(fpath)
                     except Exception:
                         pass
+            elif result == ExportConflictDialog.CLEAR:
+                # Interactive only - the batch path handled its own clear
+                # above, once, before this branch was reached.
+                if not self.confirm_clear_analysis_folder():
+                    self.exporting = False
+                    self.btn_export.setEnabled(True)
+                    self.btn_stop_export.setVisible(False)
+                    self.progress_widget.setVisible(False)
+                    return
+                _rm, _freed, _fail = clear_analysis_folder(
+                    base_output_dir, log=self.log_message)
+                for _f in _fail:
+                    self.log_message(f"  \u26a0 could not remove {_f}")
+                skip_existing = False
+                output_dir = base_output_dir
             elif result == ExportConflictDialog.NEW_FOLDER:
                 from datetime import datetime
                 timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -12520,13 +18734,13 @@ class UWBQuickVisualizationWindow(QWidget):
                 return
 
         # Create output directory and subfolders only as needed
-        os.makedirs(output_dir, exist_ok=True)
+        ensure_dir(output_dir)
         plots_dir = os.path.join(output_dir, 'plots')
         if save_plots:
-            os.makedirs(plots_dir, exist_ok=True)
+            ensure_dir(plots_dir)
         animations_dir = os.path.join(output_dir, 'animation_Tracking')
         if save_animation:
-            os.makedirs(animations_dir, exist_ok=True)
+            ensure_dir(animations_dir)
 
         try:
             # Busy cursor for the whole synchronous prep. The heavy pandas /
@@ -12536,6 +18750,13 @@ class UWBQuickVisualizationWindow(QWidget):
             # looking dead. Restored in the finally so every exit path clears it.
             QApplication.setOverrideCursor(Qt.WaitCursor)
             self.log_message(f"Starting export to {output_dir}")
+            # Before the long part, not after: a folder that accepts writes but
+            # refuses to be listed exports fine and can never be cleared again,
+            # so every later run's output piles onto this one's.
+            for _d in (output_dir, csv_output_dir(output_dir)):
+                _why = check_dir_usable(_d)
+                if _why:
+                    self.log_message(f"  ⚠ OUTPUT FOLDER PROBLEM: {_why}")
             self.lbl_export_progress.setText("Initializing export...")
 
             # Calculate total steps for progress
@@ -12565,7 +18786,8 @@ class UWBQuickVisualizationWindow(QWidget):
                 QApplication.processEvents()
 
                 raw_csv_filename = f'{db_name}_raw.csv'
-                raw_csv_path = os.path.join(output_dir, raw_csv_filename)
+                raw_csv_path = os.path.join(
+                    csv_output_dir(output_dir, create=True), raw_csv_filename)
                 if skip_existing and os.path.exists(raw_csv_path):
                     self.log_message(f"Skipped (exists): {raw_csv_filename}")
                 else:
@@ -12578,8 +18800,16 @@ class UWBQuickVisualizationWindow(QWidget):
                     self.log_message(f"✓ Raw CSV exported: {raw_csv_filename}")
                     QApplication.processEvents()
 
+            # Which regions to measure. Read once, before anything is
+            # written, so a run measures a fixed set even if the user carries
+            # on drawing while the export proceeds.
+            region_sets = self.region_sets() if export_zone_occupancy else []
+            roi_bout_rows = []
+
             # Prepare processed data (needed for smoothed CSV, plots, animation, behaviors)
-            needs_processed_data = export_smoothed_csv or save_plots or save_animation or detect_proximity
+            needs_processed_data = (export_smoothed_csv or save_plots
+                                    or save_animation or detect_proximity
+                                    or (export_zone_occupancy and region_sets))
             csv_path = None  # Path to the CSV that plots/animation will use
             plot_csv_path = None
             anim_csv_path = None
@@ -12588,7 +18818,8 @@ class UWBQuickVisualizationWindow(QWidget):
             # written by the data pass, so render straight from it instead of
             # re-reading and re-smoothing every tag (minutes of pure waste).
             if getattr(self, '_batch_reuse_smoothed', False):
-                _existing = os.path.join(output_dir, f'{db_name}_smoothed.csv')
+                _existing = export_csv_path(output_dir,
+                                            f'{db_name}_smoothed.csv')
                 if os.path.exists(_existing):
                     csv_path = _existing
                     plot_csv_path = _existing if save_plots else None
@@ -12631,8 +18862,18 @@ class UWBQuickVisualizationWindow(QWidget):
                 # that later runs would mistake for a complete export — the
                 # failure mode seen when a crash killed a batch mid-write.
                 selected_tags = sorted(selected_tags)
+                # Optional Name/Code columns, decided ONCE for the whole file:
+                # the CSV is streamed tag by tag with the header written from
+                # the first tag, so every tag must carry the same columns. A
+                # column is included when any selected animal has that field;
+                # the rest get a blank.
+                ident_extra_cols = [
+                    key for key in ('name', 'code')
+                    if any(str((self.tag_identities.get(t) or {}).get(key, '')
+                               or '').strip() for t in selected_tags)]
                 smoothed_csv_filename = f'{db_name}_smoothed.csv'
-                smoothed_csv_path = os.path.join(output_dir, smoothed_csv_filename)
+                smoothed_csv_path = os.path.join(
+                    csv_output_dir(output_dir, create=True), smoothed_csv_filename)
                 smoothed_partial_path = smoothed_csv_path + '.partial'
                 csv_path = smoothed_csv_path  # plots/animation/proximity read this
                 stream_smoothed = export_smoothed_csv and not (
@@ -12701,6 +18942,12 @@ class UWBQuickVisualizationWindow(QWidget):
                     if len(tag_data) == 0:
                         continue
 
+                    # Before anything else touches the track: while two rows
+                    # can share a timestamp, every velocity computed from them
+                    # is fiction.
+                    tag_data, _cs = collapse_multi_solutions(
+                        tag_data, log=self.log_message, label=f"HexID {hex_id}")
+
                     tag_data['Timestamp'] = pd.to_datetime(tag_data['timestamp'], unit='ms', origin='unix', utc=True)
                     tag_data['Timestamp'] = tag_data['Timestamp'].dt.tz_convert(tz)
                     tag_data['location_x'] *= 0.0254
@@ -12710,7 +18957,12 @@ class UWBQuickVisualizationWindow(QWidget):
                     # Per-tag time trimming (same helper the preview uses)
                     data_last = (tag_data['Timestamp'].max()
                                  if len(tag_data) else None)
-                    tag_data, trimmed = self._trim_to_tag_window(tag_data, tag, tz)
+                    tag_data, trimmed, off_trimmed = self._trim_tag(tag_data, tag, tz)
+                    if off_trimmed > 0:
+                        n_holes = len(self._tag_off_intervals(tag, tz))
+                        self.log_message(
+                            f"    Excluded {off_trimmed} points inside {n_holes} "
+                            f"off-animal interval(s)")
                     if trimmed > 0:
                         self.log_message(
                             f"    Trimmed {trimmed} points outside the tag's active window")
@@ -12747,6 +18999,20 @@ class UWBQuickVisualizationWindow(QWidget):
                     else:
                         tag_data['sex'] = 'M'
                         tag_data['identity'] = f'Tag{tag}'
+                    for key in ident_extra_cols:
+                        tag_data[key] = str(
+                            (self.tag_identities.get(tag) or {}).get(key, '')
+                            or '').strip()
+
+                    # Regions, before the frame is streamed and dropped:
+                    # the name columns have to be in the CSV, and the
+                    # occupancy summary is accumulated here rather than by
+                    # re-reading the finished file. Both come from one
+                    # point-in-polygon pass over the tag.
+                    if region_sets and len(tag_data):
+                        _idx = self.annotate_regions(tag_data, region_sets)
+                        roi_bout_rows.extend(self.region_bout_rows(
+                            tag_data, tag, region_sets, idx=_idx))
 
                     # Stream this tag straight to the CSV, then release it so
                     # peak memory stays at ~one tag rather than the whole trial.
@@ -12774,6 +19040,25 @@ class UWBQuickVisualizationWindow(QWidget):
                 # leaves only a .partial, never a CSV that looks complete.
                 if stream_smoothed and smoothed_header_written:
                     os.replace(smoothed_partial_path, smoothed_csv_path)
+                    # A trial exported before the csvs/ subfolder existed has
+                    # its smoothed CSV at the top level. The new copy lives in
+                    # csvs/, so the old one is now stale but still looks
+                    # current - and export_csv_path would fall back to it the
+                    # moment the csvs/ copy went missing. Retire it, but only
+                    # here: deleting it any earlier would leave the trial with
+                    # no smoothed CSV at all if the stream then crashed.
+                    _legacy = os.path.join(output_dir, smoothed_csv_filename)
+                    if os.path.abspath(_legacy) != os.path.abspath(smoothed_csv_path):
+                        try:
+                            if os.path.exists(_legacy):
+                                os.remove(_legacy)
+                                self.log_message(
+                                    f"Removed the pre-csvs/ copy of "
+                                    f"{smoothed_csv_filename}")
+                        except OSError as exc:
+                            self.log_message(
+                                f"  ⚠ could not remove the old "
+                                f"{smoothed_csv_filename}: {exc}")
                     # Verify what actually landed on disk. Everything
                     # downstream - plots, proximity, the GBI, the ethogram -
                     # reads this file, so a corrupted cell here poisons the
@@ -12820,19 +19105,57 @@ class UWBQuickVisualizationWindow(QWidget):
                 plot_csv_path = smoothed_csv_path if save_plots else None
                 anim_csv_path = smoothed_csv_path if save_animation else None
             
+            # Region occupancy. Written after the smoothed CSV so a failure
+            # here cannot cost the expensive product, and before the config so
+            # the folder describes what it actually contains.
+            if export_zone_occupancy:
+                if not region_sets:
+                    self.log_message(
+                        "ROI occupancy requested but this trial has no drawn "
+                        "regions. Draw them in the preview, or import the "
+                        "site XML's zones, then re-export. Nothing measured.")
+                else:
+                    named = ', '.join(f"{len(r)} region(s)"
+                                      for _c, r in region_sets)
+                    self.log_message(f"ROI occupancy: measuring {named}.")
+                    if not roi_bout_rows and csv_path and os.path.exists(csv_path):
+                        # The per-tag loop did not run (a batch retry reusing a
+                        # verified CSV), so read the regions back off the file.
+                        self.log_message(
+                            "  Reading regions back from the existing smoothed "
+                            "CSV (this pass did not re-process the tags).")
+                        roi_bout_rows = self.region_bouts_from_csv(
+                            csv_path, region_sets,
+                            [t for t, cb in self.tag_checkboxes.items()
+                             if cb.isChecked()])
+                    # Both files come from the same visits, but each is ticked
+                    # on its own: asking for the summary alone must not also
+                    # drop a bout file the user did not request.
+                    if export_roi_bouts:
+                        self.write_roi_bout_csv(
+                            roi_bout_rows, output_dir, db_name,
+                            skip_existing=skip_existing)
+                    if export_roi_daily:
+                        self.write_roi_daily_summary_csv(
+                            roi_bout_rows, output_dir, db_name,
+                            skip_existing=skip_existing)
+                QApplication.processEvents()
+
             # Write the site-map image (if any) so the analysis folder is a
             # self-contained data product, then save the config that references it.
             self._export_sitemap(output_dir, db_name)
             self.save_config(output_dir)
 
-            # Save message log and run summary
+            # Save the message log. There is no separate runSummary.csv: every
+            # setting it listed already lives in fnt_config.json, and the one
+            # thing it uniquely carried - the filtering statistics - is now a
+            # 'filter_stats' block in that same JSON.
             self.save_message_log(output_dir)
-            self.save_run_summary(output_dir)
             
             # Detect proximity bouts if requested
-            # Proximity is the source for the social-network products, so run it
-            # whenever proximity OR any social-network output is requested.
-            if detect_proximity or export_social_network or social_animation:
+            # The bouts file is the only social product now: the GBI and the
+            # edge list were removed, so nothing else needs this pass.
+            if detect_proximity or social_animation:
                 if self.export_cancelled:
                     self.stop_export()
                     return
@@ -12888,22 +19211,25 @@ class UWBQuickVisualizationWindow(QWidget):
 
                         # Export proximity bouts (only when explicitly requested)
                         if detect_proximity:
-                            bouts_path = os.path.join(output_dir, f'{db_name}_proximity_bouts.csv')
+                            bouts_path = os.path.join(
+                                csv_output_dir(output_dir, create=True),
+                                f'{db_name}_SocialOverlapBouts.csv')
                             if skip_existing and os.path.exists(bouts_path):
                                 self.log_message(f"Skipped (exists): {os.path.basename(bouts_path)}")
                             else:
-                                proximity_bouts.to_csv(bouts_path, index=False)
+                                from fnt.uwb import roi_bouts as _RB
+                                self.log_audit(
+                                    os.path.basename(bouts_path),
+                                    lambda: _RB.audit_social(
+                                        proximity_bouts, proximity_threshold))
+                                if not self.write_verified_csv(
+                                        proximity_bouts, bouts_path,
+                                        self._BOUTS_NUMERIC_COLS):
+                                    return
                                 self.log_message(f"✓ Exported proximity bouts ({len(proximity_bouts)} bouts): "
                                                  f"{os.path.basename(bouts_path)}")
                             self.log_message("✓ Proximity detection complete!")
 
-                        # ── Social network outputs (edge lists + GBI + anim) ──
-                        if export_gbi or export_edgelist:
-                            self._export_social_network(
-                                prox_events, proximity_bouts, output_dir, db_name,
-                                write_gbi=export_gbi,
-                                write_edgelist=export_edgelist,
-                                skip_existing=skip_existing)
 
                 except Exception as e:
                     self.log_message(f"Error during proximity/social-network export: {e}")
@@ -12922,7 +19248,9 @@ class UWBQuickVisualizationWindow(QWidget):
                     "Classifying chases and displacements...")
                 QApplication.processEvents()
                 try:
-                    ev_path = os.path.join(output_dir, f'{db_name}_behavior_events.csv')
+                    ev_path = os.path.join(
+                        csv_output_dir(output_dir, create=True),
+                        f'{db_name}_behavior_events.csv')
                     if skip_existing and os.path.exists(ev_path):
                         self.log_message(
                             f"Skipped (exists): {os.path.basename(ev_path)}")
@@ -12933,7 +19261,41 @@ class UWBQuickVisualizationWindow(QWidget):
                         chosen = [t for t, cb in self.tag_checkboxes.items()
                                   if cb.isChecked()]
                         ev = self._export_behavior_events(csv_path, chosen)
-                        ev.to_csv(ev_path, index=False)
+                        if len(ev):
+                            # Displacement is parked, so its bouts must never
+                            # reach this file; dyad_type must be one of the
+                            # four documented values, with MIXED always 'MF'
+                            # so a downstream filter on it cannot miss.
+                            seen_b = sorted(set(ev['behavior']))
+                            seen_d = sorted(set(ev['dyad_type']))
+                            self.log_audit(os.path.basename(ev_path), [
+                                (ev.notna().all().all().item(),
+                                 f"{len(ev):,} bout(s), no missing values"),
+                                (set(seen_b) <= {'chase'},
+                                 f"behaviours present: {', '.join(seen_b)}"),
+                                (set(seen_d) <= {'MM', 'MF', 'FF', 'NA'},
+                                 f"dyad types present: {', '.join(seen_d)}"),
+                                ((ev['actor'] != ev['target']).all().item(),
+                                 "actor is never its own target"),
+                                ((ev['duration_s'] >= 0).all().item(),
+                                 "no negative durations"),
+                                (((ev['bout_stop'] - ev['bout_start'])
+                                  .dt.total_seconds() - ev['duration_s'])
+                                 .abs().max() < 1e-6,
+                                 "duration_s == bout_stop - bout_start for "
+                                 "EVERY row"),
+                                ((ev['n_frames'] >= 1).all().item(),
+                                 "every bout spans at least one classifier "
+                                 "frame"),
+                            ] + ([(True,
+                                   f"note: {int((ev['n_fixes'] == 0).sum()):,} "
+                                   f"bout(s) had no actor/target fix inside "
+                                   f"the window (held positions) and use the "
+                                   f"1 Hz slot edges")]
+                                 if (ev['n_fixes'] == 0).any() else []))
+                        if not self.write_verified_csv(
+                                ev, ev_path, self._BEHAVIOR_NUMERIC_COLS):
+                            return
                         by = ev['behavior'].value_counts().to_dict() if len(ev) else {}
                         self.log_message(
                             f"\u2713 Exported behaviour events ({len(ev)} bouts"
@@ -12948,6 +19310,21 @@ class UWBQuickVisualizationWindow(QWidget):
                             "Error: No smoothed data available for behaviour events")
                 except Exception as e:
                     self.log_message(f"Error during behaviour-event export: {e}")
+                    import traceback
+                    traceback.print_exc()
+                self.log_message("=" * 50)
+
+            # Weather and daylight: cheap, and independent of the tracks.
+            if export_weather and not self.export_cancelled:
+                self.log_message("=" * 50)
+                self.log_message("Weather and daylight...")
+                self.lbl_export_progress.setText("Fetching weather and daylight...")
+                QApplication.processEvents()
+                try:
+                    if not self._export_weather(output_dir, db_name, skip_existing):
+                        return
+                except Exception as e:
+                    self.log_message(f"Error during weather export: {e}")
                     import traceback
                     traceback.print_exc()
                 self.log_message("=" * 50)
@@ -12991,8 +19368,10 @@ class UWBQuickVisualizationWindow(QWidget):
                     self.combo_timezone.currentText(),
                     self.tag_identities,
                     bool(self.tag_identities),  # Use identities if any are configured
-                    # Always pass the image; whether it is drawn is decided by the
-                    # export layer choice (self.plot_layers), not the preview toggle.
+                    # Always pass the image; whether it is drawn is decided by
+                    # self.plot_layers, which for an interactive export mirrors
+                    # the preview toggle and for a batch job replays the layers
+                    # the job was queued with.
                     self.background_image,
                     self.bg_width_meters,  # Pass scaled width
                     self.bg_height_meters,  # Pass scaled height
@@ -13003,6 +19382,8 @@ class UWBQuickVisualizationWindow(QWidget):
                     self.combo_window_units.currentText(),  # seconds vs samples
                     plot_layers=self.plot_layers,
                     xml_zones=self.xml_zones,
+                    rois=self.rois,
+                    occupancy_sources=[c for c, _ in self.region_sets()],
                     anchor_positions=self.anchor_positions,
                     xml_map_image=self.xml_map_image,
                     xml_map_extent=self.xml_map_extent,
@@ -13010,6 +19391,7 @@ class UWBQuickVisualizationWindow(QWidget):
                     bg_offset_y=self.bg_offset_y,
                     behavior_params=self._behavior_params(),
                     axis_limits=self.xy_range(),
+                    label_type=self.plot_label_type(),
                 )
                 self.worker.progress.connect(self.update_status)
                 self.worker.finished.connect(lambda success, msg: self.export_finished(success, msg, save_animation, output_dir, total_steps, current_step, anim_csv_path, animations_dir))

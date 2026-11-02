@@ -39,6 +39,13 @@ from typing import Callable, Dict, Iterable, List, Optional
 from .mad_labels import pred_csv_sibling_path
 
 
+def _model_label(model_path) -> str:
+    """Run-folder name for a checkpoint; see mad_inference.model_label.
+    Imported lazily: mad_inference pulls in the model stack."""
+    from .mad_inference import model_label
+    return model_label(model_path)
+
+
 MANIFEST_NAME = "manifest.jsonl"
 RUN_INFO_NAME = "run_info.json"
 
@@ -101,7 +108,7 @@ class RunSettings:
     @classmethod
     def from_config(cls, cfg) -> 'RunSettings':
         return cls(
-            model_name=Path(cfg.model_path).stem if cfg.model_path else "",
+            model_name=_model_label(cfg.model_path),
             threshold=round(float(cfg.threshold), 6),
             min_blob_pixels=int(cfg.min_blob_pixels),
             merge_consecutive=bool(getattr(cfg, 'merge_consecutive', False)),
@@ -169,23 +176,52 @@ class RunSettings:
 
 
 def file_already_done(wav_path: str, settings: RunSettings) -> bool:
-    """True when ``wav_path``'s sibling CSV already holds predictions from this
-    model at these settings.
+    """True when ``wav_path``'s store already holds predictions from this model
+    at these settings.
 
-    A file with *no* prediction rows is treated as done when the CSV exists and
-    was written by this model — a recording containing zero calls is a legitimate
-    result, and re-running it every time would defeat resuming on exactly the
-    quiet files that dominate 24/7 recordings. Presence of the provenance is
-    established from any prediction row; the empty case falls back to the run
-    manifest, which records zero-detection files explicitly.
+    Reads the .mad store, not a CSV: a run no longer writes a CSV, and the
+    prediction crops carry the model name, threshold and min-blob-pixels that
+    produced them. Only the crop attributes are touched — no pixel array is
+    decompressed — so answering this for a few thousand previously-analysed
+    recordings stays a metadata scan.
+
+    A file with *no* prediction crops is treated as done when the store exists
+    and its grid was written by a run: a recording containing zero calls is a
+    legitimate result, and re-running it every time would defeat resuming on
+    exactly the quiet files that dominate 24/7 recordings. That empty case
+    falls back to the run manifest, which records zero-detection files
+    explicitly.
+
+    A legacy CSV is still honoured for recordings analysed before the store
+    carried provenance, so resuming an old run does not redo everything.
     """
+    from .fnt_mask_store import (
+        get_infer_run_attrs, masks_sibling_path, read_pred_attrs)
+
+    h5_path = masks_sibling_path(wav_path)
+    if os.path.isfile(h5_path):
+        attrs = read_pred_attrs(h5_path)
+        if attrs:
+            for a in attrs:
+                if not settings.matches_row(a):
+                    return False
+            # The crops carry model, threshold and min-blob, not how blobs
+            # were merged; the store's run attributes do. Without this a
+            # merge-off re-run skipped every file a merge-on run had done (9
+            # of the first 10 mad_v5_VC recordings) and split nothing. A store
+            # that cannot say is redone: skipping work never done is the worse
+            # failure.
+            merged = get_infer_run_attrs(h5_path).get("last_infer_merge")
+            if merged is None:
+                return False
+            return bool(int(merged)) == bool(settings.merge_consecutive)
+        # No crops at all: nothing to attest, leave it to the manifest.
+        return False
+
+    # --- legacy: recordings whose predictions predate provenance in the store
     csv_path = pred_csv_sibling_path(wav_path)
     if not os.path.isfile(csv_path):
         return False
-    # Streamed, and only the four provenance fields are touched. read_blob_csv
-    # would parse and float-convert ~40 columns of every detection on the file;
-    # at 3,000 previously-analyzed recordings that is minutes of work to answer
-    # a yes/no question. Bails at the first mismatching row.
     import csv as _csv
     n_pred = 0
     try:
@@ -194,10 +230,10 @@ def file_already_done(wav_path: str, settings: RunSettings) -> bool:
                 raw = row.get('call_id', row.get('blob_id'))
                 if raw is None:
                     continue
-                try:                       # int call_id == model prediction
+                try:
                     int(str(raw).strip())
                 except (TypeError, ValueError):
-                    continue               # string id == hand-label, not ours
+                    continue
                 n_pred += 1
                 if not settings.matches_row(row):
                     return False
@@ -328,8 +364,22 @@ class RunManifest:
             'audio_dur_s': timing.get('audio_dur_s'),
             't_total': timing.get('t_total'),
             'realtime_factor': timing.get('realtime_factor'),
+            # The GPU-only rate, kept separately so comparing devices or
+            # batch sizes across runs doesn't mean re-deriving it from
+            # stage times the manifest doesn't carry.
+            'scan_realtime_factor': timing.get('scan_realtime_factor'),
             'device': timing.get('device'),
+            # How the spectrogram was made: 'cuda' or 'cpu', and whether it
+            # was built ahead during the previous file's scan.
+            'spec_backend': timing.get('spec_backend'),
+            'prefetched': timing.get('prefetched'),
+            't_spec': timing.get('t_spec'),
             'error': summary.get('error'),
+            # Process + system memory as of this file. Recorded on the error
+            # path too: the reading at the moment a file fails is the one that
+            # says whether the batch ran out of commit or the file is bad.
+            'mem': summary.get('mem') or None,
+            'retry': bool(summary.get('retry')),
             'ts': time.time(),
         }
         assert self._fh is not None

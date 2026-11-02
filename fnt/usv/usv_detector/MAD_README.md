@@ -66,7 +66,7 @@ The **CSV is canonical** for tabular output. Pixel data lives in HDF5 siblings.
 
 Per recording `<wav>`:
 
-- `<wav>_FNT_MAD_predictions.csv` — the **unified table of every call** on the
+- `<wav>_FNT_MAD_annotations.csv` — the **unified table of every call** on the
   file: hand-labels **and** model predictions, one row each. The first 16 columns
   mirror CAD's `_FNT_CAD_detections.csv` (so the two tools are cross-readable);
   the rest are MAD's richer per-call quantification. CAD's harmonic columns and
@@ -83,8 +83,9 @@ Per recording `<wav>`:
     for hand-labels).
   - `status` — `pending` (unreviewed) · `accepted` (hand-labels write accepted,
     and accepting a prediction in train mode also saves a training example) ·
-    `rejected` (a **recorded** human "no", kept visible as an audit trail;
-    *not* used as negative training data). **Delete** drops the row + mask
+    `rejected` (a **recorded** human "no", kept visible as an audit trail
+    **and reused as a hard negative** — see *Hard negatives* below).
+    **Delete** drops the row + mask
     entirely (no `deleted` status). The on-screen color of each status depends
     on the active spectrogram colormap — see *Review colors* below.
   - `source` — `prediction` or `label`.
@@ -184,8 +185,49 @@ Project-wide:
 
 - `models/training_data/training_data.h5` — every confirmed labeling example
   (spec patch + mask + metadata) used for training.
+
+  Each example carries **`mask`** (this call and nothing else) and an optional
+  **`neighbors`** (other confirmed calls that fall inside the same patch
+  window, disjoint from `mask`). Keep them apart: everything outside training
+  — the spectrogram overlay, the confirmed-mask gallery, mask editing, the CSV
+  geometry — reads `mask` as *this call's shape*. Merging the two is what made
+  adjacent calls read as a single detection and let a later label paint over
+  an earlier one. `collect_training_examples` recombines them: a label's
+  neighbours are supervised **positive**, a rejection's are **excluded from
+  the loss** (weight 0), because a rejection's target is all-zero and would
+  otherwise teach a confirmed call as background.
+
+  Stores written between 2026-09-05 and 2026-09-08 have the two composited
+  into `mask`. Split them with
+  `python -m fnt.usv.usv_detector.mad_migrate_composites <project>
+  --audio-root <audio tree> --apply` (omit `--apply` for a dry run; it backs
+  up each store and reports anything it cannot separate).
 - `.scratch/` — temporary masks/predictions for files you're **browsing in
   place** but haven't accepted a call on yet. Wiped on close (see below).
+
+### The Audio list
+
+One list, and everything in it is the project. There is no separate "session"
+vs "training" set: any recording you add is labelable, and **the model trains on
+every confirmed call across all of them**. Add files with **Add Folder…**
+(offers the whole tree when there is one) or **Add Files…**.
+
+What the rows mean:
+
+- `name (a, p, r)` — accepted / pending / rejected call counts, colored to match
+  the spectrogram overlay (see *Review colors*). A green ✓ means the file has
+  recorded calls.
+- **⚠ name** — the audio moved or its drive is not mounted. This is a **soft**
+  state: labels, the training store, saved detections and batch inference are
+  all unaffected; only preview and playback need the file. Selecting one blanks
+  the canvas rather than leaving the previous file's detections on screen under
+  the wrong name. Use **File ▸ Locate Missing Recordings…**, which infers the
+  move from one file and repoints every sibling that moved with it.
+
+Removing a row only *unregisters* it — the wav and its sibling csv/h5 stay where
+they are, because MAD never owned them. Only project-owned copies (a legacy
+`recordings/` file, or one made by **Pack Project**) are deleted, and the prompt
+says so explicitly.
 
 ### Recordings are referenced, not copied
 
@@ -214,10 +256,21 @@ of the project's `source_folders`. A candidate is accepted only if the size — 
 the fingerprint, when known — matches, so a same-named different recording is
 never silently swapped in.
 
-When automatic resolution fails, **File ▸ Locate Missing Recordings…** asks for
-one file and infers the prefix change from it (`D:/exp/mic2/a.wav` →
-`E:/data/exp/mic2/a.wav` implies `D:/` → `E:/data`), then repoints every sibling
-that moved the same way. Fix one, fix two hundred. Prefix matching compares whole
+When automatic resolution fails, **File ▸ Locate Missing Recordings…** (or
+double-clicking a flagged row) offers two strategies:
+
+- **Pick the file…** — infers the prefix change from one file
+  (`D:/exp/mic2/a.wav` → `E:/data/exp/mic2/a.wav` implies `D:/` → `E:/data`) and
+  repoints every sibling that moved the same way. Fix one, fix two hundred.
+- **Search a folder…** — walks a folder and its subfolders, matching by name and
+  then verifying size and fingerprint. Use this when the tree was *reorganized*
+  rather than moved as a unit, which no single prefix change can describe.
+
+When a recording legitimately exists in more than one place with identical audio
+(a working copy and an archive), content cannot tell them apart — so the search
+prefers the candidate whose folder structure most resembles where the entry used
+to live. This matters because labels are *sibling* files: picking the wrong copy
+would silently swap in a different label set. Prefix matching compares whole
 path components, so a neighbouring `exp_backup/` tree is never dragged along, and
 only files that are *currently missing* and whose rewritten path *exists* are
 changed — a wrong guess is a no-op.
@@ -325,6 +378,110 @@ artifacts. Measured peak RSS for a 100 s @ 250 kHz slice: **1240 MB -> 95 MB**.
 
 ---
 
+## dB normalization (`db_norm`)
+
+Before the model sees a spectrogram, dB values are mapped to 0-1. **How** that
+mapping is chosen is a project setting:
+
+- **`fixed`** (default) — every recording uses the project's `db_min`-`db_max`.
+  Simple, and what every model trained before this option existed used.
+- **`per_file`** — each recording's own percentile range (5th to 99.9th,
+  minimum 20 dB span), measured from evenly spaced probe windows.
+
+`per_file` exists because a fixed range assumes every recording shares a gain
+and a noise floor. Across trials with different mics, distances and ambient
+conditions they don't, so the same call arrives at the model at different input
+intensities — a large part of why a model trained on a few recordings
+generalizes poorly to the rest.
+
+Three things make it safe:
+
+- **The range is the recording's, never the patch's.** A window over a loud call
+  and a window of silence must normalize identically, or the model sees the same
+  call at different intensities depending on what happened to be next to it.
+  Measured once per file and cached.
+- **The probes are deterministic**, never random, so labeling and inference
+  derive an identical range for the same audio.
+- **The rule travels with the model.** It is written into the checkpoint, and
+  inference reads it back rather than trusting the caller — feeding a
+  per-file-normalized model fixed-range input silently degrades every detection.
+
+**Switching is not free.** A patch is normalized *and quantized* when it is
+saved, so it can never be re-normalized. Examples saved under different rules sit
+on two incompatible intensity scales, which looks like a merely mediocre model
+rather than a broken setup — so training refuses to start, names both rules and
+their counts, and tells you to either switch back or re-label. Decide before you
+build a label set, not after.
+
+---
+
+## How a labeled call becomes training tiles
+
+A saved example is a spectrogram **patch** — the call plus context on each side —
+not a tile. Turning patches into fixed-size tiles is where a subtle and
+expensive bug lived, so the rules are worth stating.
+
+Each patch is placed **at a random column offset** inside the tile,
+`tile_placements` times (default 3), on a background of the patch's own
+noise floor, with the **entire tile supervised** (weight 1, target 0 outside the
+call). Patches wider than a tile yield random windows into themselves.
+
+The original cutter did none of that: it placed every patch at column 0, padded
+the rest of the tile with **zeros**, and gave the padding **zero weight**. Three
+consequences compounded.
+
+- Every call sat at the same offset, so the model learned *call at column ~64*
+  rather than *call*.
+- The flat-zero region does not occur in any real recording, so half of every
+  training tile was a distribution the model would never meet again.
+- Because the padding was unsupervised, firing into it cost nothing. The model
+  duly learned to.
+
+The result looked fine by every number training reported — validation Dice
+0.64, and 0.89 measured inside the patch region — while being close to useless
+on a real file. Sliding real calls across a tile of real audio showed the model
+detecting them **63% of the time at the training offset and under 31% everywhere
+else**, and 98% of its positive pixels landing in the zero padding. Call-level
+F1 on its own training recordings was **0.094**.
+
+The lesson generalizes: a segmentation model trained on tiles will learn the
+tile layout as readily as the signal, and tile-level metrics cannot see it.
+Evaluate at call level on a full recording — that is what `Evaluate Model…`
+is for.
+
+---
+
+## Hard negatives from rejections
+
+Rejecting a prediction stores a **negative example**: the same spectrogram patch
+with an empty mask, so training supervises every pixel of it as background.
+
+These are the most informative negatives available — they are exactly the things
+this model got wrong, picked out by a human. Previously a rejection was an audit
+trail only, so the model never learned from its own false positives and would
+keep making them.
+
+Details that matter:
+
+- **Only detections become negatives.** A rejected *hand-label* is you
+  withdrawing a call you drew, not evidence the region is noise, so it is
+  ignored.
+- **Retracted when the rejection stops being true.** Negatives use a
+  deterministic id (`<stem>_neg_<call_id>`), so accepting the call after all —
+  or deleting the detection — removes the negative. Otherwise the model would
+  keep being taught to suppress a call you changed your mind about, invisibly,
+  since nothing in the UI lists negatives.
+- **They never inflate label counts.** `count_examples()` reports labels by
+  default; run names and the UI keep meaning "calls you drew". The training
+  summary records `n_negatives` separately.
+
+This is what makes rejecting worth the keystroke: every rejection is a training
+signal, not just bookkeeping. It also does the work of teaching harmonic
+suppression if your labeling policy is fundamentals-only — reject the harmonics
+the model finds and it learns to stop.
+
+---
+
 ## Knowing when a model is ready
 
 ### The train/val split holds out whole recordings
@@ -388,6 +545,93 @@ After a large run the bottleneck is human attention, not compute.
   Call-level re-thresholding for free, with no re-run, using the stored score.
   It never hides accepted or rejected calls (a decision is not a guess), and the
   count label always reports how many are hidden.
+
+---
+
+## Call trajectories (3D)
+
+The **3D view (T)** checkbox, at the right end of the line above the
+spectrogram, pops out a window that draws every call as a *path* rather than a
+shape. T opens it and closes it again; closing the window with its own X unticks
+the box. Each spectrogram frame of a
+call becomes one point, plotted by three of its features against each other,
+so the call traces a line through feature space:
+
+| Axis | Default | What it captures |
+|---|---|---|
+| X | **Pitch** (kHz) — loudest masked frequency per frame | where the call is |
+| Y | **Spectral entropy** — full-column, per frame | timbre: tonal vs noisy |
+| Z | **Pitch rate** (kHz/ms) — derivative of pitch | motion: which way it is going, how fast |
+
+Pitch against its own rate of change is a phase portrait: an upsweep sits above
+the zero-rate plane, a downsweep below it, a flat call on it, and a trill loops
+— once per cycle of its frequency modulation. Shapes that are easy to miss
+scrolling a spectrogram separate clearly here. Each axis is a dropdown
+(bandwidth, centroid, tonality, power and time in call are also available), and
+each is scaled independently to fill the box, since kHz, kHz/ms and a 0–1
+entropy share no common unit.
+
+**Only masks are drawn — pending and accepted, never rejected.** Every feature
+is computed over the call's own pixels (`call_frame_features`), so the
+broadband noise under a USV, or a second call overlapping it in time, never
+bends its path. This is the thing a mask-based detector can show that a
+boundary-based one cannot. Rejected masks are excluded outright: they record
+what a call is *not*. Harmonics (`H2`, `H3`…) are hidden by default because a
+harmonic is a scaled copy of its fundamental's contour and would redraw the same
+path higher up the pitch axis; a checkbox brings them back.
+
+**Reading it.** Lines brighten from onset (marked with a dot) to offset, so a
+still frame still shows direction. Accepted calls are green, pending yellow, and
+the call selected in the spectrogram turns white and thick. *In view* follows
+the spectrogram as you scroll; *Whole file* shows every call in the recording.
+
+**Playback.** Stopped, the window is a static picture that follows the
+spectrogram. Press **Play** and it becomes a player driven by the same playhead:
+every call is hidden until the playhead reaches it, then draws itself frame by
+frame behind a bright marker at the current moment, and dims to a ghost once it
+has played — so the call under the playhead is always the one that stands out,
+and the ghosts build up the stretch's repertoire as it plays. It runs at the
+playback speed, so at 0.03x a 40 ms USV takes over a second to trace. The axes
+keep the static view's scale throughout, so Play and Stop never make the box
+jump, and Stop (or reaching the end) returns to the static picture. Opening the
+window mid-playback picks the run up where the playhead is.
+
+**Smoothing, and what it trades away.** Pitch in the 3D view is located
+*between* frequency bins — a parabola through the loudest bin and its two
+neighbours (`peak_freq_interp_hz`) — which removes the one-bin (~244 Hz)
+staircase a nearest-bin contour draws on clean signals. On real recordings,
+though, the peak also scatters by about a bin from frame to frame from noise
+(measured ~260 Hz on field USVs, interpolated or not), and a rate taken over
+0.5 ms frames turns that into ~0.7 kHz/ms of noise — the same size as real FM
+rates. The **Smoothing** slider (a centred moving average, in ms, remembered
+between sessions) removes it by averaging over time, and that is the trade-off:
+averaging over time is also what erases fast frequency modulation. Measured on
+synthetic calls through the real STFT:
+
+| | 2.5 ms | 10 ms |
+|---|---|---|
+| ±5 kHz trill, 6 ms period — drawn swing | ±3.7 kHz | ±0.9 kHz |
+| 40→55 kHz frequency jump — drawn as a ramp of | 2 ms | 8.7 ms |
+
+So: up to ~10 ms for smooth sweeps (cleanest lines), ~1.5–2.5 ms for species
+with fast trills or step calls. A Savitzky–Golay filter and frequency-domain
+averaging were both tested and did not beat the moving average on this
+trade-off. Smoothing changes only the picture — the CSV metrics always use the
+unsmoothed, nearest-bin contour, so existing numbers never move. Each call's
+spectrogram work is cached separately from its smoothing, so dragging the slider
+redraws instantly, even mid-playback.
+
+**Rotation.** The window opens turning slowly about the vertical axis (a full
+turn a minute) — a 3D shape reads far better in motion than from any single
+angle. Drag to take the camera; release and it carries on from where you left
+it. Axis labels move to whichever edges face the camera, so they never float
+over the data from behind the box.
+
+**Same numbers as the CSV.** `compute_call_metrics` now reduces the very
+per-frame arrays this view draws — contour, entropy, tonality and envelope all
+come from one shared core — so a call's path and its CSV row cannot disagree.
+The refactor is pinned by a test against a frozen copy of the previous
+function: no CSV value moved.
 
 ---
 
@@ -457,10 +701,13 @@ of sync.
 |---|---|
 | `mad_pyqt.py` | PyQt5 GUI (labeling, review, training/inference dialogs). |
 | `mad_inference.py` | Run a checkpoint over a wav → CSV rows + per-call crops. |
+| `mad_trajectory.py` | Calls as paths through feature space: axis catalogue, smoothing, scaling (pure numpy). |
+| `../mad_trajectory_view.py` | The 3D trajectory pop-out (pyqtgraph OpenGL); which calls are drawn. |
 | `mad_training.py` | Train the U-Net from confirmed examples; grouped (leak-free) train/val split. |
 | `mad_examples.py` | Confirmed training-example store (`training_data.h5`). |
 | `mad_dataset.py` | Spectrogram/tile helpers shared by training & inference. |
 | `mad_project.py` | Project config / on-disk layout; folds pre-merge two-list projects into one `audio_files` registry. |
 | `mad_registry.py` | Referenced-recording registry: fingerprints, re-resolving moved files. |
 | `mad_labels.py` | Sibling-path helpers (CSV naming, etc.). |
+| `mad_export.py` | Folder-wide tables (recordings, detections, labelled calls, call images) from the `.mad` files, incremental; File ▸ Export… (`../mad_export_dialog.py`) and `mad export`. |
 | `fnt_mask_store.py` | Shared HDF5 mask storage (CAD + MAD); `/calls`, `/pred_calls`, training store, repack. |

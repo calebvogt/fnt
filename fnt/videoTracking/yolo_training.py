@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import tempfile
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
@@ -17,7 +18,8 @@ from typing import Callable, Dict, List, Optional
 import cv2
 import numpy as np
 
-from .mask_tracker_annotator import segmentation_to_polygons
+from .mask_tracker_annotator import (mask_to_coco_polygons, segmentation_to_mask,
+                                     segmentation_to_polygons)
 
 
 @dataclass
@@ -27,14 +29,14 @@ class YOLOTrainingConfig:
     output_dir: str = ""
     run_name: str = ""
     num_iterations: int = 100
-    learning_rate: float = 0.01
+    learning_rate: float = 0.002            # AdamW; SGD wants ~0.01
     batch_size: int = 8
     val_fraction: float = 0.2
     device: str = "auto"
     model_variant: str = "yolo11n-seg"
     imgsz: int = 640
     early_stop_patience: int = 50
-    freeze_backbone: bool = True
+    freeze_backbone: bool = False
     optimizer: str = "AdamW"
     # Online augmentation (mapped to Ultralytics params)
     aug_fliplr: float = 0.0
@@ -43,11 +45,34 @@ class YOLOTrainingConfig:
     aug_scale: float = 0.0
     aug_hsv_v: float = 0.0
     aug_hsv_s: float = 0.0
-    aug_mosaic: float = 0.0
+    aug_mosaic: float = 1.0
+    # Copy-paste: animals cut from one training image pasted into another (by
+    # their masks). Strong for instance segmentation with few labeled frames.
+    aug_copy_paste: float = 0.3
+    # The project's region of interest (mtt_roi.ROI.to_dict()): frames are cut
+    # to its crop and its excluded areas filled grey. Saved with the model, so
+    # every prediction prepares frames the same way.
+    roi: Optional[Dict] = None
 
     def resolve_run_dir(self) -> str:
         name = self.run_name or datetime.now().strftime("yolo_%Y%m%d_%H%M%S")
         return str(Path(self.output_dir) / name)
+
+
+def join_pieces(polys: List[List[float]]) -> List[float]:
+    """One outline from several polygons (x, y, x, y ...): each piece is spliced
+    into the outline at its closest point, out along a zero-width bridge, round
+    the piece and back -- one instance for YOLO, as Ultralytics joins
+    multi-polygon COCO instances (done here so exporting needs no torch: torch
+    loaded before Qt crashes the process on Windows)."""
+    rings = [np.asarray(p, np.float64).reshape(-1, 2) for p in polys]
+    out = rings[0]
+    for ring in rings[1:]:
+        d = np.linalg.norm(out[:, None, :] - ring[None, :, :], axis=2)
+        a, b = np.unravel_index(int(np.argmin(d)), d.shape)
+        piece = np.roll(ring, -b, axis=0)
+        out = np.concatenate([out[:a + 1], piece, piece[:1], out[a:]])
+    return out.reshape(-1).tolist()
 
 
 def convert_coco_to_yolo(
@@ -55,6 +80,7 @@ def convert_coco_to_yolo(
     images_dir: str,
     output_dir: str,
     val_fraction: float = 0.2,
+    roi: Optional[Dict] = None,
 ) -> str:
     """Convert COCO JSON annotations to YOLO segmentation format.
 
@@ -64,8 +90,15 @@ def convert_coco_to_yolo(
             labels/train/  labels/val/
             data.yaml
 
+    With a ``roi`` (mtt_roi.ROI.to_dict()), frames are written cut to its
+    crop with its excluded areas grey, and labels are cut to match: a label
+    centred in an excluded or cut-away area is dropped.
+
     Returns the path to data.yaml.
     """
+    from .mtt_roi import ROI
+    roi_obj = ROI.from_dict(roi)
+    n_dropped = 0
     with open(coco_json) as f:
         coco = json.load(f)
 
@@ -99,7 +132,16 @@ def convert_coco_to_yolo(
 
         src = os.path.join(images_dir, fname)
         dst = os.path.join(output_dir, "images", split, fname)
-        if os.path.exists(src) and not os.path.exists(dst):
+        origin, out_w, out_h = (0, 0), w, h
+        if roi_obj is not None:
+            img = cv2.imdecode(np.fromfile(src, np.uint8), cv2.IMREAD_COLOR) \
+                if os.path.exists(src) else None
+            if img is not None:
+                h, w = img.shape[:2]
+                cut, origin = roi_obj.apply(img)
+                out_h, out_w = cut.shape[:2]
+                cv2.imencode(Path(fname).suffix or ".png", cut)[1].tofile(dst)
+        elif os.path.exists(src) and not os.path.exists(dst):
             shutil.copy2(src, dst)
 
         label_name = Path(fname).stem + ".txt"
@@ -110,16 +152,41 @@ def convert_coco_to_yolo(
             cls_idx = cat_id_to_idx.get(ann["category_id"])
             if cls_idx is None:
                 continue
-            # YOLO wants normalised polygons, so RLE ground truth is traced
-            # back to outlines here. The stored mask stays lossless; only this
-            # throwaway training copy is polygonised.
-            for seg in segmentation_to_polygons(ann["segmentation"], h, w):
-                if len(seg) < 6:
+            if roi_obj is not None:
+                # The label as the cut frame shows it: off the excluded areas,
+                # in the crop's coordinates.
+                m = roi_obj.clip(segmentation_to_mask(ann["segmentation"], h, w))
+                if m is None:
+                    n_dropped += 1
                     continue
+                x0, y0 = origin
+                polys = [p for p in mask_to_coco_polygons(m[y0:y0 + out_h, x0:x0 + out_w])
+                         if len(p) >= 6]
+            else:
+                # YOLO wants normalised polygons, so RLE ground truth is traced
+                # back to outlines here. The stored mask stays lossless; only this
+                # throwaway training copy is polygonised.
+                polys = [p for p in segmentation_to_polygons(ann["segmentation"], h, w)
+                         if len(p) >= 6]
+            if not polys:
+                continue
+            if len(polys) > 1:
+                # Specks (< 3% of the mask) are dropped, not bridged to the
+                # body: a stray sliver joined by a long thin line is no mouse.
+                areas = [cv2.contourArea(np.asarray(p, np.float32).reshape(-1, 2)) for p in polys]
+                polys = [p for p, a in zip(polys, areas) if a >= 0.03 * sum(areas)] or polys[:1]
+            if len(polys) > 1:
+                # One mask in pieces (a tail cut off by erasing, a tail loop)
+                # is still one animal, but YOLO reads every line as its own
+                # instance: tail fragments trained as extra mice. Join the
+                # pieces into one outline with zero-width bridges, as
+                # Ultralytics does for multi-polygon COCO instances.
+                polys = [join_pieces(polys)]
+            for seg in polys:
                 coords = []
                 for j in range(0, len(seg), 2):
-                    nx = seg[j] / w
-                    ny = seg[j + 1] / h
+                    nx = seg[j] / out_w
+                    ny = seg[j + 1] / out_h
                     coords.append(f"{nx:.6f}")
                     coords.append(f"{ny:.6f}")
                 lines.append(f"{cls_idx} " + " ".join(coords))
@@ -140,9 +207,106 @@ def convert_coco_to_yolo(
         f.write(yaml_content)
 
     print(f"[YOLO Convert] {len(train_ids)} train, {len(val_ids)} val images")
+    if roi_obj is not None:
+        print(f"[YOLO Convert] ROI: {roi_obj.describe()}; "
+              f"{n_dropped} label(s) outside it dropped")
     print(f"[YOLO Convert] {len(cat_names)} classes: {cat_names}")
     print(f"[YOLO Convert] data.yaml: {data_yaml_path}")
     return data_yaml_path
+
+
+#: Validation frames shown in the training window's live preview, at most.
+PREVIEW_TILES = 6
+
+
+def preview_set(yolo_dir: str, n: int = PREVIEW_TILES) -> List[dict]:
+    """The validation frames shown in the training window, fixed for the run
+    so their tiles can be compared epoch to epoch: frames with animals first,
+    then one empty frame if there is room (or one in place of the last).
+    Each holds the frame and its ground-truth mask, drawn from the YOLO
+    labels."""
+    img_dir = os.path.join(yolo_dir, "images", "val")
+    lbl_dir = os.path.join(yolo_dir, "labels", "val")
+    if not os.path.isdir(img_dir):
+        return []
+    with_animals, empty = [], []
+    for name in sorted(os.listdir(img_dir)):
+        lbl = os.path.join(lbl_dir, Path(name).stem + ".txt")
+        lines = []
+        if os.path.exists(lbl):
+            with open(lbl) as f:
+                lines = [ln for ln in f.read().splitlines() if ln.strip()]
+        (with_animals if lines else empty).append((name, lines))
+    chosen = with_animals[:n]
+    if empty:
+        chosen = (chosen[:n - 1] if len(chosen) >= n else chosen) + empty[:max(1, n - len(chosen))]
+    out = []
+    for name, lines in chosen:
+        bgr = cv2.imread(os.path.join(img_dir, name), cv2.IMREAD_COLOR)
+        if bgr is None:
+            continue
+        h, w = bgr.shape[:2]
+        gt = np.zeros((h, w), np.uint8)
+        for ln in lines:
+            xy = np.array(ln.split()[1:], float).reshape(-1, 2) * (w, h)
+            cv2.fillPoly(gt, [np.round(xy).astype(np.int32)], 1)
+        out.append({"name": name, "bgr": bgr, "gt": gt > 0, "n_gt": len(lines)})
+    return out
+
+
+def epoch_preview_tiles(weights, frames: List[dict], imgsz: int, device: str,
+                        conf: float = 0.25, size: int = 192):
+    """The model at ``weights`` on the preview frames: one tile per frame,
+    cropped around the animals (true and predicted), with the frame (grey),
+    the ground-truth mask, the predicted mask, Dice over the whole frame
+    (None when the frame has no animal and none was predicted; 0 for a
+    prediction on an empty frame) and the counts. Returns (tiles, mean Dice
+    over the frames with animals)."""
+    if not weights or not os.path.exists(str(weights)) or not frames:
+        return [], None
+    from ultralytics import YOLO
+    model = YOLO(str(weights))
+    results = model.predict([f["bgr"] for f in frames], imgsz=imgsz, conf=conf,
+                            device=device, retina_masks=True, verbose=False)
+    tiles, dices = [], []
+    for f, r in zip(frames, results):
+        gt = f["gt"]
+        h, w = gt.shape
+        pred = np.zeros((h, w), bool)
+        n_pred = 0
+        if r.masks is not None and len(r.masks):
+            m = r.masks.data.cpu().numpy() > 0.5
+            if m.shape[1:] != (h, w):
+                m = np.stack([cv2.resize(x.astype(np.uint8), (w, h),
+                                         interpolation=cv2.INTER_NEAREST) > 0 for x in m])
+            pred = m.any(axis=0)
+            n_pred = len(m)
+        if gt.any():
+            dice = float(2 * np.count_nonzero(gt & pred) / (gt.sum() + pred.sum()))
+            dices.append(dice)
+        else:
+            dice = 0.0 if pred.any() else None
+        ys, xs = np.nonzero(gt | pred)
+        if ys.size:
+            x0, x1, y0, y1 = xs.min(), xs.max() + 1, ys.min(), ys.max() + 1
+            pad = max(24, int(0.25 * max(x1 - x0, y1 - y0)))
+            x0, y0 = max(0, x0 - pad), max(0, y0 - pad)
+            x1, y1 = min(w, x1 + pad), min(h, y1 + pad)
+        else:
+            x0, y0, x1, y1 = 0, 0, w, h
+        scale = size / max(x1 - x0, y1 - y0)
+        tw, th = max(1, round((x1 - x0) * scale)), max(1, round((y1 - y0) * scale))
+        grey = cv2.cvtColor(f["bgr"][y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+        tiles.append({
+            "name": f["name"],
+            "img": cv2.resize(grey, (tw, th), interpolation=cv2.INTER_AREA),
+            "gt": cv2.resize(gt[y0:y1, x0:x1].astype(np.uint8), (tw, th),
+                             interpolation=cv2.INTER_NEAREST) > 0,
+            "pred": cv2.resize(pred[y0:y1, x0:x1].astype(np.uint8), (tw, th),
+                               interpolation=cv2.INTER_NEAREST) > 0,
+            "dice": dice, "n_gt": f["n_gt"], "n_pred": n_pred,
+        })
+    return tiles, (float(np.mean(dices)) if dices else None)
 
 
 def _resolve_device(pref: str) -> str:
@@ -162,6 +326,37 @@ def _resolve_device(pref: str) -> str:
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
+
+def _named_losses(loss, names) -> dict:
+    """{name: value} from a trainer's epoch loss.
+
+    Older Ultralytics gives one tensor of the parts in ``loss_names`` order;
+    8.4 gives a dict of named tensors (and adds ``sem_loss``), which
+    ``float()`` choked on: the first epoch of every training run died with
+    "float() argument must be ... not 'dict'" (lab PC, Ultralytics 8.4.115).
+    """
+    if loss is None:
+        return {}
+    if isinstance(loss, dict):
+        return {str(k): float(v) for k, v in loss.items()}
+    items = loss.detach().cpu().numpy() if hasattr(loss, "cpu") else loss
+    try:
+        items = list(items)
+    except TypeError:                       # a single number
+        return {"loss": float(items)}
+    return {(names[i] if i < len(names) else f"loss_{i}"): float(v) for i, v in enumerate(items)}
+
+
+def _paths_past_max_path(folder: str, limit: int = 260) -> List[str]:
+    """Files in ``folder`` whose resolved path (the form Ultralytics opens) is
+    too long for Windows without long-path support; empty elsewhere."""
+    if os.name != "nt":
+        return []
+    root = str(Path(folder).resolve())
+    paths = (os.path.join(root, os.path.relpath(os.path.join(d, f), folder))
+             for d, _, files in os.walk(folder) for f in files)
+    return [p for p in paths if len(p) >= limit]
 
 
 def train_yolo_seg(
@@ -191,12 +386,27 @@ def train_yolo_seg(
     print(f"[YOLO Train] Config: epochs={cfg.num_iterations}, lr={cfg.learning_rate}, "
           f"batch={cfg.batch_size}, imgsz={cfg.imgsz}, model={cfg.model_variant}")
 
-    yolo_data_dir = os.path.join(run_dir, "yolo_dataset")
+    # The YOLO copy of the frames goes in a short local folder, not the run
+    # folder: Ultralytics resolves a mapped drive to its network path (Z: ->
+    # \\server\share), and past 260 characters Windows cannot open a label
+    # file, which Ultralytics then reads as a frame with no animals. In
+    # 2026-10 that silently trained 165 of 177 resource-zone frames as empty.
+    yolo_data_dir = tempfile.mkdtemp(prefix="fnt_yolo_")
     data_yaml = convert_coco_to_yolo(
-        cfg.coco_json_path, cfg.images_dir, yolo_data_dir, cfg.val_fraction,
+        cfg.coco_json_path, cfg.images_dir, yolo_data_dir, cfg.val_fraction, roi=cfg.roi,
     )
+    too_long = _paths_past_max_path(yolo_data_dir)
+    if too_long:
+        shutil.rmtree(yolo_data_dir, ignore_errors=True)
+        raise RuntimeError(
+            f"{len(too_long)} training file paths are too long for Windows "
+            f"(260 characters), e.g. {too_long[0]}. Shorten the TEMP folder path "
+            f"or the frame names.")
 
     device = _resolve_device(cfg.device)
+    # The training window's live preview: fixed validation frames, re-predicted
+    # by each epoch's weights (as MAD's training window does).
+    preview_frames = preview_set(yolo_data_dir) if progress else []
 
     # --- Diagnostic info ---
     print(f"[YOLO Train] Python: {platform.python_version()}  |  "
@@ -242,10 +452,13 @@ def train_yolo_seg(
         """Capture training loss and sub-losses (available before validation)."""
         # Use tloss (epoch-averaged) instead of loss (last batch only).
         # With small batch sizes, last-batch loss is extremely noisy.
-        if hasattr(trainer, "tloss") and trainer.tloss is not None:
-            loss_val = float(trainer.tloss.mean()) if hasattr(trainer.tloss, "mean") else float(trainer.tloss)
-        elif hasattr(trainer, "loss"):
-            loss_val = float(trainer.loss)
+        names = getattr(trainer, "loss_names", None) or []
+        sub = (_named_losses(getattr(trainer, "tloss", None), names)
+               or _named_losses(getattr(trainer, "loss_items", None), names))
+        if sub:
+            loss_val = sum(sub.values()) / len(sub)     # the mean of the parts, as tloss.mean() was
+        elif getattr(trainer, "loss", None) is not None:
+            loss_val = float(trainer.loss.sum()) if hasattr(trainer.loss, "sum") else float(trainer.loss)
         else:
             loss_val = 0.0
         if loss_val < best_loss[0]:
@@ -254,19 +467,6 @@ def train_yolo_seg(
         iteration_count[0] = trainer.epoch + 1
         _epoch_cache["loss"] = loss_val
         _epoch_cache["lr"] = trainer.optimizer.param_groups[0]["lr"]
-        sub = {}
-        if hasattr(trainer, "tloss") and trainer.tloss is not None:
-            names = trainer.loss_names if hasattr(trainer, "loss_names") else []
-            items = trainer.tloss.cpu().numpy() if hasattr(trainer.tloss, "cpu") else trainer.tloss
-            for i, v in enumerate(items):
-                key = names[i] if i < len(names) else f"loss_{i}"
-                sub[key] = float(v)
-        elif hasattr(trainer, "loss_items") and trainer.loss_items is not None:
-            names = trainer.loss_names if hasattr(trainer, "loss_names") else []
-            items = trainer.loss_items.cpu().numpy() if hasattr(trainer.loss_items, "cpu") else trainer.loss_items
-            for i, v in enumerate(items):
-                key = names[i] if i < len(names) else f"loss_{i}"
-                sub[key] = float(v)
         _epoch_cache["sub"] = sub
 
     def on_fit_epoch_end(trainer):
@@ -322,6 +522,15 @@ def train_yolo_seg(
                 **map_vals,
             }
             progress(epoch, total, metrics)
+            if preview_frames:
+                try:
+                    tiles, mean_dice = epoch_preview_tiles(
+                        getattr(trainer, "last", None), preview_frames, cfg.imgsz, device)
+                    if tiles:
+                        progress(epoch, total, {"status": "epoch_preview", "epoch": epoch,
+                                                "tiles": tiles, "val_dice": mean_dice})
+                except Exception as exc:     # previews are best-effort; never break a run
+                    print(f"\n[YOLO Train] preview skipped: {exc}")
         if should_stop and should_stop():
             trainer.stop = True
 
@@ -350,32 +559,37 @@ def train_yolo_seg(
         print("[YOLO Train] Augmentation: disabled")
 
     t0 = _time.time()
-    results = model.train(
-        data=data_yaml,
-        epochs=cfg.num_iterations,
-        imgsz=cfg.imgsz,
-        batch=cfg.batch_size,
-        lr0=cfg.learning_rate,
-        patience=cfg.early_stop_patience,
-        device=device,
-        workers=0,
-        project=run_dir,
-        name="train",
-        exist_ok=True,
-        verbose=False,
-        freeze=freeze_layers,
-        optimizer=cfg.optimizer,
-        plots=True,
-        save=True,
-        # Online augmentation
-        fliplr=cfg.aug_fliplr,
-        flipud=cfg.aug_flipud,
-        degrees=cfg.aug_degrees,
-        scale=cfg.aug_scale,
-        hsv_v=cfg.aug_hsv_v,
-        hsv_s=cfg.aug_hsv_s,
-        mosaic=cfg.aug_mosaic,
-    )
+    try:
+        results = model.train(
+            data=data_yaml,
+            epochs=cfg.num_iterations,
+            imgsz=cfg.imgsz,
+            batch=cfg.batch_size,
+            lr0=cfg.learning_rate,
+            patience=cfg.early_stop_patience,
+            device=device,
+            workers=0,
+            project=run_dir,
+            name="train",
+            exist_ok=True,
+            verbose=False,
+            freeze=freeze_layers,
+            optimizer=cfg.optimizer,
+            plots=True,
+            save=True,
+            # Online augmentation
+            fliplr=cfg.aug_fliplr,
+            flipud=cfg.aug_flipud,
+            degrees=cfg.aug_degrees,
+            scale=cfg.aug_scale,
+            hsv_v=cfg.aug_hsv_v,
+            hsv_s=cfg.aug_hsv_s,
+            mosaic=cfg.aug_mosaic,
+            copy_paste=cfg.aug_copy_paste,
+        )
+    finally:
+        # Remove the temporary YOLO dataset conversion directory
+        shutil.rmtree(yolo_data_dir, ignore_errors=True)
     elapsed = _time.time() - t0
     print()  # newline after the \r-updating status line
 
@@ -389,10 +603,6 @@ def train_yolo_seg(
         shutil.copy2(best_pt, dest_best)
     if os.path.exists(last_pt):
         shutil.copy2(last_pt, dest_last)
-
-    # Remove the temporary YOLO dataset conversion directory
-    if os.path.isdir(yolo_data_dir):
-        shutil.rmtree(yolo_data_dir, ignore_errors=True)
 
     with open(cfg.coco_json_path) as f:
         coco_data = json.load(f)

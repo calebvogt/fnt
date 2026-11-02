@@ -1,250 +1,236 @@
+"""Cleaned reads -> bouts: continuous stays of one animal in one zone.
+
+A tag sitting on an antenna is re-read about once a second, so an animal in a
+zone produces a dense run of reads and a bout is that run. The default rule
+(``gap_zone_day``):
+
+* per animal, reads in time order (both of its tags together);
+* consecutive reads in the same ``zone_id`` no more than ``gap`` seconds apart
+  (default 50 s) belong to the same bout;
+* a zone change, a longer gap, or the noon day boundary ends it;
+* duration = max(stop - start, 1 s), so a lone read is a 1 s bout and still
+  counts as a visit; ``stop`` is moved out to ``start + duration`` to match.
+
+The day split matters for per-day tables - a bout that ran across noon would
+otherwise be credited entirely to the day it started in.
+
+``legacy_r`` reproduces ``2_create_ALLTRIAL_MOVEBOUT.R`` (the original
+pipeline), for regenerating published numbers only. It classifies lone reads,
+then pairs the remaining START and STOP marks by POSITION within each
+animal-day, which mis-pairs about 2% of bouts on real data: they end up
+spanning a gap or even a zone change. Its loop skips the check at ``i+1``
+whenever it has just marked ``i+1``; that makes the marks alternate within a
+run of consecutive transitions, which is what lets it be computed here with
+array operations rather than a loop over reads.
 """
-Movement Bout Detector - Stage 2 of pipeline.
 
-Detects movement bouts from RFID reads:
-- Identifies continuous presence in a zone
-- Classifies reads as START, STOP, or SINGLE_READ
-- Calculates bout durations
+from __future__ import annotations
 
-Equivalent to R script: 2_create_ALLTRIAL_MOVEBOUT.R
-"""
-
-import pandas as pd
 import numpy as np
-from pathlib import Path
-from typing import Optional, Callable
+import pandas as pd
 
-from ..config import RFIDConfig
+BOUT_COLUMNS = ["animal", "name", "trial", "sex", "phase", "code", "paddock",
+                "zone", "zone_id", "away", "day", "start", "stop", "duration_s",
+                "n_reads"]
 
 
-class BoutDetector:
+def _codes(series: pd.Series) -> np.ndarray:
+    if isinstance(series.dtype, pd.CategoricalDtype):
+        return series.cat.codes.to_numpy()
+    return pd.factorize(series)[0]
+
+
+def gaps(values: np.ndarray) -> np.ndarray:
+    """Differences of elapsed seconds, rounded to the microsecond.
+
+    Reader times are whole milliseconds, so a gap of exactly 50 s is exactly
+    50 s - but as a difference of two floats it can come out 50.0000000001
+    and fall on the wrong side of the threshold. Rounding makes the
+    comparison mean what it says.
     """
-    Detector for movement bouts from RFID data.
+    return np.round(np.diff(values), 6)
 
-    Identifies continuous bouts of presence in zones based on time threshold.
+
+def _elapsed(reads: pd.DataFrame) -> np.ndarray:
+    if "elapsed" in reads.columns:
+        return reads["elapsed"].to_numpy(float)
+    # asi8 is in the index's own unit (microseconds under pandas 3): pin ns
+    return pd.DatetimeIndex(reads["t"]).as_unit("ns").asi8 / 1e9
+
+
+def _attach_animal_info(bouts: pd.DataFrame, animals: pd.DataFrame | None) -> pd.DataFrame:
+    if animals is None or animals.empty:
+        for col in ("name", "trial", "sex", "phase", "code"):
+            if col not in bouts.columns:
+                bouts[col] = ""
+        return bouts
+    info = animals.set_index("animal")
+    for col in ("name", "trial", "sex", "phase", "code"):
+        bouts[col] = bouts["animal"].astype(str).map(info[col]).fillna("")
+    return bouts
+
+
+def detect_bouts(reads: pd.DataFrame, gap_s: float = 50.0, min_bout_s: float = 1.0,
+                 rule: str = "gap_zone_day", animals: pd.DataFrame | None = None,
+                 progress=None) -> pd.DataFrame:
+    """Bouts from cleaned reads sorted by (animal, t). See the module docstring."""
+    say = progress or (lambda _m: None)
+    if rule not in ("gap_zone_day", "legacy_r"):
+        raise ValueError(f"Unknown bout rule {rule!r}")
+    if reads.empty:
+        return pd.DataFrame(columns=BOUT_COLUMNS)
+    if rule == "legacy_r":
+        bouts = _legacy_r(reads, gap_s)
+    else:
+        bouts = _gap_zone_day(reads, gap_s)
+    short = bouts["duration_s"] < min_bout_s
+    bouts.loc[short, "duration_s"] = float(min_bout_s)
+    bouts["stop"] = bouts["stop"].where(
+        ~short, bouts["start"] + pd.to_timedelta(bouts["duration_s"], unit="s"))
+    bouts = _attach_animal_info(bouts, animals)
+    say(f"{len(bouts):,} bouts ({rule}), "
+        f"{bouts['duration_s'].sum() / 3600:,.0f} animal-hours in zones")
+    return bouts[BOUT_COLUMNS].sort_values(["animal", "start"], kind="mergesort") \
+                              .reset_index(drop=True)
+
+
+def _gap_zone_day(reads: pd.DataFrame, gap_s: float) -> pd.DataFrame:
+    n = len(reads)
+    animal = _codes(reads["animal"])
+    zone = _codes(reads["zone_id"])
+    day = reads["day"].to_numpy()
+    el = _elapsed(reads)
+    new = np.ones(n, bool)
+    if n > 1:
+        new[1:] = ((animal[1:] != animal[:-1]) | (zone[1:] != zone[:-1])
+                   | (day[1:] != day[:-1]) | (gaps(el) > gap_s))
+    first = np.flatnonzero(new)
+    last = np.append(first[1:] - 1, n - 1)
+    t = reads["t"].to_numpy()
+    out = reads.iloc[first][["animal", "paddock", "zone", "zone_id", "away", "day"]] \
+               .reset_index(drop=True)
+    out["start"] = t[first]
+    out["stop"] = t[last]
+    # the reader stamps milliseconds; anything finer is float noise
+    out["duration_s"] = np.round(el[last] - el[first], 3)
+    out["n_reads"] = last - first + 1
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# The legacy R rule
+# --------------------------------------------------------------------------- #
+
+def _group_positions(group: np.ndarray):
+    """Position within each run of equal group ids, and each run's size."""
+    n = len(group)
+    starts = np.flatnonzero(np.r_[True, group[1:] != group[:-1]]) if n else np.array([], int)
+    sizes = np.diff(np.append(starts, n))
+    pos = np.arange(n) - np.repeat(starts, sizes)
+    size = np.repeat(sizes, sizes)
+    return pos, size
+
+
+def legacy_single_reads(t: np.ndarray, z: np.ndarray, group: np.ndarray,
+                        thresh: float) -> np.ndarray:
+    """R's SINGLE_READ classification, per animal-day group."""
+    n = len(t)
+    pos, size = _group_positions(group)
+    same_prev = np.r_[False, group[1:] == group[:-1]]
+    same_next = np.r_[group[:-1] == group[1:], False]
+    gap_prev = np.where(same_prev, np.r_[np.inf, gaps(t)], np.inf)
+    gap_next = np.where(same_next, np.r_[gaps(t), np.inf], np.inf)
+    zdiff_prev = same_prev & np.r_[False, z[1:] != z[:-1]]
+    zdiff_next = same_next & np.r_[z[:-1] != z[1:], False]
+
+    single = np.zeros(n, bool)
+    single |= size == 1
+    two = size == 2
+    # R's two-read case: the gap test overwrites the same-zone test
+    pair_gap = np.where(pos == 0, gap_next, gap_prev)
+    single |= two & (pair_gap >= thresh)
+    many = size >= 3
+    first, lastpos = pos == 0, pos == size - 1
+    middle = ~first & ~lastpos
+    single |= many & first & ((gap_next >= thresh) | zdiff_next)
+    single |= many & lastpos & ((gap_prev >= thresh) | zdiff_prev)
+    single |= many & middle & (((gap_prev >= thresh) & (gap_next >= thresh))
+                               | (zdiff_prev & zdiff_next))
+    return single
+
+
+def legacy_marks(t: np.ndarray, z: np.ndarray, group: np.ndarray,
+                 thresh: float) -> np.ndarray:
+    """START (1) / STOP (2) / none (0) marks on the non-single reads.
+
+    R's loop, for i in order: skip if already marked; else if the step to
+    i+1 is a transition (same zone and gap >= thresh, or a zone change) mark
+    i STOP and i+1 START. Index 0 and the last index start out marked. So in
+    a run of consecutive transitions only every other one is applied - the
+    first, third, fifth... (counting from index 1 when the run touches 0).
     """
+    n = len(t)
+    marks = np.zeros(n, np.int8)
+    if n == 0:
+        return marks
+    pos, size = _group_positions(group)
+    same_next = np.r_[group[:-1] == group[1:], False]
+    gap_next = np.r_[gaps(t), np.inf]
+    zchange = np.r_[z[:-1] != z[1:], False]
+    trans = same_next & (zchange | (gap_next >= thresh))
+    candidate = trans & (pos >= 1) & (pos <= size - 2)
+    # alternate within runs of consecutive candidates
+    run_start = candidate & ~np.r_[False, candidate[:-1] & same_next[:-1]]
+    run_id = np.cumsum(run_start)
+    first_in_run = np.zeros(n, int)
+    starts_idx = np.flatnonzero(run_start)
+    first_in_run[candidate] = starts_idx[run_id[candidate] - 1]
+    applied = candidate & (((np.arange(n) - first_in_run) % 2) == 0)
 
-    def __init__(self, config: RFIDConfig):
-        """
-        Initialize bout detector with configuration.
+    marks[pos == 0] = 1
+    marks[pos == size - 1] = 2
+    marks[applied] = 2
+    marks[np.flatnonzero(applied) + 1] = 1
+    return marks
 
-        Args:
-            config: RFID configuration object
-        """
-        self.config = config
 
-    def detect_bouts(
-        self,
-        rfid_df: pd.DataFrame,
-        progress_callback: Optional[Callable] = None
-    ) -> pd.DataFrame:
-        """
-        Detect movement bouts from RFID data.
+def _legacy_r(reads: pd.DataFrame, thresh: float) -> pd.DataFrame:
+    animal = _codes(reads["animal"])
+    day = reads["day"].to_numpy()
+    group = pd.factorize(pd.MultiIndex.from_arrays([animal, day]))[0]
+    t = _elapsed(reads)
+    z = _codes(reads["zone_id"])
+    cols = ["animal", "paddock", "zone", "zone_id", "away", "day"]
 
-        Algorithm:
-        1. Group by (trial, animal, day)
-        2. Sort by time
-        3. Identify bout boundaries:
-           - New bout starts when: time gap > threshold OR zone changes
-           - Bout ends when next bout starts or at last read
-        4. Classify reads: START, STOP, or SINGLE_READ
-        5. Calculate bout durations
+    single = legacy_single_reads(t, z, group, thresh)
+    singles = reads.loc[single, cols].reset_index(drop=True)
+    singles["start"] = reads["t"].to_numpy()[single]
+    singles["stop"] = singles["start"] + pd.Timedelta(seconds=1)
+    singles["duration_s"] = 1.0
+    singles["n_reads"] = 1
 
-        Args:
-            rfid_df: Processed RFID DataFrame
-            progress_callback: Optional callback function(message: str)
-
-        Returns:
-            DataFrame with bout information added
-
-        Raises:
-            ValueError: If required columns are missing
-        """
-        # Validate input
-        required_cols = ['trial', 'name', 'noon_day', 'time_sec', 'zone_id']
-        missing_cols = [col for col in required_cols if col not in rfid_df.columns]
-
-        if missing_cols:
-            raise ValueError(f"Missing required columns: {missing_cols}")
-
-        if progress_callback:
-            progress_callback("Detecting movement bouts...")
-
-        # Process each group separately
-        bout_dfs = []
-
-        # Group by trial, animal, day
-        grouped = rfid_df.groupby(['trial', 'name', 'noon_day'], dropna=False)
-        total_groups = len(grouped)
-
-        for i, ((trial, animal, day), group_df) in enumerate(grouped):
-            if progress_callback and i % 100 == 0:
-                progress_callback(f"Processing group {i+1}/{total_groups} ({trial}, {animal}, day {day})")
-
-            # Process this group
-            bout_df = self._process_group(group_df)
-            bout_dfs.append(bout_df)
-
-        # Combine all results
-        result_df = pd.concat(bout_dfs, ignore_index=True)
-
-        if progress_callback:
-            progress_callback(f"Detected {result_df['bout_type'].value_counts().to_dict()}")
-
-        # Save output
-        output_path = self._save_output(result_df, progress_callback)
-
-        if progress_callback:
-            progress_callback(f"Saved movement bouts to: {output_path}")
-
-        return result_df
-
-    def _process_group(self, group_df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Process a single group (trial, animal, day) to detect bouts.
-
-        Args:
-            group_df: DataFrame for one group
-
-        Returns:
-            DataFrame with bout information
-        """
-        if len(group_df) == 0:
-            return group_df
-
-        # Sort by time
-        group_df = group_df.sort_values('time_sec').copy()
-
-        # Calculate time differences between consecutive reads
-        group_df['time_diff'] = group_df['time_sec'].diff()
-
-        # Detect zone changes
-        group_df['zone_changed'] = (group_df['zone_id'] != group_df['zone_id'].shift(1))
-
-        # Identify bout starts
-        # A bout starts when:
-        # 1. It's the first read (time_diff is NaN)
-        # 2. Time gap > threshold
-        # 3. Zone changed
-        bout_threshold = self.config.bout_threshold_sec
-
-        group_df['bout_start'] = (
-            group_df['time_diff'].isna() |
-            (group_df['time_diff'] > bout_threshold) |
-            group_df['zone_changed']
-        )
-
-        # Assign bout IDs
-        group_df['bout_id'] = group_df['bout_start'].cumsum()
-
-        # Calculate bout statistics
-        bout_groups = group_df.groupby('bout_id')
-
-        # Bout start and end times
-        bout_start_times = bout_groups['time_sec'].first()
-        bout_end_times = bout_groups['time_sec'].last()
-        bout_sizes = bout_groups.size()
-
-        # Create bout info mapping
-        group_df['bout_start_time'] = group_df['bout_id'].map(bout_start_times)
-        group_df['bout_end_time'] = group_df['bout_id'].map(bout_end_times)
-        group_df['bout_size'] = group_df['bout_id'].map(bout_sizes)
-
-        # Calculate bout duration
-        group_df['bout_duration'] = group_df['bout_end_time'] - group_df['bout_start_time']
-
-        # Classify reads
-        group_df['bout_type'] = 'WITHIN_BOUT'  # Default
-
-        # Mark bout starts and ends
-        for bout_id in group_df['bout_id'].unique():
-            bout_mask = group_df['bout_id'] == bout_id
-            bout_indices = group_df[bout_mask].index
-
-            if len(bout_indices) == 1:
-                # Single read - mark as SINGLE_READ
-                group_df.loc[bout_indices, 'bout_type'] = 'SINGLE_READ'
-                # Set duration to min_duration_sec for single reads
-                group_df.loc[bout_indices, 'bout_duration'] = self.config.min_duration_sec
-            else:
-                # Multi-read bout - mark START and STOP
-                group_df.loc[bout_indices[0], 'bout_type'] = 'START'
-                group_df.loc[bout_indices[-1], 'bout_type'] = 'STOP'
-
-        # Apply minimum duration
-        # Zero-duration bouts get min_duration_sec
-        zero_duration_mask = group_df['bout_duration'] == 0
-        group_df.loc[zero_duration_mask, 'bout_duration'] = self.config.min_duration_sec
-
-        # Clean up temporary columns
-        group_df = group_df.drop(columns=['time_diff', 'zone_changed', 'bout_start'])
-
-        return group_df
-
-    def _save_output(
-        self,
-        df: pd.DataFrame,
-        progress_callback: Optional[Callable] = None
-    ) -> str:
-        """
-        Save movement bout data to file.
-
-        Args:
-            df: Movement bout DataFrame
-            progress_callback: Optional callback function
-
-        Returns:
-            Path to output file
-        """
-        output_dir = Path(self.config.output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        output_path = output_dir / "ALLTRIAL_MOVEBOUT.csv"
-
-        df.to_csv(output_path, index=False)
-
-        if progress_callback:
-            progress_callback(f"Saved {len(df):,} reads with bout information")
-
-        return str(output_path)
-
-    def get_bout_statistics(self, bout_df: pd.DataFrame) -> dict:
-        """
-        Calculate summary statistics for movement bouts.
-
-        Args:
-            bout_df: Movement bout DataFrame
-
-        Returns:
-            Dictionary of summary statistics
-        """
-        stats = {
-            'total_reads': len(bout_df),
-            'total_bouts': bout_df['bout_id'].nunique(),
-            'bout_type_counts': bout_df['bout_type'].value_counts().to_dict(),
-        }
-
-        # Only analyze actual bouts (not single reads)
-        bout_reads = bout_df[bout_df['bout_type'].isin(['START', 'STOP'])]
-
-        if len(bout_reads) > 0:
-            # Get bout-level statistics (one row per bout - use START reads)
-            bout_starts = bout_reads[bout_reads['bout_type'] == 'START']
-
-            stats['bout_duration_stats'] = {
-                'mean': bout_starts['bout_duration'].mean(),
-                'median': bout_starts['bout_duration'].median(),
-                'min': bout_starts['bout_duration'].min(),
-                'max': bout_starts['bout_duration'].max(),
-                'std': bout_starts['bout_duration'].std()
-            }
-
-            # Per-animal bout counts
-            if 'name' in bout_df.columns:
-                stats['bouts_per_animal'] = bout_starts.groupby('name').size().to_dict()
-
-            # Per-zone bout counts
-            if 'zone_id' in bout_df.columns:
-                stats['bouts_per_zone'] = bout_starts.groupby('zone_id').size().to_dict()
-
-        return stats
+    rest = np.flatnonzero(~single)
+    marks = legacy_marks(t[rest], z[rest], group[rest], thresh)
+    kept = rest[marks > 0]
+    kmarks = marks[marks > 0]
+    kgroup = group[kept]
+    frame = pd.DataFrame({"row": kept, "mark": kmarks, "group": kgroup})
+    frame["k"] = frame.groupby(["group", "mark"]).cumcount()
+    counts = frame.groupby(["group", "mark"]).size().unstack(fill_value=0)
+    counts = counts.reindex(columns=[1, 2], fill_value=0)
+    ns, ne = counts[1], counts[2]
+    # drop the unmatched trailing mark when the counts differ by one; a group
+    # whose counts differ by more has no paired bouts at all (as in R)
+    n_pairs = np.where((ns - ne).abs() <= 1, np.minimum(ns, ne), 0)
+    n_pairs = pd.Series(n_pairs, index=counts.index)
+    frame = frame[frame["k"] < frame["group"].map(n_pairs).to_numpy()]
+    starts = frame[frame["mark"] == 1].sort_values(["group", "k"])
+    stops = frame[frame["mark"] == 2].sort_values(["group", "k"])
+    s_rows, e_rows = starts["row"].to_numpy(), stops["row"].to_numpy()
+    paired = reads.iloc[s_rows][cols].reset_index(drop=True)
+    paired["start"] = reads["t"].to_numpy()[s_rows]
+    paired["stop"] = reads["t"].to_numpy()[e_rows]
+    paired["duration_s"] = np.round(t[e_rows] - t[s_rows], 3)
+    paired.loc[paired["duration_s"] == 0, "duration_s"] = 1.0
+    paired["n_reads"] = np.nan               # not recoverable from R's pairing
+    return pd.concat([singles, paired], ignore_index=True)

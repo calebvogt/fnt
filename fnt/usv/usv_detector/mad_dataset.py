@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
 
+import warnings
 import numpy as np
 
 from .mad_labels import (
@@ -41,17 +42,262 @@ def spec_to_image(spec_db: np.ndarray, db_min: float, db_max: float) -> np.ndarr
     return np.clip(out, 0.0, 1.0).astype(np.float32)
 
 
+# Per-recording dB normalization ---------------------------------------------
+# Percentiles, not min/max: the floor should track the noise bed (not the single
+# quietest bin) and the ceiling should sit just under the loudest calls without
+# being pinned by one broadband click.
+DB_PCT_LO, DB_PCT_HI = 5.0, 99.9
+DB_MIN_SPAN = 20.0          # never map a near-flat recording onto full contrast
+
+
+def estimate_db_range(
+    audio: np.ndarray, sample_rate: int, nperseg: int, noverlap: int,
+    nfft: int, lo_pct: float = DB_PCT_LO, hi_pct: float = DB_PCT_HI,
+    n_windows: int = 24, window_s: float = 1.0,
+) -> tuple:
+    """Estimate a recording's own dB range from evenly spaced probe windows.
+
+    A project-wide fixed range assumes every recording shares a noise floor and
+    gain. Across trials with different mics, distances and ambient conditions
+    they do not, so the same call arrives at the model at different input
+    intensities — which is a large part of why a model trained on a few
+    recordings generalizes poorly to the rest.
+
+    Probes are **evenly spaced and deterministic**, never random: labeling and
+    inference must derive an identical range for the same audio, or a call
+    would be normalized one way when it trains and another way when it is
+    detected. Sampling ~24 s of a long recording is enough for percentiles and
+    avoids computing a full-file spectrogram just to pick two numbers.
+    """
+    audio = np.asarray(audio, dtype=np.float32)
+    win = max(int(window_s * sample_rate), nperseg * 4)
+    if audio.size <= win:
+        starts = [0]
+    else:
+        n = max(1, int(n_windows))
+        step = max(1, (audio.size - win) // n)
+        starts = [i * step for i in range(n)]
+    noverlap_safe = min(noverlap, nperseg - 1)
+    chunks = []
+    for st in starts:
+        seg = audio[st:st + win]
+        if seg.size < nperseg:
+            continue
+        _f, _t, sxx = compute_spectrogram(
+            seg, sr=sample_rate, nperseg=nperseg, noverlap=noverlap_safe,
+            nfft=nfft)
+        chunks.append(sxx.ravel())
+    if not chunks:
+        return (-100.0, -20.0)
+    vals = np.concatenate(chunks)
+    lo = float(np.percentile(vals, lo_pct))
+    hi = float(np.percentile(vals, hi_pct))
+    if hi - lo < DB_MIN_SPAN:
+        hi = lo + DB_MIN_SPAN
+    return (lo, hi)
+
+
+def db_range_for(
+    db_norm: str, db_min: float, db_max: float,
+    audio=None, sample_rate: int = 0, nperseg: int = 512,
+    noverlap: int = 384, nfft: int = 1024,
+) -> tuple:
+    """Resolve the dB range to normalize with: the project's fixed pair, or this
+    recording's own. Falls back to fixed when there is no audio to measure."""
+    if db_norm == 'per_file' and audio is not None and sample_rate:
+        try:
+            return estimate_db_range(audio, sample_rate, nperseg, noverlap, nfft)
+        except Exception:
+            pass
+    return (float(db_min), float(db_max))
+
+
 def compute_full_spec_image(
     audio: np.ndarray, sample_rate: int,
     nperseg: int, noverlap: int, nfft: int,
     db_min: float, db_max: float,
+    chunk_frames: int = 20000,
+    as_uint8: bool = False,
 ) -> np.ndarray:
-    """Return normalized full-file spec image, shape (n_freq_bins, n_time_frames)."""
-    _, _, sxx_db = compute_spectrogram(
-        audio, sr=sample_rate,
-        nperseg=nperseg, noverlap=noverlap, nfft=nfft,
-    )
-    return spec_to_image(sxx_db, db_min=db_min, db_max=db_max)
+    """Return normalized full-file spec image, shape (n_freq_bins, n_time_frames).
+
+    Computed in time chunks, with the dB conversion and normalization fused
+    into the same pass and written straight into the destination.
+
+    The obvious version — full STFT, then ``10*log10``, then normalize — is
+    three separate passes that each allocate a whole-file array. On a 600 s
+    250 kHz recording that is 2.4 GB three times over plus scipy's own
+    temporaries, and the cost is memory traffic rather than arithmetic: it
+    measured 2.5x slower than this, and threading the STFT made it *worse*
+    because the bandwidth was already saturated. Only one output array is
+    allocated here; the working buffer stays small enough to be cache-friendly.
+
+    Output is bit-identical to the unfused version — the same operations in the
+    same order and dtype, just applied per chunk and in place.
+    """
+    audio = np.asarray(audio, dtype=np.float32)
+    hop = max(1, int(nperseg) - int(noverlap))
+    n_freq = int(nfft) // 2 + 1
+    if len(audio) < nperseg:
+        return np.zeros((n_freq, 0), dtype=np.float32)
+    n_frames = (len(audio) - int(nperseg)) // hop + 1
+    if db_max <= db_min:                 # mirrors spec_to_image
+        db_max = db_min + 1e-3
+    span = db_max - db_min
+
+    from scipy import signal as _signal
+    # uint8 costs a quarter of the memory and is the precision the model was
+    # actually trained at — td_save_example stores every example as
+    # (clip(x,0,1)*255).round().astype(uint8), so a float32 input at inference
+    # is finer-grained than anything the weights ever saw.
+    out = np.empty((n_freq, n_frames), dtype=np.uint8 if as_uint8 else np.float32)
+    f0 = 0
+    while f0 < n_frames:
+        f1 = min(n_frames, f0 + int(chunk_frames))
+        # Overlapping sample span for exactly the frames [f0, f1).
+        s0 = f0 * hop
+        s1 = (f1 - 1) * hop + int(nperseg)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            _, _, sxx = _signal.spectrogram(
+                audio[s0:s1], fs=sample_rate,
+                nperseg=nperseg, noverlap=noverlap, nfft=nfft,
+                window='hann', scaling='density')
+            sxx = sxx[:, :f1 - f0]
+            # dB, then [0,1] normalization, in place on the chunk.
+            np.log10(sxx + 1e-10, out=sxx)
+            sxx *= 10.0
+            sxx -= db_min
+            sxx /= span
+            np.clip(sxx, 0.0, 1.0, out=sxx)
+            if as_uint8:
+                sxx *= 255.0
+                np.round(sxx, out=sxx)
+        out[:, f0:f1] = sxx
+        f0 = f1
+    return out
+
+
+def compute_full_spec_image_torch(
+    audio: np.ndarray, sample_rate: int,
+    nperseg: int, noverlap: int, nfft: int,
+    db_min: float, db_max: float, device: str,
+    chunk_frames: int = 65536,
+) -> np.ndarray:
+    """:func:`compute_full_spec_image` (uint8) computed with torch on ``device``.
+
+    Reproduces ``scipy.signal.spectrogram(window='hann', scaling='density')``
+    step for step in float32 -- per-frame mean removal (scipy's default
+    detrend), the periodic Hann window, density scaling summed the way scipy
+    sums it, the x2 one-sided PSD -- then the same dB / [0, 1] / uint8 steps.
+    The older ``gpu_spectrogram`` module skips the mean removal and the x2,
+    which puts it 3 dB and ~10 grey levels off what the model was trained on.
+
+    Measured on three 10-minute recordings: within one grey level of the CPU
+    image on 0.0004-0.0007% of pixels; detections identical in count, all but
+    9 of 2,057 pixel-identical and those 9 off by one edge pixel; 14.5 s ->
+    1.2 s on an RTX 4070 Ti SUPER. Use through :func:`spec_image_for_device`,
+    which checks agreement first and falls back to the CPU.
+    """
+    import torch
+    from scipy.signal import get_window
+    audio = np.ascontiguousarray(audio, dtype=np.float32)
+    hop = max(1, int(nperseg) - int(noverlap))
+    n_freq = int(nfft) // 2 + 1
+    if len(audio) < nperseg:
+        return np.zeros((n_freq, 0), dtype=np.uint8)
+    n_frames = (len(audio) - int(nperseg)) // hop + 1
+    if db_max <= db_min:                 # mirrors spec_to_image
+        db_max = db_min + 1e-3
+    span = float(db_max - db_min)
+    # scipy casts the window to complex64 and sums its square there.
+    wc = get_window('hann', int(nperseg)).astype(np.complex64)
+    scale = float(np.complex64(1.0 / (sample_rate * (wc * wc).sum())).real)
+    out = np.empty((n_freq, n_frames), dtype=np.uint8)
+    with torch.no_grad():
+        win = torch.from_numpy(wc.real.copy()).to(device)
+        x = torch.from_numpy(audio).to(device)
+        for f0 in range(0, n_frames, int(chunk_frames)):
+            f1 = min(n_frames, f0 + int(chunk_frames))
+            fr = x[f0 * hop:(f1 - 1) * hop + int(nperseg)].unfold(
+                0, int(nperseg), hop)
+            fr = fr - fr.mean(dim=1, keepdim=True)
+            X = torch.fft.rfft(fr * win, n=int(nfft), dim=1)
+            p = (X.real * X.real + X.imag * X.imag) * scale
+            del X, fr
+            if int(nfft) % 2 == 0:
+                p[:, 1:-1] *= 2.0       # the Nyquist bin is unpaired
+            else:
+                p[:, 1:] *= 2.0
+            p = torch.log10(p + 1e-10) * 10.0
+            p = torch.clamp((p - db_min) / span, 0.0, 1.0)
+            out[:, f0:f1] = (torch.round(p * 255.0).to(torch.uint8)
+                             .T.cpu().numpy())
+            del p
+        del x, win
+    return out
+
+
+#: Devices whose torch spectrogram was checked against the CPU this process:
+#: ``{device: bool}``.
+_TORCH_SPEC_OK: dict = {}
+
+
+def torch_spectrogram_agrees(device: str) -> bool:
+    """Does the torch spectrogram reproduce the CPU one on ``device``?
+
+    Checked once per process on a synthetic recording (noise plus a sweep and
+    a tone), because a backend can lack an op or compute it differently: it
+    must land within one grey level on at most 0.01% of pixels. Anything
+    else -- including an exception -- answers no, and the CPU is used.
+    """
+    if device in _TORCH_SPEC_OK:
+        return _TORCH_SPEC_OK[device]
+    ok = False
+    try:
+        sr = 250_000
+        rng = np.random.default_rng(0)
+        t = np.arange(2 * sr) / sr
+        x = rng.normal(0, 0.01, t.size)
+        x += 0.05 * np.sin(2 * np.pi * (30_000 + 10_000 * t) * t)
+        x += 0.02 * np.sin(2 * np.pi * 21_500 * t)
+        x = x.astype(np.float32)
+        args = (sr, 512, 384, 1024, -100.0, -20.0)
+        cpu = compute_full_spec_image(x, *args, as_uint8=True)
+        gpu = compute_full_spec_image_torch(x, *args, device=device)
+        d = np.abs(cpu.astype(np.int16) - gpu.astype(np.int16))
+        ok = (cpu.shape == gpu.shape and int(d.max(initial=0)) <= 1
+              and np.count_nonzero(d) <= 1e-4 * d.size)
+    except Exception:
+        ok = False
+    _TORCH_SPEC_OK[device] = ok
+    return ok
+
+
+def spec_image_for_device(
+    audio: np.ndarray, sample_rate: int,
+    nperseg: int, noverlap: int, nfft: int,
+    db_min: float, db_max: float, device: Optional[str] = None,
+) -> Tuple[np.ndarray, str]:
+    """The uint8 inference image, on the GPU when that is safe.
+
+    CUDA only. On Apple Silicon (MPS) the tile scan is the slow half and the
+    prefetch thread already hides the CPU spectrogram behind it, so there is
+    nothing to gain -- and the CPU path is the one every result so far came
+    from. Returns ``(image, backend)``; any GPU failure (a check that does not
+    agree, an out-of-memory) quietly uses the CPU.
+    """
+    if device and str(device).startswith('cuda') \
+            and torch_spectrogram_agrees(str(device)):
+        try:
+            return (compute_full_spec_image_torch(
+                audio, sample_rate, nperseg, noverlap, nfft, db_min, db_max,
+                device=str(device)), 'cuda')
+        except Exception:
+            pass
+    return (compute_full_spec_image(
+        audio, sample_rate, nperseg=nperseg, noverlap=noverlap, nfft=nfft,
+        db_min=db_min, db_max=db_max, as_uint8=True), 'cpu')
 
 
 # ----------------------------------------------------------------------

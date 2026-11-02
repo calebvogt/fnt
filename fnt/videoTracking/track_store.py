@@ -25,6 +25,13 @@ those become cheap offline passes over a file that sits next to the CSV::
         /bbox               float32[N, 4]    x1, y1, x2, y2
         /centroid           float32[N, 2]
         /area               int32  [N]
+        /major_axis_px      float32[N]   equivalent-ellipse posture
+        /minor_axis_px      float32[N]   descriptors, schema 2 onward;
+        /elongation         float32[N]   NaN on box-only runs
+        /orientation_deg    float32[N]
+        /eccentricity       float32[N]
+        /perimeter_px       float32[N]
+        /solidity           float32[N]
 
 One row per (frame, detection). Rows are appended in frame order, so a frame's
 detections are contiguous, and ``/frame`` is non-decreasing.
@@ -49,8 +56,11 @@ except Exception:  # pragma: no cover
     _HAS_H5 = False
 
 from .mask_tracker_annotator import mask_to_rle, rle_to_mask
+from .mask_tracker_inference import SHAPE_FIELDS
 
-SCHEMA_VERSION = 1
+# 2 added the per-detection shape descriptors. Stores written by schema 1
+# still open; they simply carry no shape columns into the rebuilt CSV.
+SCHEMA_VERSION = 2
 TRACKS_SUFFIX = "_tracks.h5"
 
 # Rows buffered before a flush. Keeps peak memory flat on hour-long videos
@@ -92,6 +102,12 @@ class TrackMaskWriter:
         ("score", np.float32), ("area", np.int32),
     )
 
+    # Posture descriptors, stored beside the geometry rather than recomputed.
+    # The proofreader rebuilds the CSV from this file, and decoding several
+    # hundred thousand masks to recover shape would make saving a correction
+    # take minutes. NaN on box-only runs.
+    _SHAPE = tuple((name, np.float32) for name in SHAPE_FIELDS)
+
     def __init__(self, path: str, video_path: str = "", fps: float = 30.0,
                  frame_count: int = 0, width: int = 0, height: int = 0,
                  model_dir: str = "", has_masks: bool = True):
@@ -114,7 +130,7 @@ class TrackMaskWriter:
             "rle_counts", shape=(0,), maxshape=(None,), dtype=np.int32,
             chunks=(65536,), compression="gzip", compression_opts=4,
         )
-        for name, dt in self._SCALARS:
+        for name, dt in self._SCALARS + self._SHAPE:
             self._f.create_dataset(
                 name, shape=(0,), maxshape=(None,), dtype=dt,
                 chunks=(4096,), compression="gzip", compression_opts=4,
@@ -125,7 +141,9 @@ class TrackMaskWriter:
                 chunks=(4096, cols), compression="gzip", compression_opts=4,
             )
 
-        self._buf: Dict[str, list] = {n: [] for n, _ in self._SCALARS}
+        self._buf: Dict[str, list] = {
+            n: [] for n, _ in self._SCALARS + self._SHAPE
+        }
         self._buf["bbox"] = []
         self._buf["centroid"] = []
         self._counts_buf: List[np.ndarray] = []
@@ -166,6 +184,13 @@ class TrackMaskWriter:
             self._buf["area"].append(int(det.get("area", 0)))
             self._buf["bbox"].append(box)
             self._buf["centroid"].append([float(cx), float(cy)])
+
+            shape = det.get("shape") or {}
+            for name, _ in self._SHAPE:
+                value = shape.get(name)
+                self._buf[name].append(
+                    float("nan") if value is None else float(value)
+                )
             self.n_rows += 1
 
         if len(self._buf["frame"]) >= _FLUSH_EVERY:
@@ -186,7 +211,7 @@ class TrackMaskWriter:
                 ds[old:] = joined
             self._counts_buf = []
 
-        for name, dt in self._SCALARS:
+        for name, dt in self._SCALARS + self._SHAPE:
             ds = self._f[name]
             old = ds.shape[0]
             ds.resize((old + n_new,))
@@ -251,6 +276,12 @@ class TrackMaskReader:
         self.centroid = self._f["centroid"][:]
         self._rle_start = self._f["rle_start"][:]
         self._rle_len = self._f["rle_len"][:]
+
+        # Absent from schema 1 stores. Left empty rather than backfilled,
+        # since recovering it would mean decoding every mask in the file.
+        self.shape_features: Dict[str, np.ndarray] = {
+            name: self._f[name][:] for name in SHAPE_FIELDS if name in self._f
+        }
 
         # frame -> row slice. Rows are written in frame order, so each frame's
         # detections form one contiguous block.
@@ -402,6 +433,8 @@ def trajectories_dataframe(
         "mask_area": reader.area[keep].astype(int),
         "confidence": np.round(reader.score[keep], 4),
     })
+    for name, values in reader.shape_features.items():
+        df[name] = values[keep]
     df = df.sort_values(["object_id", "frame"]).reset_index(drop=True)
 
     if categories:
@@ -426,7 +459,8 @@ def trajectories_dataframe(
 
     order = ["frame", "time_s", "object_id", "object_name", "label",
              "x", "y", "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2",
-             "mask_area", "confidence", "vx", "vy", "speed"]
+             "mask_area", *SHAPE_FIELDS,
+             "confidence", "vx", "vy", "speed"]
     return df[[c for c in order if c in df.columns]]
 
 

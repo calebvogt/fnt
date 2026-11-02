@@ -72,8 +72,12 @@ def test_uneven_groups_stay_whole():
 # _split_tiles — picks the strongest level the labels support
 # ----------------------------------------------------------------------
 def test_multiple_recordings_split_at_file_level():
+    """With several labelled recordings, 'auto' takes the strongest split it
+    can — whole recordings held out, the only one that answers "does this work
+    on a recording it has never seen". The default mode is 'call'; this asks
+    for auto because file-level is the behaviour under test."""
     groups = _groups({f'rec_{i}.wav': (5, 3) for i in range(4)})
-    out = _split_tiles(groups, len(groups), 0.25)
+    out = _split_tiles(groups, len(groups), 0.25, mode='auto')
 
     assert out['split_level'] == 'file'
     assert out['val_held_out'] is True
@@ -128,7 +132,12 @@ def test_grouped_split_eliminates_leakage_that_tile_shuffle_produced():
     assert leaked > 0, "sanity: the old scheme is expected to leak here"
 
     # New behavior: nothing in val shares a recording OR a call with train.
-    out = _split_tiles(groups, n_total, 0.20)
+    #
+    # mode='auto' explicitly. The default is 'call' (MADTrainingConfig
+    # .split_mode), which holds out whole CALLS and deliberately lets train and
+    # val share recordings — a weaker guarantee that the run log reports as
+    # such. File-level holdout is what this test is about, so it asks for it.
+    out = _split_tiles(groups, n_total, 0.20, mode='auto')
     train_files = {groups[i][0] for i in out['train_idx']}
     train_calls = {groups[i][1] for i in out['train_idx']}
     assert not any(groups[i][0] in train_files for i in out['val_idx'])

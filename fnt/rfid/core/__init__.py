@@ -1,44 +1,33 @@
-"""Core RFID preprocessing modules."""
+"""Core RFID preprocessing stages.
 
-from .file_readers import read_rfid_file, read_rfid_directory, read_all_trials
-from .utils import (
-    map_antenna_to_zone,
-    get_zone_coordinates,
-    parse_metadata,
-    create_tag_mapping,
-    filter_cross_paddock_reads,
-    create_temporal_variables,
-    assign_zone_info
-)
-from .preprocessor import RFIDPreprocessor
-from .bout_detector import BoutDetector
-from .gbi_generator import GBIGenerator
-from .social_network import SocialNetworkAnalyzer
-from .edgelist import EdgelistGenerator
-from .displacement import DisplacementDetector
-from .hinde_index import HindeIndexCalculator
+    downloads -> reads -> cleaned reads -> bouts -> summaries, QC
+
+``file_readers`` parses Biomark downloads, ``metadata`` the animal table,
+``cleaning`` applies identity, place and every cleaning rule, ``bout_detector``
+builds bouts, ``summaries`` the per-day tables and ``qc`` the reports.
+
+The GBI, edgelist, displacement, Hinde and social-network modules are optional
+layers carried over from the earlier module (see ``RFIDConfig.layers``).
+"""
+
+from .file_readers import (read_downloads, list_download_files, read_export,
+                           read_biomark_txt, read_xlsx_text, normalise_tag_value,
+                           normalise_tags, parse_scan_times, DownloadResult)
+from .metadata import (load_animals, AnimalTable, read_grid, list_sheets,
+                       detect_header_row, header_names, guess_mapping,
+                       excel_date, excel_time, combine_date_time)
+from .cleaning import clean_reads, CleanResult, day_index, resolve_origin
+from .bout_detector import detect_bouts, BOUT_COLUMNS
+from .summaries import animal_days, zone_holders, co_occupancy, overlapping_bouts
+from . import qc
 
 __all__ = [
-    # File readers
-    'read_rfid_file',
-    'read_rfid_directory',
-    'read_all_trials',
-
-    # Utilities
-    'map_antenna_to_zone',
-    'get_zone_coordinates',
-    'parse_metadata',
-    'create_tag_mapping',
-    'filter_cross_paddock_reads',
-    'create_temporal_variables',
-    'assign_zone_info',
-
-    # Pipeline stages
-    'RFIDPreprocessor',
-    'BoutDetector',
-    'GBIGenerator',
-    'SocialNetworkAnalyzer',
-    'EdgelistGenerator',
-    'DisplacementDetector',
-    'HindeIndexCalculator',
+    "read_downloads", "list_download_files", "read_export", "read_biomark_txt",
+    "read_xlsx_text", "normalise_tag_value", "normalise_tags", "parse_scan_times",
+    "DownloadResult",
+    "load_animals", "AnimalTable", "read_grid", "list_sheets", "detect_header_row",
+    "header_names", "guess_mapping", "excel_date", "excel_time", "combine_date_time",
+    "clean_reads", "CleanResult", "day_index", "resolve_origin",
+    "detect_bouts", "BOUT_COLUMNS",
+    "animal_days", "zone_holders", "co_occupancy", "overlapping_bouts", "qc",
 ]

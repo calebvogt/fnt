@@ -25,6 +25,7 @@ import numpy as np
 __all__ = [
     "kde_utilization", "kde_isopleth", "kde_isopleth_area",
     "mcp", "polygon_area", "assign_zones", "zone_occupancy",
+    "zone_intervals", "zone_visits",
 ]
 
 
@@ -265,33 +266,86 @@ def assign_zones(x, y, zones):
     return out
 
 
-def zone_occupancy(zone_idx, timestamps, n_zones):
-    """Seconds spent in each zone, from a per-fix zone assignment.
+def zone_intervals(timestamps):
+    """Seconds each fix is credited with, one per fix.
 
     Each fix is credited with the interval to the NEXT fix, so occupancy is
     measured in real time rather than in fix counts — a tag reporting twice as
     often in one zone does not appear to spend twice as long there. The final
     fix contributes the median interval, since its true dwell is unknown.
 
-    Returns an array of length ``n_zones + 1``; the last element is time spent
-    outside every zone.
+    A gap in the record is not dwell time, so each interval is capped at ten
+    times the typical one: a dropout is not billed to whichever zone the tag
+    was last seen in. Returned separately from ``zone_occupancy`` because the
+    visit statistics have to weight the same intervals the same way, and two
+    copies of this rule would eventually disagree.
     """
-    zone_idx = np.asarray(zone_idx)
     t = np.asarray(timestamps, dtype="datetime64[ns]").astype("int64") / 1e9
-    out = np.zeros(n_zones + 1, dtype=float)
     if t.size == 0:
-        return out
+        return np.zeros(0, dtype=float)
     dt = np.diff(t)
     if dt.size == 0:
-        return out
-    # A gap in the record is not dwell time: cap each interval at a generous
-    # multiple of the typical one so a dropout is not billed to whichever zone
-    # the tag was last seen in.
+        return np.zeros(1, dtype=float)
     typical = float(np.median(dt[dt > 0])) if np.any(dt > 0) else 0.0
     cap = max(typical * 10.0, 1.0)
-    dt = np.clip(dt, 0.0, cap)
-    dt = np.append(dt, typical)
+    return np.append(np.clip(dt, 0.0, cap), typical)
+
+
+def zone_occupancy(zone_idx, timestamps, n_zones):
+    """Seconds spent in each zone, from a per-fix zone assignment.
+
+    Returns an array of length ``n_zones + 1``; the last element is time spent
+    outside every zone. See ``zone_intervals`` for how a fix is credited.
+    """
+    zone_idx = np.asarray(zone_idx)
+    out = np.zeros(n_zones + 1, dtype=float)
+    dt = zone_intervals(timestamps)
+    if dt.size == 0:
+        return out
     for i in range(n_zones):
         out[i] = dt[zone_idx == i].sum()
     out[n_zones] = dt[zone_idx < 0].sum()
     return out
+
+
+def zone_visits(zone_idx, timestamps, n_zones):
+    """Seconds, visit count and mean visit length per zone.
+
+    A VISIT is a maximal run of consecutive fixes assigned to the same zone —
+    the animal enters, stays, and leaves. Counting entries as well as total
+    time distinguishes an animal that sat in the nest for six hours from one
+    that passed through it sixty times, which a seconds total alone cannot.
+
+    ``zone_idx`` must be in time order. Returns ``(seconds, visits,
+    mean_visit_s)``, each of length ``n_zones + 1`` with the last element for
+    time outside every zone. ``mean_visit_s`` is 0 where there were no visits.
+
+    ``mean_visit_s`` is the seconds total divided by the visit count, so
+    ``visits * mean_visit_s == seconds`` exactly. It is defined that way rather
+    than as the first-fix-to-last-fix span of each run because anyone reading
+    the two columns together will expect them to reconcile, and because a
+    one-fix visit has no span at all yet plainly contributed time.
+
+    A dropout mid-visit does not split a visit — the animal did not leave,
+    the tag stopped reporting — but the seconds it spans are still capped
+    out of the total, as everywhere else.
+    """
+    zone_idx = np.asarray(zone_idx)
+    seconds = np.zeros(n_zones + 1, dtype=float)
+    visits = np.zeros(n_zones + 1, dtype=np.int64)
+    mean_s = np.zeros(n_zones + 1, dtype=float)
+    dt = zone_intervals(timestamps)
+    if dt.size == 0 or zone_idx.size == 0:
+        return seconds, visits, mean_s
+
+    # 'outside' is the last slot, so map -1 there and everything else stays put.
+    slot = np.where(zone_idx < 0, n_zones, zone_idx).astype(np.int64)
+    np.add.at(seconds, slot, dt[:slot.size])
+
+    # Run boundaries: a fix starts a visit when its slot differs from the
+    # previous fix's.
+    starts = np.flatnonzero(np.r_[True, slot[1:] != slot[:-1]])
+    np.add.at(visits, slot[starts], 1)
+    nz = visits > 0
+    mean_s[nz] = seconds[nz] / visits[nz]
+    return seconds, visits, mean_s

@@ -24,15 +24,14 @@ from dataclasses import dataclass, asdict, fields
 
 import numpy as np
 
-# Locomotor state (mutually exclusive, one per animal per frame).
-# Deliberately bimodal: UWB centroid tracking of small animals does not resolve
-# a trustworthy third "running" tier - the speed that would separate it sits in
-# the same range as position noise once the track is smoothed at all.
-LOC_NODATA, LOC_INACTIVE, LOC_MOVING = 0, 1, 2
-LOCOMOTOR_LABELS = {LOC_NODATA: "no data", LOC_INACTIVE: "inactive",
-                    LOC_MOVING: "moving"}
+# Locomotor state detection was removed: an inactive/moving split off a single
+# speed threshold is trivially reproduced downstream from the smoothed CSV's
+# own coordinates, and doing it here forced a threshold choice into the
+# exports. NODATA survives because the social raster still needs a colour for
+# frames where an animal was not tracked.
+NODATA = 0
 
-# Social state (at most one per animal per frame; independent of locomotor)
+# Social state (at most one per animal per frame)
 # Ordered by precedence: a higher code overwrites a lower one when an animal
 # qualifies for several at once (being displaced outranks merely touching).
 SOC_NONE, SOC_CONTACT, SOC_DISPLACED, SOC_DISPLACING, SOC_CHASED, SOC_CHASING = 0, 1, 2, 3, 4, 5
@@ -41,11 +40,7 @@ SOCIAL_LABELS = {SOC_NONE: "", SOC_CONTACT: "contact",
                  SOC_CHASED: "chased", SOC_CHASING: "chasing"}
 
 # Display colours, shared by the canvas overlay and the state panel.
-STATE_COLORS = {
-    LOC_INACTIVE: "#7f8c99",
-    LOC_MOVING: "#4da3ff",
-    LOC_NODATA: "#4a4a4a",
-}
+NODATA_COLOR = "#4a4a4a"
 SOCIAL_COLORS = {
     SOC_CONTACT: "#2ea043",
     SOC_DISPLACING: "#c77dff",
@@ -63,9 +58,6 @@ class BehaviorParams:
     # overlap is when two circles intersect (centres within 2 * radius).
     # 0.25 m reproduces the existing 0.5 m centre-to-centre proximity exactly.
     social_radius: float = 0.25
-
-    # Locomotor speed cut (m/s): at or below is inactive, above is moving.
-    still_speed: float = 0.06
 
     # Chase: close, both moving, a heading at b, b heading away from a.
     chase_distance: float = 0.50
@@ -289,7 +281,6 @@ def classify(times, x, y, params=None):
     Returns a dict with:
       velocity, heading   (frames, tags)
       pairs               dict of (frames, tags, tags) geometry
-      locomotor           (frames, tags) LOC_* codes
       social              (frames, tags) SOC_* codes
       partner             (frames, tags) index of the social partner, else -1
       contact             (frames, tags, tags) bool, circles overlapping
@@ -316,12 +307,6 @@ def classify(times, x, y, params=None):
 
     n_frames, n_tags = velocity.shape
     have = np.isfinite(xh)
-
-    # --- locomotor --------------------------------------------------------
-    locomotor = np.full((n_frames, n_tags), LOC_NODATA, dtype=np.int8)
-    v_ok = np.isfinite(velocity)
-    locomotor[have & v_ok & (velocity <= params.still_speed)] = LOC_INACTIVE
-    locomotor[have & v_ok & (velocity > params.still_speed)] = LOC_MOVING
 
     # --- social overlap ---------------------------------------------------
     dist = pairs["dist"]
@@ -371,7 +356,7 @@ def classify(times, x, y, params=None):
     _assign(chase, SOC_CHASING)
 
     return {"velocity": velocity, "heading": heading, "pairs": pairs,
-            "locomotor": locomotor, "social": social, "partner": partner,
+            "social": social, "partner": partner,
             "contact": contact, "chase": chase, "dt": dt,
             "displacing": displacing, "displacements": displacements,
             "have_fix": have_fix, "present": have, "x": xh, "y": yh}
@@ -394,8 +379,7 @@ def speed_summary(velocity, have_fix, params):
     pct = {q: float(np.percentile(vals, q)) for q in (50, 90, 99)}
     msg = ("Speed of the shown track: half of fixes below {:.3f} m/s, "
            "fastest 1% above {:.3f} m/s.".format(pct[50], pct[99]))
-    over = [name for name, thr in (("moving", params.still_speed),
-                                   ("chasing", params.chase_speed))
+    over = [name for name, thr in (("chasing", params.chase_speed),)
             if thr > pct[99]]
     if over:
         msg += ("  Nothing can register as " + " or ".join(over) +
@@ -419,17 +403,17 @@ def speed_percentiles(velocity, qs=(50, 75, 90, 95, 99)):
     return {q: float(np.percentile(v, q)) for q in qs}
 
 
-def state_label(loc_code, soc_code):
-    """Single display label: social state when present, else locomotor."""
+def state_label(soc_code):
+    """Display label for a frame: the social state, or nothing."""
     if soc_code and soc_code != SOC_NONE:
         return SOCIAL_LABELS.get(soc_code, "")
-    return LOCOMOTOR_LABELS.get(loc_code, "")
+    return ""
 
 
-def state_color(loc_code, soc_code):
+def state_color(soc_code):
     if soc_code and soc_code != SOC_NONE:
         return SOCIAL_COLORS.get(soc_code, "#cccccc")
-    return STATE_COLORS.get(loc_code, "#cccccc")
+    return NODATA_COLOR
 
 
 def _runs(mask):

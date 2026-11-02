@@ -42,7 +42,7 @@ def detect_proximity_bouts(df, threshold=0.5, gap_s=5, tag_identities=None,
             timestamp, Day, Date, animal1, animal2, distance, in_proximity
         proximity_bouts columns:
             animal1, animal2, Day, Date, bout_start, bout_stop,
-            duration_s, mean_distance, n_observations
+            duration_s, mean_distance, n_reads
     """
     def _log(msg):
         if log_callback:
@@ -68,12 +68,29 @@ def detect_proximity_bouts(df, threshold=0.5, gap_s=5, tag_identities=None,
 
     # ── Prepare working copy ─────────────────────────────────────────────
     work = df[['Timestamp', 'shortid', x_col, y_col]].copy()
+    # Parse via UTC (robust to a recording that crosses a DST boundary and so
+    # carries two offsets), then convert back to the recording's own timezone
+    # so exported bout times read in local wall-clock like every other product.
     work['Timestamp'] = pd.to_datetime(work['Timestamp'], format='ISO8601',
                                        utc=True, errors='coerce')
     work = work.dropna(subset=['Timestamp', x_col, y_col])
+    # The tz is read off the CALLER's column, to convert back to it. That
+    # column may legitimately be strings - the line above parses them - and
+    # `.dt` on a string Series raises AttributeError rather than returning a
+    # default, so the guard has to sit on `.dt` itself, not on `.tz`. With
+    # string input there is no source timezone to return to and the parsed
+    # UTC value stands, which is the honest answer rather than a guess.
+    src = df['Timestamp'] if 'Timestamp' in df.columns else None
+    src_tz = getattr(getattr(src, 'dt', None), 'tz', None)
+    if src_tz is not None:
+        work['Timestamp'] = work['Timestamp'].dt.tz_convert(src_tz)
 
-    # Round timestamp to nearest second (reduces computation like R version)
-    work['ts_rounded'] = work['Timestamp'].dt.round('1s')
+    # Bin to 1 s to PAIR the animals. Tags report asynchronously at well under
+    # 1 Hz, so two animals essentially never share an exact millisecond: without
+    # a binning key the pairwise join would match almost nothing. The bin is
+    # only the join key — the true millisecond timestamps are carried alongside
+    # (ts_first/ts_last below) so bout edges and durations keep full resolution.
+    work['ts_rounded'] = work['Timestamp'].dt.floor('1s')
 
     # Derive Day and Date from timestamp.
     #
@@ -106,7 +123,7 @@ def detect_proximity_bouts(df, threshold=0.5, gap_s=5, tag_identities=None,
         empty_bouts = pd.DataFrame(columns=['animal1', 'animal2', 'Day',
                                             'Date', 'bout_start', 'bout_stop',
                                             'duration_s', 'mean_distance',
-                                            'n_observations'])
+                                            'n_reads'])
         return empty_events, empty_bouts
 
     _log(f"Computing pairwise distances for {len(animals)} animals "
@@ -121,6 +138,11 @@ def detect_proximity_bouts(df, threshold=0.5, gap_s=5, tag_identities=None,
     grouped = work.groupby(['ts_rounded', 'animal']).agg(
         x=(x_col, 'mean'),
         y=(y_col, 'mean'),
+        # True (millisecond) span of the fixes that fell in this bin, so a bout
+        # can later report when contact actually started/ended rather than the
+        # bin edge.
+        ts_first=('Timestamp', 'min'),
+        ts_last=('Timestamp', 'max'),
         Day=('Day', 'first'),
         Date=('Date', 'first')
     ).reset_index()
@@ -128,8 +150,10 @@ def detect_proximity_bouts(df, threshold=0.5, gap_s=5, tag_identities=None,
     # Build events via merge for each pair
     events_list = []
     for a1, a2 in pairs:
-        d1 = grouped[grouped['animal'] == a1][['ts_rounded', 'x', 'y', 'Day', 'Date']]
-        d2 = grouped[grouped['animal'] == a2][['ts_rounded', 'x', 'y']]
+        d1 = grouped[grouped['animal'] == a1][
+            ['ts_rounded', 'x', 'y', 'ts_first', 'ts_last', 'Day', 'Date']]
+        d2 = grouped[grouped['animal'] == a2][
+            ['ts_rounded', 'x', 'y', 'ts_first', 'ts_last']]
         merged = d1.merge(d2, on='ts_rounded', suffixes=('_1', '_2'))
         if merged.empty:
             continue
@@ -140,9 +164,15 @@ def detect_proximity_bouts(df, threshold=0.5, gap_s=5, tag_identities=None,
         merged['in_proximity'] = merged['distance'] <= threshold
         merged['animal1'] = a1
         merged['animal2'] = a2
+        # Millisecond envelope of the evidence for this pair in this bin: the
+        # earliest and latest real fix from either animal. Bout edges are taken
+        # from these, so bout_start/bout_stop are true observation times rather
+        # than 1 s bin edges.
+        merged['ts_first'] = merged[['ts_first_1', 'ts_first_2']].min(axis=1)
+        merged['ts_last'] = merged[['ts_last_1', 'ts_last_2']].max(axis=1)
         events_list.append(
-            merged[['ts_rounded', 'Day', 'Date', 'animal1', 'animal2',
-                     'distance', 'in_proximity']]
+            merged[['ts_rounded', 'ts_first', 'ts_last', 'Day', 'Date',
+                    'animal1', 'animal2', 'distance', 'in_proximity']]
         )
 
     if not events_list:
@@ -153,10 +183,13 @@ def detect_proximity_bouts(df, threshold=0.5, gap_s=5, tag_identities=None,
         empty_bouts = pd.DataFrame(columns=['animal1', 'animal2', 'Day',
                                             'Date', 'bout_start', 'bout_stop',
                                             'duration_s', 'mean_distance',
-                                            'n_observations'])
+                                            'n_reads'])
         return empty_events, empty_bouts
 
     proximity_events = pd.concat(events_list, ignore_index=True)
+    # 'timestamp' stays the 1 s pairing bin (that is what a per-bin distance
+    # refers to); ts_first/ts_last carry the millisecond evidence window and are
+    # consumed by the bout aggregation below.
     proximity_events = proximity_events.rename(columns={'ts_rounded': 'timestamp'})
     proximity_events = proximity_events.sort_values(
         ['animal1', 'animal2', 'timestamp']).reset_index(drop=True)
@@ -174,16 +207,19 @@ def detect_proximity_bouts(df, threshold=0.5, gap_s=5, tag_identities=None,
         empty_bouts = pd.DataFrame(columns=['animal1', 'animal2', 'Day',
                                             'Date', 'bout_start', 'bout_stop',
                                             'duration_s', 'mean_distance',
-                                            'n_observations'])
+                                            'n_reads'])
         return proximity_events, empty_bouts
 
     prox_only = prox_only.sort_values(['animal1', 'animal2', 'timestamp'])
 
-    # Calculate time gaps within each pair
-    prox_only['prev_ts'] = prox_only.groupby(
-        ['animal1', 'animal2'])['timestamp'].shift(1)
+    # Time gaps within each pair, measured between real fixes: from the last
+    # fix of the previous in-contact bin to the first fix of this one. The 1 s
+    # bin labels would quantise the gap (two bins 5 s apart can hold fixes
+    # anywhere from 4.0 to 6.0 s apart), so a bout could be bridged or split
+    # by where the fixes happened to fall relative to the bin edges.
+    prev_last = prox_only.groupby(['animal1', 'animal2'])['ts_last'].shift(1)
     prox_only['time_gap'] = (
-        prox_only['timestamp'] - prox_only['prev_ts']
+        prox_only['ts_first'] - prev_last
     ).dt.total_seconds()
 
     # New bout when gap > gap_s or first observation for pair
@@ -197,23 +233,29 @@ def detect_proximity_bouts(df, threshold=0.5, gap_s=5, tag_identities=None,
     proximity_bouts = prox_only.groupby(
         ['animal1', 'animal2', 'bout_id'], sort=False
     ).agg(
-        bout_start=('timestamp', 'min'),
-        bout_stop=('timestamp', 'max'),
+        # True millisecond edges: the first and last real fix supporting this
+        # contact, NOT the 1 s bins used to pair the animals.
+        bout_start=('ts_first', 'min'),
+        bout_stop=('ts_last', 'max'),
         mean_distance=('distance', 'mean'),
-        n_observations=('distance', 'count'),
+        n_reads=('distance', 'count'),
         Day=('Day', 'first'),
         Date=('Date', 'first')
     ).reset_index()
 
-    # Duration in seconds (floor at 1s like R version)
+    # Observed duration at full resolution. Deliberately NOT clipped to a 1 s
+    # floor as the original R port was: a bout supported by a single pair of
+    # near-simultaneous fixes genuinely spans only milliseconds, and rounding it
+    # up to a second overstated contact time. Sum n_reads instead if a
+    # sampling-interval-weighted budget is wanted.
     proximity_bouts['duration_s'] = (
         proximity_bouts['bout_stop'] - proximity_bouts['bout_start']
-    ).dt.total_seconds().clip(lower=1)
+    ).dt.total_seconds()
 
     # Select and order columns to match VoleCosm schema
     proximity_bouts = proximity_bouts[
         ['animal1', 'animal2', 'Day', 'Date', 'bout_start', 'bout_stop',
-         'duration_s', 'mean_distance', 'n_observations']
+         'duration_s', 'mean_distance', 'n_reads']
     ].sort_values(['animal1', 'animal2', 'bout_start']).reset_index(drop=True)
 
     # Present Date as a plain calendar date, matching the previous output.

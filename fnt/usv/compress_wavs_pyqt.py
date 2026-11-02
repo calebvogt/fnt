@@ -4,9 +4,36 @@ import subprocess
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QLabel, QTextEdit, QFileDialog, 
                              QMessageBox, QGroupBox, QLineEdit, QProgressBar, QFrame,
-                             QScrollArea, QComboBox)
-from PyQt5.QtCore import QThread, pyqtSignal, Qt
+                             QScrollArea, QComboBox, QCheckBox)
+from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer
 from PyQt5.QtGui import QFont
+
+#: Stops each ffmpeg call opening a console window of its own when the tool
+#: was started without a console (pythonw, a shortcut, a queued launch).
+NO_WINDOW = ({"creationflags": subprocess.CREATE_NO_WINDOW}
+             if os.name == "nt" else {})
+
+
+def media_duration(path):
+    """Length in seconds as ffprobe reads it from the header, or None."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=60, **NO_WINDOW)
+        return float(r.stdout.strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def already_compressed(input_path, output_path, tolerance=0.05):
+    """True when ``output_path`` exists and is as long as ``input_path`` --
+    a file cut short by a crash or a stop is not, so it is done again."""
+    if not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
+        return False
+    a, b = media_duration(input_path), media_duration(output_path)
+    return a is not None and b is not None and abs(a - b) <= tolerance
+
 
 class CompressWorker(QThread):
     """Worker thread for compressing WAV files"""
@@ -14,11 +41,12 @@ class CompressWorker(QThread):
     file_progress = pyqtSignal(int, int)  # current file, total files
     finished = pyqtSignal(bool, str)
     
-    def __init__(self, folder_path, output_folder, codec):
+    def __init__(self, folder_path, output_folder, codec, skip_done=False):
         super().__init__()
         self.folder_path = folder_path
         self.output_folder = output_folder
         self.codec = codec
+        self.skip_done = skip_done
         self._stop_requested = False
     
     def stop(self):
@@ -40,7 +68,8 @@ class CompressWorker(QThread):
             
             self.progress.emit(f"Found {len(wav_files)} WAV file(s)\n")
             self.progress.emit(f"Using codec: {self.codec}\n")
-            
+            skipped = 0
+
             # Process each file
             for idx, wav_file in enumerate(wav_files, 1):
                 # Check if stop was requested
@@ -55,8 +84,16 @@ class CompressWorker(QThread):
                 
                 # Update progress
                 self.file_progress.emit(idx, len(wav_files))
+                if self.skip_done and already_compressed(input_path, output_path):
+                    skipped += 1
+                    self.progress.emit(f"[{idx}/{len(wav_files)}] Already compressed: {wav_file}")
+                    continue
                 self.progress.emit(f"\n[{idx}/{len(wav_files)}] Processing: {wav_file}")
-                
+
+                # Written under a temporary name and renamed once ffmpeg
+                # succeeds, so a crash or a stop never leaves a short file
+                # under the real name.
+                part_path = output_path + ".part"
                 # ffmpeg command: downsample to 250kHz, mono, selected codec
                 cmd = [
                     "ffmpeg",
@@ -64,8 +101,9 @@ class CompressWorker(QThread):
                     "-ar", "250000",  # 250kHz sample rate
                     "-ac", "1",       # mono
                     "-c:a", self.codec,
+                    "-f", "wav",
                     "-y",  # overwrite output
-                    output_path
+                    part_path
                 ]
                 
                 try:
@@ -75,8 +113,10 @@ class CompressWorker(QThread):
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
                         text=True,
-                        check=True
+                        check=True,
+                        **NO_WINDOW
                     )
+                    os.replace(part_path, output_path)
                     
                     # Show stderr (ffmpeg progress info)
                     if result.stderr:
@@ -91,8 +131,12 @@ class CompressWorker(QThread):
                 except subprocess.CalledProcessError as e:
                     self.progress.emit(f"✗ Error processing {wav_file}: {e}")
                     self.progress.emit(f"stderr: {e.stderr}")
-            
+                    if os.path.exists(part_path):
+                        os.remove(part_path)
+
             self.progress.emit("\n" + "="*50)
+            if skipped:
+                self.progress.emit(f"{skipped} file(s) were already compressed and were kept")
             self.progress.emit("✅ All files compressed successfully!")
             self.finished.emit(True, "Compression completed successfully!")
             
@@ -272,6 +316,13 @@ class CompressWavsWindow(QMainWindow):
         self.codec_info_label.setWordWrap(True)
         folder_layout.addWidget(self.codec_info_label)
         
+        self.chk_skip_done = QCheckBox(
+            "Skip files already compressed (output as long as the original)")
+        self.chk_skip_done.setToolTip(
+            "Resumes an interrupted run: an output cut short by a crash or a "
+            "stop is a different length, so it is compressed again.")
+        folder_layout.addWidget(self.chk_skip_done)
+        
         info_label = QLabel("Compressed files saved to output subfolder in input directory")
         info_label.setStyleSheet("color: #999999; font-style: italic; margin-top: 10px;")
         info_label.setWordWrap(True)
@@ -426,6 +477,7 @@ class CompressWavsWindow(QMainWindow):
         self.btn_process.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.codec_combo.setEnabled(False)
+        self.chk_skip_done.setEnabled(False)
         
         # Show progress bar
         self.progress_bar.setVisible(True)
@@ -458,7 +510,8 @@ class CompressWavsWindow(QMainWindow):
         self.txt_output_display.append("="*50 + "\n")
         
         # Create and start worker thread
-        self.worker = CompressWorker(folder_path, output_folder, self.codec)
+        self.worker = CompressWorker(folder_path, output_folder, self.codec,
+                                     skip_done=self.chk_skip_done.isChecked())
         self.worker.progress.connect(self.update_progress)
         self.worker.file_progress.connect(self.update_file_progress)
         self.worker.finished.connect(self.folder_compression_finished)
@@ -515,6 +568,7 @@ class CompressWavsWindow(QMainWindow):
         self.btn_process.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.codec_combo.setEnabled(True)
+        self.chk_skip_done.setEnabled(True)
         
         # Hide progress bar
         self.progress_bar.setVisible(False)
@@ -526,10 +580,48 @@ class CompressWavsWindow(QMainWindow):
             QMessageBox.critical(self, "Error", message)
 
 
-def main():
-    app = QApplication(sys.argv)
+def _launch_parser():
+    """``--input-dir DIR`` (repeatable) preselects folders; ``--start`` then
+    runs them with the window's default settings, exactly as pressing Start
+    Compression would -- so a dictated or queued run still shows its progress
+    on screen."""
+    import argparse
+    p = argparse.ArgumentParser(prog="compress-wavs",
+                                description="FNT Compress WAV Files.")
+    p.add_argument("--input-dir", action="append", default=[], metavar="DIR",
+                   help="Folder of WAV files to compress (repeatable).")
+    p.add_argument("--start", action="store_true",
+                   help="Start compressing the --input-dir folders at once, "
+                        "with the default settings.")
+    p.add_argument("--skip-done", action="store_true",
+                   help="Tick 'Skip files already compressed' (resumes an "
+                        "interrupted run).")
+    return p
+
+
+def apply_launch_args(window, args) -> None:
+    """Preselect ``args.input_dir`` in ``window``; start if ``args.start``."""
+    if getattr(args, "skip_done", False):
+        window.chk_skip_done.setChecked(True)
+    for d in args.input_dir:
+        d = os.path.abspath(d)
+        if os.path.isdir(d) and d not in window.folder_paths:
+            window.folder_paths.append(d)
+    if window.folder_paths:
+        window.update_folder_display()
+        window.btn_process.setEnabled(True)
+        window.btn_clear.setEnabled(True)
+        if args.start:
+            QTimer.singleShot(500, window.start_compression)
+
+
+def main(argv=None):
+    args, qt_args = _launch_parser().parse_known_args(
+        sys.argv[1:] if argv is None else argv)
+    app = QApplication([sys.argv[0]] + qt_args)
     window = CompressWavsWindow()
     window.show()
+    apply_launch_args(window, args)
     sys.exit(app.exec_())
 
 

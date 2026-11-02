@@ -36,11 +36,50 @@
 - 
 
 
+## MAD (Mask Audio Detector)
+- self-supervised pretraining on our own unlabeled audio. ImageNet-pretrained resnet50 is a poor prior for spectrograms; we have ~3.7 TB of unlabeled VoleCosm USV audio sitting there. Masked-autoencoder or contrastive pretraining of the encoder on our own spectrograms, then fine-tune the U-Net. Highest ceiling of the generalization ideas, also the most work — do it once labeling breadth stops being the bottleneck.
+- harmonic linker. MAD has no way to relate a harmonic to its fundamental (CAD's harmonic columns are deliberately omitted). Current labeling policy is fundamentals only, so this only matters if harmonic structure itself becomes a variable of interest.
+- cross-recording call-type clustering / UMAP off the stored per-call embeddings (`mad embeddings`) — overlaps with the UMAP item above.
+- active learning is a *workflow* change not a code one: label the calls whose score sits near the decision threshold rather than labeling in file order. Sort the Detections list by Score and work the middle.
+- watch the train/val split when adding labeled recordings. With very unbalanced per-file label counts, `grouped_split` can hold out most of the data; the run summary reports `split_level` and val tile count — check it rather than trusting the number.
+
 # video tracking
 - improve the video tracking/optical flow SAM module tab; still underperforming
 
 # video processing
  - explore CLAHE algo implementation for video processing; may not be necessary
+
+# Camera Grid
+Cross-camera sync is currently anchored on the day-bucket stamp plus accumulated
+segment duration. Measured on T005: each camera carries a small, STABLE offset
+from that anchor (cam1 +0.36s, cam4 +0.85s, cam2 +1.11s, cam3 +1.47s; sd 0.08s
+for the well-read cameras over a full day), giving about a 1.0s spread between
+cells. Fine for scoring a transition, but the residual is structured rather than
+random, so it is correctable.
+
+- **Manual clock calibration.** Per-camera frame-by-frame nudge: the user steps
+  each cell until its burnt-in clock ticks over, and every camera is aligned to
+  the first frame of the SAME named second. One frame at 30fps is 33ms, roughly
+  30x tighter than today. Offsets are stable across a trial, so this is a
+  one-time-per-trial step that amortises over a multi-day encode. Sidesteps the
+  OCR problem below entirely, since a human reads a cluttered clock easily.
+  Must display each camera's current clock VALUE, not just "a tick" - aligning
+  cam1's :30 to cam3's :32 would lock in a whole-second error.
+- **Audio cross-correlation calibration.** Cameras sharing a room hear the same
+  sounds, so cross-correlating their audio would align them to the millisecond -
+  far beyond what a 1-second burnt-in clock can resolve, and with no OCR at all.
+  Only possible from RAW footage: the preprocessing step strips the mono PCM
+  track the ViewTron writes. Highest achievable precision of the three options.
+- **Automatic clock calibration** (partially prototyped). Detect the frame where
+  the burnt-in clock ticks and derive a sub-second phase. Works well on cameras
+  whose clock sits over dark background (cam1/cam4 measured to sd ~0.09s), but
+  the template matcher fails on cam5, where the clock overlays bright clutter,
+  and is spotty on cam2/cam3. Temporal differencing would likely isolate the
+  digits - they change every second while the background does not.
+- Recorder profiles beyond ViewTron, for NVRs whose offload windows are not
+  midnight-to-midnight and whose naming we do not yet model.
+- Consider caching per-camera normalised streams so re-running a trial with a
+  different layout does not re-decode everything.
 
  # sleap tools
 - for roi tool; auto load the keypoint tracking and allow user to scroll through with the track labels. 

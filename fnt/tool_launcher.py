@@ -39,17 +39,12 @@ class ToolSpec:
 TOOL_REGISTRY = {
     spec.key: spec for spec in [
         # --- Behavior / acquisition ---
-        ToolSpec("abma_designer", "fnt.abma.gui.abma_main_pyqt",
-                 "ABMAWindow", "ABMA Designer",
-                 post_show="show_start_dialog"),   # New / Open project chooser
         ToolSpec("rfid_preprocessing", "fnt.rfid.rfid_preprocessing_pyqt",
                  "RFIDPreprocessingWindow", "RFID PreProcessing"),
         # FED3 runs devices that keep going without it, so its window can live
         # in its own process like every other tool: a crash costs the window,
         # never the experiment. One copy only, since two would fight over ports.
         ToolSpec("fed3", "fnt.fed3.ui.window", "FedWindow", "FED3", multi=False),
-        ToolSpec("musestudio", "fnt.musestudio.musestudio_pyqt",
-                 "MuseStudioWindow", "Muse Studio"),
 
         # --- Video processing ---
         ToolSpec("video_trim", "fnt.videoProcessing.video_trim_pyqt",
@@ -60,6 +55,8 @@ TOOL_REGISTRY = {
                  "VideoProcessingGUI", "Video PreProcessing"),
         ToolSpec("behavior_scoring", "fnt.videoProcessing.behavior_scoring_studio_pyqt",
                  "BehaviorScoringStudioWindow", "Behavior Scoring Studio"),
+        ToolSpec("camera_grid", "fnt.videoProcessing.camera_grid_pyqt",
+                 "CameraGridWindow", "Camera Grid"),
 
         # --- SLEAP / pose ---
         ToolSpec("sleap_inference", "fnt.sleapProcessing.sleap_inference_tool_pyqt",

@@ -31,16 +31,27 @@ Batch analysis module for detecting pairwise proximity events between tracked an
 
 ## Input Data Format
 
-The tool expects UWB data with at minimum:
+The input is a **Wiser tracking server SQLite database**. The columns the
+pipeline reads are:
 
 | Column | Description |
 |--------|-------------|
-| `Timestamp` | ISO 8601 timestamp (UTC or local) |
-| `shortid` | UWB tag identifier |
-| `location_x` | X position (metres) |
-| `location_y` | Y position (metres) |
+| `timestamp` | milliseconds since the Unix epoch (an instant, not a local time) |
+| `shortid` | UWB tag identifier (decimal encoding of the hex Tag ID) |
+| `location_x` | X position **in inches** — converted to metres on read |
+| `location_y` | Y position **in inches** — converted to metres on read |
+| `battery_voltage` | optional per-tag readout |
 
-Additional columns (e.g., `location_z`, `location_quality`) are preserved during export.
+Everything else in the table is left alone. Two columns look like quality
+metrics and are deliberately **not** used for filtering: `calculation_error`
+is not anchor-count-neutral (a fix from 3-5 anchors reports a perfect zero
+71% of the time against 35% for a fix from 21+, because there is too little
+redundancy for few anchors to disagree), and gating on `anchors_used` can lengthen the very steps it is
+meant to remove.
+
+See **[WISER_SCHEMA.md](WISER_SCHEMA.md)** for the full column reference, the
+reverse-engineered form of `calculation_error`, the clock's measured
+behaviour, and how to read the exported timestamps downstream.
 
 ## Output
 

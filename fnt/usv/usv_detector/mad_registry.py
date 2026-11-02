@@ -6,7 +6,7 @@ That made projects self-contained but duplicated hundreds of MB per file (a
 the copy never reached the original and vice versa.
 
 The copies were never needed for *training*. MAD bakes each confirmed call into
-``models/training_data/training_data.h5`` as a self-contained spectrogram patch
+``training_data/training_data.h5`` as a self-contained spectrogram patch
 plus mask, and ``mad_training`` reads only that store — it never opens a wav. So
 the audio is needed for exactly one thing: re-opening a file to look at it. That
 is a much weaker dependency than SLEAP has on its videos (SLEAP stores only frame
@@ -25,7 +25,7 @@ import hashlib
 import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Callable, Dict, Iterable, List, Optional, Sequence
 
 
 # Bytes read from each end of the file for the content fingerprint. Wav headers
@@ -95,8 +95,41 @@ class RegisteredFile:
         return bool(self.path) and os.path.isfile(self.path)
 
 
+class _DirIndex:
+    """Answers "does this file exist?" from one listing per directory.
+
+    A project registers thousands of recordings in a handful of folders, and
+    every ``os.path.isfile`` on a network share is a round trip: 6,252 of them
+    measured 5.3 s, all of it on the UI thread during project open. Listing
+    each directory once instead costs three round trips for the same project.
+
+    Falls back to a direct stat for any directory that cannot be listed, so a
+    permission-restricted folder degrades to the old behaviour rather than
+    reporting every file in it as missing.
+    """
+
+    def __init__(self):
+        self._dirs: Dict[str, Optional[set]] = {}
+
+    def exists(self, path: str) -> bool:
+        if not path:
+            return False
+        d = os.path.dirname(path) or '.'
+        names = self._dirs.get(d, False)
+        if names is False:
+            try:
+                names = {e.name.lower() for e in os.scandir(d) if not e.is_dir()}
+            except Exception:
+                names = None            # unlistable: stat individually below
+            self._dirs[d] = names
+        if names is None:
+            return os.path.isfile(path)
+        return os.path.basename(path).lower() in names
+
+
 def _candidate_dirs(entries: Sequence[RegisteredFile],
-                    extra_roots: Iterable[str]) -> List[str]:
+                    extra_roots: Iterable[str],
+                    index: Optional['_DirIndex'] = None) -> List[str]:
     """Directories worth searching for a missing file, most likely first.
 
     Files move in groups — a whole experiment folder gets relocated — so the
@@ -112,8 +145,9 @@ def _candidate_dirs(entries: Sequence[RegisteredFile],
         if n not in {os.path.normcase(x) for x in seen} and os.path.isdir(d):
             seen.append(d)
 
+    idx = index if index is not None else _DirIndex()
     for e in entries:
-        if e.exists():
+        if idx.exists(e.path):
             add(os.path.dirname(e.path))
     for r in extra_roots:
         add(r)
@@ -139,8 +173,9 @@ def resolve_entries(
     """
     out: Dict[str, Optional[str]] = {}
     unresolved: List[RegisteredFile] = []
+    index = _DirIndex()
     for e in entries:
-        if e.exists():
+        if index.exists(e.path):
             out[e.path] = e.path
         else:
             out[e.path] = None
@@ -148,22 +183,11 @@ def resolve_entries(
     if not unresolved:
         return out
 
-    for d in _candidate_dirs(entries, extra_roots):
+    for d in _candidate_dirs(entries, extra_roots, index):
         still: List[RegisteredFile] = []
         for e in unresolved:
             cand = os.path.join(d, e.basename)
-            if not os.path.isfile(cand):
-                still.append(e)
-                continue
-            try:
-                if e.size and os.path.getsize(cand) != e.size:
-                    still.append(e)
-                    continue
-            except OSError:
-                still.append(e)
-                continue
-            if (verify_fingerprint and e.fingerprint
-                    and file_fingerprint(cand) != e.fingerprint):
+            if not _accepts(e, cand, verify_fingerprint):
                 still.append(e)
                 continue
             out[e.path] = os.path.abspath(cand)
@@ -185,6 +209,97 @@ def _is_under(path: str, prefix: str) -> bool:
     if p == q:
         return True
     return p.startswith(q + os.sep) or p.startswith(q + '/')
+
+
+def _accepts(entry: 'RegisteredFile', candidate: str,
+             verify_fingerprint: bool = True) -> bool:
+    """Is ``candidate`` the same recording as ``entry``?
+
+    Size first (cheap), then the content fingerprint when both are known. A
+    same-named different recording is never accepted silently — that would
+    repoint a project at the wrong audio, which is far worse than leaving the
+    row flagged.
+    """
+    if not os.path.isfile(candidate):
+        return False
+    try:
+        if entry.size and os.path.getsize(candidate) != entry.size:
+            return False
+    except OSError:
+        return False
+    if verify_fingerprint and entry.fingerprint:
+        return file_fingerprint(candidate) == entry.fingerprint
+    return True
+
+
+def _shared_tail(a: str, b: str) -> int:
+    """How many trailing path components two paths have in common."""
+    pa = Path(os.path.abspath(a)).parts
+    pb = Path(os.path.abspath(b)).parts
+    n = 0
+    while (n < min(len(pa), len(pb))
+           and os.path.normcase(pa[-1 - n]) == os.path.normcase(pb[-1 - n])):
+        n += 1
+    return n
+
+
+def index_tree_by_basename(
+    root: str, suffixes: Sequence[str] = ('.wav',),
+    progress: Optional[Callable[[int, str], None]] = None,
+) -> Dict[str, List[str]]:
+    """``{lowercased basename: [paths]}`` for every matching file under ``root``.
+
+    One walk, reused for every missing entry — the alternative is re-walking a
+    large tree per file, which on a network share is the difference between
+    seconds and minutes.
+    """
+    idx: Dict[str, List[str]] = {}
+    n = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith('.'))
+        for fn in filenames:
+            if fn.lower().endswith(tuple(suffixes)) and not fn.startswith('.'):
+                idx.setdefault(os.path.normcase(fn), []).append(
+                    os.path.join(dirpath, fn))
+                n += 1
+        if progress is not None:
+            progress(n, dirpath)
+    return idx
+
+
+def resolve_in_tree(
+    entries: Sequence['RegisteredFile'], root: str,
+    verify_fingerprint: bool = True,
+    progress: Optional[Callable[[int, str], None]] = None,
+) -> Dict[str, str]:
+    """Find missing entries anywhere under ``root``, by name then content.
+
+    Complements :func:`remap_prefix`, which needs the tree to have moved as a
+    unit. This handles the case where recordings were reorganized, split across
+    subfolders, or renamed around — the user points at a folder and says "it is
+    somewhere in here".
+
+    Returns ``{old_path: found_path}`` for entries that were resolved; entries
+    already present, or with no acceptable match, are simply absent.
+    """
+    missing = [e for e in entries if not e.exists()]
+    if not missing or not root or not os.path.isdir(root):
+        return {}
+    idx = index_tree_by_basename(root, progress=progress)
+    out: Dict[str, str] = {}
+    for e in missing:
+        cands = idx.get(os.path.normcase(e.basename), ())
+        # A recording can legitimately exist in more than one place (a working
+        # copy and an archive, say) with byte-identical audio, so the content
+        # check cannot separate them. Prefer the candidate sitting in the most
+        # similar location to where this entry used to live: MAD's labels are
+        # sibling files, so picking the wrong copy silently swaps in a different
+        # label set. Walk order is not a defensible tiebreak.
+        for cand in sorted(cands, key=lambda c: -_shared_tail(e.path, c)):
+            if _accepts(e, cand, verify_fingerprint):
+                out[e.path] = os.path.abspath(cand)
+                break
+    return out
 
 
 def remap_prefix(entries: Sequence[RegisteredFile],

@@ -20,8 +20,11 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.patches import Circle, Polygon as MplPolygon
 from matplotlib.collections import LineCollection
+import matplotlib.patheffects as pe
 
 import cv2
+
+from fnt.uwb.identities import SEX_ID, tag_label
 
 
 # Video render resolution per the quality preset shown in the UI.
@@ -83,11 +86,14 @@ _NEUTRAL_COLOR = 'blue'
 
 
 def build_tag_styles(tags, tag_identities=None, use_custom_identities=False,
-                     color_by="None"):
+                     color_by="None", id_type=SEX_ID):
     """Map each tag id to its {'label', 'color'} for the animation.
 
-    Labels follow the configured identities (``sex-identity`` when available,
-    otherwise a ``HexID`` label). Colour is governed by ``color_by``:
+    Labels use ``id_type`` exactly as the preview's Show Tag ID selector does
+    (SexID / Name / Code / HexID / ShortID, see identities.tag_label), so the
+    video reads the same as the view it was tuned in. With
+    ``use_custom_identities`` off, identities are ignored and every tag falls
+    back to its HexID. Colour is governed by ``color_by``:
 
     * ``"None"`` (default) — every tag drawn in a single neutral colour.
     * ``"ID"``            — a distinct colour per tag (``tab20`` palette).
@@ -104,17 +110,9 @@ def build_tag_styles(tags, tag_identities=None, use_custom_identities=False,
         id_palette = {tag: cmap(idx % 20) for idx, tag in enumerate(tags)}
 
     for tag in tags:
-        # Label: prefer configured identity, else HexID.
-        if use_custom_identities and tag in tag_identities:
-            info = tag_identities[tag]
-            sex = info.get('sex', 'M')
-            identity = info.get('identity', str(tag))
-            label = f"{sex}-{identity}"
-        else:
-            info = tag_identities.get(tag, {})
-            sex = info.get('sex', 'M')
-            hex_id = hex(int(tag)).upper().replace('0X', '')
-            label = f"HexID {hex_id}"
+        info = tag_identities.get(tag, {}) or {}
+        sex = info.get('sex', 'M')
+        label = tag_label(tag, info if use_custom_identities else None, id_type)
 
         if color_mode == "id":
             color = id_palette[tag]
@@ -128,35 +126,169 @@ def build_tag_styles(tags, tag_identities=None, use_custom_identities=False,
 
 
 def draw_static_context(ax, layers, *, bg_image=None, bg_extent=None,
-                        arena_zones=None, anchors=None, log=None):
+                        zones_xml=None, arena_zones=None, anchors=None,
+                        rois=None, log=None):
     """Draw the background image, zone polygons (with labels) and anchors.
 
     Gated by ``layers`` (dict with 'background'/'zones'/'anchors' booleans).
-    ``arena_zones`` is a DataFrame with columns ('zone', 'x', 'y'); ``anchors``
-    is a list of dicts with 'x'/'y'. Must be idempotent — the frame loop calls
-    it after every ``ax.clear()``.
+    ``zones_xml`` is the preview's list of {name, color, points} polygons and is
+    preferred, so the video shows the zones in the SAME authored colours the
+    preview drew them in; ``arena_zones`` (a DataFrame with columns
+    ('zone', 'x', 'y')) is the fallback for a config that carries only the flat
+    table. ``anchors`` is a list of dicts with 'x'/'y'. Must be idempotent — the
+    frame loop calls it after every ``ax.clear()``.
     """
     layers = layers or {}
     if layers.get('background') and bg_image is not None and bg_extent is not None:
         ax.imshow(bg_image, extent=list(bg_extent), origin='upper',
                   aspect='auto', alpha=0.6, zorder=0)
-    if layers.get('zones') and arena_zones is not None and not arena_zones.empty:
+    if layers.get('zones'):
         try:
-            for zone_name in arena_zones['zone'].unique():
-                coords = arena_zones[arena_zones['zone'] == zone_name][['x', 'y']].values
-                if len(coords) >= 3:  # need >=3 points for a polygon
-                    ax.add_patch(MplPolygon(coords, fill=False, edgecolor='black',
-                                            linewidth=1.5, linestyle='--', zorder=1))
-                    cx, cy = coords[:, 0].mean(), coords[:, 1].mean()
-                    ax.text(cx, cy, zone_name, fontsize=8, ha='center', va='center',
-                            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.5),
-                            zorder=1)
+            if zones_xml:
+                for z in zones_xml:
+                    pts = np.asarray(z.get('points'), float)
+                    if pts.ndim != 2 or len(pts) < 3:
+                        continue
+                    # "Arena" is the enclosure boundary, not a zone: outline
+                    # only, so it never tints the floor it encloses.
+                    is_bounds = (z.get('name', '') or '').strip().lower() == 'arena'
+                    color = z.get('color', '#888888')
+                    ax.add_patch(MplPolygon(
+                        pts, closed=True,
+                        facecolor='none' if is_bounds else color,
+                        edgecolor=color,
+                        alpha=1.0 if is_bounds else 0.28,
+                        linewidth=2.0 if is_bounds else 1.2, zorder=1))
+                    if not is_bounds:
+                        cx, cy = pts[:, 0].mean(), pts[:, 1].mean()
+                        ax.text(cx, cy, z.get('name', ''), fontsize=8,
+                                color='#111111', fontweight='bold',
+                                ha='center', va='center', zorder=1,
+                                path_effects=[pe.withStroke(linewidth=2.2,
+                                                            foreground='white')])
+            elif arena_zones is not None and not arena_zones.empty:
+                for zone_name in arena_zones['zone'].unique():
+                    coords = arena_zones[arena_zones['zone'] == zone_name][['x', 'y']].values
+                    if len(coords) >= 3:  # need >=3 points for a polygon
+                        ax.add_patch(MplPolygon(coords, fill=False, edgecolor='black',
+                                                linewidth=1.5, linestyle='--', zorder=1))
+                        cx, cy = coords[:, 0].mean(), coords[:, 1].mean()
+                        ax.text(cx, cy, zone_name, fontsize=8, ha='center', va='center',
+                                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.5),
+                                zorder=1)
         except Exception as e:  # never let a zone glitch abort the render
             if log:
                 log(f"Error drawing zones in animation: {e}")
+    # The user's own regions (see fnt.uwb.uwb_roi): outline plus a faint
+    # wash, so a track running through one stays readable.
+    if layers.get('rois', True) and rois:
+        from fnt.uwb.uwb_preview_canvas import label_halo
+        for r in rois:
+            pts = np.asarray(r.get('points'), dtype=float).reshape(-1, 2)
+            if len(pts) < 3:
+                continue
+            col = r.get('color', '#e6194b')
+            ax.add_patch(MplPolygon(pts, closed=True, facecolor=col,
+                                    alpha=0.10, edgecolor='none', zorder=1.5))
+            ax.add_patch(MplPolygon(pts, closed=True, facecolor='none',
+                                    edgecolor=col,
+                                    linewidth=float(r.get('linewidth', 2.0)),
+                                    zorder=1.6))
+            ax.annotate(r.get('name', ''),
+                        (pts[:, 0].mean(), pts[:, 1].mean()), color=col,
+                        fontsize=8, fontweight='bold', ha='center',
+                        va='center', zorder=5,
+                        path_effects=label_halo(col, 2.2))
+
     if layers.get('anchors') and anchors:
         ax.scatter([a['x'] for a in anchors], [a['y'] for a in anchors],
                    marker='^', s=40, c='#f2c24f', edgecolors='none', zorder=2)
+
+
+def _build_sky_icon(ax, size_pt):
+    """Every sky state's artists, made once and hidden (animated) until drawn.
+
+    ``size_pt`` is the icon's width in points, to turn the shapes' line
+    widths (fractions of the box) into matplotlib linewidths.
+    """
+    from matplotlib.lines import Line2D
+    from fnt.uwb import weather as wx
+    out = {}
+    for state in wx.SKY_STATES:
+        arts = []
+        for shape in wx.sky_icon_shapes(state):
+            kind = shape[0]
+            if kind == "circle":
+                a = Circle(shape[1], shape[2], facecolor=shape[3],
+                           edgecolor='none', animated=True)
+                ax.add_patch(a)
+            elif kind == "poly":
+                a = MplPolygon(np.asarray(shape[1]), closed=True,
+                               facecolor=shape[2], edgecolor='none',
+                               animated=True)
+                ax.add_patch(a)
+            else:
+                (x0, y0), (x1, y1) = shape[1]
+                a = Line2D([x0, x1], [y0, y1], color=shape[2],
+                           linewidth=max(shape[3] * size_pt, 0.6),
+                           solid_capstyle='round', animated=True)
+                ax.add_line(a)
+            arts.append(a)
+        out[state] = arts
+    return out
+
+
+def _draw_environment(timeline, frame_start, weather_artist, light, units, fig):  # noqa: E501
+    """Per-frame weather line and light bar (blitted like everything else)."""
+    from fnt.uwb import weather as wx
+    t_ns = frame_start.value
+    state = timeline.at(t_ns)
+    if weather_artist is not None:
+        weather_artist.set_text(wx.format_weather(state, units)
+                                or "weather: no record near this time")
+        fig.draw_artist(weather_artist)
+    if light is None:
+        return
+    day = frame_start.normalize()
+    if light['day'] != day:
+        nxt = (day.tz_localize(None) + pd.Timedelta(days=1))
+        nxt = (nxt.tz_localize(day.tz, ambiguous=True, nonexistent='shift_forward')
+               if day.tz is not None else nxt)
+        _t, levels, moon = timeline.light_strip(day.value, nxt.value, 480)
+        rgb = np.array([wx.light_rgb(v if np.isfinite(v) else 0.0, m)
+                        for v, m in zip(levels, moon)])[None, :, :]
+        light['strip'].set_data(rgb)
+        rate, kind = timeline.precip_strip(day.value, nxt.value, 480)
+        band = np.zeros((1, len(rate), 4))
+        for i, (r, k) in enumerate(zip(rate, kind)):
+            c = wx.precip_rgba(r, k)
+            if c is not None:
+                band[0, i] = c
+        light['precip'].set_data(band)
+        light['day'] = day
+        light['span'] = (day.value, nxt.value)
+    a, b = light['span']
+    f = (t_ns - a) / max(b - a, 1)
+    light['cursor'].set_xdata([f, f])
+    sky = timeline.sky(t_ns) if hasattr(timeline, 'sky') else None
+    light['text'].set_text(" · ".join(
+        t for t in (wx.format_sky(sky), wx.format_light(state)) if t))
+    fig.draw_artist(light['text'])
+    if sky and light.get('sky_ax') is not None:
+        for a in light['sky'].get(sky['state'], ()):
+            light['sky_ax'].draw_artist(a)
+    lax = light['ax']
+    for key in ('strip', 'precip', 'ticks', 'cursor'):
+        lax.draw_artist(light[key])
+    k = state.get('moon_illumination', np.nan)
+    if np.isfinite(k):
+        light['moon_lit'].set_xy(wx.moon_disc_polygon(
+            k, state.get('moon_waxing', True), state.get('southern', False)))
+        alpha = 1.0 if state.get('moon_up', True) else 0.5
+        light['moon_disc'].set_alpha(alpha)
+        light['moon_lit'].set_alpha(alpha)
+        light['moon_ax'].draw_artist(light['moon_disc'])
+        light['moon_ax'].draw_artist(light['moon_lit'])
 
 
 def compute_axis_limits(data, layers=None, bg_extent=None, pad_frac=0.05):
@@ -175,11 +307,17 @@ def compute_axis_limits(data, layers=None, bg_extent=None, pad_frac=0.05):
 def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
                      dpi=100, speed_text="", title="UWB Tracking Animation",
                      layers=None, bg_image=None, bg_extent=None,
-                     arena_zones=None, anchors=None,
+                     zones_xml=None, arena_zones=None, anchors=None,
+                     rois=None,
                      tag_identities=None, use_custom_identities=False,
+                     id_type=SEX_ID,
                      color_by="None", marker_size=10, show_battery=False,
+                     show_speed=False, show_step=False, gap_s=60.0,
+                     label_color=None, label_outline=True,
                      axis_limits=None, behavior=None, show_trail=True,
-                     show_labels=True, time_range=None,
+                     show_labels=True, time_range=None, data_view=None,
+                     environment=None, show_weather=False, show_light=False,
+                     weather_units="metric", day_one=None,
                      is_cancelled=None, progress=None, log=None):
     """Render tracking frames to an MP4 at ``output_path``.
 
@@ -194,16 +332,25 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
         circle_color edge colour for those circles
         grid         int64 ns timestamps of the classification frames
         tags         tag ids, in the column order of `loc`/`soc`
-        loc          (frames, tags) locomotor codes, or None
         soc          (frames, tags) social codes, or None
         links        (n, 4) int32 rows of (frame, i, j, kind), sorted by frame
         link_colors  {kind: colour}
-        state_labels {"loc": {code: text}, "soc": {code: text}}
-        state_colors {"loc": {code: colour}, "soc": {code: colour}}
+        state_labels {"soc": {code: text}}
+        state_colors {"soc": {code: colour}}
 
     The classification grid is independent of the video frame rate: each video
     frame takes the classification row nearest its own timestamp, so the
     overlay stays correct whatever speed the video is rendered at.
+
+    ``day_one`` is the trial's first local calendar date, so a daily clip
+    says "Day 3" rather than starting again at Day 1. Defaults to the first
+    date in ``data``.
+
+    ``environment`` is a ``weather.WeatherTimeline``. With ``show_weather``
+    each frame prints the weather record covering its moment above the
+    title; with ``show_light`` a strip of the current local day's sunlight is
+    drawn across the top with the moment marked. The figure grows taller for
+    them rather than shrinking the arena.
 
     Callbacks (all optional):
         is_cancelled() -> bool : checked before each frame; True aborts.
@@ -241,7 +388,8 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
     # Pre-slice each tag's trajectory + resolve its label/colour once.
     tags = list(data['shortid'].unique()) if 'shortid' in data.columns else list(data['ID'].unique())
     id_col = 'shortid' if 'shortid' in data.columns else 'ID'
-    styles = build_tag_styles(tags, tag_identities, use_custom_identities, color_by)
+    styles = build_tag_styles(tags, tag_identities, use_custom_identities, color_by,
+                              id_type=id_type)
     keep_cols = ['Timestamp', 'smoothed_x', 'smoothed_y']
     if show_battery and 'battery_voltage' in data.columns:
         keep_cols.append('battery_voltage')
@@ -255,20 +403,69 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
         sub = data[data[id_col] == tag][keep_cols].sort_values('Timestamp')
         bat = (sub['battery_voltage'].to_numpy(dtype='float64')
                if 'battery_voltage' in sub.columns else None)
+        t_ns = sub['Timestamp'].dt.as_unit('ns').astype('int64').to_numpy()
+        xs = sub['smoothed_x'].to_numpy(dtype='float64')
+        ys = sub['smoothed_y'].to_numpy(dtype='float64')
+        step = speed = None
+        if show_speed or show_step:
+            # Measured here rather than taken from a column, so every caller
+            # (clip, export, batch worker) gets the same numbers, on the same
+            # coordinates the frame actually draws. A step spanning more than
+            # gap_s is dropped, matching the preview's Time gap grouping.
+            step = np.full(len(xs), np.nan)
+            speed = np.full(len(xs), np.nan)
+            if len(xs) > 1:
+                dt = np.diff(t_ns) / 1e9
+                d = np.hypot(np.diff(xs), np.diff(ys))
+                ok = (dt > 0) & (dt <= gap_s)
+                step[1:] = np.where(ok, d, np.nan)
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    speed[1:] = np.where(ok, d / dt, np.nan)
         tag_data_dict[tag] = {
             # int64 nanoseconds: directly comparable to a Timestamp's own
             # .value, and free of any per-comparison timezone handling.
-            't_ns': sub['Timestamp'].dt.as_unit('ns').astype('int64').to_numpy(),
-            'xs': sub['smoothed_x'].to_numpy(dtype='float64'),
-            'ys': sub['smoothed_y'].to_numpy(dtype='float64'),
+            't_ns': t_ns,
+            'xs': xs,
+            'ys': ys,
             'battery': bat,
+            'step': step,
+            'speed': speed,
             'label': styles[tag]['label'],
             'color': styles[tag]['color']}
 
     # GUI-free Agg figure/canvas (no pyplot global state).
-    fig = Figure(figsize=(10, 8), dpi=dpi)
+    # The Data View widens the CANVAS rather than shrinking the arena: the
+    # arena is the thing being watched, and squeezing it to make room for the
+    # numbers would trade the more important half for the less.
+    arena_w, fig_h = 10.0, 8.0
+    panel = None
+    panel_w = 0.0
+    dv_fmt = None
+    if data_view:
+        from fnt.uwb import dataview_panel as DVP
+        from fnt.uwb.dataview import human_duration as _hd
+        dv_fmt = data_view.get('fmt') or _hd
+        n_a = len(data_view.get('animals') or ())
+        n_r = len(data_view.get('roi_names') or ())
+        dyad_mode = data_view.get('dyad_mode', 'partner')
+        dyad_rows = max(n_a - 1, 0) if dyad_mode == 'triangle' else n_a
+        rows = (2 + n_a) + 2 + (2 + dyad_rows)
+        fs = DVP._fit_fontsize(rows, fig_h)
+        panel_w = DVP.panel_width_in(n_a, n_r, fs, dyad_mode)
+    if environment is None:
+        show_weather = show_light = False
+    band_w = 0.34 if show_weather else 0.0
+    # The light readout sits ABOVE the strip rather than on it: over a dawn
+    # the text and the strip are the same brightness and neither can be read.
+    band_l = 0.58 if show_light else 0.0
+    total_h = fig_h + band_w + band_l
+    px = int(round(total_h * dpi))
+    total_h = (px + px % 2) / dpi   # even pixel height, for video encoders
+    vs = fig_h / total_h          # the original layout, in the lower fig_h
+    fig = Figure(figsize=(arena_w + panel_w, total_h), dpi=dpi)
     canvas = FigureCanvasAgg(fig)
-    ax = fig.add_subplot(111)
+    frac = arena_w / (arena_w + panel_w)
+    ax = fig.add_axes([0.08 * frac, 0.08 * vs, 0.86 * frac, 0.86 * vs])
     ax.grid(False)
 
     # Draw the unchanging scene (background image, zones, anchors, axes) ONCE and
@@ -277,12 +474,94 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
     # on *every* frame — very slow, and a heavy source of per-frame native memory
     # churn in the Agg/NumPy layer. Caching removes essentially all of that work.
     draw_static_context(ax, layers, bg_image=bg_image, bg_extent=bg_extent,
-                        arena_zones=arena_zones, anchors=anchors, log=log)
+                        zones_xml=zones_xml, arena_zones=arena_zones,
+                        anchors=anchors, rois=rois, log=log)
     ax.set_xlim(x_min, x_max)
     ax.set_ylim(y_min, y_max)
     ax.set_aspect('equal')
     ax.set_xlabel("X Position (m)", fontsize=12)
     ax.set_ylabel("Y Position (m)", fontsize=12)
+
+    # Built BEFORE the background is cached, so the panel's furniture (titles,
+    # headers, row labels, frame) bakes into the cached scene and only the
+    # numbers are redrawn per frame.
+    if data_view:
+        panel = DVP.DataViewPanel(
+            fig, [frac + 0.012, 0.06 * vs, (1.0 - frac) - 0.024, 0.88 * vs],
+            data_view['animals'], data_view.get('roi_names') or [],
+            data_view.get('occupancy') or {},
+            data_view.get('overlaps') or {},
+            text_color=data_view.get('text_color', '#e6e6e6'),
+            grid_color=data_view.get('grid_color', '#4a4a4a'),
+            bg_color=data_view.get('bg_color', '#1b1b1b'),
+            accent=data_view.get('accent', '#ffd166'),
+            dyad_mode=dyad_mode)
+
+    # Weather line and light bar, in the band added above the title.
+    weather_artist = None
+    light = None
+    if show_weather:
+        weather_artist = fig.text(
+            0.5, (fig_h + 0.08) / total_h, "", ha='center', va='bottom',
+            fontsize=11, family='monospace', animated=True)
+    if show_light:
+        from fnt.uwb import weather as _wx
+        ltext = fig.text(0.08 * frac, (fig_h + band_w + 0.34) / total_h, "",
+                         ha='left', va='bottom', fontsize=9,
+                         family='monospace', animated=True)
+        y0 = (fig_h + band_w + 0.06) / total_h
+        lax = fig.add_axes([0.08 * frac, y0, 0.86 * frac, 0.22 / total_h])
+        lax.set_xlim(0, 1)
+        lax.set_ylim(0, 1)
+        lax.set_xticks([])
+        lax.set_yticks([])
+        strip = lax.imshow(np.zeros((1, 2, 3)), extent=(0, 1, 0, 1),
+                           aspect='auto', interpolation='bilinear',
+                           animated=True)
+        ticks = LineCollection([[(f, 0), (f, 0.25)] for f in (0.25, 0.5, 0.75)],
+                               colors=[(0.5, 0.5, 0.5, 0.8)], linewidths=0.8,
+                               animated=True)
+        lax.add_collection(ticks)
+        precip_img = lax.imshow(np.zeros((1, 2, 4)), extent=(0, 1, 0, 0.26),
+                                aspect='auto', interpolation='nearest',
+                                animated=True)
+        cursor = lax.axvline(0, color='#e0322b', linewidth=2.0, animated=True)
+        fig_w = arena_w + panel_w
+        mox = fig.add_axes([0.94 * frac + 0.006, y0 - 0.03 / total_h,
+                            0.28 / fig_w, 0.28 / total_h])
+        mox.set_xlim(-1.15, 1.15)
+        mox.set_ylim(-1.15, 1.15)
+        mox.set_aspect('equal')
+        mox.axis('off')
+        # A dark backing that never fades, so the icon reads on any figure
+        # background even while the moon is down.
+        mox.add_patch(Circle((0, 0), 1.14, facecolor=(0, 0, 0, 0.6),
+                             edgecolor='none'))
+        moon_disc = Circle((0, 0), 1.0, facecolor='#2b3040',
+                           edgecolor='#8a8f9c', linewidth=0.6, animated=True)
+        moon_lit = MplPolygon(np.zeros((3, 2)), closed=True,
+                              facecolor='#f1efe4', edgecolor='none',
+                              animated=True)
+        mox.add_patch(moon_disc)
+        mox.add_patch(moon_lit)
+        # The sky condition, mirrored on the strip's left. Same size and
+        # backing as the moon so the pair reads as one row of symbols.
+        sky_w = 0.28 / fig_w
+        sky_x = max(0.08 * frac - 0.006 - sky_w, 0.0)
+        sax = fig.add_axes([sky_x, y0 - 0.03 / total_h, sky_w, 0.28 / total_h])
+        sax.set_xlim(-0.07, 1.07)
+        sax.set_ylim(-0.07, 1.07)
+        sax.set_aspect('equal')
+        sax.axis('off')
+        sax.add_patch(Circle((0.5, 0.5), 0.57, facecolor=(0, 0, 0, 0.6),
+                             edgecolor='none'))
+        sky_artists = _build_sky_icon(sax, 0.28 * 72 / 1.14)
+        light = {'ax': lax, 'strip': strip, 'precip': precip_img,
+                 'ticks': ticks,
+                 'cursor': cursor, 'text': ltext, 'day': None,
+                 'span': (0, 1), 'wx': _wx, 'moon_ax': mox,
+                 'moon_disc': moon_disc, 'moon_lit': moon_lit,
+                 'sky_ax': sax, 'sky': sky_artists}
 
     canvas.draw()
     width, height = canvas.get_width_height()
@@ -292,6 +571,24 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
     # rather than created/destroyed — no artist-list growth, minimal allocation.
     # animated=True keeps them out of canvas.draw(), so they never bake into the
     # cached background; they are drawn only via draw_artist during blitting.
+    # Per-tag label styling, inherited from the preview. The readouts used to
+    # be hard-coded black, which vanished over a dark floorplan; the halo is
+    # what makes any of this text survive an arbitrary background image.
+    from fnt.uwb.uwb_preview_canvas import label_halo
+    read_col = label_color or '#000000'
+    read_fx = label_halo(read_col, 1.8) if label_outline else []
+    # The behaviour state changes colour per frame, so its halo has to follow.
+    # Memoised on the colour: the palette is a handful of entries and this sits
+    # inside the per-frame loop of a render that can run for hours.
+    _state_fx = {}
+
+    def state_halo(col):
+        if not label_outline:
+            return []
+        if col not in _state_fx:
+            _state_fx[col] = label_halo(col, 1.8)
+        return _state_fx[col]
+
     title_artist = ax.set_title("", fontsize=14, fontweight='bold')
     title_artist.set_animated(True)
     dyn = {}
@@ -302,12 +599,19 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
         (marker,) = ax.plot([], [], 'o', color=color, markersize=marker_size,
                             animated=True)
         label = ax.text(0, 0, '', fontsize=10, ha='center', color=color,
-                        fontweight='bold', animated=True)
-        # Battery voltage under the ID label, small black font (drawn only when
-        # show_battery is on). va='top' so it hangs beneath the shared anchor.
+                        fontweight='bold', animated=True,
+                        path_effects=(label_halo(color, 2.0) if label_outline
+                                      else []))
+        # Battery voltage under the ID label (drawn only when show_battery is
+        # on). va='top' so it hangs beneath the shared anchor.
         batt_label = ax.text(0, 0, '', fontsize=7, ha='center', va='top',
-                             color='#000000', animated=True)
-        dyn[tag] = (trail_line, marker, label, batt_label)
+                             color=read_col, animated=True,
+                             path_effects=read_fx)
+        # Speed / step distance on one line under the voltage.
+        readout_label = ax.text(0, 0, '', fontsize=7, ha='center', va='top',
+                                color=read_col, animated=True,
+                                path_effects=read_fx)
+        dyn[tag] = (trail_line, marker, label, batt_label, readout_label)
 
     # Behaviour overlays get the same treatment as everything else here: one
     # persistent artist per tag, repositioned each frame rather than recreated,
@@ -331,12 +635,23 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
                 beh_circles[tag] = circ
             beh_states[tag] = ax.text(0, 0, '', fontsize=7, ha='center',
                                       va='bottom', animated=True)
-        # Dashed like the circles they join, but heavier, so a link reads as a
-        # connection rather than as another radius outline.
-        link_lc = LineCollection([], linewidths=2.2, alpha=0.95,
+        # Dashed like the circles they join and at the same weight, so the
+        # radius and the link it produced read as one thing; the longer dash is
+        # what tells them apart. Matches the preview. The tag markers here are
+        # Line2D at the default zorder 2, so 4.6 already puts the link across
+        # the icons (the preview needs 5.5 because its markers are a scatter at
+        # zorder 5); staying under 5 keeps ROI name labels readable.
+        link_lc = LineCollection([], linewidths=1.2, alpha=0.95,
                                  linestyle=(0, (3, 2)), zorder=4.6,
                                  animated=True)
         ax.add_collection(link_lc)
+
+    # Day 1 is the first local date of the TRIAL, not of this clip, so a
+    # daily video is labelled with its real day number.
+    if day_one is None:
+        day_one = data['Timestamp'].min().date()
+    elif hasattr(day_one, 'date'):
+        day_one = day_one.date()
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     video_writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
@@ -376,12 +691,17 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
         title_text = title
         if speed_text:
             title_text += f" - Speed: {speed_text}"
-        title_text += f"\nTime: {frame_start.strftime('%Y-%m-%d %H:%M:%S')}"
+        day_n = (frame_start.date() - day_one).days + 1
+        title_text += (f"\nDay {day_n} · Time: "
+                       f"{frame_start.strftime('%Y-%m-%d %H:%M:%S')}")
         title_artist.set_text(title_text)
         ax.draw_artist(title_artist)
+        if weather_artist is not None or light is not None:
+            _draw_environment(environment, frame_start, weather_artist, light,
+                              weather_units, fig)
 
         for tag, tag_info in tag_data_dict.items():
-            trail_line, marker, label, batt_label = dyn[tag]
+            trail_line, marker, label, batt_label, readout_label = dyn[tag]
             state_txt = beh_states.get(tag)
             circ = beh_circles.get(tag)
             t_ns = tag_info['t_ns']
@@ -393,6 +713,7 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
                 marker.set_data([], [])
                 label.set_text('')
                 batt_label.set_text('')
+                readout_label.set_text('')
                 if state_txt is not None:
                     state_txt.set_text('')
                 if circ is not None:
@@ -409,39 +730,39 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
                 if circ is not None:
                     circ.set_center((cx, cy))
                     circ.set_visible(True)
-                # 'moving - chasing': the locomotor half and the social half,
-                # either of which is dropped when its layer is off or the
-                # animal is not doing it. Colour follows the social state when
-                # there is one, since that is the rarer, more informative half.
+                # The animal's social state, or nothing. An animal doing
+                # nothing social is left unlabelled rather than carrying the
+                # locomotor word that used to fill that space.
                 state_text, state_col = '', '#cccccc'
                 if state_txt is not None and beh_i >= 0:
                     j = beh_col_of.get(tag)
-                    if j is not None:
-                        parts = []
-                        lc_ = beh.get('loc')
-                        sc_ = beh.get('soc')
-                        if lc_ is not None:
-                            code = int(lc_[beh_i, j])
-                            txt = beh['state_labels']['loc'].get(code, '')
-                            if txt:
-                                parts.append(txt)
-                                state_col = beh['state_colors']['loc'].get(
-                                    code, state_col)
-                        if sc_ is not None:
-                            code = int(sc_[beh_i, j])
-                            txt = beh['state_labels']['soc'].get(code, '')
-                            if txt:
-                                parts.append(txt)
-                                state_col = beh['state_colors']['soc'].get(
-                                    code, state_col)
-                        state_text = ' - '.join(parts)
+                    sc_ = beh.get('soc')
+                    if j is not None and sc_ is not None:
+                        code = int(sc_[beh_i, j])
+                        txt = beh['state_labels']['soc'].get(code, '')
+                        if txt:
+                            state_text = txt
+                            state_col = beh['state_colors']['soc'].get(
+                                code, state_col)
                 if state_txt is not None:
                     state_txt.set_text(state_text)
                     state_txt.set_color(state_col)
+                    state_txt.set_path_effects(state_halo(state_col))
                     state_txt.set_position((cx, cy + y_range * 0.02))
                 # The state line sits where the ID normally does, so lift the
                 # ID clear of it when both are shown.
                 lift = y_range * 0.028 if state_text else 0.0
+                # Speed / step distance share one line, as in the preview.
+                bits = []
+                if show_speed and tag_info['speed'] is not None:
+                    sv = tag_info['speed'][hi - 1]
+                    if np.isfinite(sv):
+                        bits.append(f"{sv:.3f} m/s")
+                if show_step and tag_info['step'] is not None:
+                    dv = tag_info['step'][hi - 1]
+                    if np.isfinite(dv):
+                        bits.append(f"{dv:.2f} m")
+                readout_text = ' · '.join(bits)
                 if show_battery:
                     # Lift the label and hang the voltage beneath it (shared
                     # anchor at cy+off: label grows up, voltage grows down).
@@ -458,10 +779,17 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
                     label.set_verticalalignment('baseline')
                     label.set_text(tag_info['label'] if show_labels else '')
                     batt_label.set_text('')
+                # BELOW the marker, not appended to the ID/voltage stack above
+                # it: that stack hangs downward and would put this line on top
+                # of the dot. Clearance is a share of the view, so it holds at
+                # any arena size.
+                readout_label.set_position((cx, cy - y_range * 0.035))
+                readout_label.set_text(readout_text)
             ax.draw_artist(trail_line)
             ax.draw_artist(marker)
             ax.draw_artist(label)
             ax.draw_artist(batt_label)
+            ax.draw_artist(readout_label)
             if tag in beh_circles and beh_circles[tag].get_visible():
                 ax.draw_artist(beh_circles[tag])
             if tag in beh_states:
@@ -485,10 +813,23 @@ def render_animation(data, output_path, *, frame_interval, trailing_window, fps,
                 link_lc.set_color(cols)
             ax.draw_artist(link_lc)
 
+        if panel is not None:
+            # Read the cumulative curves at THIS frame's trial time. Nothing
+            # is accumulated frame to frame, so the numbers are independent of
+            # the video's speed and frame rate, and the final frame carries
+            # the same totals the CSV does.
+            panel.update(now_ns / 1e9, dv_fmt)
+            panel.draw()
+
         canvas.blit(fig.bbox)
         buf = np.frombuffer(canvas.buffer_rgba(), dtype=np.uint8)
         buf = buf.reshape(canvas.get_width_height()[::-1] + (4,))
         video_writer.write(cv2.cvtColor(buf, cv2.COLOR_RGBA2BGR))
+
+    # No end card. The video is the tracking view and its counters, and
+    # nothing else; a wall of totals appended to the end is not what anyone
+    # scrubbing an animation is looking for. DataViewPanel.render_totals_card
+    # is still there if that changes.
 
     video_writer.release()
     fig.clear()

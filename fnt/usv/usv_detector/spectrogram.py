@@ -18,6 +18,14 @@ from typing import Tuple, Optional
 # Mask Audio Detector at startup) even before a spectrogram is computed.
 import warnings
 
+#: Keyword arguments that stop a console subprocess (ffmpeg, ffprobe,
+#: nvidia-smi) from opening a window of its own. A process started without a
+#: console -- MAD launched from pythonw or a shortcut -- has none to lend, so
+#: Windows opened one per call: a terminal flashing up every time a file was
+#: switched. Empty elsewhere.
+NO_WINDOW = ({"creationflags": subprocess.CREATE_NO_WINDOW}
+             if os.name == "nt" else {})
+
 try:
     import soundfile as sf
     HAS_SOUNDFILE = True
@@ -142,8 +150,7 @@ def _load_with_ffmpeg(filepath: str, sf_error: Optional[Exception] = None) -> Tu
             result = subprocess.run(
                 probe_cmd, capture_output=True,
                 encoding='utf-8', errors='replace', check=True,
-                timeout=30,
-            )
+                timeout=30, **NO_WINDOW)
             sr = int(result.stdout.strip())
         except subprocess.TimeoutExpired:
             parts = [f"ffprobe timed out reading {os.path.basename(filepath)}"]
@@ -200,8 +207,7 @@ def _load_with_ffmpeg(filepath: str, sf_error: Optional[Exception] = None) -> Tu
             proc = subprocess.run(
                 [ffmpeg_exe, '-i', filepath] + base_cmd[1:],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                timeout=_FFMPEG_TIMEOUT,
-            )
+                timeout=_FFMPEG_TIMEOUT, **NO_WINDOW)
         except subprocess.TimeoutExpired:
             proc = None
 
@@ -213,8 +219,7 @@ def _load_with_ffmpeg(filepath: str, sf_error: Optional[Exception] = None) -> Tu
                         [ffmpeg_exe, '-i', 'pipe:0'] + base_cmd[1:],
                         stdin=audio_in,
                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                        timeout=_FFMPEG_TIMEOUT,
-                    )
+                        timeout=_FFMPEG_TIMEOUT, **NO_WINDOW)
             except subprocess.TimeoutExpired:
                 parts = [
                     f"ffmpeg timed out decoding "
@@ -567,8 +572,7 @@ def get_audio_info(filepath: str) -> dict:
         import json
         result = subprocess.run(
             probe_cmd, capture_output=True,
-            encoding='utf-8', errors='replace', check=True,
-        )
+            encoding='utf-8', errors='replace', check=True, **NO_WINDOW)
         data = json.loads(result.stdout)
 
         stream = data.get('streams', [{}])[0]
