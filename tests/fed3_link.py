@@ -6,6 +6,7 @@ rows interleave with replies, and a port can vanish mid-command.
 POSIX only (it needs a pty); skipped on Windows.
 """
 import os
+import select
 import sys
 import threading
 import time
@@ -49,6 +50,10 @@ class Responder(threading.Thread):
     def run(self):
         buffer = b""
         while not self.stopping:
+            # Never block in read: closing the pty while this thread is inside
+            # os.read() can hang on macOS, so the test stops and joins it first.
+            if not select.select([self.fd], [], [], 0.05)[0]:
+                continue
             try:
                 data = os.read(self.fd, 256)
             except OSError:
@@ -124,6 +129,7 @@ def main():
     check("and the link recovers when it answers again",
           link.call("PING").startswith("PONG,"))
     responder.stopping = True
+    responder.join()
     os.close(master)
     try:
         link.call("PING", timeout=0.5)
