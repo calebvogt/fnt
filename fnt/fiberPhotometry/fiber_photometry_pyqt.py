@@ -266,7 +266,9 @@ class FiberPhotometryWindow(QWidget):
             self.files.append(p)
             vids = p.parent if p.suffix.lower() == ".dat" else p.parent / f"{p.stem}_Videos"
             has_video = vids.is_dir() and any(v.suffix.lower() in VIDEO_SUFFIXES for v in vids.iterdir())
-            item = QListWidgetItem(f"{p.name}   [{'video' if has_video else 'no video'}]")
+            # LabJack files share names across sessions (data_0_<date>.dat): show date/animal folders
+            name = f"{p.parent.parent.name}/{p.parent.name}/{p.name}" if p.suffix.lower() == ".dat" else p.name
+            item = QListWidgetItem(f"{name}   [{'video' if has_video else 'no video'}]")
             item.setData(Qt.UserRole, str(p))
             self.file_list.addItem(item)
             n += 1
