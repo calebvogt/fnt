@@ -21,6 +21,7 @@ class _FakeFfmpeg:
     """Stands in for subprocess.Popen: writes some bytes to the output path (the
     command's last argument), prints a few lines, and exits with ``code``."""
     code = 0
+    pid = 4242
 
     def __init__(self, cmd, **kwargs):
         self.out = cmd[-1]
@@ -112,3 +113,17 @@ def test_skip_existing_redoes_an_unreadable_output(monkeypatch, tmp_path):
     monkeypatch.setattr(w, "_get_video_resolution", lambda p: None)  # ffprobe: moov atom not found
     work, skipped = w._plan_work([(src, out_dir)])
     assert work == [(src, out_dir)] and skipped == 0
+
+
+def test_each_ffmpeg_is_opted_out_of_power_throttling(monkeypatch, tmp_path):
+    # With the display off, Windows held the encodes on the E-cores (2026-11-01);
+    # ffmpeg does not inherit the tool's own opt-out, so each child gets its own.
+    w = _worker(tmp_path)
+    src, out_dir, out = _video(tmp_path)
+    _FakeFfmpeg.code = 0
+    monkeypatch.setattr(V.subprocess, "Popen", _FakeFfmpeg)
+    monkeypatch.setattr(w, "_get_video_resolution", lambda p: (1920, 1080))
+    pids = []
+    monkeypatch.setattr(V, "keep_full_speed", lambda pid=None: pids.append(pid) or True)
+    assert w.process_single_file(src, out_dir, 1) is True
+    assert pids == [4242]

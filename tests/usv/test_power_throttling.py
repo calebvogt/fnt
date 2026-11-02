@@ -19,6 +19,21 @@ def test_the_opt_out_takes_on_windows():
     assert power.keep_full_speed() is True
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only API")
+def test_a_child_process_can_be_opted_out_by_pid():
+    import subprocess
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
+    try:
+        assert power.keep_full_speed(child.pid) is True
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_a_pid_that_cannot_be_opened_is_false_not_an_error():
+    assert power.keep_full_speed(0x7FFFFFF0) is False
+
+
 def test_elsewhere_it_is_a_harmless_no_op(monkeypatch):
     monkeypatch.setattr(power.sys, "platform", "linux")
     assert power.keep_full_speed() is False

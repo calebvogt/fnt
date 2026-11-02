@@ -16,6 +16,8 @@ import tempfile
 import zlib
 from pathlib import Path
 
+from fnt.usv.usv_detector.power import keep_full_speed
+
 try:
     from PyQt5.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
@@ -666,6 +668,9 @@ class VideoProcessorWorker(QThread):
                 bufsize=1,
                 cwd=run_cwd
             )
+            # Windows throttles windowless children onto the E-cores once the
+            # display is off; ffmpeg does not inherit our opt-out (see power.py).
+            keep_full_speed(process.pid)
 
             # Use a background thread to read lines from stdout so we can
             # detect stalls without blocking (works cross-platform, inc. Windows).

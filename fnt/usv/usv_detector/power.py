@@ -8,7 +8,10 @@ clocks. Measured on the lab PC (i9-14900K): the same 10-minute recording took
 re-detection took 6.0 h instead of 3.3 h. The GPU pass slows too, because
 feeding it is CPU work.
 
-The opt-out is per process and is not inherited by child processes.
+The opt-out is per process and is not inherited by child processes, so a
+tool that runs ffmpeg opts each child out by its pid. Video PreProcessing does:
+on 2026-11-01 the lab PC's display went off and its x265 encodes were held on
+the 16 E-cores (CPU 96% -> 50%, ~40% fewer videos per hour) until opted out.
 """
 from __future__ import annotations
 
@@ -16,10 +19,11 @@ import sys
 
 _PROCESS_POWER_THROTTLING = 4          # PROCESS_INFORMATION_CLASS
 _THROTTLING_EXECUTION_SPEED = 0x1
+_PROCESS_SET_INFORMATION = 0x0200
 
 
-def keep_full_speed() -> bool:
-    """Ask Windows never to throttle this process's execution speed.
+def keep_full_speed(pid: int | None = None) -> bool:
+    """Ask Windows never to throttle this process's (or ``pid``'s) execution speed.
 
     Best-effort and silent: returns True when the opt-out took, False on any
     other platform or on failure. Never raises -- a run must not fail because
@@ -42,10 +46,23 @@ def keep_full_speed() -> bool:
         k32.SetProcessInformation.argtypes = [w.HANDLE, ctypes.c_int,
                                               ctypes.c_void_p, w.DWORD]
         k32.SetProcessInformation.restype = w.BOOL
+        k32.OpenProcess.argtypes = [w.DWORD, w.BOOL, w.DWORD]
+        k32.OpenProcess.restype = w.HANDLE
+        k32.CloseHandle.argtypes = [w.HANDLE]
+        if pid is None:
+            handle = k32.GetCurrentProcess()
+        else:
+            handle = k32.OpenProcess(_PROCESS_SET_INFORMATION, False, int(pid))
+            if not handle:
+                return False
         # Control execution speed, state off: "never throttle".
         state = _State(1, _THROTTLING_EXECUTION_SPEED, 0)
-        return bool(k32.SetProcessInformation(
-            k32.GetCurrentProcess(), _PROCESS_POWER_THROTTLING,
-            ctypes.byref(state), ctypes.sizeof(state)))
+        try:
+            return bool(k32.SetProcessInformation(
+                handle, _PROCESS_POWER_THROTTLING,
+                ctypes.byref(state), ctypes.sizeof(state)))
+        finally:
+            if pid is not None:
+                k32.CloseHandle(handle)
     except Exception:
         return False
