@@ -20,8 +20,7 @@ from datetime import datetime
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
-    QFileDialog, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QMessageBox,
+    QFileDialog, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QMessageBox, QSpinBox,
     QPlainTextEdit, QPushButton, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout,
     QWidget,
 )
@@ -33,7 +32,6 @@ from .editor import ProtocolEditor
 from .health import health
 
 TEST_TONE = "tone:4000:200"
-ID_TEXT = re.compile(r"\s*(?:FED)?\s*(\d{1,3})\s*", re.IGNORECASE)   # 7, 007, FED007
 PENDING_FOR = 5.0           # seconds a chosen ID shows while the FED3 takes it
 STARTING_FOR = 30.0         # seconds Start stays off waiting for pre-flight
 PORT, ID, STATUS, TESTS = range(4)
@@ -44,16 +42,32 @@ def fed_name(number):
     return f"FED{number:03d}"
 
 
-def parse_id(text):
-    """A typed ID as a number, or None: 7, 007, FED007 and fed7 are all 7."""
-    match = ID_TEXT.fullmatch(text or "")
-    number = int(match.group(1)) if match else 0
-    return number if 1 <= number <= 999 else None
-
-
 def port_order(port):
     """COM3 before COM10: ports in natural order, so rows don't move."""
     return [int(p) if p.isdigit() else p for p in re.split(r"(\d+)", port)]
+
+
+class IdBox(QSpinBox):
+    """A FED3's ID: "FED", which can't be edited, then the number, which can:
+    digits only, 1 to 999, so it never holds something that isn't an ID.
+    Enter (or leaving the box) sets it. There are no arrows, and the wheel and
+    arrow keys do nothing, so scrolling past a FED3 can't renumber it."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setPrefix("FED")
+        self.setRange(1, 999)
+        self.setButtonSymbols(QSpinBox.NoButtons)
+        self.setAlignment(Qt.AlignCenter)
+
+    def textFromValue(self, value):     # noqa: N802 - Qt's name
+        return f"{value:03d}"
+
+    def stepBy(self, steps):            # noqa: N802 - Qt's name
+        pass
+
+    def wheelEvent(self, event):        # noqa: N802 - Qt's name
+        event.ignore()
 
 
 def device_health(device):
@@ -282,18 +296,7 @@ class SetupView(QWidget):
         device = self._device(port)
         if not device:
             return
-        old = self._shown_id(device)
-        typed = box.text().strip()
-        number = parse_id(typed)
-        if number is None:
-            box.setText(fed_name(old))
-            box.setStyleSheet(box.styleSheet() + f" border: 1px solid {theme.BAD};")
-            self.id_note.setText(f"'{typed}' isn't an ID, so {port} keeps {fed_name(old)}. "
-                                 "An ID is a number from 1 to 999, e.g. 7 or FED007."
-                                 if typed else
-                                 f"{port} keeps {fed_name(old)}: an ID can't be blank.")
-            return
-        box.setText(fed_name(number))
+        old, number = self._shown_id(device), box.value()
         self.id_note.setText("")
         if number == old:
             return
@@ -339,7 +342,7 @@ class SetupView(QWidget):
         name = fed_name(number)
         for column, text, colour in (
                 (PORT, "—", theme.MUTED),
-                (STATUS, f"not plugged in: plug it in, or type {name} into a row's ID",
+                (STATUS, f"not plugged in: plug it in, or give a row's FED3 the ID {name}",
                  theme.WARN)):
             item = QTableWidgetItem(text)
             item.setForeground(QColor(colour))
@@ -353,15 +356,11 @@ class SetupView(QWidget):
         for column in (PORT, STATUS):
             self.table.setItem(row, column, QTableWidgetItem(""))
         self.table.item(row, PORT).setText(port)
-        box = QLineEdit()
-        box.setObjectName("id")
-        box.setMaxLength(8)
-        box.setFixedWidth(84)
-        box.setAlignment(Qt.AlignCenter)
-        box.setPlaceholderText("FED…")
+        box = IdBox()
         box.editingFinished.connect(lambda p=port, b=box: self._renumber(p, b))
         self.table.setCellWidget(row, ID, box)
         tests = QWidget()
+        tests.setObjectName("cell")
         b = QHBoxLayout(tests)
         b.setContentsMargins(2, 0, 2, 0)
         lights = theme.small(QPushButton("Lights"))
@@ -385,8 +384,8 @@ class SetupView(QWidget):
         item = self.table.item(row, PORT)
         item.setToolTip(device["description"] if device else "")
         box = self.table.cellWidget(row, ID)
-        if number and not box.hasFocus() and box.text() != fed_name(number):
-            box.setText(fed_name(number))      # never under someone's typing
+        if number and not box.hasFocus() and box.value() != number:
+            box.setValue(number)               # never under someone's typing
         used = number in self._used_ids()
         name = fed_name(number) if used else None     # its name in this protocol
         style = (f"color: {self._colour(number)}; font-weight: bold;" if used
@@ -396,8 +395,8 @@ class SetupView(QWidget):
             box.setToolTip(("In this protocol. " if used else
                             "Not in this protocol, so it won't be used. " if self._used_ids()
                             else "")
-                           + "Type another ID (e.g. 7 or FED007) and press Enter to "
-                             "renumber this FED3; it's saved on its SD card.")
+                           + "Type another number and press Enter to renumber this "
+                             "FED3; it's saved on its SD card.")
         if name and name in preflight and preflight[name] != "ok":
             text, colour = f"didn't pass pre-flight: {preflight[name]}", theme.BAD
         elif device:

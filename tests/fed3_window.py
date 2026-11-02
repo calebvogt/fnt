@@ -16,7 +16,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5.QtCore import QSettings                       # noqa: E402
 from PyQt5.QtCore import Qt                              # noqa: E402
-from PyQt5.QtWidgets import QApplication, QLineEdit, QPushButton, QWidget    # noqa: E402
+from PyQt5.QtTest import QTest                           # noqa: E402
+from PyQt5.QtWidgets import QApplication, QPushButton, QWidget    # noqa: E402
 
 from fnt.fed3 import protocol as proto                   # noqa: E402
 from fnt.fed3.ui import editor as ed                     # noqa: E402
@@ -201,13 +202,16 @@ def run_checks(app, tmp):
     box = lambda r: setup.table.cellWidget(r, 1)         # noqa: E731
     shown = lambda: [box(r).text() for r in range(2)]   # noqa: E731
 
-    def type_id(row, text):
-        """Type into a row's ID box and press Enter."""
-        box(row).setText(text)
-        box(row).editingFinished.emit()
+    def type_id(row, keys, enter=True):
+        """Select a row's ID number and type over it as a person would, then Enter."""
+        box(row).setFocus()
+        box(row).selectAll()
+        QTest.keyClicks(box(row), keys)
+        if enter:
+            QTest.keyClick(box(row), Qt.Key_Return)
 
-    check("the ID is a box showing each FED3's ID",
-          isinstance(box(0), QLineEdit) and wait(app, lambda: shown() == ["FED001", "FED002"], 5))
+    check("the ID shows each FED3's ID",
+          wait(app, lambda: shown() == ["FED001", "FED002"], 5))
     tests = setup.table.cellWidget(0, 3)
     check("Tests has Lights, Tone and Feed together",
           [b.text() for b in tests.findChildren(QPushButton)] == ["Lights", "Tone", "Feed"])
@@ -229,7 +233,7 @@ def run_checks(app, tmp):
     check("and FED001 gets a greyed row of its own, so the table is the protocol's list",
           setup.table.rowCount() == 3 and setup.table.cellWidget(2, 1).text() == "FED001"
           and status(2).startswith("not plugged in"))
-    type_id(0, "FED002")
+    type_id(0, "2")
     check("typing an ID another FED3 has swaps the two, and says so",
           wait(app, lambda: numbers() == {"SIM1": 2, "SIM2": 7}, 10)
           and "swapped" in setup.id_note.text())
@@ -239,18 +243,22 @@ def run_checks(app, tmp):
     wait(app, lambda: False, 1)          # a few refreshes: nothing jumps back
     check("the choice holds once the FED3s have taken it",
           shown() == ["FED002", "FED007"])
-    type_id(1, "fed 42")
-    check("any way of writing it works: 7, 007, FED007, fed 42",
+    type_id(1, "042")
+    check("with or without leading zeros",
           wait(app, lambda: numbers() == {"SIM1": 2, "SIM2": 42}, 10) and box(1).text() == "FED042")
-    type_id(1, "")
-    check("a blank ID is put back, saying so",
-          box(1).text() == "FED042" and "can't be blank" in setup.id_note.text())
-    for bad in ("abc", "0", "1000"):
-        type_id(1, bad)
-    check("anything that isn't 1-999 is put back, quoting what was typed",
-          box(1).text() == "FED042" and "'1000' isn't an ID" in setup.id_note.text()
-          and "1 to 999" in setup.id_note.text()
-          and wait(app, lambda: False, 1) is False and numbers() == {"SIM1": 2, "SIM2": 42})
+    type_id(1, "FEDx7", enter=False)
+    check("FED is fixed and can't be typed over: only the digits go in",
+          box(1).text() == "FED7", box(1).text())
+    QTest.keyClicks(box(1), "1234")
+    check("three digits at most", box(1).text() == "FED712", box(1).text())
+    type_id(1, "042")
+    for keys in ("", "000"):
+        type_id(1, keys)
+    QTest.keyClick(box(1), Qt.Key_Up)
+    QTest.keyClick(box(1), Qt.Key_Return)
+    check("a blank, 0 or an arrow key leave the ID as it was",
+          wait(app, lambda: False, 1) is False and numbers() == {"SIM1": 2, "SIM2": 42}
+          and box(1).text() == "FED042", box(1).text())
     type_id(0, "1")
     type_id(1, "2")
     check("and back", wait(app, lambda: numbers() == {"SIM1": 1, "SIM2": 2}, 10)
@@ -416,9 +424,7 @@ def run_checks(app, tmp):
                == ["FED001", "FED001", "FED002"], 10)
           and wait(app, lambda: "SIM1 and SIM2 are both FED001" in setup.id_problems.text(), 5)
           and not setup.start.isEnabled())
-    combo = setup.table.cellWidget(1, 1)
-    combo.setText("2")
-    combo.editingFinished.emit()
+    type_id(1, "2")
     check("giving one of them FED002 is all it takes",
           wait(app, setup.start.isEnabled, 10))
     setup.start.click()

@@ -39,6 +39,7 @@ QHeaderView::section {{ background-color: {PANEL}; border: none;
 QFrame#card {{ background-color: {PANEL}; border: 1px solid {BORDER}; border-radius: 6px; }}
 QFrame#card[problem="true"] {{ border: 2px solid {BAD}; }}
 QFrame#card QLabel {{ background: transparent; }}
+QWidget#cell {{ background: transparent; }}    /* a group of widgets in a table cell */
 QLabel#title {{ font-size: 14pt; font-weight: bold; }}
 QLabel#muted {{ color: {MUTED}; }}
 QWidget#stagebar {{ background-color: {PANEL}; border-bottom: 1px solid {BORDER}; }}
