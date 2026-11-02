@@ -78,10 +78,10 @@ class PreviewPane(QWidget):
         for p in (self.p_mov, self.p_link):
             p.setMaximumHeight(90)
         self.p_all.setMaximumHeight(110)
-        self.p_sig.addLegend(offset=(5, 2), labelTextSize="8pt")
-        self.c_sig = self.p_sig.plot(pen=pg.mkPen(GREEN, width=1), name="470 nm signal")
+        self.legend = self.p_sig.addLegend(offset=(5, 2), labelTextSize="8pt")
+        self.c_sig = self.p_sig.plot(pen=pg.mkPen(GREEN, width=1), name="signal")
         self.c_fit = self.p_sig.plot(pen=pg.mkPen(VIOLET, width=1),
-                                     name="fitted control (415 nm scaled onto the signal)")
+                                     name="fitted control (scaled onto the signal)")
         self.c_dff = self.p_dff.plot(pen=pg.mkPen(BLUE, width=1))
         self.c_z = self.p_z.plot(pen=pg.mkPen(AMBER, width=1))
         self.c_mov = self.p_mov.plot(pen=pg.mkPen(GREY, width=1))
@@ -142,14 +142,19 @@ class PreviewPane(QWidget):
         self._set_enabled(False)
 
     def set_recording(self, name: str, result, video_path: Optional[str], label: str = "",
-                      movement=None, link=None, frame_times=None):
+                      movement=None, link=None, frame_times=None, signal_nm=None, control_nm=None):
         """Show ``result`` (a PhotometryResult) with its video. ``movement`` and ``link`` are
         optional (time, values) pairs: headstage acceleration and wireless signal strength.
-        ``frame_times``: each video frame's time on the photometry clock (default k / fps)."""
+        ``frame_times``: each video frame's time on the photometry clock (default k / fps).
+        ``signal_nm`` / ``control_nm``: the channels' wavelengths, for the legend."""
         import cv2
         self.clear(f"{name}   {label}")
         self.r = result
         t = result.time
+        self.legend.clear()
+        self.legend.addItem(self.c_sig, f"{signal_nm} nm signal" if signal_nm else "signal")
+        self.legend.addItem(self.c_fit, f"fitted control ({control_nm} nm scaled onto the signal)"
+                            if control_nm else "fitted control (scaled onto the signal)")
         for plot, curve, extra in ((self.p_mov, self.c_mov, movement),
                                    (self.p_link, self.c_link, link)):
             plot.setVisible(extra is not None)

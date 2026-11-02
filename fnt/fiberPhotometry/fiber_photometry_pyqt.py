@@ -164,11 +164,12 @@ class FiberPhotometryWindow(QWidget):
         pl.addWidget(self.stack)
 
         common = QFormLayout()
-        self.chk_dropouts = QCheckBox("Remove wireless dropouts (full and partial)")
+        self.chk_dropouts = QCheckBox("Remove wireless dropouts (Doric; full and partial)")
         self.chk_dropouts.setChecked(True)
         self.chk_dropouts.setToolTip("Samples below 0.5 x a channel's median, or 0.85 x its 10-s running "
                                      "median, are bridged before filtering, left out of the fit and "
-                                     "shown as gaps.")
+                                     "shown as gaps. Wired recordings (LabJack .dat) have no radio link "
+                                     "and are never cleaned.")
         common.addRow(self.chk_dropouts)
         self.notch = QLineEdit()
         self.notch.setPlaceholderText("e.g. 3.32 9.94 (blank = none)")
@@ -359,7 +360,9 @@ class FiberPhotometryWindow(QWidget):
             except OSError:
                 pass
         self.preview.set_recording(rec.name, r, video, label, movement=movement, link=link,
-                                   frame_times=frame_times)
+                                   frame_times=frame_times, signal_nm=data.signal_channel.wavelength,
+                                   control_nm=data.isosbestic_channel.wavelength
+                                   if data.isosbestic_channel else None)
         self.log(f"Preview {rec.name}: {label}")
 
     # ------------------------------------------------------------------ run

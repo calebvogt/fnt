@@ -139,8 +139,11 @@ def load_and_process(recording, settings: Settings):
     if data.signal_channel is None:
         raise ValueError(f"no signal channel found in {Path(recording).name}")
     data = reader.load_data(data)
+    kwargs = settings.processing_kwargs()
+    if isinstance(reader, LabJackFileReader):
+        kwargs["remove_dropouts"] = False        # wired rig: no radio link to drop out
     r = process(data.signal_data, data.isosbestic_data, data.signal_time,
-                data.signal_channel.sampling_rate, settings.pipeline, **settings.processing_kwargs())
+                data.signal_channel.sampling_rate, settings.pipeline, **kwargs)
     return data, r
 
 
@@ -194,7 +197,8 @@ def process_recording(recording, settings: Settings, out_dir, log: Callable[[str
         from .video_overlay import AMBER, BLUE, GREEN, VIOLET, Row, render_combined_video
         rows = []
         if settings.show_raw:
-            rows.append(Row("470 nm (V)" if data.signal_channel.wavelength == 470 else "Signal (V)",
+            wl = data.signal_channel.wavelength
+            rows.append(Row(f"{wl} nm (V)" if wl else "Signal (V)",
                             r.time, np.where(r.dropout, np.nan, r.signal), GREEN,
                             second=np.where(r.dropout, np.nan, r.fitted_control),
                             second_colour=VIOLET, second_label="fitted control"))

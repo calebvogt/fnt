@@ -102,3 +102,13 @@ def test_batch_times_frames_by_the_ttl(tmp_path):
     assert len(f) == len(frames) and f["Time_sec"].iloc[0] == pytest.approx(2.0, abs=0.01)
     peak = f.loc[f["DeltaF_F"].idxmax(), "Time_sec"]
     assert peak == pytest.approx(5.0, abs=0.1)     # the transient lands on its own frames
+
+
+def test_wired_recordings_are_never_cleaned_of_dropouts(tmp_path):
+    from fnt.fiberPhotometry.batch import load_and_process
+    frames = _synthetic_dat(tmp_path / "rec.dat")
+    d = pd.read_csv(tmp_path / "rec.dat", sep="\t")
+    d.loc[500:700, ["v0", "v1"]] *= 0.3                # would look like a wireless dropout
+    d.to_csv(tmp_path / "rec.dat", sep="\t", index=False, float_format="%.6f")
+    _, r = load_and_process(tmp_path / "rec.dat", Settings(pipeline="matlab", remove_dropouts=True))
+    assert not r.dropout.any()
