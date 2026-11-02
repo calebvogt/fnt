@@ -31,12 +31,26 @@ import numpy as np
 import pandas as pd
 
 from .doric import DoricFileReader
+from .labjack import LabJackFileReader, is_labjack_dat
 from .processing import PIPELINES, process
-from .sync import align_to_frames, check_video_clock, video_frame_times
+from .sync import align_to_frames, check_video_clock, recording_frame_times
 
 RUNS_FOLDER = "FNT_FiberPhotometry"
 SUMMARY_FILE = "FiberPhotometry_summary.csv"
-RECORDING_SUFFIXES = (".doric",)
+RECORDING_SUFFIXES = (".doric", ".dat")
+
+
+def open_reader(recording):
+    """The reader for ``recording``: Doric .doric or LabJack LJStreamUD .dat."""
+    if Path(recording).suffix.lower() == ".dat":
+        return LabJackFileReader(recording)
+    return DoricFileReader(recording)
+
+
+def _is_recording(p: Path) -> bool:
+    if p.suffix.lower() == ".dat":
+        return is_labjack_dat(p)
+    return p.suffix.lower() in RECORDING_SUFFIXES
 
 
 @dataclass
@@ -95,8 +109,8 @@ def find_recordings(items: Iterable[str]) -> List[Path]:
     for it in items:
         p = Path(it)
         if p.is_dir():
-            out += sorted(f for f in p.iterdir() if f.suffix.lower() in RECORDING_SUFFIXES)
-        elif p.suffix.lower() in RECORDING_SUFFIXES and p.exists():
+            out += sorted(f for f in p.iterdir() if f.is_file() and _is_recording(f))
+        elif p.is_file() and _is_recording(p):
             out.append(p)
         else:
             raise FileNotFoundError(f"not a recording or folder: {it}")
@@ -113,7 +127,7 @@ def _fnt_version():
 
 def load_and_process(recording, settings: Settings):
     """(DoricFileData, PhotometryResult) for one recording: what the preview shows."""
-    reader = DoricFileReader(recording)
+    reader = open_reader(recording)
     data = reader.scan_file()
     for attr, override in (("signal_channel", settings.signal_channel),
                            ("isosbestic_channel", settings.control_channel)):
@@ -156,12 +170,14 @@ def process_recording(recording, settings: Settings, out_dir, log: Callable[[str
     video = data.video_info.absolute_path if data.video_info else None
     clock = None
     if video and Path(video).exists():
-        ft, fps = video_frame_times(video)
+        ft, fps = recording_frame_times(data, video)
         clock = check_video_clock(ft, data.video_timestamps)
         if "logged_frames" in clock and clock["logged_frames"] != clock["video_frames"]:
-            log(f"Video has {clock['video_frames']:,} frames over {clock['video_span_s']:.1f} s; "
-                f"the recording logged {clock['logged_frames']:,} frame times over "
-                f"{clock['logged_span_s']:.1f} s. Frames are timed at {fps:g} fps from the video.")
+            how = ("by the recording's frame clock, in order" if data.video_frame_clock
+                   else f"at {fps:g} fps from the video")
+            log(f"Video has {clock['video_frames']:,} frames; the recording logged "
+                f"{clock['logged_frames']:,} frame times over {clock['logged_span_s']:.1f} s. "
+                f"Frames are timed {how}.")
         frames = pd.DataFrame({"Frame": np.arange(1, len(ft) + 1), "Time_sec": ft,
                                "DeltaF_F": align_to_frames(r.time, r.dff, ft),
                                "ZScore": align_to_frames(r.time, r.z, ft)})
@@ -188,7 +204,7 @@ def process_recording(recording, settings: Settings, out_dir, log: Callable[[str
         made_video = render_combined_video(
             video, str(paths["video"]), rows, window_s=settings.video_window_s,
             progress=lambda k, n: log(f"  frame {k:,} / {n:,}") if k % 3000 == 0 else None,
-            should_stop=should_stop)
+            should_stop=should_stop, frame_times=ft)
 
     row = {"recording": recording.name, "status": "done", "pipeline": settings.pipeline,
            "duration_s": round(duration, 2), "sampling_rate_hz": round(float(fs), 2),
@@ -197,6 +213,7 @@ def process_recording(recording, settings: Settings, out_dir, log: Callable[[str
            "dff_robust_sd_pct": round(float(1.4826 * np.nanmedian(np.abs(r.dff - np.nanmedian(r.dff)))), 3),
            "fit_slope": r.info.get("slope"), "fit_intercept": r.info.get("intercept"),
            "video_frames": clock["video_frames"] if clock else None,
+           "video_timing": ("frame clock" if data.video_frame_clock else "video fps") if clock else None,
            "logged_frames": clock.get("logged_frames") if clock else None,
            "combined_video": made_video}
     record = {"recording": str(recording), "settings": asdict(settings), "fit": r.info,

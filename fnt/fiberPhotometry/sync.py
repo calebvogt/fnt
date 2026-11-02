@@ -31,6 +31,26 @@ def video_frame_times(video_path: str) -> Tuple[np.ndarray, float]:
     return np.arange(n) / fps, float(fps)
 
 
+def recording_frame_times(data, video_path: str) -> Tuple[np.ndarray, float]:
+    """(frame times in s on the photometry clock, fps) for ``data``'s video.
+
+    Timed by the video's own rate (``video_frame_times``) unless the recording logged one
+    hardware time per frame (``data.video_frame_clock``, e.g. a camera TTL). Then frame k takes
+    the k-th logged time: surplus logged times at the end are dropped, as the Warden lab MATLAB
+    did, and frames past the last logged time continue at the median interval.
+    """
+    ft, fps = video_frame_times(video_path)
+    logged = getattr(data, "video_timestamps", None)
+    if not getattr(data, "video_frame_clock", False) or logged is None or len(logged) < 2:
+        return ft, fps
+    logged = np.asarray(logged, float)
+    n = len(ft)
+    if n <= len(logged):
+        return logged[:n], fps
+    step = float(np.median(np.diff(logged)))
+    return np.concatenate([logged, logged[-1] + step * np.arange(1, n - len(logged) + 1)]), fps
+
+
 def check_video_clock(frame_times: np.ndarray, logged_times: Optional[np.ndarray]) -> Dict:
     """Compare the video's own frame times with timestamps the acquisition system logged."""
     out = {"video_frames": int(len(frame_times)),

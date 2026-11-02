@@ -1,7 +1,8 @@
 """The behaviour video with the photometry scrolling underneath it.
 
 Every output frame is one input frame, so the overlay never drifts from the video: the panel
-under frame k shows the traces around frame k's own time (k / fps). Each row is a window of
+under frame k shows the traces around frame k's own time (k / fps, or the time the recording
+logged for that frame). Each row is a window of
 ``window_s`` seconds centred on that time, with a cursor in the middle. Rows are drawn with
 OpenCV and the frames piped to ffmpeg, so an hour of 1080p video takes minutes, not hours.
 """
@@ -108,8 +109,10 @@ def draw_panel(rows: List[Row], t_now: float, width: int, row_h: int, window_s: 
 def render_combined_video(video_path: str, out_path: str, rows: List[Row], *, window_s: float = 20.0,
                           row_h: int = 170, width: Optional[int] = None, grayscale: bool = True,
                           crf: int = 23, progress: Optional[Callable[[int, int], None]] = None,
-                          should_stop: Optional[Callable[[], bool]] = None) -> bool:
-    """Write the video with ``rows`` under it to ``out_path`` (H.264 mp4).
+                          should_stop: Optional[Callable[[], bool]] = None,
+                          frame_times: Optional[np.ndarray] = None) -> bool:
+    """Write the video with ``rows`` under it to ``out_path`` (H.264 mp4). ``frame_times``: each
+    frame's time on the photometry clock (default k / fps).
 
     Returns False if stopped; the partial file is then removed.
     """
@@ -149,7 +152,8 @@ def render_combined_video(video_path: str, out_path: str, rows: List[Row], *, wi
                 frame = cv2.cvtColor(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
             if frame.shape[1] != width or frame.shape[0] != vid_h:
                 frame = cv2.resize(frame, (width, vid_h), interpolation=cv2.INTER_AREA)
-            panel = draw_panel(rows, k / fps, width, row_h, window_s, limits)[:panel_h]
+            t_k = frame_times[k] if frame_times is not None and k < len(frame_times) else k / fps
+            panel = draw_panel(rows, t_k, width, row_h, window_s, limits)[:panel_h]
             proc.stdin.write(np.vstack([frame, panel]).tobytes())
             if progress and k % 300 == 0:
                 progress(k, n)

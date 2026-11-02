@@ -1,8 +1,8 @@
 """The Fiber Photometry tool's preview: the behaviour video with the traces aligned under it.
 
 Scrub with the slider (or arrow keys), play at 0.25-8x, and click the session overview to jump.
-The traces show a window centred on the current frame's time (frame k at k / fps of the video,
-the same timing the outputs use); dropouts show as gaps. Playback keeps to the wall clock: when the
+The traces show a window centred on the current frame's time (frame k at k / fps of the video, or
+the time the recording logged for it; the same timing the outputs use); dropouts show as gaps. Playback keeps to the wall clock: when the
 PC cannot decode every frame at the chosen speed it skips frames rather than slowing down. For a
 wireless headstage two more rows show its movement (accelerometer) and its link strength.
 """
@@ -28,6 +28,7 @@ class PreviewPane(QWidget):
         super().__init__(parent)
         self.cap = None
         self.fps = 30.0
+        self.frame_times = None     # per-frame times on the photometry clock; None = k / fps
         self.n_frames = 0
         self.frame = 0
         self.r = None
@@ -132,6 +133,7 @@ class PreviewPane(QWidget):
         if self.cap is not None:
             self.cap.release()
         self.cap, self.r = None, None
+        self.frame_times = None
         self.title.setText(message)
         self.video.setText("no video")
         self.video.setPixmap(QPixmap())
@@ -140,9 +142,10 @@ class PreviewPane(QWidget):
         self._set_enabled(False)
 
     def set_recording(self, name: str, result, video_path: Optional[str], label: str = "",
-                      movement=None, link=None):
+                      movement=None, link=None, frame_times=None):
         """Show ``result`` (a PhotometryResult) with its video. ``movement`` and ``link`` are
-        optional (time, values) pairs: headstage acceleration and wireless signal strength."""
+        optional (time, values) pairs: headstage acceleration and wireless signal strength.
+        ``frame_times``: each video frame's time on the photometry clock (default k / fps)."""
         import cv2
         self.clear(f"{name}   {label}")
         self.r = result
@@ -175,6 +178,8 @@ class PreviewPane(QWidget):
             self.video.setText("no video for this recording")
             self.fps = 30.0
             self.n_frames = int((t[-1] - t[0]) * self.fps)
+        if self.cap is not None and frame_times is not None:
+            self.frame_times = np.asarray(frame_times, float)
         self._last_read = -1
         self.slider.blockSignals(True)
         self.slider.setRange(0, max(0, self.n_frames - 1))
@@ -244,7 +249,7 @@ class PreviewPane(QWidget):
     def _show_traces(self):
         if self.r is None:
             return
-        t_now = self.frame / self.fps
+        t_now = self._time_of(self.frame)
         half = self.window.value() / 2
         self.p_sig.setXRange(t_now - half, t_now + half, padding=0)
         for c in self.cursors:
@@ -261,7 +266,19 @@ class PreviewPane(QWidget):
         if not self.p_all.sceneBoundingRect().contains(ev.scenePos()):
             return
         t = vb.mapSceneToView(ev.scenePos()).x()
-        self.slider.setValue(int(np.clip(t * self.fps, 0, self.n_frames - 1)))
+        self.slider.setValue(self._frame_at(t))
+
+    def _time_of(self, frame):
+        if self.frame_times is not None and len(self.frame_times):
+            return float(self.frame_times[min(frame, len(self.frame_times) - 1)])
+        return frame / self.fps
+
+    def _frame_at(self, t):
+        if self.frame_times is not None and len(self.frame_times):
+            k = int(np.searchsorted(self.frame_times, t))
+        else:
+            k = int(t * self.fps)
+        return int(np.clip(k, 0, self.n_frames - 1))
 
     def keyPressEvent(self, ev):
         step = {Qt.Key_Right: 1, Qt.Key_Left: -1, Qt.Key_PageDown: int(self.fps * 5),

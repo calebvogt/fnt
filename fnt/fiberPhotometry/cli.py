@@ -1,6 +1,6 @@
 """Fiber photometry from the command line.
 
-    python -m fnt.fiberPhotometry.cli info  <recording.doric>
+    python -m fnt.fiberPhotometry.cli info  <recording.doric | recording.dat>
     python -m fnt.fiberPhotometry.cli process <folder or recordings...> [--pipeline guppy] [options]
     python -m fnt.fiberPhotometry.cli summary <run folder>
     python -m fnt.fiberPhotometry.cli gui [<folder or recordings...>]
@@ -62,15 +62,16 @@ def settings_from(args):
 
 
 def cmd_info(args):
-    from .doric import DoricFileReader
+    from .batch import open_reader
     from .processing import find_dropouts
-    from .sync import check_video_clock, video_frame_times
-    r = DoricFileReader(args.recording)
+    from .sync import check_video_clock, recording_frame_times
+    r = open_reader(args.recording)
     d = r.scan_file()
     print(f"{Path(args.recording).name}")
     for c in d.all_channels:
         role = ("signal" if d.signal_channel is c else "control" if d.isosbestic_channel is c else "")
-        print(f"  {c.name}: {c.wavelength or '?'} nm, {c.sampling_rate:.1f} Hz, {c.n_samples:,} samples  {role}")
+        nm = f"{c.wavelength} nm, " if c.wavelength else ""
+        print(f"  {c.name}: {nm}{c.sampling_rate:.1f} Hz, {c.n_samples:,} samples  {role}")
     d = r.load_data(d)
     print(f"  duration {d.signal_time[-1] - d.signal_time[0]:.1f} s")
     if d.isosbestic_data is not None:
@@ -78,10 +79,11 @@ def cmd_info(args):
         print(f"  dropouts {100 * bad.mean():.1f}% of samples")
     v = d.video_info.absolute_path if d.video_info else None
     if v and Path(v).exists():
-        ft, fps = video_frame_times(v)
+        ft, fps = recording_frame_times(d, v)
         c = check_video_clock(ft, d.video_timestamps)
-        print(f"  video {Path(v).name}: {c['video_frames']:,} frames at {fps:g} fps over "
-              f"{c['video_span_s']:.1f} s; .doric logged {c.get('logged_frames', 0):,} frame times")
+        timing = "timed by the frame clock" if d.video_frame_clock else f"timed at {fps:g} fps"
+        print(f"  video {Path(v).name}: {c['video_frames']:,} frames ({timing}); "
+              f"the recording logged {c.get('logged_frames', 0):,} frame times")
     else:
         print("  no video" if not v else f"  video missing: {v}")
     return 0

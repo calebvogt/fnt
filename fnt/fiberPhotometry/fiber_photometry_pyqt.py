@@ -24,8 +24,10 @@ from PyQt5.QtWidgets import (
 from fnt.theme import BLUE_BUTTON_STYLE, apply_dark_theme
 
 from .batch import Settings, find_recordings, load_and_process, run_batch
+from .labjack import VIDEO_SUFFIXES
 from .processing import PIPELINE_LABELS, PIPELINES
 from .preview_view import PreviewPane
+from .sync import recording_frame_times
 
 ZSCORE_METHODS = [("standard", "Whole session (mean, SD)"),
                   ("modified", "Robust (median, MAD)"),
@@ -262,9 +264,8 @@ class FiberPhotometryWindow(QWidget):
             if p in self.files:
                 continue
             self.files.append(p)
-            vids = p.parent / f"{p.stem}_Videos"
-            has_video = vids.is_dir() and any(v.suffix.lower() in (".mp4", ".avi", ".mov", ".mkv")
-                                              for v in vids.iterdir())
+            vids = p.parent if p.suffix.lower() == ".dat" else p.parent / f"{p.stem}_Videos"
+            has_video = vids.is_dir() and any(v.suffix.lower() in VIDEO_SUFFIXES for v in vids.iterdir())
             item = QListWidgetItem(f"{p.name}   [{'video' if has_video else 'no video'}]")
             item.setData(Qt.UserRole, str(p))
             self.file_list.addItem(item)
@@ -280,7 +281,8 @@ class FiberPhotometryWindow(QWidget):
             self.add_paths([folder])
 
     def add_files(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, "Recordings", "", "Doric (*.doric)")
+        paths, _ = QFileDialog.getOpenFileNames(self, "Recordings", "",
+                                                "Recordings (*.doric *.dat);;Doric (*.doric);;LabJack LJStreamUD (*.dat)")
         if paths:
             self.add_paths(paths)
 
@@ -348,7 +350,14 @@ class FiberPhotometryWindow(QWidget):
             # -127 dBm is the headstage's "no link" value
             link = (data.state_time, np.where(data.signal_strength <= -120, np.nan,
                                               data.signal_strength))
-        self.preview.set_recording(rec.name, r, video, label, movement=movement, link=link)
+        frame_times = None
+        if video and data.video_frame_clock:
+            try:
+                frame_times = recording_frame_times(data, video)[0]
+            except OSError:
+                pass
+        self.preview.set_recording(rec.name, r, video, label, movement=movement, link=link,
+                                   frame_times=frame_times)
         self.log(f"Preview {rec.name}: {label}")
 
     # ------------------------------------------------------------------ run

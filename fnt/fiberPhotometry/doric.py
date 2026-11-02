@@ -54,6 +54,9 @@ class DoricFileData:
     isosbestic_data: Optional[np.ndarray] = None
     isosbestic_time: Optional[np.ndarray] = None
     video_timestamps: Optional[np.ndarray] = None
+    # True when video_timestamps hold one hardware time per camera frame (LabJack camera TTL):
+    # frames are then timed by them, not by k / fps
+    video_frame_clock: bool = False
     
     # IMU data (accelerometer)
     imu_accel_x: Optional[np.ndarray] = None
