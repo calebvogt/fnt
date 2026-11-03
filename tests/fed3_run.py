@@ -126,20 +126,20 @@ def copy_text(world, logical, folder=None):
 
 
 PROTOCOL = """\
-format: fnt-fed3-protocol/1
+format: fnt-fed3-protocol/2
 name: Engine test
 devices: [FED003, FED007]
 cues:
   ding: [{tone: {hz: 4000, ms: 100}}]
 phases:
   - name: Train
-    until: [{rewards: 3, devices: all}, {after: 2d}]
-    all: {active: both, cue: {reward: ding}}
+    until: [{rewards: 3, of: all}, {after: 2d}]
+    rule: {active: both, cue: {reward: ding}}
   - name: Hold
     until: {manual: true}
-    all: {active: left, ratio: 2}
+    rule: {active: left, ratio: 2}
   - name: Last
-    all: {active: none, free_feed: 1}
+    rule: {active: none, free_feed: 1}
 checks:
   no_pellets: 2h
 """
@@ -250,8 +250,8 @@ def run_checks(root):
     check("Advance phase moves a phase that ends by hand", phases == {"FED003": "2", "FED007": "2"})
 
     print("\n--- editing mid-run ---")
-    edited = PROTOCOL.replace("all: {active: none, free_feed: 1}",
-                              "all: {active: none, free_feed: 1, refill_delay: 60s}")
+    edited = PROTOCOL.replace("rule: {active: none, free_feed: 1}",
+                              "rule: {active: none, free_feed: 1, refill_delay: 60s}")
     world.engine.submit("edit", protocol_text=edited)
     world.run_for(40)
     check("an edit reaches the devices",
@@ -406,26 +406,26 @@ def run_checks(root):
 
 
 ONE_PHASE = """\
-format: fnt-fed3-protocol/1
+format: fnt-fed3-protocol/2
 name: Guard test 1
 devices: [FED001, FED002]
 phases:
   - name: FR1
-    all: {active: both}
+    rule: {active: both}
 checks:
   no_pellets: 2h
 """
 
 RACE = """\
-format: fnt-fed3-protocol/1
+format: fnt-fed3-protocol/2
 name: Race
 devices: [FED001, FED002]
 phases:
   - name: Race
-    until: {rewards: 3, devices: any}
-    all: {active: both}
+    until: {rewards: 3, of: any}
+    rule: {active: both}
   - name: Next
-    all: {active: left}
+    rule: {active: left}
 """
 
 

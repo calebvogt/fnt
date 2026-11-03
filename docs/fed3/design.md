@@ -421,7 +421,7 @@ folder.
 ### Structure
 
 ```yaml
-format: fnt-fed3-protocol/1
+format: fnt-fed3-protocol/2
 name: Short name
 description: Free text.
 devices: [FED001, FED002]   # FED3 IDs: the same name on the device, in data and in FNT
@@ -443,8 +443,8 @@ rules:                   # optional named rules
 phases:                  # run in order; the last one runs until Stop
   - name: …
     until: …             # when this phase ends (omit on the last phase)
-    all: …               # rule for every device
-    devices: {A: …}      # per-device rule
+    rule: …              # the rule every device runs
+    only: {FED002: …}    # changes to the rule for some devices
     rotate: …            # reassign rules between devices periodically
     daily: […]           # clock-time windows inside this phase
 
@@ -452,11 +452,31 @@ checks:                  # optional; what the GUI flags as a problem
   no_pellets: 8h
 ```
 
+`devices` means one thing: the list of FED3s at the top. Every device in it
+runs every phase, so a phase's `rule` is what they all do; `only` changes it
+for the devices it names.
+
 ### Rules in the file
 
 A rule is either a mapping of the keys from Part 1, or the name of an entry in
 `rules`. `use: <name>` inside a mapping starts from that named rule; the keys
 written beside it override it.
+
+`only` (in a phase or a daily window) maps FED3s to rules. A key can name
+several FED3s, separated by commas, to give them one rule:
+
+```yaml
+rule: {active: both, ratio: 1}
+only:
+  FED001, FED002: {ratio: 5}        # FR5 on both pokes, for these two
+  FED003: {active: left}            # FR1 on the left poke
+```
+
+Each FED3 may appear in `only` once. Inside `{ }` a comma separates entries,
+so there a key naming several FED3s needs quotes, `{"FED001, FED002": rich}`,
+or is written as a list, `{[FED001, FED002]: rich}`. A phase with `only` and
+no `rule` runs the defaults (FR1 on the left poke) on the devices `only`
+leaves out, which the checker warns about.
 
 `cue.*` keys are written as a nested `cue:` mapping. A cue is a named cue, or a
 list of actions where each action is either a one-key mapping or `click`:
@@ -494,10 +514,18 @@ ends the phase:
 | `{after: 48h}` | 48 h after the phase started. | Device |
 | `{at: "19:00"}` | At the first 19:00 after the phase started. | Device |
 | `{at: "19:00", day: 3}` | At 19:00 on day 3 of the run. | Device |
-| `{rewards: 200}` | When this device has delivered 200 rewards in this phase. | Device |
-| `{pokes: 500, side: any}` | After 500 pokes on this device in this phase (`side` can be `left`, `right` or `any`). | Device |
+| `{rewards: 200, of: each}` | On each device by itself, when that device has delivered 200 rewards in this phase. | Device |
+| `{pokes: 500, side: any, of: each}` | On each device by itself, after 500 pokes on it in this phase (`side` can be `left`, `right` or `any`). | Device |
+| `{rewards: 200, of: all}` | On every device at once, when every device has delivered 200 rewards in this phase. | FNT |
+| `{rewards: 200, of: any}` | On every device at once, when any one device has delivered 200. | FNT |
+| `{rewards: 200, of: [FED001, FED002]}` | On every device at once, when each one listed has delivered 200. | FNT |
 | `{manual: true}` | When someone presses **Advance phase**. | FNT |
-| `{rewards: 200, devices: all}` | When every device (or `any` device, or a list such as `[A, B]`) has delivered 200 rewards in this phase. | FNT |
+
+`of` says whose counts end the phase, and works the same for `pokes`. With
+`of: each` the devices move on separately, so they can end up in different
+phases. `of` can be left out when the protocol has one device; with several,
+the checker warns until it's written, so that a phase never splits the
+devices up without saying so.
 
 ### Conditions that need FNT
 
@@ -509,7 +537,7 @@ or on a person pressing **Advance phase**, has to be checked by FNT.
   every device still in phase *n*. Devices that already left by a local
   fallback are untouched.
 - **If FNT is down,** such a phase doesn't end until FNT is back, unless it
-  also has a device-local condition. `until: [{rewards: 100, devices: all},
+  also has a device-local condition. `until: [{rewards: 100, of: all},
   {after: 4d}]` ends at whichever comes first, and the 4-day limit still
   applies with FNT down.
 - **The checker and editor** mark every phase that needs FNT, and warn when it
@@ -526,8 +554,12 @@ rotate:
   at: "19:00"          # optional, and only with every: 1d
   mode: cycle          # cycle: each device takes the next one's assignment
                        # shuffle: random permutation, seeded per run
-  assign: {A: rich, B: rich, C: poor, D: poor}   # the first period
+  assign:              # the first period; every device needs one
+    FED001, FED002: rich
+    FED003, FED004: poor
 ```
+
+`assign` names devices the same way `only` does.
 
 FNT expands a rotation into consecutive phases (`Competition 1`,
 `Competition 2`, …), one per period, with each device given its own
@@ -546,23 +578,41 @@ start to the next boundary.
 
 ```yaml
 daily:
-  - {from: "07:00", to: "19:00", all: {free_feed: 1}}
-  - {from: "20:00", to: "22:00", devices: {A: {ratio: 3}}}
+  - {from: "07:00", to: "19:00", rule: {free_feed: 1}}
+  - {from: "20:00", to: "22:00", only: {FED002: {ratio: 3}}}
 ```
 
 A window overrides keys from the phase's rule between two clock times every
-day, for every device (`all`), for some (`devices`), or both. A window may cross midnight. Windows within a phase may not overlap; this
-is checked when the file is loaded.
+day, for every device (`rule`), for some (`only`), or both. A device `only`
+leaves out keeps the phase's rule during the window. A window may cross
+midnight. Windows within a phase may not overlap; this is checked when the
+file is loaded.
 
 ### Merge order
 
 Each phase's rule for a device is built by merging, in this order (later wins):
 1. the built-in defaults;
-2. the phase's `all`;
+2. the phase's `rule`;
 3. the phase's rotation assignment for that device;
-4. the phase's `devices` entry for that device.
+4. the phase's `only` entry for that device.
 
 `daily` windows become `WINDOW` lines.
+
+### Format 1
+
+Files written as `format: fnt-fed3-protocol/1` still load, so older protocols
+and runs keep working, but FNT writes format 2. Format 1 used other names for
+the same three things:
+
+| Format 1 | Format 2 |
+| --- | --- |
+| phase or window `all:` | `rule:` |
+| phase or window `devices: {FED001: …}` | `only: {FED001: …}` |
+| `until: {rewards: 100, devices: all}` | `until: {rewards: 100, of: all}` |
+| `until: {rewards: 100}` | `until: {rewards: 100, of: each}` |
+
+To move a file to format 2, change its first line and these keys. The form in
+the editor writes whichever format the file it's editing uses.
 
 ### Checks
 
@@ -581,10 +631,13 @@ line:
   - out-of-range values;
   - overlapping windows;
   - a phase that can never end;
-  - a device name that isn't declared;
+  - a device name that isn't declared, or one given twice in `only` or
+    `assign`;
   - a schedule over the device limits.
 
-  It also lists the phases that need FNT.
+  It warns about a count condition without `of` when there are several
+  devices, and a phase whose `only` leaves devices on the defaults. It also
+  lists the phases that need FNT.
 - `fnt-fed compile protocol.yaml` prints each device's schedule.
 - `fnt-fed preview protocol.yaml --days 21` prints the timeline. Count
   conditions are shown as "after 200 rewards" rather than given times.
@@ -794,10 +847,12 @@ The file is the protocol, so the editor edits the file:
 - **Add phase…:** a form for the common settings (where it goes, end condition,
   active poke, ratio, timeout, quota, free feeding, pellet or none, reward tone,
   flash and BNC train, clicks). It writes the YAML for you, so a new phase
-  never needs typing.
+  never needs typing. With several devices, an end on rewards or pokes is
+  labelled "each device on its own" and written with `of: each`. In a format 1
+  file the form writes format 1 keys.
 - **Edit phase / Remove phase:** the same form, filled from a phase's YAML, or
   deleting its lines. A phase the form can't show in full (named rules,
-  rotation, windows, per-device rules) is edited in the text instead; the form
+  rotation, windows, per-device rules in `only`) is edited in the text instead; the form
   never drops what it can't show.
 - **During a run** the editor opens on the running protocol and **Apply to
   running devices** sends it. The engine refuses an edit that changes a
@@ -855,7 +910,7 @@ run**.
 ### 1. Both pokes, stepping up the ratio by count
 
 ```yaml
-format: fnt-fed3-protocol/1
+format: fnt-fed3-protocol/2
 name: FR1 to FR5, both pokes
 devices: [FED001]
 
@@ -870,12 +925,12 @@ rules:
 phases:
   - name: FR1
     until: {rewards: 50}
-    all: {use: base, ratio: 1}
+    rule: {use: base, ratio: 1}
   - name: FR3
     until: {rewards: 100}
-    all: {use: base, ratio: 3}
+    rule: {use: base, ratio: 3}
   - name: FR5
-    all: {use: base, ratio: 5}
+    rule: {use: base, ratio: 5}
 ```
 
 This compiles to:
@@ -895,7 +950,7 @@ SET active=both ratio=5 cue.reward=tone:4000:200+flash:poke:0:0:30:0:500
 ### 2. Four-patch competition with depletion and daily reshuffle
 
 ```yaml
-format: fnt-fed3-protocol/1
+format: fnt-fed3-protocol/2
 name: Four-patch competition
 description: >
   Two rich and two poor patches that each refill hourly. Which patches are
@@ -917,11 +972,11 @@ rules:
 phases:
   - name: Habituation
     until: {at: "19:00", day: 3}
-    all: {active: none, free_feed: 1}
+    rule: {active: none, free_feed: 1}
 
   - name: Training
-    until: [{rewards: 100, devices: all}, {after: 4d}]
-    all: patch
+    until: [{rewards: 100, of: all}, {after: 4d}]
+    rule: patch
 
   - name: Competition
     until: {after: 14d}
@@ -929,10 +984,12 @@ phases:
       every: 1d
       at: "19:00"
       mode: shuffle
-      assign: {FED001: rich, FED002: rich, FED003: poor, FED004: poor}
+      assign:
+        FED001, FED002: rich
+        FED003, FED004: poor
 
   - name: Recovery
-    all: {active: none, free_feed: 1}
+    rule: {active: none, free_feed: 1}
 
 checks:
   no_pellets: 8h
@@ -946,14 +1003,14 @@ one is short unless Training happens to end at 19:00.
 ### 3. Timed feeding
 
 ```yaml
-format: fnt-fed3-protocol/1
+format: fnt-fed3-protocol/2
 name: Timed feeding 19:00-21:00
 devices: [FED001]
 phases:
   - name: Restricted
-    all: {active: none}
+    rule: {active: none}
     daily:
-      - {from: "19:00", to: "21:00", all: {free_feed: 1}}
+      - {from: "19:00", to: "21:00", rule: {free_feed: 1}}
 ```
 
 The window runs on the device, so it opens and closes on time with the PC off.
@@ -972,6 +1029,7 @@ It also keeps working after Stop.
 | Blank card | FR1, left poke. |
 | After Stop | The device keeps running its current phase, including daily windows. |
 | Where the schedule runs | On the device; FNT only checks conditions that span devices. |
+| Several devices in a phase | One `rule` for all of them, `only` for exceptions, and `of` on a count condition saying whose counts end it (format 2). |
 | Notifications | None. The GUI flags problems until they're acknowledged. |
 | `status` rows | Hourly. |
 | Limits | 256 phases, 8 daily windows and 6 `until` lines per phase. |
