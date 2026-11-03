@@ -730,6 +730,10 @@ class MADSpectrogramWidget(SpectrogramWidget):
         # masks. ``self.mask`` is their union (uint8 {0,1}) kept for fill
         # rendering, save-target and inference-preserve compatibility.
         self.annotations: List[dict] = []
+        # Ridges of calls confirmed this session, by example id: {bins, t0,
+        # mask}. A drawn or edited mask gets its ridge when it is saved; an
+        # annotation adopts it while its mask still matches (see _has_ridge).
+        self.label_ridges: Dict[str, dict] = {}
         # Vertex-edit state (Phase F): index of the annotation being edited and
         # its polygon points in full-grid (t, f) coords.
         self._editing_ann_idx: Optional[int] = None
@@ -838,6 +842,7 @@ class MADSpectrogramWidget(SpectrogramWidget):
         self._pending = np.zeros_like(self.mask)
         self._pending_bbox = None
         self.annotations = []
+        self.label_ridges = {}
         self._mask_dirty = False
         self.clear_sam_prompts()
         self.update()
@@ -2000,12 +2005,12 @@ class MADSpectrogramWidget(SpectrogramWidget):
         the pixels under its mask, one point per time column (mad_ridge). A blob
         over a fast trill has a flat centroid; this line still shows the trill.
 
-        Drawn only while the mask is the one the ridge was computed from: an
-        edited mask has no ridge until inference or add-ridge writes one."""
-        bins = ann.get('ridge_bins')
-        if bins is None or ann.get('_ridge_mask') is not ann.get('mask'):
+        Drawn only while the mask is the one the ridge was computed from; a
+        mask drawn or edited by hand shows its ridge once it is confirmed."""
+        if not self._has_ridge(ann):
             return
-        t0 = ann['t0']
+        bins = ann['ridge_bins']
+        t0 = ann.get('ridge_t0', ann['t0'])
         runs = []
         # One row per piece where a mask's pieces share columns (mad_ridge).
         for row in np.atleast_2d(bins):
@@ -2029,6 +2034,24 @@ class MADSpectrogramWidget(SpectrogramWidget):
                     painter.drawPolyline(QPolygonF(pts))
                 else:
                     painter.drawPoint(pts[0])
+
+    def _has_ridge(self, ann) -> bool:
+        """True when ``ann`` has a ridge computed from its current mask: its
+        own (a prediction's crop, a reloaded label), or the one saved when its
+        mask was confirmed this session (``label_ridges``), adopted here."""
+        if (ann.get('ridge_bins') is not None
+                and ann.get('_ridge_mask') is ann.get('mask')):
+            return True
+        lr = self.label_ridges.get(str(ann.get('id')))
+        m = ann.get('mask')
+        if lr is None or m is None:
+            return False
+        m = np.asarray(m) > 0
+        if m.shape != lr['mask'].shape or not np.array_equal(m, lr['mask']):
+            return False
+        ann['ridge_bins'], ann['ridge_t0'] = lr['bins'], lr['t0']
+        ann['_ridge_mask'] = ann['mask']
+        return True
 
     @staticmethod
     def _draw_haloed_text(painter, pos, text, color, halo):
@@ -2351,7 +2374,7 @@ class MADSpectrogramWidget(SpectrogramWidget):
             painter.save()
             painter.setClipRect(spec_rect)
             for ai, ann in enumerate(self.annotations):
-                if (ai == self._editing_ann_idx or 'ridge_bins' not in ann
+                if (ai == self._editing_ann_idx
                         or ann.get('status') == 'rejected'
                         or self._score_hidden(ann)):
                     continue
@@ -17748,6 +17771,16 @@ class MADMainWindow(QMainWindow):
         # example comes through here, so this is the one place the cached count
         # has to be dropped.
         self._invalidate_label_count(wav_path)
+        # The ridge just saved with a label, for the overlay: a SAM or painted
+        # mask has no prediction crop to draw one from.
+        rg = res.get('ridge') or {}
+        if kind == 'label' and rg.get('khz') is not None:
+            sg.label_ridges[str(ex_id)] = {
+                'bins': np.asarray(rg['khz'], np.float64) * 1000.0 / df,
+                't0': int(pt0) + int(rg['t_off']),
+                'mask': np.asarray(local) > 0}
+        else:
+            sg.label_ridges.pop(str(ex_id), None)
         # Hand the pre-write id list to the undo snapshot that is waiting for
         # it. Only the first commit of an operation sets it: a snapshot covers
         # one user action, and its baseline is the state before that action.

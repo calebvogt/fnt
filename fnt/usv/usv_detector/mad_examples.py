@@ -519,6 +519,18 @@ def _examples_to_annotations(examples, wav_name, grid_shape, kinds=("label",)):
         # with no example behind it" and not draw the call twice.
         if meta.get("blob_id") is not None:
             ann["blob_id"] = meta["blob_id"]
+        # The label's brightness ridge, in spectrogram bins, from the frame it
+        # starts at; tied to this mask object like a prediction's (MAD hides a
+        # ridge once its mask is edited).
+        if ex.get("ridge") is not None:
+            try:
+                df_hz = float(meta["sample_rate"]) / 2.0 / (int(meta["nfft"]) // 2)
+            except (KeyError, TypeError, ValueError, ZeroDivisionError):
+                df_hz = None
+            if df_hz:
+                ann["ridge_bins"] = np.asarray(ex["ridge"], np.float64) * 1000.0 / df_hz
+                ann["ridge_t0"] = t_off + int(ex.get("ridge_t_off") or 0)
+                ann["_ridge_mask"] = ann["mask"]
         yield ann
 
 

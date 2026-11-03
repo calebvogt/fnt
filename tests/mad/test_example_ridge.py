@@ -184,5 +184,39 @@ def test_the_csv_export_carries_a_labels_ridge():
         assert rows["painted"]["ridge_trill"] == 1    # painted by hand: no crop at all
 
 
+def test_reloaded_labels_carry_their_ridge_for_the_overlay():
+    from fnt.usv.usv_detector.mad_examples import _examples_to_annotations
+    spec, mask, meta = _patch()
+    exp = _expected(spec, mask)
+    with tempfile.TemporaryDirectory() as d:
+        h5 = os.path.join(d, "rec_FNT.mad")
+        res = ms.td_commit_example(h5, spec, mask, dict(meta, patch_t_off=1000), "e1")
+        np.testing.assert_allclose(res["ridge"]["khz"], exp["khz"])
+        assert res["ridge"]["t_off"] == T0
+        (ann,) = _examples_to_annotations(ms.td_iter_file_examples(h5, "rec.wav", with_spec=False),
+                                          "rec.wav", (N_FREQ, 10_000))
+    # bins on the file's grid, starting at the call's first frame; drawn while the mask is unedited
+    assert ann["ridge_t0"] == 1000 + T0 == ann["t0"]
+    np.testing.assert_allclose(ann["ridge_bins"], exp["khz"] * 1000 / DF_HZ)
+    assert ann["_ridge_mask"] is ann["mask"]
+
+
+def test_a_mask_confirmed_this_session_adopts_its_saved_ridge():
+    from types import SimpleNamespace
+    from fnt.usv.mad_pyqt import MADSpectrogramWidget
+    has = MADSpectrogramWidget._has_ridge
+    own = np.zeros((5, 8), bool)
+    own[2, :] = True
+    canvas = SimpleNamespace(label_ridges={"e1": {"bins": np.arange(8.0), "t0": 42,
+                                                  "mask": own.copy()}})
+    sam = {"id": "e1", "t0": 42, "mask": own.copy()}        # a new mask object, same pixels
+    assert has(canvas, sam) and sam["ridge_t0"] == 42 and sam["_ridge_mask"] is sam["mask"]
+    edited = own.copy()
+    edited[3, :] = True
+    sam["mask"] = edited                                    # edited after confirming: hidden
+    assert not has(canvas, sam)
+    assert not has(canvas, {"id": "other", "t0": 0, "mask": own})
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

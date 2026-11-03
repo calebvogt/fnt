@@ -776,9 +776,10 @@ def store_example_ridge(g, spec=None, mask=None, meta=None) -> Optional[Dict]:
     """(Re)compute an example group's ridge, dropping any stale one first.
 
     ``spec``, ``mask`` and ``meta`` default to what the group holds. Returns
-    the measures stored (``{ridge_turns, ...}``), or None when the example has
-    no ridge (no pixels inside its bounds, or no grid in its meta). Never
-    raises: a ridge must not stop a label from being saved."""
+    the measures stored (``{ridge_turns, ...}``) plus the ridge itself
+    (``khz``, starting at patch frame ``t_off``) for the overlay, or None when
+    the example has no ridge (no pixels inside its bounds, or no grid in its
+    meta). Never raises: a ridge must not stop a label from being saved."""
     from .mad_ridge import RIDGE_ATTRS
     try:
         if EXAMPLE_RIDGE_DS in g:
@@ -803,7 +804,9 @@ def store_example_ridge(g, spec=None, mask=None, meta=None) -> Optional[Dict]:
         g.attrs["ridge_t_off"] = res["t_off"]
         g.create_dataset(EXAMPLE_RIDGE_DS, data=res["khz"], compression="gzip",
                          compression_opts=4)
-        return {k: res[k] for k in RIDGE_ATTRS}
+        out = {k: res[k] for k in RIDGE_ATTRS}
+        out.update(khz=res["khz"], t_off=res["t_off"])
+        return out
     except Exception:
         return None
 
@@ -1676,7 +1679,13 @@ def td_iter_file_examples(h5_path: str, wav_name: str,
             # `neighbors` is deliberately NOT read here: every caller of this
             # function wants per-call geometry for the overlay, and the whole
             # point of the split is that those readers see only this call.
-            yield {"meta": meta, "spec": spec, "mask": mask}
+            item = {"meta": meta, "spec": spec, "mask": mask}
+            # The call's ridge, so the overlay can draw a label's ridge too
+            # (a few hundred floats; see store_example_ridge).
+            if EXAMPLE_RIDGE_DS in g:
+                item["ridge"] = g[EXAMPLE_RIDGE_DS][()]
+                item["ridge_t_off"] = int(g.attrs.get("ridge_t_off", 0))
+            yield item
 
 
 def td_read_example(h5_path: str, example_id: str) -> Optional[Dict]:
