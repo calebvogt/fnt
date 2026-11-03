@@ -768,6 +768,27 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Recompute ridges that are already stored.")
     pr.set_defaults(func=_cmd_add_ridge)
 
+    # wheel
+    pw = sub.add_parser('wheel',
+                        help="Flag running-wheel squeaks among stored detections: "
+                             "short detections whose frequency band repeats at the "
+                             "beat of the wheel's low-register thumps.")
+    pw.add_argument('--input', required=True, nargs='+',
+                    help="Wav files/folders whose .mad files hold detections.")
+    pw.add_argument('--overwrite', action='store_true',
+                    help="Recompute recordings that are already done.")
+    pw.add_argument('--workers', type=int, default=1,
+                    help="Recordings processed in parallel (default 1).")
+    pw.add_argument('--low-priority', action='store_true',
+                    help="Run the workers at idle CPU priority.")
+    pw.add_argument('--model', default='',
+                    help="Only recordings whose last inference was this model (its "
+                         "run folder name, or a start of it).")
+    pw.add_argument('--settle-minutes', type=float, default=10.0,
+                    help="Leave out .mad files written in the last N minutes, which "
+                         "MAD may still be writing (default 10; 0 keeps all).")
+    pw.set_defaults(func=_cmd_wheel)
+
     # export
     px = sub.add_parser('export',
                         help="Write folder-wide CSV tables from the .mad files: one "
@@ -968,6 +989,63 @@ def _cmd_add_ridge(args) -> int:
         print(f"{os.path.basename(s)}: {k} detection(s), {e} label(s)", flush=True)
     print(f"added ridges to {n_calls} detection(s) and {n_labels} label(s) "
           f"in {n_files} file(s)")
+    return 0
+
+
+def _wheel_one(args):
+    w, overwrite, low, model = args
+    if low:
+        try:
+            import psutil
+            psutil.Process().nice(getattr(psutil, 'IDLE_PRIORITY_CLASS', 19))
+        except Exception:
+            pass
+    from .wheel_noise import run_recording
+    try:
+        return w, run_recording(w, overwrite=overwrite, model=model)
+    except Exception as ex:
+        return w, {'status': f'failed ({ex})', 'n': 0, 'squeaks': 0}
+
+
+def _cmd_wheel(args) -> int:
+    """Flag running-wheel squeaks among the detections of the given recordings
+    (wheel_noise) and store them in each .mad under /wheel. Recordings already
+    done for their current detections are passed over unless --overwrite;
+    .mad files written in the last --settle-minutes are left alone, since MAD
+    may still be writing them."""
+    import time
+    from .fnt_mask_store import masks_sibling_path
+    wavs = []
+    for w in _expand_inputs(args.input):
+        h5 = masks_sibling_path(w)
+        if not os.path.isfile(h5):
+            continue
+        if args.settle_minutes and time.time() - os.path.getmtime(h5) < 60 * args.settle_minutes:
+            continue
+        wavs.append(w)
+    jobs = [(w, args.overwrite, args.low_priority, args.model) for w in wavs]
+    if args.workers > 1:
+        from multiprocessing import Pool
+        pool = Pool(args.workers)
+        results = pool.imap_unordered(_wheel_one, jobs)
+    else:
+        pool, results = None, map(_wheel_one, jobs)
+    n_files = n_dets = n_sq = 0
+    try:
+        for i, (w, r) in enumerate(results, 1):
+            if r['status'] == 'ok':
+                n_files += 1
+                n_dets += r['n']
+                n_sq += r['squeaks']
+                print(f"[{i}/{len(jobs)}] {os.path.basename(w)}: {r['squeaks']}/{r['n']} "
+                      f"squeak(s), wheel running {r['running_s']:.0f} s", flush=True)
+            elif r['status'] not in ('done', 'other_model'):
+                print(f"[{i}/{len(jobs)}] {os.path.basename(w)}: {r['status']}", flush=True)
+    finally:
+        if pool is not None:
+            pool.close()
+            pool.join()
+    print(f"flagged {n_sq} of {n_dets} detection(s) as wheel squeaks in {n_files} file(s)")
     return 0
 
 
