@@ -139,11 +139,12 @@ def _frames_fft(x: np.ndarray, a: int, b: int, hop: int, nperseg: int, nfft: int
     """Complex spectrum (frames ``a..b-1`` x bins) on the MAD grid: frame ``i``
     covers samples ``i*hop .. i*hop + nperseg`` (Hann window)."""
     from numpy.lib.stride_tricks import sliding_window_view
+    from scipy.fft import rfft
     from scipy.signal import get_window
     seg = np.asarray(x[a * hop:(b - 1) * hop + nperseg], np.float32)
     fr = sliding_window_view(seg, nperseg)[::hop]
     w = get_window("hann", nperseg).astype(np.float32)
-    return np.fft.rfft(fr * w, nfft, axis=1)
+    return rfft(fr * w, nfft, axis=1)          # float32 in, complex64 out
 
 
 def _rows_db(z: np.ndarray, rows: np.ndarray) -> np.ndarray:
