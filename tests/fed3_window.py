@@ -28,15 +28,15 @@ from fnt.fed3.ui.window import FedWindow                 # noqa: E402
 
 RESULTS = []
 PROTOCOL = """\
-format: fnt-fed3-protocol/1
+format: fnt-fed3-protocol/2
 name: Window test
 devices: [FED001, FED002]
 phases:
   - name: Free
     until: {after: 1h}
-    all: {active: none, free_feed: 1}
+    rule: {active: none, free_feed: 1}
   - name: FR1
-    all: {active: both}
+    rule: {active: both}
 """
 
 
@@ -136,12 +136,52 @@ def run_checks(app, tmp):
     form.timeout.setValue(30)
     check("a timeout makes its click available", form.clicks["timeout"].isEnabled())
     compiled, problems = proto.check(
-        "format: fnt-fed3-protocol/1\nname: x\ndevices: [FED001]\nphases:\n"
-        "  - name: a\n    until: {rewards: 5}\n    all: {active: none}\n  - name: b\n")
+        "format: fnt-fed3-protocol/2\nname: x\ndevices: [FED001]\nphases:\n"
+        "  - name: a\n    until: {rewards: 5}\n    rule: {active: none}\n  - name: b\n")
     check("the checker refuses the same thing written in the text",
           compiled is None and any("only ends on rewards" in p.message for p in problems))
     removed = ed.remove_phase(edited, 0)
     check("Remove phase takes it out again", removed.strip() == TEMPLATES["Timed feeding"].strip())
+
+    print("\n--- the form with several devices, and in format 1 files ---")
+    keys, several = ed.syntax_of(PROTOCOL)
+    check("a two-device protocol is several devices, in format 2",
+          keys == proto.KEY_NAMES[proto.FORMAT] and several)
+    form = PhaseDialog(places=["Free", "FR1"], keys=keys, several=several)
+    check("ends on counts say each device moves on alone",
+          "each device on its own" in form.ends.itemText(2))
+    form.name.setText("Each")
+    form.place.setCurrentIndex(2)
+    form.ends.setCurrentIndex(2)
+    form.amount.setText("20")
+    added = ed.insert_phase(PROTOCOL, form.yaml, form.before())
+    compiled, problems = proto.check(added)
+    check("it writes of: each, which the checker accepts without a warning",
+          "{rewards: 20, of: each}" in added and compiled is not None and not problems,
+          "; ".join(p.message for p in problems))
+    block = ed.phase_blocks(added)[1]
+    settings, missing = ed.settings_from_phase(block.mapping, keys)
+    check("and reads it back as an end on each device's rewards",
+          not missing and settings["ends"] == "rewards" and settings["amount"] == "20")
+    every = ed.phase_yaml(dict(ed.NEW_PHASE, ends="all_rewards", amount="9", fallback="2d"),
+                          keys=keys, several=True)
+    check("every device's rewards is written with of: all",
+          "[{rewards: 9, of: all}, {after: 2d}]" in every)
+
+    v1 = (PROTOCOL.replace(proto.FORMAT, proto.FORMAT_1).replace("rule: ", "all: "))
+    keys, several = ed.syntax_of(v1)
+    check("a format 1 file is seen as one", keys == proto.KEY_NAMES[proto.FORMAT_1])
+    written = ed.phase_yaml(dict(ed.NEW_PHASE, ends="all_rewards", amount="9", fallback=""),
+                            keys=keys, several=several)
+    check("the form writes format 1 keys into it",
+          "    all:\n" in written and "{rewards: 9, devices: all}" in written
+          and "rule:" not in written and " of:" not in written)
+    edited = ed.insert_phase(v1, lambda indent: written, 1)
+    compiled, problems = proto.check(edited)
+    check("so the file still checks", compiled is not None,
+          "; ".join(p.message for p in problems))
+    settings, missing = ed.settings_from_phase(ed.phase_blocks(edited)[1].mapping, keys)
+    check("and the form reads format 1 back", not missing and settings["ends"] == "all_rewards")
 
     print("\n--- the log's colours ---")
     check("problems are red", event_style("problem: jammed")[0] == theme.BAD)

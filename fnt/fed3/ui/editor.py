@@ -90,6 +90,22 @@ def _seconds(text):
 
 
 REWARD_ENDS = ("rewards", "all_rewards")
+EACH_ENDS = ("rewards", "pokes")         # each device on its own
+V2_KEYS = proto.KEY_NAMES[proto.FORMAT]
+
+
+def syntax_of(text):
+    """How a phase in ``text`` is written: its format's key names, and whether
+    it has several devices (so an end on counts says whose)."""
+    try:
+        doc = yaml.load(text, Loader=proto._Loader)   # noqa: S506 - a SafeLoader
+    except yaml.YAMLError:
+        doc = None
+    doc = doc if isinstance(doc, dict) else {}
+    fmt = doc.get("format")
+    keys = proto.KEY_NAMES.get(fmt, V2_KEYS) if isinstance(fmt, str) else V2_KEYS
+    devices = doc.get("devices")
+    return keys, isinstance(devices, list) and len(devices) > 1
 
 
 def can_earn(s):
@@ -123,25 +139,28 @@ def coherent(s):
     return s
 
 
-def phase_yaml(s, indent=2):
-    """One phase list item, from the form's settings."""
+def phase_yaml(s, indent=2, keys=V2_KEYS, several=False):
+    """One phase list item, from the form's settings. ``keys`` are the key
+    names of the file's format; ``several`` says the protocol has more than one
+    device, so an end on counts is written as each device's own."""
     s = coherent(s)
     pad = " " * indent
     lines = [f"{pad}- name: {_plain(s['name'].strip() or 'New phase')}"]
     amount = str(s.get("amount", "")).strip().strip('"\'')
     day = f", day: {s['day']}" if s.get("day") else ""
     side = f", side: {s['side']}" if s.get("side", "any") != "any" else ""
+    each = ", of: each" if several and keys == V2_KEYS else ""     # format 1 had no each
     until = {
         "after": f"{{after: {_plain(amount)}}}",
         "at": f"{{at: {json.dumps(amount)}{day}}}",
-        "rewards": f"{{rewards: {amount}}}",
-        "pokes": f"{{pokes: {amount}{side}}}",
+        "rewards": f"{{rewards: {amount}{each}}}",
+        "pokes": f"{{pokes: {amount}{side}{each}}}",
         "manual": "{manual: true}",
     }.get(s["ends"])
     if s["ends"] == "all_rewards":
         fallback = str(s.get("fallback", "")).strip()
-        until = (f"[{{rewards: {amount}, devices: all}}, {{after: {_plain(fallback)}}}]"
-                 if fallback else f"{{rewards: {amount}, devices: all}}")
+        every = f"{{rewards: {amount}, {keys['of']}: all}}"
+        until = (f"[{every}, {{after: {_plain(fallback)}}}]" if fallback else every)
     if until:
         lines.append(f"{pad}  until: {until}")
     rule = [f"active: {s['active']}"]
@@ -172,7 +191,7 @@ def phase_yaml(s, indent=2):
         cues.append("reward:")
         cues += [f"  - {action}" for action in actions]
     cues += [f"{slot}: [click]" for slot in CLICK_SLOTS if s[f"click_{slot}"]]
-    lines.append(f"{pad}  all:")
+    lines.append(f"{pad}  {keys['rule']}:")
     lines += [f"{pad}    {line}" for line in rule]
     if cues:
         lines.append(f"{pad}    cue:")
@@ -180,23 +199,24 @@ def phase_yaml(s, indent=2):
     return "\n".join(lines) + "\n"
 
 
-def settings_from_phase(mapping):
+def settings_from_phase(mapping, keys=V2_KEYS):
     """Read a phase back into the form: ``(settings, what the form can't show)``.
 
-    ``mapping`` is the phase as YAML read it. The second value lists what the
-    form would lose; the phase can be edited in the form only when it's empty.
+    ``mapping`` is the phase as YAML read it, written with the key names
+    ``keys``. The second value lists what the form would lose; the phase can be
+    edited in the form only when it's empty.
     """
     s = dict(RULE_DEFAULTS, ends="never", amount="", fallback="", day=0, side="any")
     missing = []
     if not isinstance(mapping, dict):
         return s, ["it isn't written as a mapping"]
     s["name"] = str(mapping.get("name", ""))
-    for key, what in (("devices", "per-device rules"), ("rotate", "a rotation"),
+    for key, what in ((keys["only"], "per-device rules"), ("rotate", "a rotation"),
                       ("daily", "daily windows")):
         if key in mapping:
             missing.append(what)
-    _read_until(mapping.get("until"), s, missing)
-    rule = mapping.get("all", {})
+    _read_until(mapping.get("until"), s, missing, keys["of"])
+    rule = mapping.get(keys["rule"], {})
     if isinstance(rule, str):
         missing.append(f"the named rule '{rule}'")
     elif isinstance(rule, dict):
@@ -206,12 +226,13 @@ def settings_from_phase(mapping):
     return s, missing
 
 
-def _read_until(until, s, missing):
+def _read_until(until, s, missing, scope="of"):
+    """``scope`` is the key saying whose counts end the phase."""
     if until is None:
         return
     conditions = list(until) if isinstance(until, list) else [until]
     if (len(conditions) == 2 and all(isinstance(c, dict) for c in conditions)
-            and set(conditions[0]) == {"rewards", "devices"} and conditions[0]["devices"] == "all"
+            and set(conditions[0]) == {"rewards", scope} and conditions[0][scope] == "all"
             and set(conditions[1]) == {"after"}):
         s.update(ends="all_rewards", amount=str(conditions[0]["rewards"]),
                  fallback=str(conditions[1]["after"]))
@@ -220,8 +241,10 @@ def _read_until(until, s, missing):
         missing.append("an until with several conditions")
         return
     condition = conditions[0]
+    if condition.get(scope) == "each" and set(condition) & {"rewards", "pokes"}:
+        condition = {k: v for k, v in condition.items() if k != scope}   # as the form writes it
     keys = set(condition)
-    if keys == {"rewards", "devices"} and condition["devices"] == "all":
+    if keys == {"rewards", scope} and condition[scope] == "all":
         s.update(ends="all_rewards", amount=str(condition["rewards"]), fallback="")
     elif keys == {"pokes", "side"} and condition["side"] in ("any", "left", "right"):
         s.update(ends="pokes", amount=str(condition["pokes"]), side=condition["side"])
@@ -413,7 +436,7 @@ def remove_phase(text, index):
 
 def _classic(name, phase, explain, **settings):
     s = dict(RULE_DEFAULTS, name=phase, ends="never", amount="", fallback="", **settings)
-    return (f"format: fnt-fed3-protocol/1\n"
+    return (f"format: {proto.FORMAT}\n"
             f"name: {_plain(name)}\n"
             f"description: >\n"
             + "".join(f"  {line}\n" for line in explain.splitlines())
@@ -477,7 +500,7 @@ CLASSIC = {
         "poke.",
         active="right", reward="none", bnc=True, **CLASSIC_CUE),
     "Timed feeding": """\
-format: fnt-fed3-protocol/1
+format: fnt-fed3-protocol/2
 name: Timed feeding 19:00-21:00
 description: >
   Classic FED3 Timed feeding: free feeding between two clock times each
@@ -485,9 +508,9 @@ description: >
 devices: [FED001]
 phases:
   - name: Restricted
-    all: {active: none}
+    rule: {active: none}
     daily:
-      - {from: "19:00", to: "21:00", all: {free_feed: 1}}
+      - {from: "19:00", to: "21:00", rule: {free_feed: 1}}
 """,
     "FR with timeout": _classic(
         "FR1 with a 30 s timeout", "FRTO",
@@ -507,12 +530,12 @@ UNSUPPORTED = {"Light tracking": "Light tracking needs a poke light that stays o
 
 EXAMPLES = {
     "FR1, both pokes, with a cue": """\
-format: fnt-fed3-protocol/1
+format: fnt-fed3-protocol/2
 name: FR1 both pokes
 devices: [FED001]
 phases:
   - name: FR1
-    all:
+    rule:
       active: both
       cue:
         reward:
@@ -520,7 +543,7 @@ phases:
           - flash: {target: poke, color: blue, ms: 500}
 """,
     "Step up the ratio by rewards": """\
-format: fnt-fed3-protocol/1
+format: fnt-fed3-protocol/2
 name: FR1 to FR5, both pokes
 devices: [FED001]
 
@@ -535,15 +558,15 @@ rules:
 phases:
   - name: FR1
     until: {rewards: 50}
-    all: {use: base, ratio: 1}
+    rule: {use: base, ratio: 1}
   - name: FR3
     until: {rewards: 100}
-    all: {use: base, ratio: 3}
+    rule: {use: base, ratio: 3}
   - name: FR5
-    all: {use: base, ratio: 5}
+    rule: {use: base, ratio: 5}
 """,
     "Four-patch competition": """\
-format: fnt-fed3-protocol/1
+format: fnt-fed3-protocol/2
 name: Four-patch competition
 description: >
   Two rich and two poor patches that each refill hourly. Which patches are
@@ -565,11 +588,11 @@ rules:
 phases:
   - name: Habituation
     until: {at: "19:00", day: 3}
-    all: {active: none, free_feed: 1}
+    rule: {active: none, free_feed: 1}
 
   - name: Training
-    until: [{rewards: 100, devices: all}, {after: 4d}]
-    all: patch
+    until: [{rewards: 100, of: all}, {after: 4d}]
+    rule: patch
 
   - name: Competition
     until: {after: 14d}
@@ -577,10 +600,12 @@ phases:
       every: 1d
       at: "19:00"
       mode: shuffle
-      assign: {FED001: rich, FED002: rich, FED003: poor, FED004: poor}
+      assign:
+        FED001, FED002: rich
+        FED003, FED004: poor
 
   - name: Recovery
-    all: {active: none, free_feed: 1}
+    rule: {active: none, free_feed: 1}
 
 checks:
   no_pellets: 8h
@@ -621,11 +646,13 @@ class PhaseDialog(QDialog):
     passes ``settings`` read from the phase instead.
     """
 
-    def __init__(self, parent=None, settings=None, places=None, note=""):
+    def __init__(self, parent=None, settings=None, places=None, note="", keys=V2_KEYS,
+                 several=False):
         super().__init__(parent)
         editing = settings is not None
         self.setWindowTitle("Edit a phase" if editing else "Add a phase")
         self.places = places or []
+        self.keys, self.several = keys, several
         s = dict(NEW_PHASE, **(settings or {}))
         if not editing and self.places:
             s["ends"], s["amount"] = "never", ""     # it goes last, and the last runs until Stop
@@ -642,6 +669,8 @@ class PhaseDialog(QDialog):
 
         self.ends = QComboBox()
         for key, label in ENDS:
+            if several and key in EACH_ENDS:
+                label += " (each device on its own)"
             self.ends.addItem(label, key)
         self.amount = QLineEdit()
         self.fallback_label = QLabel("or after")
@@ -862,7 +891,7 @@ class PhaseDialog(QDialog):
         return index - 1 if index > 0 else None
 
     def yaml(self, indent=2):
-        return phase_yaml(self.settings(), indent)
+        return phase_yaml(self.settings(), indent, self.keys, self.several)
 
 
 # ---------------------------------------------------------------------------
@@ -1077,7 +1106,8 @@ class ProtocolEditor(QDialog):
             QMessageBox.information(self, "Add a phase",
                                     "Fix the YAML first, so the phases can be found.")
             return
-        dialog = PhaseDialog(self, places=[b.name for b in blocks])
+        keys, several = syntax_of(self.text())
+        dialog = PhaseDialog(self, places=[b.name for b in blocks], keys=keys, several=several)
         if dialog.exec_() != QDialog.Accepted:
             return
         self._set_text(insert_phase(self.text(), dialog.yaml, dialog.before()))
@@ -1087,7 +1117,8 @@ class ProtocolEditor(QDialog):
         if not blocks or index >= len(blocks):
             return
         block = blocks[index]
-        settings, missing = settings_from_phase(block.mapping)
+        keys, several = syntax_of(self.text())
+        settings, missing = settings_from_phase(block.mapping, keys)
         if missing:
             box = QMessageBox(QMessageBox.Information, "Edit a phase",
                               f"The form can't show everything in '{block.name}', so it "
@@ -1102,7 +1133,7 @@ class ProtocolEditor(QDialog):
         lines = self.text().splitlines()[block.start:block.end]
         note = ("Comments inside this phase will be removed."
                 if any(line.lstrip().startswith("#") or " #" in line for line in lines) else "")
-        dialog = PhaseDialog(self, settings=settings, note=note)
+        dialog = PhaseDialog(self, settings=settings, note=note, keys=keys, several=several)
         if dialog.exec_() != QDialog.Accepted:
             return
         self._set_text(replace_phase(self.text(), index, dialog.yaml(block.indent)))

@@ -53,9 +53,27 @@ FED002]`), and phases, each with a rule and a way to end.
     is a warning.
 - **Edit phase** reads a phase back into the same form and rewrites it, and
   **Remove phase** deletes one. A phase that uses something the form doesn't
-  have (a named rule, a rotation, daily windows, per-device rules) is edited in
+  have (a named rule, a rotation, daily windows, per-device rules in `only`) is edited in
   the text: the form says what it can't show and takes you to the phase rather
   than drop it. Comments inside a phase the form rewrites are lost.
+- **With several FED3s,** every one runs every phase. A phase's `rule` is what
+  they all do, and `only` changes it for the ones it names:
+
+  ```yaml
+  - name: Training
+    until: {rewards: 100, of: all}
+    rule: {active: both, ratio: 1}
+    only:
+      FED003, FED004: {ratio: 5}
+  ```
+
+  `of` says whose rewards end the phase: `all` moves every FED3 on together
+  once each has 100 (FNT checks this, so it must be running), and `each` moves
+  each FED3 on by itself when it reaches 100. With several FED3s the check
+  warns until you write one.
+- **Older protocols** (`format: fnt-fed3-protocol/1`) still open and run. They
+  used `all` for `rule`, and `devices` for both `only` and `of`; see
+  [design.md](design.md#format-1).
 - **The check on the right** updates as you type and points at the line of any
   problem.
 - **The timeline below it** shows when each phase will start, and marks the

@@ -22,7 +22,15 @@ import yaml
 
 from . import schedule as sch
 
-FORMAT = "fnt-fed3-protocol/1"
+FORMAT = "fnt-fed3-protocol/2"
+# Format 1 is still read, so runs and files written before format 2 keep
+# loading. It called a phase's rule `all`, its per-device rules `devices`, and
+# whose counts end a phase `devices` too; format 2 calls them rule, only and of.
+FORMAT_1 = "fnt-fed3-protocol/1"
+KEY_NAMES = {
+    FORMAT: {"rule": "rule", "only": "only", "of": "of"},
+    FORMAT_1: {"rule": "all", "only": "devices", "of": "devices"},
+}
 MAX_PROTOCOL_NAME = 60
 DEVICE_NAME = re.compile(r"FED(?!000)\d{3}")     # a FED3's ID, as on its screen and in FNT
 BUILTIN_COLORS = {
@@ -35,9 +43,7 @@ RESERVED_CUES = ("none", "click")
 
 TOP_KEYS = ("format", "name", "description", "devices", "colors", "cues",
             "rules", "phases", "checks")
-PHASE_KEYS = ("name", "until", "all", "devices", "rotate", "daily")
 ROTATE_KEYS = ("every", "at", "mode", "assign")
-WINDOW_KEYS = ("from", "to", "all", "devices")
 CHECK_KEYS = ("no_pellets",)
 CUE_SLOTS = ("reward", "counted", "inactive", "timeout", "depleted")
 CUE_PARAMS = {
@@ -91,6 +97,7 @@ class _Loader(yaml.SafeLoader):
     def __init__(self, stream):
         super().__init__(stream)
         self.duplicates = []
+        self.bad_keys = []              # lines of keys that can't be a key
 
 
 def _construct_map(loader, node):
@@ -100,6 +107,13 @@ def _construct_map(loader, node):
     for key_node, value_node in node.value:
         key = loader.construct_object(key_node, deep=True)
         line = key_node.start_mark.line + 1
+        if isinstance(key, list):
+            key = tuple(key)            # [FED001, FED002]: rich
+        try:
+            hash(key)
+        except TypeError:
+            loader.bad_keys.append(line)
+            continue
         if key in mapping:
             loader.duplicates.append((line, key))
         mapping[key] = loader.construct_object(value_node, deep=True)
@@ -131,7 +145,7 @@ class Condition:
     day: int = 0
     count: int = 0
     side: str = "any"
-    devices: object = None      # None: this device; "all" | "any" | tuple
+    devices: object = None      # None: each device on its own; "all" | "any" | tuple
     line: int | None = None
 
     @property
@@ -173,8 +187,8 @@ class Rotation:
 class DailyWindow:
     start: int
     end: int
-    all: dict
-    devices: dict
+    all: dict                   # its `rule`, for every device
+    devices: dict               # its `only`: device -> overrides
     line: int | None = None
 
 
@@ -182,8 +196,8 @@ class DailyWindow:
 class PhaseSpec:
     name: str
     until: list
-    all: dict
-    devices: dict
+    all: dict                   # `rule`, for every device
+    devices: dict               # `only`: device -> overrides
     rotate: Rotation | None
     daily: list
     line: int | None = None
@@ -220,6 +234,8 @@ class _Parser:
         self.rule_specs = {}
         self.rules = {}
         self.devices = []
+        self.format = FORMAT
+        self.keys = KEY_NAMES[FORMAT]
 
     # -- reporting ------------------------------------------------------
 
@@ -230,10 +246,16 @@ class _Parser:
         self.problems.append(Problem(message, line, "warning"))
 
     def unknown_keys(self, mapping, allowed, where):
+        # Format 1's names, written in a format 2 file.
+        renamed = ({"all": "rule", "devices": "only"} if self.format == FORMAT
+                   and "rule" in allowed else {})
         for key in mapping:
             if key not in allowed:
-                hint = difflib.get_close_matches(str(key), allowed, n=1)
-                suffix = f"; did you mean '{hint[0]}'?" if hint else ""
+                if key in renamed:
+                    suffix = f"; in {FORMAT} it is called '{renamed[key]}'"
+                else:
+                    hint = difflib.get_close_matches(str(key), allowed, n=1)
+                    suffix = f"; did you mean '{hint[0]}'?" if hint else ""
                 self.error(mapping.line_of(key), f"unknown key '{key}' in {where}{suffix}")
 
     def expect_map(self, value, line, what):
@@ -443,16 +465,42 @@ class _Parser:
                 self.error(key_line, f"unknown rule key '{key}'{suffix}")
         return settings
 
+    def device_keys(self, mapping, where):
+        """``mapping``'s entries as (device names, value, line). A key names one
+        FED3, or several separated by commas (``FED001, FED002``) or in a list."""
+        out, seen = [], {}
+        for key, value in mapping.items():
+            line = mapping.line_of(key)
+            names = [str(n).strip() for n in
+                     (key if isinstance(key, tuple) else str(key).split(","))]
+            known = []
+            for name in names:
+                if name not in self.devices:
+                    self.error(line, f"'{name}' is not in devices")
+                elif name in seen:
+                    self.error(line, f"{name} is given twice in {where} (also on "
+                                     f"line {seen[name]})")
+                else:
+                    seen[name] = line
+                    known.append(name)
+            out.append((known, value, line))
+        return out
+
     def device_rules(self, value, line, where):
-        mapping = self.expect_map(value, line, f"{where}.devices")
+        """Per-device rules (``only``), device -> partial settings."""
+        mapping = self.expect_map(value, line, f"{where}.{self.keys['only']}")
         if mapping is None:
             return {}
         out = {}
-        for name, rule in mapping.items():
-            if name not in self.devices:
-                self.error(mapping.line_of(name), f"'{name}' is not in devices")
+        for names, rule, key_line in self.device_keys(mapping, self.keys["only"]):
+            if rule is None:
+                self.error(key_line, f"{', '.join(names) or 'this key'} has no rule; "
+                                     "inside { }, a key naming several FED3s needs "
+                                     "quotes, e.g. {\"FED001, FED002\": rich}")
                 continue
-            out[name] = self.rule(rule, mapping.line_of(name))
+            settings = self.rule(rule, key_line)
+            for name in names:
+                out[name] = dict(settings)
         return out
 
     # -- phases ---------------------------------------------------------
@@ -463,12 +511,23 @@ class _Parser:
             return None
         line = mapping.line
         keys = set(mapping)
+        scope = self.keys["of"]
         devices = None
-        if "devices" in mapping:
-            devices = self.who(mapping["devices"], mapping.line_of("devices"))
-            keys.discard("devices")
+        if self.format == FORMAT and "devices" in keys:
+            self.error(line, f"in {FORMAT}, whose counts end the phase is written "
+                             "of: each, all, any or a list of FED3 IDs, not devices")
+            return None
+        if scope in mapping:
+            devices = self.who(mapping[scope], mapping.line_of(scope))
+            keys.discard(scope)
             if not keys & {"rewards", "pokes"}:
-                self.error(line, "devices only applies to rewards and pokes")
+                self.error(line, f"{scope} only applies to rewards and pokes")
+        elif keys & {"rewards", "pokes"} and len(self.devices) > 1 and self.format == FORMAT:
+            kind = "rewards" if "rewards" in keys else "pokes"
+            self.warn(line, f"{kind}: {mapping[kind]} ends the phase on each FED3 by "
+                            f"itself, when that one reaches {mapping[kind]}, so they can "
+                            "end up in different phases; write of: each to mean that, "
+                            "or of: all to move them on together")
         if keys == {"after"}:
             seconds = self.duration(mapping["after"], line, "after")
             if seconds is None:
@@ -513,6 +572,9 @@ class _Parser:
         return None
 
     def who(self, value, line):
+        """Whose counts end a phase: None for each device on its own."""
+        if value == "each":
+            return None
         if value in ("all", "any"):
             return value
         if (isinstance(value, list) and value
@@ -521,7 +583,7 @@ class _Parser:
             if unknown:
                 self.error(line, f"not in devices: {', '.join(unknown)}")
             return tuple(value)
-        self.error(line, "devices is all, any, or a list of device names")
+        self.error(line, f"{self.keys['of']} is each, all, any, or a list of FED3 IDs")
         return None
 
     def rotation(self, value, line):
@@ -545,29 +607,30 @@ class _Parser:
         mode = mapping.get("mode", "cycle")
         if mode not in ("cycle", "shuffle"):
             self.error(mapping.line_of("mode"), "mode is cycle or shuffle")
-        assign = self.expect_map(mapping["assign"], mapping.line_of("assign"),
-                                 "rotate.assign")
-        if assign is None or every is None:
+        written = self.expect_map(mapping["assign"], mapping.line_of("assign"),
+                                  "rotate.assign")
+        if written is None or every is None:
             return None
-        missing = [d for d in self.devices if d not in assign]
-        if missing:
-            self.error(assign.line, f"assign gives every device a rule; missing: "
-                                    f"{', '.join(missing)}")
-        for name, rule_name in assign.items():
-            if name not in self.devices:
-                self.error(assign.line_of(name), f"'{name}' is not in devices")
-            elif not isinstance(rule_name, str):
-                self.error(assign.line_of(name), "assign maps each device to the "
-                                                 "name of a rule")
+        assign, named = {}, set()
+        for names, rule_name, key_line in self.device_keys(written, "assign"):
+            named.update(names)
+            if not isinstance(rule_name, str):
+                self.error(key_line, "assign maps each device to the name of a rule")
             else:
-                self.named_rule(rule_name, assign.line_of(name))
-        return Rotation(every, at, mode, dict(assign), mapping.line)
+                self.named_rule(rule_name, key_line)
+                assign.update(dict.fromkeys(names, rule_name))
+        missing = [d for d in self.devices if d not in named]
+        if missing:
+            self.error(written.line, f"assign gives every device a rule; missing: "
+                                     f"{', '.join(missing)}")
+        return Rotation(every, at, mode, assign, mapping.line)
 
     def window(self, value, line):
         mapping = self.expect_map(value, line, "a daily window")
         if mapping is None:
             return None
-        self.unknown_keys(mapping, WINDOW_KEYS, "a daily window")
+        rule_key, only_key = self.keys["rule"], self.keys["only"]
+        self.unknown_keys(mapping, ("from", "to", rule_key, only_key), "a daily window")
         if "from" not in mapping or "to" not in mapping:
             self.error(mapping.line, "a daily window needs from and to")
             return None
@@ -579,20 +642,22 @@ class _Parser:
             self.error(mapping.line, "a window must not start and end at the "
                                      "same time")
             return None
-        all_rule = self.rule(mapping["all"], mapping.line_of("all")) \
-            if "all" in mapping else {}
-        devices = self.device_rules(mapping["devices"], mapping.line_of("devices"),
-                                    "window") if "devices" in mapping else {}
+        all_rule = self.rule(mapping[rule_key], mapping.line_of(rule_key)) \
+            if rule_key in mapping else {}
+        devices = self.device_rules(mapping[only_key], mapping.line_of(only_key),
+                                    "window") if only_key in mapping else {}
         if not all_rule and not any(devices.values()):
             self.error(mapping.line, "a daily window must change something "
-                                     "(all or devices)")
+                                     f"({rule_key} or {only_key})")
         return DailyWindow(start, end, all_rule, devices, mapping.line)
 
     def phase(self, value, line, index):
         mapping = self.expect_map(value, line, "a phase")
         if mapping is None:
             return None
-        self.unknown_keys(mapping, PHASE_KEYS, "a phase")
+        rule_key, only_key = self.keys["rule"], self.keys["only"]
+        self.unknown_keys(mapping, ("name", "until", rule_key, only_key, "rotate", "daily"),
+                          "a phase")
         name = mapping.get("name")
         if not isinstance(name, str):
             self.error(mapping.line, f"phase {index + 1} needs a name")
@@ -611,12 +676,22 @@ class _Parser:
                 condition = self.condition(item, mapping.line_of("until"))
                 if condition:
                     until.append(condition)
-        all_rule = self.rule(mapping["all"], mapping.line_of("all")) \
-            if "all" in mapping else {}
-        devices = self.device_rules(mapping["devices"], mapping.line_of("devices"),
-                                    "phase") if "devices" in mapping else {}
+        all_rule = self.rule(mapping[rule_key], mapping.line_of(rule_key)) \
+            if rule_key in mapping else {}
+        devices = self.device_rules(mapping[only_key], mapping.line_of(only_key),
+                                    "phase") if only_key in mapping else {}
         rotate = self.rotation(mapping["rotate"], mapping.line_of("rotate")) \
             if "rotate" in mapping else None
+        if devices and rule_key not in mapping and not rotate:
+            # The rest run the defaults, which is almost never what was meant.
+            left = [d for d in self.devices if d not in devices]
+            if left:
+                one = len(left) == 1
+                self.warn(mapping.line, f"'{name}': {', '.join(left)} {'is' if one else 'are'} "
+                                        f"not in {only_key} and the phase has no {rule_key}, "
+                                        f"so {'it runs' if one else 'they run'} the defaults "
+                                        f"(FR1 on the left poke); give the phase a {rule_key}, "
+                                        f"or add {'it' if one else 'them'} to {only_key}")
         daily = []
         if "daily" in mapping:
             raw = mapping["daily"]
@@ -667,12 +742,17 @@ class _Parser:
             return None
         for line, key in loader.duplicates:
             self.error(line, f"'{key}' appears twice")
+        for line in loader.bad_keys:
+            self.error(line, "a key is a name (or a list of FED3 IDs), not a mapping")
         root = self.expect_map(root, 1, "a protocol file")
         if root is None:
             return None
         self.unknown_keys(root, TOP_KEYS, "the protocol")
 
-        if root.get("format") != FORMAT:
+        if isinstance(root.get("format"), str) and root["format"] in KEY_NAMES:
+            self.format = root["format"]
+            self.keys = KEY_NAMES[self.format]
+        else:
             self.error(root.line_of("format"), f"the first line should be "
                                                f"format: {FORMAT}")
         name = root.get("name")

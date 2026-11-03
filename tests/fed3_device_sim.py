@@ -120,9 +120,9 @@ def main(make=None):
     compiled = compile_one("""\
   - name: FR3
     until: {rewards: 2}
-    all: {ratio: 3, cue: {reward: [click], counted: [{tone: {hz: 2000, ms: 10}}]}}
+    rule: {ratio: 3, cue: {reward: [click], counted: [{tone: {hz: 2000, ms: 10}}]}}
   - name: Both
-    all: {active: both}
+    rule: {active: both}
 """)
     schedule = compiled.schedules["FED001"]
     device = MAKE(device_id=3, now=at(20, 9))
@@ -204,7 +204,7 @@ def main(make=None):
     print("\n--- ratios ---")
     device, _, _ = fresh("""\
   - name: Shared
-    all: {active: both, ratio: 2}
+    rule: {active: both, ratio: 2}
 """)
     for side in "LRLR":
         device.poke(side)
@@ -214,7 +214,7 @@ def main(make=None):
           outcomes(device) == ["counted", "reward", "counted", "reward"])
     device, _, _ = fresh("""\
   - name: PerPort
-    all: {active: both, ratio: 2, count: per_port}
+    rule: {active: both, ratio: 2, count: per_port}
 """)
     for side in "LRLR":
         device.poke(side)
@@ -224,7 +224,7 @@ def main(make=None):
           outcomes(device) == ["counted", "counted", "reward", "reward"])
     device, _, _ = fresh("""\
   - name: PR
-    all: {ratio_kind: progressive}
+    rule: {ratio_kind: progressive}
 """)
     needed = []
     pokes = 0
@@ -239,7 +239,7 @@ def main(make=None):
     check("progressive ratio follows 1, 2, 4, 6", needed == [1, 2, 4, 6], f"{needed}")
     device, _, _ = fresh("""\
   - name: RR
-    all: {ratio_kind: random, ratio: 4}
+    rule: {ratio_kind: random, ratio: 4}
 """)
     for _ in range(400):
         device.poke("L")
@@ -251,7 +251,7 @@ def main(make=None):
     print("\n--- timeout, quota, short pokes ---")
     device, _, _ = fresh("""\
   - name: TO
-    all: {timeout: 30s}
+    rule: {timeout: 30s}
 """)
     device.poke("L")
     device.advance(2)
@@ -263,7 +263,7 @@ def main(make=None):
           outcomes(device) == ["reward", "timeout", "reward"])
     device, _, _ = fresh("""\
   - name: Q
-    all: {quota: 2, quota_period: 1h, cue: {depleted: [click]}}
+    rule: {quota: 2, quota_period: 1h, cue: {depleted: [click]}}
 """)
     for _ in range(3):
         device.poke("L")
@@ -277,7 +277,7 @@ def main(make=None):
     check("it refills next period", outcomes(device)[-1] == "reward")
     device, _, _ = fresh("""\
   - name: Long
-    all: {min_poke_ms: 200}
+    rule: {min_poke_ms: 200}
 """)
     device.poke("L", ms=150)
     device.advance(2)
@@ -288,7 +288,7 @@ def main(make=None):
 
     device, _, _ = fresh("""\
   - name: Held
-    all: {ratio: 1}
+    rule: {ratio: 1}
 """)
     device.poke("L", ms=75000)
     held = rows(device, "poke")
@@ -301,7 +301,7 @@ def main(make=None):
     print("\n--- dispensing on its own ---")
     device, _, _ = fresh("""\
   - name: Free
-    all: {active: none, free_feed: 1, refill_delay: 60s}
+    rule: {active: none, free_feed: 1, refill_delay: 60s}
 """)
     device.advance(2)
     check("free feeding fills the well", len(rows(device, "dispense")) == 1)
@@ -316,9 +316,9 @@ def main(make=None):
 
     device, _, _ = fresh("""\
   - name: Fed
-    all: {active: none}
+    rule: {active: none}
     daily:
-      - {from: "19:00", to: "21:00", all: {free_feed: 1}}
+      - {from: "19:00", to: "21:00", rule: {free_feed: 1}}
 """)
     device.advance(10 * 3600 + 30)
     check("a timed-feeding window opens on time",
@@ -332,7 +332,7 @@ def main(make=None):
 
     device, _, _ = fresh("""\
   - name: J
-    all: {ratio: 1}
+    rule: {ratio: 1}
 """)
     device.jams_pending = 1
     device.poke("L")
@@ -358,12 +358,12 @@ def main(make=None):
     rotating = compile_one("""\
   - name: Hab
     until: {at: "19:00", day: 2}
-    all: {active: none, free_feed: 1}
+    rule: {active: none, free_feed: 1}
   - name: Rot
     until: {after: 3d}
     rotate: {every: 1d, at: "19:00", mode: cycle, assign: {FED001: rich, FED002: poor}}
   - name: End
-    all: {active: none, free_feed: 1}
+    rule: {active: none, free_feed: 1}
 """, devices="[FED001, FED002]", extra="rules:\n  rich: {ratio: 1}\n  poor: {ratio: 5}\n")
     device = MAKE(now=at(20, 9))
     start(device, rotating.schedules["FED001"])
@@ -394,7 +394,7 @@ def main(make=None):
     device, _, _ = fresh("""\
   - name: Q
     until: {rewards: 10}
-    all: {quota: 3, quota_period: 1h, ratio: 2}
+    rule: {quota: 3, quota_period: 1h, ratio: 2}
   - name: Next
 """)
     for _ in range(4):
@@ -423,7 +423,7 @@ def main(make=None):
 
     device, _, _ = fresh("""\
   - name: P
-    all: {ratio: 1}
+    rule: {ratio: 1}
 """)
     device.poke("L")
     device.advance(2)
@@ -437,7 +437,7 @@ def main(make=None):
 
     device, _, _ = fresh("""\
   - name: P
-    all: {ratio: 1}
+    rule: {ratio: 1}
 """)
     device.card.failing = True
     device.poke("L")
@@ -474,7 +474,7 @@ def main(make=None):
     print("\n--- FNT-driven changes ---")
     device, _, _ = fresh("""\
   - name: Train
-    until: [{rewards: 100, devices: all}, {after: 4d}]
+    until: [{rewards: 100, of: all}, {after: 4d}]
   - name: Next
 """)
     check("a stale GOTO is refused", device.command("GOTO:1,2")[0].startswith("ERR,GOTO_STALE"))
@@ -486,13 +486,13 @@ def main(make=None):
     device, compiled, _ = fresh("""\
   - name: A1
     until: {after: 1d}
-    all: {ratio: 5}
+    rule: {ratio: 5}
   - name: A2
 """)
     edited = compile_one("""\
   - name: A1
     until: {after: 2h}
-    all: {ratio: 2}
+    rule: {ratio: 2}
   - name: A2
 """)
     device.advance(3600)
@@ -512,9 +512,9 @@ def main(make=None):
     device, _, _ = fresh("""\
   - name: Fed
     until: {after: 1h}
-    all: {active: none}
+    rule: {active: none}
     daily:
-      - {from: "10:00", to: "11:00", all: {free_feed: 1}}
+      - {from: "10:00", to: "11:00", rule: {free_feed: 1}}
   - name: After
 """)
     device.command("RUN:END")
@@ -535,15 +535,15 @@ def main(make=None):
     weekly = compile_one("""\
   - name: Hab
     until: {at: "19:00", day: 2}
-    all: {active: none, free_feed: 1}
+    rule: {active: none, free_feed: 1}
   - name: Train
     until: [{rewards: 40}, {after: 2d}]
-    all: {active: both, cue: {reward: [click]}}
+    rule: {active: both, cue: {reward: [click]}}
   - name: Rot
     until: {after: 3d}
     rotate: {every: 1d, at: "19:00", mode: cycle, assign: {FED001: rich, FED002: poor}}
   - name: End
-    all: {active: none, free_feed: 1}
+    rule: {active: none, free_feed: 1}
 """, devices="[FED001, FED002]", extra="rules:\n  rich: {active: both, quota: 20, quota_period: 1h}\n"
                              "  poor: {active: both, ratio: 5}\n")
     rng = random.Random(5)
