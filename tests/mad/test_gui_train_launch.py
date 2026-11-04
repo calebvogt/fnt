@@ -327,7 +327,7 @@ def test_closing_the_inference_window_mid_run_asks_and_keeps_it(monkeypatch):
                             lambda what="training": "stop")
         w._on_infer_window_closed()
         assert stopped == [1] and shown == [1, 1]
-        assert quit_.n == 0, "quits after the summary, not on the close"
+        assert quit_.n == 0, "quits once the run winds down, not on the close"
     finally:
         w.btn_infer_pause.setEnabled(False)
 
@@ -415,3 +415,20 @@ def test_inference_folders_keep_the_order_given(tmp_path):
     wavs = w.set_inference_folders([str(tmp_path / "T006"), str(tmp_path / "T005")])
     assert [os.path.basename(os.path.dirname(p)) for p in wavs] == ["T006", "T006", "T005", "T005"]
     assert w.chk_scope_folder.isChecked()
+
+
+def test_window_only_run_end_quits_without_a_dialog(monkeypatch):
+    # A finished, stopped or failed --inference-window-only run quits at once:
+    # a summary or error box would wait for someone to close it.
+    w = gui()
+    monkeypatch.setattr(w, "_window_only", True, raising=False)
+    for name in ("exec_", "show"):
+        monkeypatch.setattr(M.MADRunSummaryTable, name,
+                            lambda *a: pytest.fail("summary dialog shown"))
+    monkeypatch.setattr(M.QMessageBox, "critical",
+                        lambda *a, **k: pytest.fail("error box shown"))
+    for args in (([{"wav": "a.wav"}, {"wav": "b.wav", "error": "x"}],), (None,)):
+        quit_ = _Quit(monkeypatch)
+        w._quit_window_only_inference(*args, error="" if args[0] else "boom")
+        QApplication.instance().processEvents()
+        assert quit_.n == 1

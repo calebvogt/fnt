@@ -12427,6 +12427,20 @@ class MADMainWindow(QMainWindow):
             self.status_bar.showMessage(msg, 8000)
             self._log(msg)
 
+    def _quit_window_only_inference(self, results, error: str = ""):
+        """End of an ``--inference-window-only`` run, finished, stopped or
+        failed: log one line and quit, with no dialog to close. The caller
+        (a scheduled chain, an assistant) reads the run's manifest."""
+        if error:
+            self._log("Inference failed: " + error[:2000])
+        else:
+            results = results or []
+            failed = sum(1 for r in results if 'error' in r)
+            self._log(f"Inference ended: {len(results)} file(s), "
+                      f"{failed} failed; quitting.")
+        self._close_infer_progress_dialog()
+        QTimer.singleShot(0, QApplication.instance().quit)
+
     def _close_infer_progress_dialog(self):
         """Put the progress box back in the Inference section and close the
         floating window. Idempotent: the end of a run, the chained cleanup and
@@ -20912,12 +20926,11 @@ class MADMainWindow(QMainWindow):
             # review: the currently-previewed file if it was inferred, else the
             # first target file.
             if getattr(self, '_window_only', False):
-                # Nothing but this run is on screen: show its summary, then
-                # quit. The Audio-list refresh and the auto-opened file are
-                # for a main window that is not there.
-                self._show_inference_summary_dialog(results, cfg,
-                                                    ridge_line=ridge_line)
-                QTimer.singleShot(0, QApplication.instance().quit)
+                # Nothing but this run is on screen: quit. No summary dialog,
+                # which would wait for someone to close it; the run's manifest
+                # and the log hold the same news. The Audio-list refresh and
+                # the auto-opened file are for a main window that is not there.
+                self._quit_window_only_inference(results)
                 return
             self._scan_all_file_counts()
             self._update_run_button()
@@ -20952,8 +20965,7 @@ class MADMainWindow(QMainWindow):
             progress.append("\nERROR:\n" + msg)
             progress.mark_done(ok=False)
             if getattr(self, '_window_only', False):
-                QMessageBox.critical(None, "Inference failed", msg[:2000])
-                QTimer.singleShot(0, QApplication.instance().quit)
+                self._quit_window_only_inference(None, error=msg)
 
         def on_device(dev: str):
             desc = dev
