@@ -172,6 +172,11 @@ harmonics the model finds, and it learns to stop.
 **Q** runs the selected model on just the visible window — useful for spot
 checks without a full run.
 
+**Play** (and **Het**) starts just before the selected call when it is on
+screen, so a wide view doesn't mean waiting through the audio to its left; the
+lead is half a second of listening (15 ms of audio at 0.03x). With nothing
+selected, Play starts at the left edge of the view.
+
 The **Min score** slider hides pending calls below a confidence. It never hides
 accepted or rejected calls, and the count label always says how many are hidden.
 The completion prompt will not claim a file is done while the filter is hiding

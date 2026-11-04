@@ -19233,11 +19233,35 @@ class MADMainWindow(QMainWindow):
         else:
             self._play_visible(mode='het')
 
+    #: Audio played before the selected call, in seconds of wall-clock
+    #: listening (so at 0.03x speed it is 15 ms of audio, at 1x 0.1 s at most).
+    PLAY_LEAD_WALL_S = 0.5
+
+    def _play_from_selected_s(self, view_start: float, view_stop: float,
+                              mode: str) -> float:
+        """Where Play starts: just before the selected call when it is on
+        screen, so a wide view does not mean waiting through the audio left of
+        the call (half the window when the call is centred, at slowed speed
+        tens of seconds). With no call selected, or one off screen, the left
+        edge of the view, as before."""
+        anns = self.spectrogram.annotations
+        sel = self.spectrogram._selected_ann_idx
+        if sel is None or not (0 <= sel < len(anns)) or not self.sample_rate:
+            return view_start
+        dt = self.spectrogram.hop / float(self.sample_rate)
+        t0 = anns[sel]['t0'] * dt
+        if not (view_start <= t0 < view_stop):
+            return view_start
+        rate = 1.0 if mode == 'het' else self.playback_speed
+        lead = min(0.1, self.PLAY_LEAD_WALL_S * rate)
+        return max(view_start, t0 - lead)
+
     def _play_visible(self, mode: str = 'slow'):
         if not HAS_SOUNDDEVICE or self.audio_data is None:
             return
         start_s, stop_s = self.spectrogram.get_view_range()
         total_duration = len(self.audio_data) / self.sample_rate
+        start_s = max(start_s, self._play_from_selected_s(start_s, stop_s, mode))
         start_s = max(0, start_s)
         stop_s = min(total_duration, stop_s)
         start_sample = int(start_s * self.sample_rate)
