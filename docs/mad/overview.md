@@ -63,9 +63,15 @@ mad add-ridge --input recordings/ --model <project>/models/<run>
 
 # Flag running-wheel squeaks among the stored detections
 mad wheel --input recordings/ --workers 3 --low-priority
+
+# Inference with only its progress window on screen; it quits when the run ends
+python -m fnt.usv.mad_pyqt --project my_project/ --infer <project>/models/<run> --inference-window-only
+# ...and stop that run from the command line: it finishes the current file and quits, no prompt
+mad stop --project my_project/
 ```
 
-Run `mad <command> --help` for the full option list.
+Run `mad <command> --help` for the full option list. A run started again on the same
+project skips the recordings it already analysed at the same settings.
 
 ## Running-wheel squeaks
 

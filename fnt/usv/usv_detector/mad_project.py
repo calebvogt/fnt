@@ -17,6 +17,9 @@ from typing import Dict, List, Optional
 
 
 PROJECT_INFO_FILENAME = 'mad_project_info.json'
+# Written into a project folder by `mad stop`: an --inference-window-only run on
+# that project stops, with no prompt, and quits.
+STOP_REQUEST_FILENAME = 'STOP_INFERENCE'
 
 
 @dataclass

@@ -789,6 +789,16 @@ def build_parser() -> argparse.ArgumentParser:
                          "MAD may still be writing (default 10; 0 keeps all).")
     pw.set_defaults(func=_cmd_wheel)
 
+    # stop
+    pst = sub.add_parser('stop',
+                         help="Stop a MAD inference run started with "
+                              "--inference-window-only on a project: it finishes the "
+                              "current file and quits, with no prompt.")
+    pst.add_argument('--project', required=True, nargs='+',
+                     help="Project folder(s) (or their mad_project_info.json) of the "
+                          "running inference.")
+    pst.set_defaults(func=_cmd_stop)
+
     # export
     px = sub.add_parser('export',
                         help="Write folder-wide CSV tables from the .mad files: one "
@@ -1005,6 +1015,21 @@ def _wheel_one(args):
         return w, run_recording(w, overwrite=overwrite, model=model)
     except Exception as ex:
         return w, {'status': f'failed ({ex})', 'n': 0, 'squeaks': 0}
+
+
+def _cmd_stop(args) -> int:
+    """Ask the --inference-window-only run on each project to stop: write the
+    STOP_INFERENCE file it watches for (see MADMainWindow.watch_stop_request)."""
+    from .mad_project import STOP_REQUEST_FILENAME
+    for p in args.project:
+        d = os.path.dirname(p) if os.path.isfile(p) else p
+        if not os.path.isdir(d):
+            print(f"no such project folder: {d}", file=sys.stderr)
+            return 1
+        with open(os.path.join(d, STOP_REQUEST_FILENAME), 'w') as f:
+            f.write("stop\n")
+        print(f"stop requested: {d}")
+    return 0
 
 
 def _cmd_wheel(args) -> int:

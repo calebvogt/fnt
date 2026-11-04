@@ -12427,6 +12427,43 @@ class MADMainWindow(QMainWindow):
             self.status_bar.showMessage(msg, 8000)
             self._log(msg)
 
+    def watch_stop_request(self, project_dir: str):
+        """Stop this run, with no prompt, when ``mad stop`` writes the
+        STOP_INFERENCE file into the project folder (checked every 5 s).
+
+        For --inference-window-only runs, so a run can be stopped by command
+        (a dictated "stop the inference") rather than by clicking through the
+        close prompt. A file left from an earlier stop is cleared first."""
+        from fnt.usv.usv_detector.mad_project import STOP_REQUEST_FILENAME
+        self._stop_request_path = os.path.join(project_dir, STOP_REQUEST_FILENAME)
+        try:
+            os.remove(self._stop_request_path)
+        except OSError:
+            pass
+        self._stop_request_timer = QTimer(self)
+        self._stop_request_timer.setInterval(5000)
+        self._stop_request_timer.timeout.connect(self._check_stop_request)
+        self._stop_request_timer.start()
+
+    def _check_stop_request(self):
+        path = getattr(self, '_stop_request_path', '')
+        if not path or not os.path.exists(path):
+            return
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        self._stop_request_timer.stop()
+        worker = getattr(self, '_infer_worker', None)
+        if worker is not None:
+            # The run winds down (the current file finishes), then ends in
+            # _quit_window_only_inference like any other window-only run.
+            self._log("Stop requested by `mad stop`: stopping after the "
+                      "current file, then quitting.")
+            worker.request_stop()
+        else:
+            self._quit_window_only_inference([])
+
     def _quit_window_only_inference(self, results, error: str = ""):
         """End of an ``--inference-window-only`` run, finished, stopped or
         failed: log one line and quit, with no dialog to close. The caller
@@ -21349,6 +21386,8 @@ def main(argv=None):
                     wavs = (win.set_inference_folders(args.infer_folder)
                             if args.infer_folder else None)
                     win.launch_inference(args.infer, wavs=wavs)
+                    if args.inference_window_only:
+                        win.watch_stop_request(win._project.project_dir)
                 QTimer.singleShot(500, _launch_infer)
         QTimer.singleShot(0, _start)
     if QApplication.instance() is app:

@@ -432,3 +432,32 @@ def test_window_only_run_end_quits_without_a_dialog(monkeypatch):
         w._quit_window_only_inference(*args, error="" if args[0] else "boom")
         QApplication.instance().processEvents()
         assert quit_.n == 1
+
+
+def test_mad_stop_stops_a_window_only_run_without_a_prompt(monkeypatch, tmp_path):
+    # `mad stop` writes STOP_INFERENCE; the watching run stops (no prompt) and
+    # is left to wind down, after which it quits as any window-only run does.
+    from fnt.usv.usv_detector import cli
+    w = gui()
+    monkeypatch.setattr(w, "_window_only", True, raising=False)
+    monkeypatch.setattr(M.QMessageBox, "exec_",
+                        lambda *a: pytest.fail("prompt shown"))
+    (tmp_path / "STOP_INFERENCE").write_text("old")
+    w.watch_stop_request(str(tmp_path))
+    assert not (tmp_path / "STOP_INFERENCE").exists(), "a stale request is cleared"
+    stopped = []
+
+    class Worker:
+        def request_stop(self):
+            stopped.append(1)
+    monkeypatch.setattr(w, "_infer_worker", Worker(), raising=False)
+    quit_ = _Quit(monkeypatch)
+    try:
+        w._check_stop_request()
+        assert not stopped                       # nothing asked yet
+        assert cli.main(["stop", "--project", str(tmp_path)]) == 0
+        w._check_stop_request()
+        assert stopped == [1] and quit_.n == 0
+        assert not (tmp_path / "STOP_INFERENCE").exists()
+    finally:
+        w._stop_request_timer.stop()
