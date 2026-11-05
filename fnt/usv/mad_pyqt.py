@@ -10033,10 +10033,15 @@ class MADMainWindow(QMainWindow):
         pos = self._selected_review_pos(order)
         has_sel = pos is not None
         nav_text = (f"{pos + 1}/{n}" if has_sel else f"0/{n}")
+        can_prev, can_next = has_sel and pos > 0, has_sel and pos < n - 1
+        if bool(getattr(self, '_call_queue', None)):
+            qn, qp = len(self._call_queue), self._call_queue_pos
+            nav_text = f"Call {qp + 1}/{qn}"
+            can_prev, can_next = qp > 0, qp < qn - 1
         has_pending = len(self._pred_indices()) > 0
         for s in getattr(self, '_review_sets', []):
-            s['prev'].setEnabled(has_sel and pos > 0)
-            s['next'].setEnabled(has_sel and pos < n - 1)
+            s['prev'].setEnabled(can_prev)
+            s['next'].setEnabled(can_next)
             for k in ('accept', 'reject', 'skip'):
                 s[k].setEnabled(has_sel)
             if s.get('delete') is not None:
@@ -10179,7 +10184,11 @@ class MADMainWindow(QMainWindow):
 
     def _pred_prev(self):
         """Back: move the selection to the previous detection in the list
-        (any status — so you can revisit an already accepted/rejected call)."""
+        (any status — so you can revisit an already accepted/rejected call);
+        in a call queue, the previous call of the queue."""
+        if bool(getattr(self, '_call_queue', None)):
+            self._queue_step(-1)
+            return
         order = self._review_order()
         if not order:
             return
@@ -10187,7 +10196,11 @@ class MADMainWindow(QMainWindow):
         self._select_review_pos((len(order) - 1) if pos is None else max(0, pos - 1))
 
     def _pred_next(self):
-        """Next: move the selection to the next detection in the list."""
+        """Next: move the selection to the next detection in the list; in a
+        call queue, the next call of the queue, in whichever recording."""
+        if bool(getattr(self, '_call_queue', None)):
+            self._queue_step(+1)
+            return
         order = self._review_order()
         if not order:
             return
@@ -10553,6 +10566,17 @@ class MADMainWindow(QMainWindow):
             self._touch_current_file_badge()
             self._update_view_header()
         self._mark("badge")
+        if (bool(getattr(self, '_call_queue', None)) and decided_id is not None
+                and decided_id == getattr(self, '_call_queue_ann_id', None)):
+            # Deciding the queue's own call moves on through the queue, not
+            # through this recording's other detections; the end-of-file
+            # prompt is for per-recording review.
+            if self._auto_advance and was_pending:
+                self._queue_step(+1)
+            else:
+                self._reselect_by_id(decided_id)
+            self._mark("select")
+            return
         if self._auto_advance and was_pending:
             if not (self._select_next_pending_from_id(successor)
                     or self._select_next_pending_after_id(decided_id)):
@@ -15288,11 +15312,15 @@ class MADMainWindow(QMainWindow):
     # Focus: show a chosen handful of the project's recordings
     # ------------------------------------------------------------------
     @staticmethod
-    def _focus_items(items) -> List[str]:
-        """Expand focus arguments: a ``.txt`` file is one recording per line
-        (path or bare filename; blank lines and ``#`` comments skipped),
-        anything else is itself a path or filename."""
-        out: List[str] = []
+    def _focus_lines(items) -> List[Tuple[str, Optional[str], str]]:
+        """Expand focus arguments into (recording, detection, note) rows.
+
+        A ``.txt`` file is one recording per line (path or bare filename;
+        blank lines and ``#`` comments skipped), anything else is itself a
+        path or filename. A line may add, after a tab, a detection number (its
+        blob_id) and, after another tab, a note: such lines make a *call
+        queue*, reviewed call by call (see :meth:`_queue_goto`)."""
+        out: List[Tuple[str, Optional[str], str]] = []
         for it in items or ():
             it = str(it).strip().strip('"')
             if not it:
@@ -15300,12 +15328,22 @@ class MADMainWindow(QMainWindow):
             if it.lower().endswith('.txt') and os.path.isfile(it):
                 with open(it, encoding='utf-8', errors='replace') as f:
                     for line in f:
-                        line = line.split('#', 1)[0].strip().strip('"')
-                        if line:
-                            out.append(line)
+                        line = line.split('#', 1)[0].rstrip()
+                        parts = [p.strip().strip('"') for p in line.split('\t')]
+                        if not parts[0]:
+                            continue
+                        bid = parts[1] if len(parts) > 1 and parts[1] else None
+                        note = parts[2] if len(parts) > 2 else ''
+                        out.append((parts[0], bid, note))
             else:
-                out.append(it)
+                out.append((it, None, ''))
         return out
+
+    @classmethod
+    def _focus_items(cls, items) -> List[str]:
+        """The recordings named by focus arguments, in order (see
+        :meth:`_focus_lines`)."""
+        return [p for p, _, _ in cls._focus_lines(items)]
 
     def _apply_focus(self, paths: List[str]) -> List[str]:
         """``paths`` (the project's registry, in order) cut down to the focus,
@@ -15360,7 +15398,13 @@ class MADMainWindow(QMainWindow):
         if not keys:
             return 0, unmatched
         self._focus_keys = keys
-        self._show_registry()
+        queue = self._build_call_queue(items)
+        if queue:
+            pos = self._saved_queue_pos(items, len(queue))
+            self._show_registry(keep=queue[pos][0],
+                                then=lambda: self._queue_goto(pos))
+        else:
+            self._show_registry()
         n = len(self.audio_files)
         self._update_focus_banner()
         self._log(f"Focus: {n} of {len(entries)} recording(s)"
@@ -15377,13 +15421,123 @@ class MADMainWindow(QMainWindow):
                    if 0 <= self.current_file_idx < len(self.audio_files)
                    else None)
         self._focus_keys = None
+        self._call_queue = []
         self._show_registry(keep=current)
         self._update_focus_banner()
         self._log("Showing all recordings")
 
-    def _show_registry(self, keep: Optional[str] = None):
+    # ------------------------------------------------------------------
+    # Call queue: a focus list that names detections, reviewed call by call
+    # ------------------------------------------------------------------
+    def _build_call_queue(self, items) -> List[Tuple[str, str, str]]:
+        """(registered path, blob_id, note) for every focus line that names a
+        detection, in the file's order; [] when none does, which leaves the
+        focus an ordinary per-recording one. The queue's file is remembered so
+        the position can be restored next time it is opened."""
+        rows = [r for r in self._focus_lines(items) if r[1] is not None]
+        self._call_queue = []
+        self._call_queue_pos = 0
+        self._call_queue_ann_id = None
+        if not rows:
+            return []
+        by_key = {self._path_key(p): p for p in self.audio_files}
+        by_name = {os.path.basename(p).lower(): p for p in self.audio_files}
+        entries = [e.path for e in self._project.audio_entries()]
+        by_key.update({self._path_key(p): p for p in entries})
+        by_name.update({os.path.basename(p).lower(): p for p in entries})
+        for path, bid, note in rows:
+            full = by_key.get(self._path_key(path)) or by_name.get(
+                os.path.basename(path).lower())
+            if full is not None:
+                self._call_queue.append((full, str(bid), note))
+        txt = [str(i) for i in (items or ()) if str(i).lower().endswith('.txt')]
+        self._call_queue_key = (
+            "mad/call_queue_pos/" + os.path.normcase(os.path.abspath(txt[0]))
+            if len(txt) == 1 else None)
+        return self._call_queue
+
+    def _saved_queue_pos(self, items, n: int) -> int:
+        """Where this queue was left last time (0 the first time)."""
+        key = getattr(self, '_call_queue_key', None)
+        if not key:
+            return 0
+        try:
+            pos = int(self._settings.value(key, 0))
+        except (TypeError, ValueError):
+            pos = 0
+        return max(0, min(pos, n - 1))
+
+    def _queue_active(self) -> bool:
+        return bool(getattr(self, '_call_queue', None))
+
+    def _queue_goto(self, pos: int):
+        """Open the queue's ``pos``-th call: its recording (asynchronously, if
+        it is not the one on screen), centred and selected."""
+        queue = getattr(self, '_call_queue', None)
+        if not queue:
+            return
+        pos = max(0, min(pos, len(queue) - 1))
+        self._call_queue_pos = pos
+        key = getattr(self, '_call_queue_key', None)
+        if key:
+            self._settings.setValue(key, pos)
+        path = queue[pos][0]
+        idx = next((i for i, p in enumerate(self.audio_files)
+                    if self._path_key(p) == self._path_key(path)), None)
+        if idx is None:
+            self.status_bar.showMessage(
+                f"Call {pos + 1}: {os.path.basename(path)} is not in the "
+                "Audio list")
+            return
+        if idx == self.current_file_idx and self.audio_data is not None:
+            self._queue_select_current()
+            return
+        # The same sequencing as _focus_confirmed_call: the row change starts
+        # the load, and the selection waits until the recording is on screen.
+        self.file_list.setCurrentRow(idx)
+        self.current_file_idx = idx
+        self._load_current_file(then=self._queue_select_current)
+
+    def _queue_select_current(self):
+        """Select the queue's current call in the recording on screen."""
+        queue = getattr(self, '_call_queue', None)
+        if not queue:
+            return
+        path, bid, note = queue[self._call_queue_pos]
+        anns = self.spectrogram.annotations
+        idx = next((i for i, a in enumerate(anns)
+                    if str(a.get('blob_id')) == bid), None)
+        n = len(queue)
+        if idx is None:
+            self._call_queue_ann_id = None
+            self.spectrogram._selected_ann_idx = None
+            self.spectrogram.update()
+            self.status_bar.showMessage(
+                f"Call {self._call_queue_pos + 1}/{n}: detection {bid} is no "
+                f"longer in {os.path.basename(path)} — Next (N) moves on")
+        else:
+            self._call_queue_ann_id = anns[idx].get('id')
+            self._center_and_select_ann(idx)
+            self.status_bar.showMessage(
+                f"Call {self._call_queue_pos + 1}/{n}: "
+                f"{os.path.basename(path)}, detection {bid}"
+                + (f" — {note}" if note else ""))
+        self._update_pred_review_widgets()
+
+    def _queue_step(self, step: int):
+        """Next (+1) / Back (-1) through the queue; says so at the end."""
+        pos = self._call_queue_pos + step
+        if pos >= len(self._call_queue):
+            self.status_bar.showMessage(
+                f"End of the queue: all {len(self._call_queue)} calls shown")
+            return
+        if pos < 0:
+            return
+        self._queue_goto(pos)
+
+    def _show_registry(self, keep: Optional[str] = None, then=None):
         """Rebuild the Audio list from the registry through the focus, and
-        open ``keep`` (or the first recording)."""
+        open ``keep`` (or the first recording); ``then`` runs once it is open."""
         entries = self._project.audio_entries()
         self.audio_files = self._apply_focus([e.path for e in entries])
         self._missing_audio = self._missing_paths(entries)
@@ -15396,7 +15550,7 @@ class MADMainWindow(QMainWindow):
                                      if self.audio_files else -1)
         self.file_list.blockSignals(False)
         if self.audio_files:
-            self._load_current_file()
+            self._load_current_file(then=then)
         self._update_scope_labels()
         self._update_project_state()
         self._sync_list_buttons()
