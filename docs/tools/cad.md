@@ -71,7 +71,7 @@ Every value is measured on the band-passed spectrogram, in dB relative to the re
 | `freq_bandwidth_hz` | Hz | max − min |
 | `peak_freq_hz` | Hz | frequency of the single loudest call pixel |
 | `mean_freq_hz` | Hz | power-weighted mean frequency of the call pixels |
-| `peak_freq_1` … `peak_freq_5` | Hz | the call's frequency contour: the loudest frequency within the call's band at 5 evenly spaced moments from start to stop |
+| `peak_freq_1` … `peak_freq_N` | Hz | the call's frequency contour: the loudest frequency within the call's band at N evenly spaced moments from start to stop (N = **Freq Samples**, 3–10). With Freq Samples off the contour is still measured for the shape columns below, but these columns are left out |
 
 ### Amplitude and energy
 
@@ -85,7 +85,7 @@ Every value is measured on the band-passed spectrogram, in dB relative to the re
 
 ### Shape of the contour
 
-Computed from the contour (`peak_freq_1` … `peak_freq_5`):
+Computed from the contour (`peak_freq_1` … `peak_freq_N`; 5 points when Freq Samples is off):
 
 | Column | Units | Meaning |
 |---|---|---|
@@ -111,10 +111,11 @@ For analysis, keep `status == "accepted"`. Calls still `pending` have not been r
 | `call_group_id` | shared by a fundamental and its harmonics: use it to count a fundamental and its harmonics as one vocalization |
 | `harmonic_ratio` | the ratio of the harmonic's peak frequency to the fundamental's (about 2 or 3; automatic harmonics only) |
 | `harmonic_of_start` | the fundamental's start time (s; automatic harmonics only) |
-| `harmonic_of`, `harmonic_rank`, `harmonic_of_call_number` | the fundamental's `call_id`, the overtone order and the fundamental's `call_number`, for harmonics linked by hand |
+| `harmonic_of` | the fundamental's `call_id` (-1 = not a harmonic) |
+| `harmonic_rank` | 1, 2 … the harmonic's order among its group's harmonics, lowest first (0 = none) |
+| `harmonic_of_call_number` | the fundamental's `call_number`, for reading the file |
 
-!!! warning "Use `call_group_id` for automatic harmonics"
-    On harmonics found by detection, `harmonic_of` does not yet hold the fundamental's `call_id`. `harmonic_rank` and `harmonic_of_call_number` are not filled in either. `call_group_id` is correct for both automatic and hand-linked harmonics.
+Older CSVs whose `harmonic_of` does not name a call in the file (automatic runs before FNT 2026-11-06) are repaired from `call_group_id` when CAD opens them.
 
 ## Calls you add or adjust by hand
 
