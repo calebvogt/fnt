@@ -172,6 +172,20 @@ harmonics the model finds, and it learns to stop.
 **Q** runs the selected model on just the visible window — useful for spot
 checks without a full run.
 
+**Play** (and **Het**) starts just before the selected call when it is on
+screen, so a wide view doesn't mean waiting through the audio to its left; the
+lead is half a second of listening (15 ms of audio at 0.03x). With nothing
+selected, Play starts at the left edge of the view.
+
+**Call queues.** A focus list (`--focus list.txt`) can name detections as well
+as recordings: `recording<TAB>detection<TAB>note`, the detection being its
+number (blob_id). Next (N) and Back (B) then walk those calls in the list's
+order across recordings, each opened centred and selected, with the note in
+the status bar; deciding the queued call moves on to the next one. The counter
+reads "Call 37/200", and the queue reopens where it was left. Use it to judge a
+random sample of detections (an honest precision) or the calls two models
+disagree on. Lines without a detection keep the ordinary per-recording focus.
+
 The **Min score** slider hides pending calls below a confidence. It never hides
 accepted or rejected calls, and the count label always says how many are hidden.
 The completion prompt will not claim a file is done while the filter is hiding

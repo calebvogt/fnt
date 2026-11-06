@@ -13,6 +13,8 @@ Batch video preprocessing combining downsampling, re-encoding, and format conver
 - **Format conversion** — change container format (`.mp4`, `.avi`, `.mkv`)
 - **Quality presets** — CRF-based quality control
 - **Batch processing** — process entire folders with progress tracking
+- **Safe to stop** — each video is encoded to `<name>.mp4.partial` and renamed only once it is complete. **Stop**, a closed window or a crash throws away the video in progress (a leftover `.partial` is ignored), and the next run with skip-existing encodes it again; an existing output that can't be read is re-encoded too.
+- **Full speed in the background** — on Windows each ffmpeg is opted out of power throttling, which otherwise holds a windowless encode on the efficiency cores once the display turns off (about 40% slower on an i9-14900K).
 
 ## Video Trim and Crop
 

@@ -60,9 +60,65 @@ mad export --input recordings/ --out tables/
 # Add stored spectrograms, then brightness ridges, to existing .mad files
 mad add-specs --input recordings/
 mad add-ridge --input recordings/ --model <project>/models/<run>
+
+# Flag running-wheel squeaks among the stored detections
+mad wheel --input recordings/ --workers 3 --low-priority
+
+# Inference with only its progress window on screen; it quits when the run ends
+python -m fnt.usv.mad_pyqt --project my_project/ --infer <project>/models/<run> --inference-window-only
+# ...and stop that run from the command line: it finishes the current file and quits, no prompt
+mad stop --project my_project/
 ```
 
-Run `mad <command> --help` for the full option list.
+Run `mad <command> --help` for the full option list. A run started again on the same
+project skips the recordings it already analysed at the same settings.
+
+## Running-wheel squeaks
+
+A running wheel near a microphone thumps in the low register (2-15 kHz) at a
+steady beat, about 7 per second, while a mouse runs. It can also squeak in
+the upper register, and the model can take those squeaks for calls. They are
+short and narrow, often near 105 kHz but also lower, and they come back at
+the thump beat. `mad wheel` finds them from the audio alone; no video is
+needed.
+
+For each detection it looks at 2 s of audio either side:
+
+1. **The beat** is the autocorrelation peak of the 2-15 kHz energy between 2
+   and 20 Hz. It takes the shortest strong lag, so a subharmonic (3 beats)
+   is not taken for the beat.
+2. **The comb** of a band is how much its autocorrelation peaks at 1, 2 and 3
+   beats and dips half-way between them. The rule computes it for the low
+   band, and for the band of the detection's own mask.
+3. **A detection is flagged** when all of these hold:
+    - the low band's comb is at least 0.15 (the wheel beats cleanly);
+    - its own band's comb is at least 0.25;
+    - the low band's autocorrelation at the beat is at least 0.2;
+    - it is shorter than 0.6 of a beat.
+
+A mouse can call while it runs, so running alone flags nothing. A call that
+lasts several beats, or a bout with its own rhythm, does not comb at the
+wheel's beat and is kept. Requiring the low band's own comb keeps dense call
+bouts: at about 8 calls per second they are close to the wheel's rhythm, but
+the mouse's own movement noise has no clean beat.
+
+The rule was calibrated on the 2021_8x8 labels. It flagged:
+
+- 1 of 1,515 accepted calls;
+- 40 % of rejected C57 detections;
+- 75 % of a hand-checked squeak train.
+
+The results go to `/wheel` in each `.mad`, and nothing else in the file
+changes. `/wheel` holds:
+
+- one row per detection: `blob_id`, `squeak` (0/1), `comb`, `low_comb`,
+  `period_s`, `low_acf` and `dur_beats`;
+- a running track in 4-s windows every 0.5 s: `track_t_s`,
+  `track_period_s`, `track_acf`, `track_comb` and `track_running`.
+
+A recording is redone automatically after a new inference run. Detections
+are never deleted. To leave squeaks out of an analysis, drop the rows with
+`squeak` = 1.
 
 ## Call embeddings
 

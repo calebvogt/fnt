@@ -11,6 +11,7 @@ Interactive GUI for loading, cleaning, and exporting UWB tracking data:
 - **Load raw data** from `.db` (SQLite) or `.csv` files containing timestamped tag positions
 - **Tag identity mapping** — assign animal IDs, sex, and metadata to each UWB tag
 - **Deployment windows and off-animal intervals** — a Start/Stop per tag, plus any number of intervals when a tag was reporting but not on its animal (e.g. a head cap found off and re-attached); fixes in either are dropped from the preview and every export
+- **Downsampling** — optionally thin every tag to a common read rate before the thresholds and the smoothing (see below)
 - **Coordinate smoothing** with configurable Savitzky-Golay filter parameters
 - **Timezone handling** — convert UTC timestamps to local time
 - **Day/night segmentation** based on a configurable light cycle
@@ -36,6 +37,17 @@ Everything goes to `<database>_FNT_analysis/` beside the database, with the sett
 
 Contact bouts are specific to the distance threshold and the bridging gap chosen at export; export again to try other values. Plots go to `plots/` and tracking or social-network animations to `animation_*/`.
 
+## Downsampling
+
+Tags flashed with different rate pairs (10/1, 4/1, 1/1) record the same movement with very different numbers of reads. The thresholds compare consecutive reads, and Savitzky-Golay smooths over 31 of them: about 3–4 s of a 10/1 tag's track but 30–40 s of a 1/1 tag's. So distance, speed and chases come out lower for an animal on a slow tag because of the tag, not the animal. Resampling the exported positions to 1 Hz afterwards does not undo this, because the smoothing has already happened.
+
+**Downsampling** (top of the preview's processing settings) runs first, before the thresholds and the smoothing:
+
+- **None (all reads)**, the default: every read is used.
+- **Random, to at most N reads/s**: each tag's time line is cut into bins of 1/N seconds and one read per bin, picked at random, is kept. A tag already at or below N is left almost untouched; faster tags are brought down to N.
+
+Set N to the rate of the slowest tags, the same for every trial you will compare (**Tag Statistics...** shows each tag's measured rate). The pick is random but reproducible: it depends only on the tag, the read's time and a seed, so the preview keeps exactly the reads the export keeps and a re-export gives the same file. `fnt_config.json` records `downsampling`, `downsampling_hz` and `downsampling_seed`, and the export log reports how many reads each tag kept.
+
 ## Input data format
 
 The tool expects UWB data with at minimum:
@@ -51,3 +63,6 @@ Additional columns (e.g., `location_z`, `location_quality`) are preserved during
 
 !!! tip "Positions for analysis"
     Use `smoothed_x` and `smoothed_y` from `<db>_smoothed.csv`, at 1 Hz or finer. Tag read rates can differ several-fold between animals, so time spent anywhere is a sum of per-fix durations, never a count of fixes.
+
+!!! note "Every smoothing method in one file"
+    Tick **Add every smoothing method to the Smoothed CSV** to also write `sg_x/sg_y` (Savitzky-Golay, 31 samples, order 2), `rollmean_x/rollmean_y` (Rolling Average), `rollmedian_x/rollmedian_y` (Rolling Median) and `ewma_x/ewma_y` (Forward-Backward EWMA). All are computed from the same filtered `location_x/location_y`; the rolling methods use the export's Smoothing Window and units and the EWMA uses the same number as its span in samples. `fnt_config.json` records them under `all_smoothing_columns`. FNT's own outputs (zones, contacts, chases, plots, animation) always use `smoothed_x/smoothed_y`, the method chosen in the Smoothing method box.

@@ -180,8 +180,79 @@ skips videos already done with the same model and settings; `--order coarse`
 (the default) spreads the work over every folder and camera first, so a stopped
 run is still an even sample.
 
+`--gate` (MP4/MOV, fixed cameras) chooses the frames by activity instead of
+`--step`. A still scene compresses to tiny frames and a moving animal multiplies
+their size, so the frame sizes in each file's index show where something moves
+without decoding the video. The gate then segments every frame of the moving
+seconds (padded by `--gate-pad`, 1 s), `--gate-low-fps` frames a second (2) where
+it is unsure, and only the keyframes elsewhere, where a resting animal can still
+be. On the 2021_8x8 resource-zone cameras the moving seconds are about a fifth
+of the video. `--gate-hi` and `--gate-lo` (2 and 1.3) are the size ratios over
+the camera's still level that mark moving and unsure seconds.
+
 `behavior-window` runs the model on every frame of a stretch of video and links
 the masks into tracks, with candidate behaviour bouts for review.
+
+### Tracking every frame
+
+The **Inference** tab tracks every frame of the queued videos and writes
+`<video>_MaskTracker/` beside each (`trajectories.csv`, the annotated video, the
+masks for proofreading). One video at a time leaves the GPU mostly idle: the work
+around the model (reading, tracking, drawing, writing) runs on the CPU one step
+after another. **Several videos at once** runs one worker process per video, and
+the preview pane shows a small tile per running video with its masks, progress
+and speed. Each video's outputs are the same as when it runs alone. **At once:
+Auto** takes as many as the machine allows (the smallest of physical CPU cores
+/ 3, free GPU memory / 1.5 GB, available RAM / 3 GB, and 8); a number sets it.
+On the lab PC (RTX 4070 Ti SUPER, i9-14900K), 1080p open-field videos with
+yolo11l-seg masks ran at 23 frames/s one at a time and 88 frames/s seven at once,
+with the GPU then fully busy. **Stop** ends every worker after its current frame
+and removes the unfinished videos' output folders.
+
+From the command line, the same run in the same window:
+
+```bash
+python -m fnt.videoTracking.mask_tracker_cli track --videos <folders, files or a .txt list> \
+    --model <model folder> --parallel auto --max-objects 1 --conf 0.5
+```
+
+Folders are searched recursively. The project is the one the model folder is in
+(`--project` for a model kept elsewhere). Every Inference setting has a flag
+(`--masks`/`--no-masks`, `--tracked-video`/`--no-tracked-video`,
+`--save-masks`, `--preview`, `--infer-device`, `--resolution`, `--max-disappear`,
+`--iou`, `--matching`, `--classifier` and its four settings); one not given keeps
+the tab's value. Videos that already have a `<video>_MaskTracker` folder are left
+out; `--redo` tracks them again after moving their old folders to
+`_TO_DELETE_tracking/` beside them. `--quit-when-done` closes the window at
+the end.
+
+Each `<video>_MaskTracker` folder records its run: `run_settings.json` (the
+model, every setting, the FNT version, when, frames per second, and how many
+frames had no detection) and `inference.log`. `--settings-from <that folder>`
+repeats the run exactly on other videos (flags given as well win). At the end of
+a run, each video folder gets `MaskTracker_summary.csv`: one row per tracked
+video with its frames, frames without a detection, tracks, speed and settings.
+`mask_tracker_cli track-summary --videos <folders>` rebuilds it for any folder;
+output from before these records is read from its trajectories and mask store.
+
+### Exits
+
+Tracking that keeps a count of the animals needs to know where an animal can
+leave the view (the mouth of an entrance tube):
+
+```bash
+python -m fnt.videoTracking.mask_tracker_cli exits --videos <folders or files> \
+    [--focus <cameras.txt>]
+```
+
+The window lists every folder and camera, unchecked ones first (a `--focus`
+file of `folder/camera` lines puts those at the top), and shows each camera's
+median frame. Click the corners round each exit and close the outline as in the
+ROI editor; corners can be dragged and **Delete** removes an exit. **Space**
+confirms the camera as it is and moves on; **PgUp** / **PgDn** step through the
+list. The exits are saved per camera in `exits.json` in each video folder. A
+fixed outline cannot follow an exit that moves (a tube that slides in its hole
+over a trial), so check those cameras across the trial.
 
 ## Labelling on another machine
 

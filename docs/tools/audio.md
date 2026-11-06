@@ -18,13 +18,13 @@ Project-based spectrogram labeling, training, and inference tool. See the [MAD O
 
 ## Classic Audio Detector (CAD)
 
-DSP-based detection and labeling tool.
+Signal-processing detection and review tool, no trained model. See the [CAD page](cad.md) for the pipeline and every output column.
 
-- **Spectrogram-based detection** using configurable DSP parameters (threshold, frequency band, minimum duration)
-- **Manual labeling** — review detections and assign class labels
-- **Random Forest classifier** — train and run classifiers on labeled call features
-- **Harmonic linking** — associate fundamental frequencies with their harmonics
-- **Batch processing** — run detection across folders of recordings
+- **Spectrogram-based detection** using configurable thresholds and filters (frequency band, energy threshold, duration, bandwidth, SNR, tonality, entropy, sweep rate), with saveable species profiles
+- **Review** — accept, reject or skip each call; add, resize or re-draw calls by hand, re-measured automatically
+- **Per-call statistics** — timing, frequency (min, max, peak, mean, 5-point contour), power, SNR, tonality, entropy and contour shape
+- **Harmonic linking** — harmonics at 2× and 3× the fundamental are labelled and grouped with it
+- **Output** — a `<recording>_FNT_CAD_detections.csv` beside each wav, one row per call, saved after every edit
 
 ## Compress Audio Files
 
