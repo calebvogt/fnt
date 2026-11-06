@@ -43,7 +43,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QFileDialog, QProgressBar, QMessageBox,
     QGroupBox, QListWidget, QListWidgetItem, QTableWidget, QTableWidgetItem,
     QCheckBox, QScrollArea, QFrame, QComboBox, QInputDialog, QSpinBox,
-    QSplitter, QSlider, QTextEdit
+    QSplitter, QSlider, QTextEdit, QSizePolicy
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QPoint
 from PyQt5.QtGui import QImage, QPixmap, QFont, QPainter, QPen, QColor, QPolygon
@@ -1692,6 +1692,8 @@ class ROIToolGUI(QMainWindow):
         
         # Scale bar state
         self.scale_bar_points = []  # Two points for scale bar
+        self.last_scale_bar_distance = None
+        self.last_selected_keypoints = None
         
         # Processing queue
         self.processing_queue = []  # List of video indices to process
@@ -2376,8 +2378,9 @@ class ROIToolGUI(QMainWindow):
         self.preview_label.setStyleSheet("border: 2px solid #333333; background-color: #1e1e1e;")
         self.preview_label.setAlignment(Qt.AlignCenter)
         self.preview_label.setMinimumSize(800, 600)
+        self.preview_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.preview_label.mousePressEvent = self.on_preview_click
-        layout.addWidget(self.preview_label)
+        layout.addWidget(self.preview_label, 1)
         
         # Frame scrubber
         scrub_row = QHBoxLayout()
@@ -2881,6 +2884,11 @@ class ROIToolGUI(QMainWindow):
         # Auto-select if only one keypoint available and none selected yet
         if len(config.available_keypoints) == 1 and not config.selected_keypoints:
             config.selected_keypoints = list(config.available_keypoints)
+        # Auto-select from previous video session settings
+        elif not config.selected_keypoints and hasattr(self, 'last_selected_keypoints') and self.last_selected_keypoints:
+            valid_kps = [kp for kp in self.last_selected_keypoints if kp in config.available_keypoints]
+            if valid_kps:
+                config.selected_keypoints = valid_kps
 
         # Create checkboxes (connect signals after all are built to avoid
         # on_keypoint_selection_changed reading a partially-built list)
@@ -2940,14 +2948,12 @@ class ROIToolGUI(QMainWindow):
 
     def start_oft_drawing(self):
         """Start OFT layout drawing."""
-        self.drawing_mode = 'oft'
+        self.drawing_mode = 'scale_bar'
+        self.next_drawing_mode = 'oft'
         self.current_polygon = []
+        self.scale_bar_points = []
         self.last_roi_layout = 'oft'
-        QMessageBox.information(
-            self, "OFT Step 1 of 2",
-            "Click the 4 corners of the Open Field Test floor.\n\n"
-            "Press ENTER when done.")
-        self.lbl_instructions.setText("OFT STEP 1 of 2: Click 4 corners. Press ENTER when done.")
+        self.lbl_instructions.setText("OFT STEP 1 of 2: Click two points for scale bar.")
         self.lbl_instructions.setStyleSheet("color: white; font-size: 14px; font-weight: bold; margin: 10px;")
 
         # Disable other ROI buttons while drawing
@@ -2957,14 +2963,12 @@ class ROIToolGUI(QMainWindow):
     
     def start_ldb_drawing(self):
         """Start Light-Dark Box drawing."""
-        self.drawing_mode = 'ldb_light'
+        self.drawing_mode = 'scale_bar'
+        self.next_drawing_mode = 'ldb_light'
         self.current_polygon = []
+        self.scale_bar_points = []
         self.last_roi_layout = 'ldb'
-        QMessageBox.information(
-            self, "LDB Step 1 of 2",
-            "Draw the LIGHT box area (polygon).\n\n"
-            "Press ENTER when done.")
-        self.lbl_instructions.setText("LDB STEP 1 of 2: Draw LIGHT box. Press ENTER when done.")
+        self.lbl_instructions.setText("LDB STEP 1 of 2: Click two points for scale bar.")
         self.lbl_instructions.setStyleSheet("color: white; font-size: 14px; font-weight: bold; margin: 10px;")
 
         # Disable other ROI buttons while drawing
@@ -3006,7 +3010,9 @@ class ROIToolGUI(QMainWindow):
         
         # Determine default scale bar distance based on ROI layout type
         # LDB boxes are 28.4cm in the lab, OFT arenas are 50cm
-        if self.last_roi_layout == 'ldb':
+        if hasattr(self, 'last_scale_bar_distance') and self.last_scale_bar_distance is not None:
+            default_distance = self.last_scale_bar_distance
+        elif self.last_roi_layout == 'ldb':
             default_distance = 28.4
         else:  # OFT or custom
             default_distance = 50.0
@@ -3023,6 +3029,7 @@ class ROIToolGUI(QMainWindow):
         )
         
         if ok and distance_cm > 0:
+            self.last_scale_bar_distance = distance_cm
             config = self.video_configs[self.current_config_idx]
             config.scale_bar_set = True
             config.scale_bar_pixels = pixel_distance
@@ -3030,7 +3037,6 @@ class ROIToolGUI(QMainWindow):
             config.pixels_per_cm = pixel_distance / distance_cm
             
             self.lbl_scale_status.setText(f"✓ Scale set: {distance_cm} cm = {pixel_distance:.1f} pixels ({config.pixels_per_cm:.2f} pixels/cm)")
-            self.lbl_instructions.setText("")
             
             # Update list item
             item = self.video_list.item(self.current_config_idx)
@@ -3039,11 +3045,27 @@ class ROIToolGUI(QMainWindow):
             else:
                 item.setText(f"◐ {os.path.basename(config.video_path)}")
             
-            # Re-enable ROI buttons after completing OFT/LDB workflow with scale bar
-            self.enable_roi_buttons()
-            self.enable_keypoint_selection()
+            # Re-enable ROI buttons if not continuing to preset ROI
+            if not hasattr(self, 'next_drawing_mode') or not self.next_drawing_mode:
+                self.enable_roi_buttons()
+                self.enable_keypoint_selection()
+        else:
+            # User cancelled scale bar
+            self.next_drawing_mode = None
 
-        self.drawing_mode = None
+        if hasattr(self, 'next_drawing_mode') and self.next_drawing_mode:
+            self.drawing_mode = self.next_drawing_mode
+            self.next_drawing_mode = None
+            self.current_polygon = []
+            if self.drawing_mode == 'oft':
+                self.lbl_instructions.setText("OFT STEP 2 of 2: Click 4 corners. Press ENTER when done.")
+            elif self.drawing_mode == 'ldb_light':
+                self.lbl_instructions.setText("LDB STEP 2 of 2: Draw LIGHT box. Press ENTER when done.")
+        else:
+            self.drawing_mode = None
+            if not self.lbl_instructions.text().startswith("ROI saved"):
+                self.lbl_instructions.setText("")
+
         self.scale_bar_points = []
         self.redraw_preview()
         self.update_config_status()
@@ -3143,37 +3165,15 @@ class ROIToolGUI(QMainWindow):
             
             self.update_roi_table()
             
-            # OFT requires scale bar - transition to scale bar setting
-            self.drawing_mode = 'scale_bar'
-            self.current_polygon = []
-            self.scale_bar_points = []
-            self.redraw_preview()
-            QMessageBox.information(
-                self, "OFT Step 2 of 2",
-                "Now set the scale bar.\n\n"
-                "Click two points of a known distance, then enter\n"
-                "the real-world distance in cm.")
-            self.lbl_instructions.setText("OFT STEP 2 of 2: Click two points for scale bar.")
-            self.lbl_instructions.setStyleSheet("color: white; font-size: 14px; font-weight: bold; margin: 10px;")
-            return
+            # Re-enable ROI buttons
+            self.enable_roi_buttons()
             
         elif self.drawing_mode == 'ldb_light':
             config.add_roi('ldb_light', self.current_polygon.copy())
             self.update_roi_table()
             
-            # LDB requires scale bar - transition to scale bar setting
-            self.drawing_mode = 'scale_bar'
-            self.current_polygon = []
-            self.scale_bar_points = []
-            self.redraw_preview()
-            QMessageBox.information(
-                self, "LDB Step 2 of 2",
-                "Now set the scale bar.\n\n"
-                "Click two points of a known distance, then enter\n"
-                "the real-world distance in cm.")
-            self.lbl_instructions.setText("LDB STEP 2 of 2: Click two points for scale bar.")
-            self.lbl_instructions.setStyleSheet("color: white; font-size: 14px; font-weight: bold; margin: 10px;")
-            return
+            # Re-enable ROI buttons
+            self.enable_roi_buttons()
             
         elif self.drawing_mode == 'custom':
             config.add_roi(f'custom_{self.current_custom_idx}', self.current_polygon.copy())
@@ -3344,6 +3344,7 @@ class ROIToolGUI(QMainWindow):
         config.selected_keypoints = [
             chk.text() for chk in self.keypoint_checkboxes if chk.isChecked()
         ]
+        self.last_selected_keypoints = config.selected_keypoints.copy()
         
         self.update_config_status()
     
