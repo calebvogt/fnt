@@ -62,6 +62,7 @@ nav:
   - Installation: installation.md
   - Tools:
       - Audio / USV: tools/audio.md
+      - Classic Audio Detector (CAD): tools/cad.md
       - Video Processing: tools/video-processing.md
       - Video Tracking: tools/video-tracking.md
       - UWB Tracking: tools/uwb.md
