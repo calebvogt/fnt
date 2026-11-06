@@ -182,7 +182,14 @@ as recordings: `recording<TAB>detection<TAB>note`, the detection being its
 number (blob_id). Next (N) and Back (B) then walk those calls in the list's
 order across recordings, each opened centred and selected, with the note in
 the status bar; deciding the queued call moves on to the next one. The counter
-reads "Call 37/200", and the queue reopens where it was left. Use it to judge a
+reads "Call 37/200", and the queue reopens where it was left. A queue never
+looks like an ordinary focus: the window title says "call queue", the line above
+the spectrogram starts with a cyan **CALL QUEUE 37/200** tag, the queued call
+has a dashed cyan frame labelled QUEUED CALL (V hides it with the other
+overlays, so the call can be seen clean), and in the Detections list its row
+is bold cyan with a ▶ while the recording's other detections are dimmed (they
+are context, not part of the queue). Skip (S), the Audio list's Prev / Next and
+clicking a recording all move through the queue too. Use it to judge a
 random sample of detections (an honest precision) or the calls two models
 disagree on. Lines without a detection keep the ordinary per-recording focus.
 

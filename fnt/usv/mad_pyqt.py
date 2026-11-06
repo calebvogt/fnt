@@ -801,6 +801,10 @@ class MADSpectrogramWidget(SpectrogramWidget):
         # Predicted prob mask (float32 in [0,1]).
         self.pred_mask: Optional[np.ndarray] = None
         self._selected_ann_idx: Optional[int] = None
+        #: id of the call-queue's call in the recording on screen (None outside
+        #: a call queue): drawn with its own cyan frame so it stands apart from
+        #: the recording's other detections, selected or not.
+        self.queue_ann_id: Optional[str] = None
         # Rubber-band multi-select (drag a box over masks with no tool active).
         self._selected_set: set = set()
         #: (rect, annotation index) for every class label drawn in the
@@ -2461,6 +2465,47 @@ class MADSpectrogramWidget(SpectrogramWidget):
                         polys.append(poly)
                     self._stroke_polys(painter, polys, pal['selected'],
                                        MASK_OUTLINE_W_SELECTED, pal['halo'])
+
+        # Call queue: a dashed cyan frame round the queue's call, labelled, so
+        # it is never mistaken for one of the recording's other detections.
+        # Drawn at every zoom (a frame, not a contour), but hidden with the other
+        # overlays in the plain-spectrogram view (V), so the call can be seen
+        # clean.
+        if (self.queue_ann_id is not None and self.annotations
+                and self.view_mode != 'spec'):
+            qa = next((a for a in self.annotations
+                       if str(a.get('id')) == str(self.queue_ann_id)), None)
+            if qa is not None and not (qa['t1'] <= t_start or qa['t0'] >= t_end):
+                x0 = _t_to_x(max(qa['t0'], t_start))
+                x1 = _t_to_x(min(qa['t1'], t_end))
+                y0 = _f_to_y(min(qa['f1'], f_end))
+                y1 = _f_to_y(max(qa['f0'], f_start))
+                pad = 6
+                rect = QRectF(min(x0, x1) - pad, min(y0, y1) - pad,
+                              abs(x1 - x0) + 2 * pad, abs(y1 - y0) + 2 * pad)
+                halo = QPen(QColor(0, 0, 0))
+                halo.setWidthF(4.0)
+                painter.setPen(halo)
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRect(rect)
+                qpen = QPen(QColor(0, 229, 255))
+                qpen.setWidthF(2.0)
+                qpen.setStyle(Qt.DashLine)
+                painter.setPen(qpen)
+                painter.drawRect(rect)
+                f = painter.font()
+                f.setPointSize(9)
+                f.setBold(True)
+                painter.setFont(f)
+                tag = "QUEUED CALL"
+                tw = painter.fontMetrics().horizontalAdvance(tag)
+                tx = rect.center().x() - tw / 2
+                ty = max(rect.top() - 6, painter.fontMetrics().ascent() + 2)
+                painter.setPen(QColor(0, 0, 0))
+                for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    painter.drawText(QPointF(tx + dx, ty + dy), tag)
+                painter.setPen(QColor(0, 229, 255))
+                painter.drawText(QPointF(tx, ty), tag)
 
         # Rubber-band selection rectangle (dotted) while dragging. Uses the
         # palette's contrast color so it shows on light maps too.
@@ -9633,6 +9678,8 @@ class MADMainWindow(QMainWindow):
             count_text += f"  ·  {self._n_score_hidden} below min score"
         if lbl:
             lbl.setText(count_text)
+        if bool(getattr(self, '_call_queue', None)):
+            self._mark_queue_row()
         self._update_pred_review_widgets()
         self._update_train_button_count()
         self._update_file_list_counts()
@@ -10300,12 +10347,20 @@ class MADMainWindow(QMainWindow):
             was_pending = st == 'prediction'
             # One list, one meaning: accepting a call in the Audio list confirms
             # it as a label, so it trains the model on the next run.
+            old_id = ann.get('id')
             self._accept_prediction(sel)
             mark("save")
-            self._after_review_decision(
-                self.spectrogram.annotations[sel].get('id')
-                if sel < len(self.spectrogram.annotations) else ann.get('id'),
-                was_pending)
+            new_id = (self.spectrogram.annotations[sel].get('id')
+                      if sel < len(self.spectrogram.annotations) else old_id)
+            # Accepting saves the call as a training example under a new id; a
+            # call queue tracks its call by id, so carry the queue over to it
+            # (else deciding the queued call reads as deciding some other one
+            # and auto-advance stays inside the recording).
+            if (old_id is not None
+                    and old_id == getattr(self, '_call_queue_ann_id', None)):
+                self._call_queue_ann_id = new_id
+                self.spectrogram.queue_ann_id = new_id
+            self._after_review_decision(new_id, was_pending)
             mark("advance")
 
     def _reject_current_pred(self):
@@ -10906,7 +10961,12 @@ class MADMainWindow(QMainWindow):
 
     def _skip_current_pred(self):
         """Leave the current detection undecided and jump to the next pending
-        one after it (no decision recorded)."""
+        one after it (no decision recorded); in a call queue, on to the
+        queue's next call."""
+        if bool(getattr(self, '_call_queue', None)) and not self._box_sel_ids:
+            self._count_skips(1)
+            self._queue_step(+1)
+            return
         sg = self.spectrogram
         sel = sg._selected_ann_idx
         if self._box_sel_ids:
@@ -15422,6 +15482,9 @@ class MADMainWindow(QMainWindow):
                    else None)
         self._focus_keys = None
         self._call_queue = []
+        self._call_queue_ann_id = None
+        self.spectrogram.queue_ann_id = None
+        self._mark_queue_row()
         self._show_registry(keep=current)
         self._update_focus_banner()
         self._log("Showing all recordings")
@@ -15492,9 +15555,17 @@ class MADMainWindow(QMainWindow):
         if idx == self.current_file_idx and self.audio_data is not None:
             self._queue_select_current()
             return
+        # The marker belongs to the recording that is leaving the screen.
+        self.spectrogram.queue_ann_id = None
         # The same sequencing as _focus_confirmed_call: the row change starts
         # the load, and the selection waits until the recording is on screen.
-        self.file_list.setCurrentRow(idx)
+        # _queue_nav tells _on_file_selected the row change is ours, not a
+        # click to redirect.
+        self._queue_nav = True
+        try:
+            self.file_list.setCurrentRow(idx)
+        finally:
+            self._queue_nav = False
         self.current_file_idx = idx
         self._load_current_file(then=self._queue_select_current)
 
@@ -15510,6 +15581,7 @@ class MADMainWindow(QMainWindow):
         n = len(queue)
         if idx is None:
             self._call_queue_ann_id = None
+            self.spectrogram.queue_ann_id = None
             self.spectrogram._selected_ann_idx = None
             self.spectrogram.update()
             self.status_bar.showMessage(
@@ -15517,12 +15589,118 @@ class MADMainWindow(QMainWindow):
                 f"longer in {os.path.basename(path)} — Next (N) moves on")
         else:
             self._call_queue_ann_id = anns[idx].get('id')
+            self.spectrogram.queue_ann_id = self._call_queue_ann_id
             self._center_and_select_ann(idx)
             self.status_bar.showMessage(
                 f"Call {self._call_queue_pos + 1}/{n}: "
                 f"{os.path.basename(path)}, detection {bid}"
                 + (f" — {note}" if note else ""))
+        self._mark_queue_row()
+        self._update_view_header()
         self._update_pred_review_widgets()
+
+    def _queue_pos_for_file(self, path: str) -> Optional[int]:
+        """The queue position of ``path``'s call (its first, if it has several
+        -- the first still pending, when one is known to be)."""
+        key = self._path_key(path)
+        hits = [i for i, (p, _, _) in enumerate(getattr(self, '_call_queue', []))
+                if self._path_key(p) == key]
+        if not hits:
+            return None
+        if self._call_queue_pos in hits:
+            return self._call_queue_pos
+        return hits[0]
+
+    def _queue_step_file(self, step: int):
+        """The Audio list's Prev/Next in a call queue: the queue's next (or
+        previous) call in a different recording."""
+        queue = getattr(self, '_call_queue', None)
+        if not queue:
+            return
+        here = self._path_key(queue[self._call_queue_pos][0])
+        pos = self._call_queue_pos + step
+        while 0 <= pos < len(queue) and self._path_key(queue[pos][0]) == here:
+            pos += step
+        if 0 <= pos < len(queue):
+            self._queue_goto(pos)
+        elif pos >= len(queue):
+            self.status_bar.showMessage(
+                f"End of the queue: all {len(queue)} calls shown")
+
+    def _queue_ann(self) -> Optional[dict]:
+        """The queue's call in the recording on screen, if it is there."""
+        qid = getattr(self, '_call_queue_ann_id', None)
+        if qid is None:
+            return None
+        return next((a for a in self.spectrogram.annotations
+                     if a.get('id') == qid), None)
+
+    def _mark_queue_row(self):
+        """In the Detections list: the queued call's row in bold cyan with a ▶,
+        every other row dimmed -- they are the recording's other detections,
+        shown for context, not part of the queue."""
+        tree = getattr(self, 'annotation_list', None)
+        grp = getattr(self, '_grp_detections', None)
+        queue = getattr(self, '_call_queue', None)
+        if grp is not None:
+            grp.setTitle("Detections in this recording (▶ = queued call)"
+                         if queue else "Detections")
+        if tree is None or not queue:
+            return
+        qid = getattr(self, '_call_queue_ann_id', None)
+        cyan, ncols = QColor(0, 229, 255), tree.columnCount()
+        pal = self._overlay_palette()
+        for r in range(tree.topLevelItemCount()):
+            item = tree.topLevelItem(r)
+            data = item.data(0, Qt.UserRole)
+            is_q = (qid is not None and isinstance(data, tuple)
+                    and len(data) > 3 and data[2] == qid)
+            f = item.font(0)
+            f.setBold(is_q)
+            if is_q:
+                col = cyan
+            else:
+                # From the row's status, not its current colour, so a row that
+                # was the queued call a moment ago loses the cyan too.
+                kind = data[3] if isinstance(data, tuple) and len(data) > 3 else ''
+                col = QColor(*(pal['pending'] if kind == 'prediction'
+                               else pal['rejected'] if kind == 'rejected'
+                               else pal['drawing'] if kind == 'pending'
+                               else pal['confirmed']))
+                col.setAlpha(110)
+            for c in range(ncols):
+                item.setFont(c, f)
+                item.setForeground(c, col)
+            text = item.text(0)
+            if is_q and not text.startswith("▶"):
+                item.setText(0, "▶ " + text)
+                tree.scrollToItem(item)
+            elif not is_q and text.startswith("▶ "):
+                item.setText(0, text[2:])
+
+    def _queue_header_html(self) -> str:
+        """The call-queue line above the spectrogram ('' outside a queue)."""
+        queue = getattr(self, '_call_queue', None)
+        if not queue:
+            return ""
+        pos = self._call_queue_pos
+        path, bid, note = queue[pos]
+        ann = self._queue_ann()
+        if ann is None:
+            where = f"detection {bid}"
+        else:
+            dt = (self.spectrogram.hop / float(self.sample_rate)
+                  if self.sample_rate else 0)
+            st = ann.get('status')
+            state = ("" if st == 'prediction'
+                     else " (already rejected)" if st == 'rejected'
+                     else " (already accepted)")
+            where = f"detection {bid} at {ann['t0'] * dt:.2f} s{state}"
+        return (f"<span style='background:#00505a; color:#00e5ff'>"
+                f"&nbsp;<b>CALL QUEUE {pos + 1}/{len(queue)}</b>&nbsp;</span>"
+                f" &nbsp;<span style='color:#00e5ff'>{where}"
+                + (f" &nbsp;·&nbsp; {note}" if note else "")
+                + "</span> &nbsp;&nbsp; ")
 
     def _queue_step(self, step: int):
         """Next (+1) / Back (-1) through the queue; says so at the end."""
@@ -15563,7 +15741,10 @@ class MADMainWindow(QMainWindow):
         name = cfg.project_name if cfg is not None else ""
         total = len(cfg.audio_entries()) if cfg is not None else 0
         if keys and cfg is not None:
-            tag = f"focus: {len(self.audio_files)} of {total}"
+            queue = getattr(self, '_call_queue', None)
+            tag = (f"call queue: {len(queue)} calls in {len(self.audio_files)} "
+                   f"recordings" if queue
+                   else f"focus: {len(self.audio_files)} of {total}")
             self.setWindowTitle(f"{self.BASE_TITLE} — {name}  [{tag}]")
             self.lbl_project_status.setText(
                 f"Project: {name} — {tag} (File ▸ Show All Recordings)")
@@ -16124,7 +16305,10 @@ class MADMainWindow(QMainWindow):
             if n_in:
                 inside = (f" &nbsp;·&nbsp; <span style='color:#ff9f40'>"
                           f"{n_in} pending inside training windows</span>")
+        queue_html = (self._queue_header_html()
+                      if bool(getattr(self, '_call_queue', None)) else "")
         lbl.setText(
+            queue_html +
             f"<b>{base}</b> &nbsp;·&nbsp; {pos} &nbsp;·&nbsp; "
             f"<span style='color:#3fbf5f'>{acc} accepted</span> &nbsp;·&nbsp; "
             f"<span style='color:#d64545'>{rej} rejected</span> &nbsp;·&nbsp; "
@@ -16361,6 +16545,15 @@ class MADMainWindow(QMainWindow):
             self.lbl_data_summary.setText(label)
 
     def _on_file_selected(self, row: int):
+        if (0 <= row < len(self.audio_files)
+                and bool(getattr(self, '_call_queue', None))
+                and not getattr(self, '_queue_nav', False)):
+            # In a call queue, picking a recording opens its queued call, so
+            # the queue position never drifts from what is on screen.
+            pos = self._queue_pos_for_file(self.audio_files[row])
+            if pos is not None and pos != self._call_queue_pos:
+                self._queue_goto(pos)
+                return
         if 0 <= row < len(self.audio_files):
             if self._is_infer_locked(self.audio_files[row]):
                 # Disabled rows are unreachable by mouse, but Prev/Next and
@@ -16383,10 +16576,16 @@ class MADMainWindow(QMainWindow):
             self._update_review_buttons_for_source()
 
     def _prev_file(self):
+        if bool(getattr(self, '_call_queue', None)):
+            self._queue_step_file(-1)
+            return
         if self.current_file_idx > 0:
             self.file_list.setCurrentRow(self.current_file_idx - 1)
 
     def _next_file(self):
+        if bool(getattr(self, '_call_queue', None)):
+            self._queue_step_file(+1)
+            return
         if self.current_file_idx < len(self.audio_files) - 1:
             self.file_list.setCurrentRow(self.current_file_idx + 1)
 

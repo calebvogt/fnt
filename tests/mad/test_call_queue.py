@@ -123,6 +123,23 @@ def test_deciding_the_queued_call_moves_on_through_the_queue():
     assert selected(w) == ("rec2.wav", "1")            # not rec1's next detection
 
 
+def test_accepting_the_queued_call_moves_on_through_the_queue():
+    """Accept saves the call under a new id; the queue must still see it as
+    its call (2026-11-05: Accept stayed inside the recording)."""
+    w, wavs, root = make()
+    q = queue_file(root, wavs, [(0, 2, ""), (1, 1, ""), (2, 3, "")])
+    w._settings.remove(f"mad/call_queue_pos/{os.path.normcase(os.path.abspath(q))}")
+    w.focus_recordings([q])
+    settle(w)
+    w._auto_advance = True
+    w._pred_next()                                     # reach call 2 the usual way
+    settle(w)
+    assert selected(w) == ("rec1.wav", "1")
+    w._accept_current_pred()
+    settle(w)
+    assert selected(w) == ("rec2.wav", "3") and w._call_queue_pos == 2
+
+
 def test_the_position_is_remembered():
     w, wavs, root = make()
     q = queue_file(root, wavs, [(0, 1, ""), (1, 1, ""), (2, 1, "")])
@@ -138,6 +155,54 @@ def test_the_position_is_remembered():
     w.focus_recordings([q])
     settle(w)
     assert w._call_queue_pos == 2 and selected(w) == ("rec2.wav", "1")
+
+
+def test_the_queued_call_is_marked_everywhere():
+    """Spectrogram frame, Detections row and header all point at the queued
+    call -- a call queue must not look like a per-recording focus."""
+    w, wavs, root = make()
+    q = queue_file(root, wavs, [(1, 2, "MMZ ch1")])
+    w._settings.remove(f"mad/call_queue_pos/{os.path.normcase(os.path.abspath(q))}")
+    w.focus_recordings([q])
+    settle(w)
+    qid = w._call_queue_ann_id
+    assert qid is not None and w.spectrogram.queue_ann_id == qid
+    tree = w.annotation_list
+    marked = [tree.topLevelItem(r) for r in range(tree.topLevelItemCount())
+              if tree.topLevelItem(r).text(0).startswith("▶")]
+    assert len(marked) == 1 and marked[0].data(0, M.Qt.UserRole)[2] == qid
+    w._update_view_header()
+    head = w.lbl_view_header.text()
+    assert "CALL QUEUE 1/1" in head and "MMZ ch1" in head
+    assert "queued call" in w._grp_detections.title()
+    assert "call queue" in w.windowTitle()
+    w.clear_focus()
+    settle(w)
+    assert w.spectrogram.queue_ann_id is None
+    assert w._grp_detections.title() == "Detections"
+
+
+def test_skip_and_file_navigation_follow_the_queue():
+    w, wavs, root = make()
+    q = queue_file(root, wavs, [(2, 3, ""), (0, 1, ""), (1, 2, "")])
+    w._settings.remove(f"mad/call_queue_pos/{os.path.normcase(os.path.abspath(q))}")
+    w.focus_recordings([q])
+    settle(w)
+    assert selected(w) == ("rec2.wav", "3")
+    w._skip_current_pred()                              # Skip = next queued call
+    settle(w)
+    assert selected(w) == ("rec0.wav", "1") and w._call_queue_pos == 1
+    w._next_file()                                      # file Next = next queued call
+    settle(w)
+    assert selected(w) == ("rec1.wav", "2") and w._call_queue_pos == 2
+    w._prev_file()
+    settle(w)
+    assert selected(w) == ("rec0.wav", "1") and w._call_queue_pos == 1
+    # Clicking a recording in the Audio list opens its queued call
+    row = next(i for i, p in enumerate(w.audio_files) if p.endswith("rec2.wav"))
+    w.file_list.setCurrentRow(row)
+    settle(w)
+    assert selected(w) == ("rec2.wav", "3") and w._call_queue_pos == 0
 
 
 if __name__ == "__main__":
