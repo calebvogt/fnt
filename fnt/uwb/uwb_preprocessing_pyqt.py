@@ -719,6 +719,44 @@ def hampel_keep(x, y, window=31, n_sigma=6.0, group=None,
 EWMA_METHOD = "Forward-Backward Exponentially Weighted Moving Average"
 SAVGOL_METHOD = "Savitzky-Golay"
 
+# "Export every smoothing method": each method's own coordinates, written to
+# the smoothed CSV beside smoothed_x/smoothed_y as <prefix>_x/<prefix>_y, so a
+# downstream analysis can compare smoothers without re-exporting. Always all
+# four (the primary method's included), so the file's columns do not depend on
+# which method was primary. Everything inside FNT still reads smoothed_x/y.
+ALT_SMOOTHING_METHODS = (
+    (SAVGOL_METHOD, 'sg'),
+    ("Rolling Average", 'rollmean'),
+    ("Rolling Median", 'rollmedian'),
+    (EWMA_METHOD, 'ewma'),
+)
+ALT_SMOOTHING_COLUMNS = tuple(
+    f'{prefix}_{axis}' for _, prefix in ALT_SMOOTHING_METHODS for axis in 'xy')
+
+
+def alt_smoothing_record(window, units):
+    """What each extra column holds, for fnt_config.json.
+
+    The rolling methods use the export's Smoothing Window and units; EWMA
+    reads the same number as a sample span; Savitzky-Golay is fixed at 31
+    samples (fewer for a shorter tag, forced odd) and order 2.
+    """
+    return {
+        'sg_x/sg_y': {'method': SAVGOL_METHOD, 'window_samples': 31,
+                      'polyorder': 2},
+        'rollmean_x/rollmean_y': {'method': "Rolling Average",
+                                  'window': window, 'units': units},
+        'rollmedian_x/rollmedian_y': {'method': "Rolling Median",
+                                      'window': window, 'units': units},
+        'ewma_x/ewma_y': {'method': EWMA_METHOD, 'span': int(max(1, window))},
+    }
+
+
+def _not_alt_smoothing_column(col):
+    """usecols filter: the readers that load the whole smoothed CSV skip the
+    extra smoothing columns, which they never use."""
+    return col not in ALT_SMOOTHING_COLUMNS
+
 
 def smoothing_window_fields(method, window, units, *, window_key,
                             units_key, span_key="smoothing_span"):
@@ -2763,8 +2801,9 @@ class PlotSaverWorker(QThread):
             # Load from CSV if available (much faster and ensures consistency)
             if self.csv_path and os.path.exists(self.csv_path):
                 self.progress.emit("Loading data from CSV...")
-                data = pd.read_csv(self.csv_path, low_memory=False)
-                
+                data = pd.read_csv(self.csv_path, low_memory=False,
+                                   usecols=_not_alt_smoothing_column)
+
                 data['Timestamp'] = smoothed_csv_timestamps(data, self.timezone)
                 
                 self.progress.emit(f"Loaded {len(data)} records from CSV")
@@ -5600,6 +5639,27 @@ class UWBQuickVisualizationWindow(QWidget):
             "Useful as a reference baseline."
         )
         export_layout.addWidget(self.chk_export_raw_csv)
+
+        self.chk_export_all_smoothing = QCheckBox(
+            "Add every smoothing method to the Smoothed CSV")
+        self.chk_export_all_smoothing.setChecked(False)
+        self.chk_export_all_smoothing.setToolTip(
+            "Besides smoothed_x/smoothed_y (the method chosen above, which every "
+            "plot, zone, contact, chase and animation output uses), write each "
+            "smoothing method's own coordinates as extra columns:\n"
+            "\n"
+            "  sg_x, sg_y                  Savitzky-Golay (31 samples, order 2)\n"
+            "  rollmean_x, rollmean_y      Rolling Average\n"
+            "  rollmedian_x, rollmedian_y  Rolling Median\n"
+            "  ewma_x, ewma_y              Forward-Backward EWMA\n"
+            "\n"
+            "The rolling methods use the Smoothing Window and units above; the "
+            "EWMA uses the same number as its span in samples. All are computed "
+            "from the same filtered location_x/location_y, and their settings "
+            "are recorded in fnt_config.json (all_smoothing_columns), so a "
+            "downstream analysis can compare smoothers without re-exporting. "
+            "Adds roughly a fifth to the file size per method.")
+        export_layout.addWidget(self.chk_export_all_smoothing)
 
         # The filtered + smoothed CSV is ALWAYS exported (it's the canonical
         # analysis product and the source for plots/animations/proximity), so it
@@ -15107,7 +15167,22 @@ class UWBQuickVisualizationWindow(QWidget):
                 lambda x: forward_backward_ewma(x, span))
 
         return data
-    
+
+    def add_alt_smoothing_columns(self, data, window=None, units=None):
+        """Add every method's coordinates (ALT_SMOOTHING_COLUMNS) to ``data``.
+
+        Each method runs on its own copy of the filtered location_x/location_y,
+        through the same apply_smoothing_to_data the primary method uses, so
+        e.g. rollmean_x equals smoothed_x when Rolling Average is primary.
+        """
+        base = data[['shortid', 'Timestamp', 'location_x', 'location_y']]
+        for method, prefix in ALT_SMOOTHING_METHODS:
+            out = self.apply_smoothing_to_data(base.copy(), method,
+                                               window=window, units=units)
+            data[f'{prefix}_x'] = out['smoothed_x'].to_numpy()
+            data[f'{prefix}_y'] = out['smoothed_y'].to_numpy()
+        return data
+
     def reset_filter_stats(self):
         """Clear accumulated filter statistics at the start of an export run."""
         self.filter_stats = {}
@@ -15452,7 +15527,12 @@ class UWBQuickVisualizationWindow(QWidget):
             'show_battery': self.chk_show_battery.isChecked(),
             'export_raw_csv': self.chk_export_raw_csv.isChecked(),
             'export_smoothed_csv': self.chk_export_smoothed_csv.isChecked(),
-            'proximity_detection': self.chk_proximity_detection.isChecked(),
+            'export_all_smoothing': self.chk_export_all_smoothing.isChecked(),
+            'all_smoothing_columns': (
+                alt_smoothing_record(self.spin_rolling_window.value(),
+                                     self.combo_window_units.currentText())
+                if self.chk_export_all_smoothing.isChecked() else None),
+            'proximity_detection':self.chk_proximity_detection.isChecked(),
             'proximity_threshold': self.spin_proximity_threshold.value(),
             # Analysis settings, so they ARE inherited between trials -
             # unlike the regions themselves, which belong to one arena.
@@ -15997,6 +16077,10 @@ class UWBQuickVisualizationWindow(QWidget):
 
             if 'export_smoothed_csv' in config:
                 self.chk_export_smoothed_csv.setChecked(config['export_smoothed_csv'])
+
+            if 'export_all_smoothing' in config:
+                self.chk_export_all_smoothing.setChecked(
+                    bool(config['export_all_smoothing']))
 
             # 'export_downsampled_csv' / 'downsample_hz' are obsolete (the
             # downsampled export was removed); ignored if present in old configs.
@@ -16995,7 +17079,8 @@ class UWBQuickVisualizationWindow(QWidget):
             # Load data from CSV if provided (for consistency with plots)
             if csv_path and os.path.exists(csv_path):
                 self.log_message(f"Loading animation data from CSV...")
-                anim_data = pd.read_csv(csv_path, low_memory=False)
+                anim_data = pd.read_csv(csv_path, low_memory=False,
+                                        usecols=_not_alt_smoothing_column)
                 anim_data['Timestamp'] = smoothed_csv_timestamps(
                     anim_data, self.combo_timezone.currentText())
                 self.log_message(f"Loaded {len(anim_data)} records from CSV")
@@ -18321,7 +18406,7 @@ class UWBQuickVisualizationWindow(QWidget):
 
     #: Columns of the smoothed CSV that must parse as numbers.
     _SMOOTHED_NUMERIC_COLS = ('shortid', 'timestamp', 'location_x', 'location_y',
-                              'smoothed_x', 'smoothed_y')
+                              'smoothed_x', 'smoothed_y') + ALT_SMOOTHING_COLUMNS
 
     #: Columns of the social-overlap bouts CSV that must parse as numbers.
     _BOUTS_NUMERIC_COLS = ('Day', 'duration_s', 'mean_distance', 'n_reads')
@@ -19135,6 +19220,9 @@ class UWBQuickVisualizationWindow(QWidget):
                     # velocity threshold (on the smoothed track).
                     if len(tag_data) > 0:
                         tag_data = self._filter_and_smooth(tag_data, smoothing_method)
+                        if (self.chk_export_all_smoothing.isChecked()
+                                and len(tag_data)):
+                            tag_data = self.add_alt_smoothing_columns(tag_data)
 
                     # Let the window repaint / process the Stop button between
                     # tags, right after the heaviest per-tag work.

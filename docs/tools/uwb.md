@@ -63,3 +63,6 @@ Additional columns (e.g., `location_z`, `location_quality`) are preserved during
 
 !!! tip "Positions for analysis"
     Use `smoothed_x` and `smoothed_y` from `<db>_smoothed.csv`, at 1 Hz or finer. Tag read rates can differ several-fold between animals, so time spent anywhere is a sum of per-fix durations, never a count of fixes.
+
+!!! note "Every smoothing method in one file"
+    Tick **Add every smoothing method to the Smoothed CSV** to also write `sg_x/sg_y` (Savitzky-Golay, 31 samples, order 2), `rollmean_x/rollmean_y` (Rolling Average), `rollmedian_x/rollmedian_y` (Rolling Median) and `ewma_x/ewma_y` (Forward-Backward EWMA). All are computed from the same filtered `location_x/location_y`; the rolling methods use the export's Smoothing Window and units and the EWMA uses the same number as its span in samples. `fnt_config.json` records them under `all_smoothing_columns`. FNT's own outputs (zones, contacts, chases, plots, animation) always use `smoothed_x/smoothed_y`, the method chosen in the Smoothing method box.
