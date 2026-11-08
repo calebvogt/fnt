@@ -26,8 +26,11 @@ SR, HOP = 250_000, 128
 _KEEP = []
 
 
-def make():
-    """Three 2-s recordings, each with three detections (blob_ids 1-3)."""
+def make(t_offs=None):
+    """Three 2-s recordings, each with three detections (blob_ids 1-3, 40
+    frames wide at frames 600, 1200, 1800) -- or, with ``t_offs``, one
+    detection per offset (blob_ids 1..n) in every recording."""
+    t_offs = t_offs or [600, 1200, 1800]
     root = tempfile.mkdtemp(prefix="mad_queue_")
     wavs = []
     for i in range(3):
@@ -38,8 +41,8 @@ def make():
         MS.set_grid_attrs(h5, sample_rate=SR, nperseg=512, noverlap=384, nfft=1024,
                           n_freq_bins=513, n_time_frames=2 * SR // HOP)
         MS.write_pred_masks(h5, [{"blob_id": b, "mask": np.ones((20, 40), np.uint8),
-                                  "f_off": 250, "t_off": 600 * b, "score": 0.9}
-                                 for b in (1, 2, 3)])
+                                  "f_off": 250, "t_off": t, "score": 0.9}
+                                 for b, t in enumerate(t_offs, start=1)])
         wavs.append(p)
     proj = os.path.join(root, "p")
     create_mad_project(proj)
@@ -138,6 +141,55 @@ def test_accepting_the_queued_call_moves_on_through_the_queue():
     w._accept_current_pred()
     settle(w)
     assert selected(w) == ("rec2.wav", "3") and w._call_queue_pos == 2
+
+
+def test_deciding_the_queued_call_first_clears_its_training_window():
+    """Deciding a queued call inside a bout puts its neighbours into training
+    as background unless they are decided too (2026-11-08). So Auto-advance
+    first walks every pending detection in the queued call's training window,
+    which widens with each decision (a chain of calls), and only then moves on
+    through the queue. A detection beyond the chain is left alone."""
+    # 40-frame calls 100 frames apart chain through the 128-frame context;
+    # blob 4 (950) is reached only once blob 3 (800-840, window to 968) is
+    # decided; blob 5 at 1600 is beyond the last window (990 + 128 = 1118).
+    w, wavs, root = make([600, 700, 800, 950, 1600])
+    q = queue_file(root, wavs, [(0, 2, ""), (1, 1, "")])
+    w._settings.remove(f"mad/call_queue_pos/{os.path.normcase(os.path.abspath(q))}")
+    w.focus_recordings([q])
+    settle(w)
+    assert selected(w) == ("rec0.wav", "2")
+    assert w._queue_window_pending() == []           # queued call still pending
+    w._auto_advance = True
+    w._reject_current_pred()
+    settle(w)
+    seen = []
+    while selected(w)[0] == "rec0.wav":
+        seen.append(selected(w)[1])
+        assert "in its training window" in w._queue_header_html()
+        w._reject_current_pred()
+        settle(w)
+        assert len(seen) < 6
+    assert sorted(seen) == ["1", "3", "4"]            # the chain, not blob 5
+    assert seen[-1] == "4"                           # reached only via blob 3's window
+    assert selected(w) == ("rec1.wav", "1") and w._call_queue_pos == 1
+    pending = [a.get("blob_id") for a in w.spectrogram.annotations
+               if a.get("status") == "prediction"]
+    assert pending == [1, 2, 3, 4, 5]                # rec1 untouched
+
+
+def test_skip_leaves_the_training_window_and_moves_on():
+    w, wavs, root = make([600, 700, 1600])
+    q = queue_file(root, wavs, [(0, 1, ""), (2, 3, "")])
+    w._settings.remove(f"mad/call_queue_pos/{os.path.normcase(os.path.abspath(q))}")
+    w.focus_recordings([q])
+    settle(w)
+    w._auto_advance = True
+    w._reject_current_pred()
+    settle(w)
+    assert selected(w) == ("rec0.wav", "2")           # its window holds blob 2
+    w._skip_current_pred()
+    settle(w)
+    assert selected(w) == ("rec2.wav", "3") and not w._queue_window_mode
 
 
 def test_the_position_is_remembered():

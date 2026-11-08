@@ -181,7 +181,14 @@ selected, Play starts at the left edge of the view.
 as recordings: `recording<TAB>detection<TAB>note`, the detection being its
 number (blob_id). Next (N) and Back (B) then walk those calls in the list's
 order across recordings, each opened centred and selected, with the note in
-the status bar; deciding the queued call moves on to the next one. The counter
+the status bar; deciding the queued call moves on to the next one. Deciding it
+also puts its training window (the call plus the context on each side) into
+training, so with Auto-advance on MAD first selects each pending detection
+inside that window, nearest first, and moves on only once none is left; each
+decision widens the window, so a call in a bout can lead through the whole
+bout. The header shows how many are still pending in the window, and Skip (S)
+leaves them undecided (trained as background) and goes to the next queued
+call. The counter
 reads "Call 37/200", and the queue reopens where it was left. A queue never
 looks like an ordinary focus: the window title says "call queue", the line above
 the spectrogram starts with a cyan **CALL QUEUE 37/200** tag, the queued call

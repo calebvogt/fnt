@@ -10622,12 +10622,26 @@ class MADMainWindow(QMainWindow):
             self._update_view_header()
         self._mark("badge")
         if (bool(getattr(self, '_call_queue', None)) and decided_id is not None
-                and decided_id == getattr(self, '_call_queue_ann_id', None)):
-            # Deciding the queue's own call moves on through the queue, not
-            # through this recording's other detections; the end-of-file
-            # prompt is for per-recording review.
+                and (decided_id == getattr(self, '_call_queue_ann_id', None)
+                     or getattr(self, '_queue_window_mode', False))):
+            # Deciding the queue's own call puts call +- context into training,
+            # so first walk through every pending detection inside that window
+            # (each decision widens it, so it is re-read every time), then move
+            # on through the queue -- not through this recording's other
+            # detections; the end-of-file prompt is for per-recording review.
             if self._auto_advance and was_pending:
-                self._queue_step(+1)
+                left = self._queue_window_pending()
+                if left:
+                    self._queue_window_mode = True
+                    self._center_and_select_ann(left[0])
+                    self._update_view_header()
+                    self.status_bar.showMessage(
+                        f"Training window: {len(left)} pending detection(s) "
+                        "to decide before the next queued call (Skip leaves "
+                        "them as background and moves on)")
+                else:
+                    self._queue_window_mode = False
+                    self._queue_step(+1)
             else:
                 self._reselect_by_id(decided_id)
             self._mark("select")
@@ -15533,12 +15547,38 @@ class MADMainWindow(QMainWindow):
     def _queue_active(self) -> bool:
         return bool(getattr(self, '_call_queue', None))
 
+    def _queue_window_pending(self) -> List[int]:
+        """Pending detections inside the training window that holds the queue's
+        call, nearest first.
+
+        Once the queued call is decided, training supervises call +- context;
+        anything still pending in that span would be taught as background. The
+        window is the merged one from :meth:`training_windows`, so every
+        decision inside it widens it and this is re-read after each one, until
+        nothing pending overlaps it. Empty while the queued call is pending.
+        """
+        qa = self._queue_ann()
+        if qa is None or qa.get('status') == 'prediction':
+            return []
+        sg = self.spectrogram
+        t0, t1 = int(qa['t0']), int(qa['t1'])
+        win = next(((lo, hi) for lo, hi in sg.training_windows()
+                    if lo <= t0 and hi >= t1), None)
+        if win is None:
+            return []
+        mid = (t0 + t1) / 2.0
+        anns = sg.annotations
+        return sorted(sg.undecided_in_training_windows([win]),
+                      key=lambda i: abs((int(anns[i]['t0'])
+                                         + int(anns[i]['t1'])) / 2.0 - mid))
+
     def _queue_goto(self, pos: int):
         """Open the queue's ``pos``-th call: its recording (asynchronously, if
         it is not the one on screen), centred and selected."""
         queue = getattr(self, '_call_queue', None)
         if not queue:
             return
+        self._queue_window_mode = False
         pos = max(0, min(pos, len(queue) - 1))
         self._call_queue_pos = pos
         key = getattr(self, '_call_queue_key', None)
@@ -15696,6 +15736,10 @@ class MADMainWindow(QMainWindow):
                      else " (already rejected)" if st == 'rejected'
                      else " (already accepted)")
             where = f"detection {bid} at {ann['t0'] * dt:.2f} s{state}"
+            n_win = len(self._queue_window_pending())
+            if n_win:
+                where += (f" &nbsp;·&nbsp; <span style='color:#ff9f40'>"
+                          f"{n_win} pending in its training window</span>")
         return (f"<span style='background:#00505a; color:#00e5ff'>"
                 f"&nbsp;<b>CALL QUEUE {pos + 1}/{len(queue)}</b>&nbsp;</span>"
                 f" &nbsp;<span style='color:#00e5ff'>{where}"
