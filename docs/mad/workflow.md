@@ -188,7 +188,12 @@ inside that window, nearest first, and moves on only once none is left; each
 decision widens the window, so a call in a bout can lead through the whole
 bout. The header shows how many are still pending in the window, and Skip (S)
 leaves them undecided (trained as background) and goes to the next queued
-call. The counter
+call. Editing a pending call's shape (right-click → Edit shape, then Enter)
+accepts it, so it counts as a decision here too: editing the queued call, or
+a pending call in its window during that walk, moves on exactly as Accept
+would. While you work on one call, MAD reads the queue's next recording in the
+background, so stepping to it skips the few seconds a 10-minute recording takes
+to decode. The counter
 reads "Call 37/200", and the queue reopens where it was left. A queue never
 looks like an ordinary focus: the window title says "call queue", the line above
 the spectrogram starts with a cyan **CALL QUEUE 37/200** tag, the queued call

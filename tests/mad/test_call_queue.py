@@ -257,6 +257,212 @@ def test_skip_and_file_navigation_follow_the_queue():
     assert selected(w) == ("rec2.wav", "3") and w._call_queue_pos == 0
 
 
+def _edit_shape(w, idx, paint=None):
+    """Right-click -> edit shape on call ``idx``, paint, Enter."""
+    sg = w.spectrogram
+    sg.start_edit(idx)
+    assert sg.is_editing()
+    if paint is not None:
+        sg.paint_mode = 'brush'
+        sg.brush_radius_px = 2
+        sg._stamp(*paint)
+    w._confirm_pending()
+    settle(w)
+
+
+def test_editing_the_queued_call_keeps_the_queue_and_walks_its_window():
+    """An edit saves the call under a new id; the queue must follow it, and
+    since the edit accepts a pending call it moves on like Accept: through the
+    call's training window, then the queue (2026-11-08: after an edit the
+    header lost the queued call and the window walk became the whole file)."""
+    w, wavs, root = make([600, 700, 800, 950, 1600])
+    q = queue_file(root, wavs, [(0, 2, ""), (1, 1, "")])
+    w._settings.remove(f"mad/call_queue_pos/{os.path.normcase(os.path.abspath(q))}")
+    w.focus_recordings([q])
+    settle(w)
+    assert selected(w) == ("rec0.wav", "2")
+    w._auto_advance = True
+    sg = w.spectrogram
+    _edit_shape(w, sg._selected_ann_idx, paint=(720, 271))
+    qa = w._queue_ann()
+    assert qa is not None and qa['status'] == 'accepted'
+    assert sg.queue_ann_id == w._call_queue_ann_id == qa['id']
+    assert str(qa['blob_id']) == "2"                # still the model's detection
+    assert w._queue_window_mode
+    assert "in its training window" in w._queue_header_html()
+    seen = []
+    while selected(w)[0] == "rec0.wav":
+        seen.append(selected(w)[1])
+        w._reject_current_pred()
+        settle(w)
+        assert len(seen) < 6
+    assert sorted(seen) == ["1", "3", "4"]
+    assert selected(w) == ("rec1.wav", "1") and w._call_queue_pos == 1
+    w._pred_prev()                                   # Back finds the edited call
+    settle(w)
+    assert selected(w) == ("rec0.wav", "2")
+    assert w._queue_ann().get('status') in (None, 'accepted')   # a label now
+
+
+def test_editing_a_neighbour_during_the_window_walk_continues_the_walk():
+    w, wavs, root = make([600, 700, 800, 950, 1600])
+    q = queue_file(root, wavs, [(0, 2, ""), (1, 1, "")])
+    w._settings.remove(f"mad/call_queue_pos/{os.path.normcase(os.path.abspath(q))}")
+    w.focus_recordings([q])
+    settle(w)
+    w._auto_advance = True
+    w._reject_current_pred()                         # decide the queued call
+    settle(w)
+    first = selected(w)
+    assert first[0] == "rec0.wav" and first[1] in ("1", "3")
+    _edit_shape(w, w.spectrogram._selected_ann_idx)  # edit = accept the neighbour
+    nxt = selected(w)
+    assert nxt[0] == "rec0.wav" and nxt[1] != first[1]   # the walk went on
+    assert w._queue_window_mode
+    seen = [first[1]]
+    while selected(w)[0] == "rec0.wav":
+        seen.append(selected(w)[1])
+        w._reject_current_pred()
+        settle(w)
+        assert len(seen) < 6
+    assert sorted(seen) == ["1", "3", "4"]
+    assert selected(w) == ("rec1.wav", "1") and w._call_queue_pos == 1
+
+
+def _fresh_load(path):
+    """What a normal open decodes for ``path`` (the same worker, run inline)."""
+    wk = M.MADAudioLoadWorker(path, 0)
+    got = {}
+    wk.loaded.connect(lambda t, a, sr, e: got.update(a=a, sr=sr),
+                      M.Qt.DirectConnection)
+    wk.run()
+    return got['a'], got['sr']
+
+
+def _until(cond, timeout=20.0):
+    import time
+    end = time.time() + timeout
+    while time.time() < end:
+        QApplication.instance().processEvents()
+        if cond():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def _count_decodes(monkeypatch, slow=None):
+    """Recordings decoded, in order (``slow`` takes half a second)."""
+    import time
+    decoded = []
+    orig = M.load_audio
+
+    def load(p, *a, **k):
+        name = os.path.basename(p)
+        decoded.append(name)
+        if name == slow:
+            time.sleep(0.5)
+        return orig(p, *a, **k)
+    monkeypatch.setattr(M, "load_audio", load)
+    return decoded
+
+
+def _prefetched(w, name):
+    pf = w._prefetch
+    return pf is not None and pf['done'] and pf['path'].endswith(name)
+
+
+def test_the_next_queued_recording_is_decoded_ahead(monkeypatch):
+    """Stepping to a call in another recording decoded the whole file on the
+    spot (~3-5 s for 600 s of ADPCM) -- twice, side by side. The queue now
+    reads its next recording while you work and the open takes that read
+    over: one decode, the same samples, and the .mad's crops read once."""
+    w, wavs, root = make()
+    for p in wavs:                      # stamped: opening writes nothing
+        MS.mark_ridges_complete(MS.masks_sibling_path(p))
+    decoded = _count_decodes(monkeypatch)
+    reads = []
+    orig_read = MS.read_all_pred_masks
+
+    def read(h5, *a, **k):
+        reads.append(os.path.basename(h5))
+        return orig_read(h5, *a, **k)
+    monkeypatch.setattr(MS, "read_all_pred_masks", read)
+    mad2 = os.path.basename(MS.masks_sibling_path(wavs[2]))
+    q = queue_file(root, wavs, [(0, 1, ""), (0, 3, ""), (2, 2, ""), (1, 1, "")])
+    w._settings.remove(f"mad/call_queue_pos/{os.path.normcase(os.path.abspath(q))}")
+    w.focus_recordings([q])
+    settle(w)
+    assert selected(w) == ("rec0.wav", "1")
+    assert decoded.count("rec0.wav") == 1           # one decode per open
+    # The next call in ANOTHER recording is rec2's: rec0's second is skipped.
+    assert _until(lambda: _prefetched(w, "rec2.wav"))
+    assert decoded.count("rec2.wav") == 1 and reads.count(mad2) == 1
+    w._pred_next()
+    settle(w)
+    assert selected(w) == ("rec0.wav", "3")         # same recording, no load
+    hits = w._prefetch_hits
+    w._pred_next()
+    settle(w)
+    assert selected(w) == ("rec2.wav", "2")
+    assert w._prefetch_hits == hits + 1
+    assert decoded.count("rec2.wav") == 1           # served from the prefetch
+    assert reads.count(mad2) == 1                   # and so were its crops
+    audio, sr = _fresh_load(wavs[2])
+    assert w.audio_data.dtype == audio.dtype
+    assert np.array_equal(w.audio_data, audio) and w.sample_rate == sr
+    pend = sorted(a.get("blob_id") for a in w.spectrogram.annotations
+                  if a.get("status") == "prediction")
+    assert pend == [1, 2, 3]
+    # rec1 is read ahead now; Back to rec0, which is not, decodes it once.
+    assert _until(lambda: _prefetched(w, "rec1.wav"))
+    before = decoded.count("rec0.wav")
+    w._pred_prev()
+    settle(w)
+    assert selected(w) == ("rec0.wav", "3")
+    assert decoded.count("rec0.wav") == before + 1
+    w.clear_focus()
+    settle(w)
+    assert w._prefetch is None
+
+
+def test_an_open_takes_over_a_prefetch_still_running(monkeypatch):
+    w, wavs, root = make()
+    decoded = _count_decodes(monkeypatch, slow="rec1.wav")
+    q = queue_file(root, wavs, [(0, 1, ""), (1, 2, ""), (2, 3, "")])
+    w._settings.remove(f"mad/call_queue_pos/{os.path.normcase(os.path.abspath(q))}")
+    w.focus_recordings([q])
+    settle(w)
+    assert selected(w) == ("rec0.wav", "1")
+    assert _until(lambda: "rec1.wav" in decoded)
+    assert w._prefetch is not None and not w._prefetch['done']
+    w._pred_next()                                   # while rec1 still decodes
+    settle(w)
+    assert selected(w) == ("rec1.wav", "2")
+    assert decoded.count("rec1.wav") == 1
+    audio, _sr = _fresh_load(wavs[1])
+    assert np.array_equal(w.audio_data, audio)
+
+
+def test_a_mad_changed_since_the_prefetch_is_read_again():
+    w, wavs, root = make()
+    for p in wavs:
+        MS.mark_ridges_complete(MS.masks_sibling_path(p))
+    q = queue_file(root, wavs, [(0, 1, ""), (1, 2, "")])
+    w._settings.remove(f"mad/call_queue_pos/{os.path.normcase(os.path.abspath(q))}")
+    w.focus_recordings([q])
+    settle(w)
+    assert _until(lambda: _prefetched(w, "rec1.wav"))
+    MS.write_pred_masks(MS.masks_sibling_path(wavs[1]),
+                        [{"blob_id": 2, "mask": np.ones((20, 40), np.uint8),
+                          "f_off": 250, "t_off": 1200, "score": 0.9}])
+    w._pred_next()
+    settle(w)
+    assert selected(w) == ("rec1.wav", "2")
+    pend = [a.get("blob_id") for a in w.spectrogram.annotations
+            if a.get("status") == "prediction"]
+    assert pend == [2]                               # the .mad as it is now
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

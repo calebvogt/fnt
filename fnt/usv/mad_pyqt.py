@@ -1176,11 +1176,41 @@ class MADSpectrogramWidget(SpectrogramWidget):
     def get_pending(self) -> Optional[np.ndarray]:
         return self._pending
 
-    def clear_pending(self) -> None:
+    def _pending_dirty_box(self):
+        """(f0, f1, t0, t1) covering every pixel that can be set in
+        ``_pending``, or None when nothing can be: the tracked box joined with
+        the stroke history's extent (strokes are always inside the box too,
+        but a test or older caller may push a stroke without noting it)."""
+        box = self._pending_bbox
+        if self._pending_stack:
+            fcat = np.concatenate([s[0] for s in self._pending_stack])
+            tcat = np.concatenate([s[1] for s in self._pending_stack])
+            if fcat.size:
+                sb = (int(fcat.min()), int(fcat.max()) + 1,
+                      int(tcat.min()), int(tcat.max()) + 1)
+                box = sb if box is None else (
+                    min(box[0], sb[0]), max(box[1], sb[1]),
+                    min(box[2], sb[2]), max(box[3], sb[3]))
+        return box
+
+    def _zero_pending(self) -> None:
+        """Empty the pending buffer by clearing only its dirty box.
+
+        ``self._pending[:] = 0`` writes the whole grid -- 601 MB on a 10-minute
+        recording, about a fifth of a second each time, and it ran on every
+        Enter, Esc and Edit Shape. Every write into the buffer notes its region
+        (``_note_pending_region``), so the box holds every set pixel.
+        """
         if self._pending is not None:
-            self._pending[:] = 0
+            box = self._pending_dirty_box()
+            if box is not None:
+                f0, f1, t0, t1 = box
+                self._pending[f0:f1, t0:t1] = 0
         self._pending_bbox = None
         self._pending_stack = []
+
+    def clear_pending(self) -> None:
+        self._zero_pending()
         self.update()
 
     def undo_pending(self) -> bool:
@@ -1205,23 +1235,18 @@ class MADSpectrogramWidget(SpectrogramWidget):
         if p is None:
             return []
         from scipy import ndimage
-        if self._pending_stack:
-            fcat = np.concatenate([s[0] for s in self._pending_stack])
-            tcat = np.concatenate([s[1] for s in self._pending_stack])
-            bf0, bf1 = int(fcat.min()), int(fcat.max()) + 1
-            bt0, bt1 = int(tcat.min()), int(tcat.max()) + 1
-        elif self._pending_bbox is not None:
-            # Written without stroke history — Edit Shape loads a call straight
-            # into the buffer. The tracked box says where, so this stays a
-            # small crop.
-            bf0, bf1, bt0, bt1 = self._pending_bbox
-        else:
+        # The tracked box joined with the strokes' extent. It used to be the
+        # strokes alone whenever there were any, which during Edit Shape left
+        # out the call loaded into the buffer (it is written without a stroke).
+        box = self._pending_dirty_box()
+        if box is None:
             # Nothing has been written since the last clear, which is the state
             # during ordinary review. This used to fall through to
             # ``p.any(axis=1)`` over the whole grid — 601M booleans, ~322 ms
             # per keystroke on a 10-minute recording — to discover the same
             # thing the box already knows.
             return []
+        bf0, bf1, bt0, bt1 = box
         sub = p[bf0:bf1, bt0:bt1] > 0
         if not sub.any():
             return []
@@ -1238,12 +1263,20 @@ class MADSpectrogramWidget(SpectrogramWidget):
         return out
 
     def pending_bbox(self):
-        """Return (f0, f1, t0, t1) [half-open] of pending pixels, or None."""
-        if self._pending is None or not self._pending.any():
+        """Return (f0, f1, t0, t1) [half-open] of pending pixels, or None.
+
+        Scans the dirty box only, never the whole grid."""
+        box = None if self._pending is None else self._pending_dirty_box()
+        if box is None:
             return None
-        fs = np.where(self._pending.any(axis=1))[0]
-        ts = np.where(self._pending.any(axis=0))[0]
-        return int(fs[0]), int(fs[-1]) + 1, int(ts[0]), int(ts[-1]) + 1
+        bf0, bf1, bt0, bt1 = box
+        sub = self._pending[bf0:bf1, bt0:bt1]
+        rows = np.flatnonzero(sub.any(axis=1))
+        if rows.size == 0:
+            return None
+        cols = np.flatnonzero(sub.any(axis=0))
+        return (bf0 + int(rows[0]), bf0 + int(rows[-1]) + 1,
+                bt0 + int(cols[0]), bt0 + int(cols[-1]) + 1)
 
     # --- accepted-annotation lifecycle --------------------------------
     def _rebuild_confirmed_mask(self) -> None:
@@ -1255,6 +1288,33 @@ class MADSpectrogramWidget(SpectrogramWidget):
             f0, f1, t0, t1 = ann['f0'], ann['f1'], ann['t0'], ann['t1']
             sub = ann['mask']
             self.mask[f0:f1, t0:t1][sub] = MASK_POSITIVE
+
+    def _restamp_confirmed_region(self, f0: int, f1: int, t0: int,
+                                  t1: int) -> None:
+        """Recompute the union buffer inside one box only.
+
+        The same result as :meth:`_rebuild_confirmed_mask` for that box, which
+        is all a change to one call can alter -- without zeroing and
+        re-stamping the whole 601 MB grid. Used by Edit Shape, which took and
+        put back one call and paid for a full rebuild each way.
+        """
+        if self.mask is None:
+            return
+        f0, t0 = max(0, int(f0)), max(0, int(t0))
+        f1 = min(self.mask.shape[0], int(f1))
+        t1 = min(self.mask.shape[1], int(t1))
+        if f1 <= f0 or t1 <= t0:
+            return
+        self.mask[f0:f1, t0:t1] = 0
+        for ann in self.annotations:
+            af0, af1, at0, at1 = ann['f0'], ann['f1'], ann['t0'], ann['t1']
+            of0, of1 = max(f0, af0), min(f1, af1)
+            ot0, ot1 = max(t0, at0), min(t1, at1)
+            if of1 <= of0 or ot1 <= ot0:
+                continue
+            sub = np.asarray(ann['mask'])[of0 - af0:of1 - af0,
+                                          ot0 - at0:ot1 - at0]
+            self.mask[of0:of1, ot0:ot1][sub > 0] = MASK_POSITIVE
 
     def set_annotations(self, anns: List[dict]) -> None:
         self.annotations = list(anns)
@@ -1367,9 +1427,15 @@ class MADSpectrogramWidget(SpectrogramWidget):
         if self._pending is None:
             self._pending = np.zeros((self.n_freq_bins, self.n_time_frames),
                                      dtype=np.uint8)
-        # Anything already half-drawn is not part of this call.
-        self._pending[:] = 0
-        self._pending_bbox = None
+        # Anything already half-drawn is not part of this call. Every buffer
+        # op here is bounded to a box: on a 10-minute recording the grid is
+        # 513 x 1.17M (601 MB), and zeroing it, copying it for the backup and
+        # rebuilding the confirmed mask from scratch each touched all of it --
+        # 0.3-0.5 s per Edit Shape before the brush could be used, and much
+        # more under memory pressure. The stroke history goes too: strokes
+        # from an earlier edit made every later stroke's component count label
+        # a crop spanning both edits.
+        self._zero_pending()
         t0, t1 = int(ann['t0']), int(ann['t1'])
         f0, f1 = int(ann['f0']), int(ann['f1'])
         h = min(f1 - f0, self.n_freq_bins - f0, m.shape[0])
@@ -1378,15 +1444,18 @@ class MADSpectrogramWidget(SpectrogramWidget):
             return
         self._pending[f0:f0 + h, t0:t0 + w] = (m[:h, :w] > 0).astype(np.uint8)
         self._note_pending_region(f0, f0 + h, t0, t0 + w)
-        # Kept so Esc can put the call back exactly as it was.
-        self._edit_backup = (ann_idx, self._pending.copy())
+        # The call's own pixels (Esc puts the call back from the untouched
+        # annotation itself; this is the record of what was loaded). Was a
+        # copy of the whole grid.
+        self._edit_backup = (ann_idx, (f0, t0, self._pending[
+            f0:f0 + h, t0:t0 + w].copy()))
         self._editing_ann_idx = ann_idx
         # The call is being drawn now, so stop drawing it as an annotation too
         # — otherwise the outline and the pending mask render on top of a
         # single call and the edit is impossible to see.
         self._edit_hidden_ann = ann
         self.annotations.pop(ann_idx)
-        self._rebuild_confirmed_mask()
+        self._restamp_confirmed_region(f0, f1, t0, t1)
         # The caller turns the Paint tool on — the buttons live on the main
         # window, and mode and button state must not be able to disagree.
         self.update()
@@ -1401,23 +1470,31 @@ class MADSpectrogramWidget(SpectrogramWidget):
         self._edit_hidden_ann = None
         self._edit_backup = None
         pend = self._pending
-        if ann is None or pend is None or not pend.any():
+        # The painted extent, found inside the dirty box: ``pend.any()`` and
+        # ``np.nonzero(pend)`` over the whole grid cost ~3.5 s on a 10-minute
+        # recording, every Enter.
+        box = self.pending_bbox() if (ann is not None
+                                      and pend is not None) else None
+        if box is None:
             # Erased to nothing — treat as cancel rather than storing an empty
-            # call, which would train the model on a blank mask.
+            # call, which would train the model on a blank mask. Cancel puts
+            # back the call it is handed, so hand it back: it was cleared
+            # above, and the call vanished from the list until the file was
+            # reopened.
+            self._edit_hidden_ann = ann
             self.cancel_edit()
             return
-        fs, ts = np.nonzero(pend)
-        f0, f1 = int(fs.min()), int(fs.max()) + 1
-        t0, t1 = int(ts.min()), int(ts.max()) + 1
+        f0, f1, t0, t1 = box
         ann['f0'], ann['f1'] = f0, f1
         ann['t0'], ann['t1'] = t0, t1
         ann['mask'] = pend[f0:f1, t0:t1].astype(bool)
         idx = len(self.annotations)
         self.annotations.append(ann)
-        self._pending[:] = 0
-        self._pending_bbox = None
+        self._zero_pending()
         self.set_paint_mode(None)
-        self._rebuild_confirmed_mask()
+        # The call was taken out of the union when the edit began; adding it
+        # back is all that changed.
+        self._restamp_call(ann)
         self.annotation_edit_finished.emit(idx)
         self.update()
 
@@ -1429,12 +1506,18 @@ class MADSpectrogramWidget(SpectrogramWidget):
         self._editing_ann_idx = None
         self._edit_hidden_ann = None
         self._edit_backup = None
-        if self._pending is not None:
-            self._pending[:] = 0
-        self._pending_bbox = None
+        self._zero_pending()
         self.set_paint_mode(None)
-        self._rebuild_confirmed_mask()
+        if ann is not None:
+            self._restamp_call(ann)
         self.update()
+
+    def _restamp_call(self, ann: dict) -> None:
+        """OR one call into the confirmed union (its box only)."""
+        if self.mask is None or ann is None:
+            return
+        self._restamp_confirmed_region(ann['f0'], ann['f1'],
+                                       ann['t0'], ann['t1'])
 
     def is_editing(self) -> bool:
         return self._editing_ann_idx is not None
@@ -3586,6 +3669,32 @@ class MADRunPanel(QWidget):
 # ======================================================================
 # SAM2-assisted labeling worker threads
 # ======================================================================
+def _file_signature(path: str):
+    """(mtime_ns, size) of a file, or None if it cannot be read."""
+    try:
+        st = os.stat(path)
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _read_crops_if_stable(h5_path: str):
+    """A recording's prediction crops with the .mad's signature, read off the
+    UI thread for a call queue's prefetch: ``(h5_path, signature, crops)``, or
+    None when there is no .mad or it changed while being read."""
+    try:
+        if not os.path.isfile(h5_path):
+            return None
+        from fnt.usv.usv_detector.fnt_mask_store import read_all_pred_masks
+        sig = _file_signature(h5_path)
+        crops = read_all_pred_masks(h5_path, include_ridge=True)
+        if sig is None or _file_signature(h5_path) != sig:
+            return None
+        return (h5_path, sig, crops)
+    except Exception:
+        return None
+
+
 class MADAudioLoadWorker(QThread):
     """Read one recording off the UI thread.
 
@@ -3602,7 +3711,8 @@ class MADAudioLoadWorker(QThread):
 
     loaded = pyqtSignal(int, object, int, str)   # token, audio, sr, error
 
-    def __init__(self, path: str, token: int, parent=None, view=None):
+    def __init__(self, path: str, token: int, parent=None, view=None,
+                 crops_h5: Optional[str] = None):
         super().__init__(parent)
         self._path = path
         self._token = token
@@ -3610,6 +3720,11 @@ class MADAudioLoadWorker(QThread):
         #: Spectrogram arrays for the first view, computed here so the UI
         #: thread does not have to. Read on the UI thread after `loaded`.
         self.spec = None
+        #: A call queue's prefetch also reads the recording's prediction crops
+        #: (``crops_h5``, its .mad): ``(h5 path, (mtime_ns, size), crops)``,
+        #: used only if the file is unchanged when the recording opens.
+        self._crops_h5 = crops_h5
+        self.crops = None
 
     def run(self):
         try:
@@ -3632,6 +3747,8 @@ class MADAudioLoadWorker(QThread):
                         lo_hz, hi_hz, total)
                 except Exception:
                     self.spec = None      # fall back to computing on demand
+            if self._crops_h5:
+                self.crops = _read_crops_if_stable(self._crops_h5)
             self.loaded.emit(self._token, audio, int(sr), "")
         except Exception as e:                    # surfaced on the UI thread
             self.loaded.emit(self._token, None, 0, str(e))
@@ -6642,6 +6759,16 @@ class MADMainWindow(QMainWindow):
         self._audio_workers: Dict[int, object] = {}
         self._audio_then: Dict[int, object] = {}
         self._loading_path: Optional[str] = None
+        # Call-queue prefetch (see _queue_prefetch_next): at most one recording
+        # decoded ahead, plus workers still finishing a prefetch that was
+        # dropped or taken over (kept alive until they end).
+        self._prefetch: Optional[dict] = None
+        self._prefetch_token = 0
+        self._prefetch_workers: Dict[int, object] = {}
+        self._prefetch_adopted: Dict[int, int] = {}   # prefetch -> load token
+        self._prefetch_restart = False
+        self._prefetch_hits = 0
+        self._prefetched_crops = None
 
         # Session-level class tracking (used when no project is open).
         self._session_classes: List[str] = ["USV"]
@@ -11606,7 +11733,9 @@ class MADMainWindow(QMainWindow):
         # Per-blob crops (few MB). Migrate a legacy prob file once, carving
         # crops from the CSV's blob boxes when a CSV is present so blob_ids and
         # accept/reject status stay joined.
-        crops = read_all_pred_masks(h5_path, include_ridge=True)
+        crops = self._take_prefetched_crops(h5_path)
+        if crops is None:
+            crops = read_all_pred_masks(h5_path, include_ridge=True)
         if not crops and has_prob(h5_path):
             crops, migrated_rows = self._migrate_legacy_prob(h5_path, sp, rows)
             if rows is None:
@@ -15328,6 +15457,7 @@ class MADMainWindow(QMainWindow):
             )
         self._project = None
         self._focus_keys = None      # a focus belongs to the project it was on
+        self._drop_prefetch()
         self.audio_files = []
         self.current_file_idx = 0
         self.audio_data = None
@@ -15499,6 +15629,7 @@ class MADMainWindow(QMainWindow):
         self._call_queue_ann_id = None
         self.spectrogram.queue_ann_id = None
         self._mark_queue_row()
+        self._drop_prefetch()
         self._show_registry(keep=current)
         self._update_focus_banner()
         self._log("Showing all recordings")
@@ -15513,6 +15644,7 @@ class MADMainWindow(QMainWindow):
         the position can be restored next time it is opened."""
         rows = [r for r in self._focus_lines(items) if r[1] is not None]
         self._call_queue = []
+        self._drop_prefetch()
         self._call_queue_pos = 0
         self._call_queue_ann_id = None
         if not rows:
@@ -15601,13 +15733,23 @@ class MADMainWindow(QMainWindow):
         # the load, and the selection waits until the recording is on screen.
         # _queue_nav tells _on_file_selected the row change is ours, not a
         # click to redirect.
+        tok = self._audio_token
         self._queue_nav = True
         try:
             self.file_list.setCurrentRow(idx)
         finally:
             self._queue_nav = False
         self.current_file_idx = idx
-        self._load_current_file(then=self._queue_select_current)
+        if (self._audio_token != tok and self._loading_path is not None
+                and self._path_key(self._loading_path)
+                == self._path_key(self.audio_files[idx])):
+            # The row change already started this recording's load
+            # (_on_file_selected); wait on that one. Starting a second load
+            # here decoded every queued recording twice, side by side -- the
+            # first copy thrown away as superseded.
+            self._audio_then[self._audio_token] = self._queue_select_current
+        else:
+            self._load_current_file(then=self._queue_select_current)
 
     def _queue_select_current(self):
         """Select the queue's current call in the recording on screen."""
@@ -15638,6 +15780,135 @@ class MADMainWindow(QMainWindow):
         self._mark_queue_row()
         self._update_view_header()
         self._update_pred_review_widgets()
+        self._queue_prefetch_next()
+
+    # --- call-queue prefetch -------------------------------------------
+    def _queue_prefetch_target(self) -> Optional[str]:
+        """The recording of the queue's next call in a different recording
+        than the current call's, or None."""
+        queue = getattr(self, '_call_queue', None)
+        if not queue:
+            return None
+        pos = self._call_queue_pos
+        here = self._path_key(queue[pos][0])
+        for p in range(pos + 1, len(queue)):
+            if self._path_key(queue[p][0]) != here:
+                return queue[p][0]
+        return None
+
+    def _queue_prefetch_next(self):
+        """Decode the next queued recording in the background while the user
+        works on this call.
+
+        Stepping to a call in another recording decoded the whole file on the
+        spot -- 600 s of IMA ADPCM through ffmpeg, about 3 s, and 5 s or more
+        with the inference run sharing the machine -- and every queue step
+        paid it. Read ahead with the same worker a normal open uses, at most
+        one recording (~600 MB of float32 samples) is kept; the open that asks
+        for it takes it over (_adopt_prefetch), finished or still running.
+        Only in a call queue, whose next file is known.
+        """
+        path = self._queue_prefetch_target()
+        if (path is None or not os.path.isfile(path)
+                or self._is_infer_locked(path)):
+            self._drop_prefetch()
+            return
+        key = self._path_key(path)
+        here = self._loaded_wav_path or self._loading_path
+        if here is not None and self._path_key(here) == key:
+            return
+        pf = self._prefetch
+        if pf is not None and pf['key'] == key:
+            return
+        self._drop_prefetch()
+        if self._prefetch_workers:
+            # A dropped prefetch is still decoding. Two at once would double
+            # the CPU and the memory, so this one starts when that one ends.
+            self._prefetch_restart = True
+            return
+        from fnt.usv.usv_detector.fnt_mask_store import masks_sibling_path
+        self._prefetch_token += 1
+        pt = self._prefetch_token
+        sg = self.spectrogram
+        win = (sg.view_end - sg.view_start) if sg.view_end > sg.view_start else 2.0
+        try:
+            h5 = masks_sibling_path(path)
+        except Exception:
+            h5 = None
+        worker = MADAudioLoadWorker(path, pt, self,
+                                    view=(win, sg.min_freq, sg.max_freq),
+                                    crops_h5=h5)
+        worker.loaded.connect(self._on_prefetch_loaded)
+        self._prefetch_workers[pt] = worker
+        self._prefetch = {'key': key, 'path': path, 'token': pt,
+                          'worker': worker, 'done': False,
+                          'audio': None, 'sr': 0}
+        worker.start()
+
+    def _on_prefetch_loaded(self, pt: int, audio, sr: int, err: str):
+        worker = self._prefetch_workers.pop(pt, None)
+        load_token = self._prefetch_adopted.pop(pt, None)
+        if load_token is not None:
+            # Taken over while it ran: finish it as the open it became (the
+            # worker is already in _audio_workers under that token, and the
+            # usual stale-token check applies).
+            self._on_audio_loaded(load_token, audio, sr, err)
+        else:
+            pf = self._prefetch
+            if pf is not None and pf['token'] == pt and audio is not None:
+                pf.update(done=True, audio=audio, sr=int(sr))
+            else:
+                if pf is not None and pf['token'] == pt:
+                    self._prefetch = None      # failed: a normal open reports it
+                if worker is not None:
+                    worker.deleteLater()
+        if self._prefetch_restart and not self._prefetch_workers:
+            self._prefetch_restart = False
+            if (self._queue_active() and self.audio_data is not None
+                    and self._loading_path is None):
+                self._queue_prefetch_next()
+
+    def _adopt_prefetch(self, filepath: str, token: int) -> bool:
+        """Serve the open of ``filepath`` (load ``token``) from the prefetch,
+        if it holds that recording. True if it did."""
+        pf = self._prefetch
+        if (pf is None or not self._queue_active()
+                or pf['key'] != self._path_key(filepath)):
+            return False
+        self._prefetch = None
+        worker = pf['worker']
+        self._audio_workers[token] = worker
+        self._prefetch_hits += 1
+        if pf['done']:
+            audio, sr = pf['audio'], pf['sr']
+            # Asynchronously, like a worker's signal: the caller expects the
+            # open to finish after it returns.
+            QTimer.singleShot(
+                0, lambda: self._on_audio_loaded(token, audio, sr, ""))
+        else:
+            self._prefetch_adopted[pf['token']] = token
+        return True
+
+    def _drop_prefetch(self):
+        """Forget the prefetched recording. A read still running is left to
+        finish (a QThread cannot be stopped mid-decode) and then discarded."""
+        pf, self._prefetch = self._prefetch, None
+        self._prefetch_restart = False
+        if pf is not None and pf['done']:
+            pf['worker'].deleteLater()     # its samples go with it
+
+    def _take_prefetched_crops(self, h5_path: str):
+        """The prediction crops a queue prefetch read for ``h5_path``, if the
+        .mad is unchanged since (else None: read it again)."""
+        got, self._prefetched_crops = self._prefetched_crops, None
+        if got is None:
+            return None
+        path, sig, crops = got
+        if (os.path.normcase(os.path.abspath(path))
+                != os.path.normcase(os.path.abspath(h5_path))
+                or _file_signature(h5_path) != sig):
+            return None
+        return crops
 
     def _queue_pos_for_file(self, path: str) -> Optional[int]:
         """The queue position of ``path``'s call (its first, if it has several
@@ -17137,6 +17408,10 @@ class MADMainWindow(QMainWindow):
         self._loading_path = filepath
         if then is not None:
             self._audio_then[token] = then
+        # A call queue decodes its next recording ahead of time; take that
+        # read over instead of starting a second one.
+        if self._adopt_prefetch(filepath, token):
+            return
         # Precompute the opening view in the worker. It is the window the
         # user is already looking at, carried over from the previous file.
         sg = self.spectrogram
@@ -17152,12 +17427,16 @@ class MADMainWindow(QMainWindow):
         user has already asked for a different one."""
         worker = self._audio_workers.pop(token, None)
         spec = getattr(worker, 'spec', None) if worker is not None else None
+        crops = getattr(worker, 'crops', None) if worker is not None else None
         if worker is not None:
             worker.deleteLater()
         then = self._audio_then.pop(token, None)
         if token != self._audio_token:
             return          # superseded — the user moved on, drop it silently
         self._loading_path = None
+        # A queue prefetch's prediction crops, for _load_predictions_as_
+        # annotations to use if the .mad is unchanged by then (None otherwise).
+        self._prefetched_crops = crops
         if not (0 <= self.current_file_idx < len(self.audio_files)):
             return
         filepath = self.audio_files[self.current_file_idx]
@@ -19277,12 +19556,20 @@ class MADMainWindow(QMainWindow):
         ann = sg.annotations[ann_idx]
         old_id = ann.get('id')
         was_status = ann.get('status')
+        # A model detection's blob_id names its prediction crop and stays with
+        # the call, as Accept and Merge keep it: QC scoring reads hits from it,
+        # the loader matches the saved label to the crop it replaces (so the
+        # detection does not come back as pending), Delete removes the crop
+        # through it, and a call queue finds its call by it. A hand label's
+        # blob_id only mirrors its own example id, so it follows the new one.
+        bid = ann.get('blob_id')
+        is_detection = bid is not None and str(bid) != str(old_id)
         comp = (ann['f0'], ann['f1'], ann['t0'], ann['t1'], ann['mask'])
         try:
             new_id = self._save_component_example(
                 ann.get('category') or 'USV', comp,
-                blob_id=ann.get('blob_id'), score=ann.get('score'),
-                provenance=ann.get('provenance'))
+                blob_id=bid if is_detection else None,
+                score=ann.get('score'), provenance=ann.get('provenance'))
         except Exception:
             return
         if old_id and old_id != new_id:
@@ -19303,7 +19590,16 @@ class MADMainWindow(QMainWindow):
             # Drop the stale CSV row keyed by the old id.
             self._remove_pred_csv_row({'blob_id': old_id})
         ann['id'] = new_id
-        ann['blob_id'] = new_id
+        ann['blob_id'] = bid if is_detection else new_id
+        # The call queue tracks its call by id, and the save above gave the call
+        # a new one; carry the queue over, as Accept does (else the queue lost
+        # its call: the header dropped it and deciding the neighbours walked
+        # the whole recording instead of the call's training window).
+        is_queued = (old_id is not None
+                     and old_id == getattr(self, '_call_queue_ann_id', None))
+        if is_queued:
+            self._call_queue_ann_id = new_id
+            sg.queue_ann_id = new_id
         ann.setdefault('source', 'label')
         ann.update(getattr(self, '_last_example_stats', {}))  # refreshed stats
         # Redrawing a mask is an affirmative decision about the call, so the
@@ -19321,7 +19617,9 @@ class MADMainWindow(QMainWindow):
         # helper is a no-op anyway). What records this decision is the
         # kind='label' example saved above, carrying blob_id so the loader can
         # match it to the prediction crop it replaces.
-        sg._rebuild_confirmed_mask()
+        # No confirmed-mask rebuild: the union covers every call whatever its
+        # status, and finish_edit already stamped the new shape. The full
+        # rebuild here zeroed and re-stamped the 601 MB grid on every Enter.
         sg.update()
         if self._project is not None:
             try:
@@ -19335,6 +19633,14 @@ class MADMainWindow(QMainWindow):
                 "Mask shape updated — call accepted")
         else:
             self.status_bar.showMessage("Updated mask shape")
+        # An edit that accepts a call is a decision, so in a call queue it moves
+        # on the way Accept does: editing the queued call (or a pending call in
+        # its training window, during the window walk) goes through the same
+        # tail -- walk the window's pending calls, then the next queued call.
+        # Only there: elsewhere an edit has never moved the selection.
+        if (promoted and self._queue_active()
+                and (is_queued or getattr(self, '_queue_window_mode', False))):
+            self._after_review_decision(new_id, was_status == 'prediction')
 
     def _merge_calls(self, indices, anchor_idx=None) -> bool:
         """Merge several calls into one accepted call (right-click → Merge).
@@ -21582,6 +21888,9 @@ class MADMainWindow(QMainWindow):
         # A background read still touching the file would outlive the window.
         self._audio_token += 1          # nothing landing now is wanted
         self._wait_for_audio_load(timeout_ms=5000)
+        self._drop_prefetch()
+        for wk in list(self._prefetch_workers.values()):
+            wk.wait(5000)           # a prefetch read would outlive it too
 
         # The windows this one owns are independent top-levels (Qt.Window, so
         # they can be sent behind the main window rather than floating over
