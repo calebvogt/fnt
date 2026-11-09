@@ -12,7 +12,7 @@ Interactive GUI for loading, cleaning, and exporting UWB tracking data:
 - **Tag identity mapping** — assign animal IDs, sex, and metadata to each UWB tag
 - **Deployment windows and off-animal intervals** — a Start/Stop per tag, plus any number of intervals when a tag was reporting but not on its animal (e.g. a head cap found off and re-attached); fixes in either are dropped from the preview and every export
 - **Downsampling** — optionally thin every tag to a common read rate before the thresholds and the smoothing (see below)
-- **Coordinate smoothing** with configurable Savitzky-Golay filter parameters
+- **Coordinate smoothing** — Savitzky-Golay, rolling average or median, or forward-backward EWMA, each with its window in seconds or in reads (see below)
 - **Timezone handling** — convert UTC timestamps to local time
 - **Day/night segmentation** based on a configurable light cycle
 - **Visual preview** of smoothed trajectories per tag
@@ -39,7 +39,7 @@ Contact bouts are specific to the distance threshold and the bridging gap chosen
 
 ## Downsampling
 
-Tags flashed with different rate pairs (10/1, 4/1, 1/1) record the same movement with very different numbers of reads. The thresholds compare consecutive reads, and Savitzky-Golay smooths over 31 of them: about 3–4 s of a 10/1 tag's track but 30–40 s of a 1/1 tag's. So distance, speed and chases come out lower for an animal on a slow tag because of the tag, not the animal. Resampling the exported positions to 1 Hz afterwards does not undo this, because the smoothing has already happened.
+Tags flashed with different rate pairs (10/1, 4/1, 1/1) record the same movement with very different numbers of reads. The thresholds compare consecutive reads, and a smoothing window in reads (Savitzky-Golay over 31) covers about 3–4 s of a 10/1 tag's track but 30–40 s of a 1/1 tag's. So distance, speed and chases come out lower for an animal on a slow tag because of the tag, not the animal. Resampling the exported positions to 1 Hz afterwards does not undo this, because the smoothing has already happened.
 
 **Downsampling** (top of the preview's processing settings) runs first, before the thresholds and the smoothing:
 
@@ -47,6 +47,18 @@ Tags flashed with different rate pairs (10/1, 4/1, 1/1) record the same movement
 - **Random, to at most N reads/s**: each tag's time line is cut into bins of 1/N seconds and one read per bin, picked at random, is kept. A tag already at or below N is left almost untouched; faster tags are brought down to N.
 
 Set N to the rate of the slowest tags, the same for every trial you will compare (**Tag Statistics...** shows each tag's measured rate). The pick is random but reproducible: it depends only on the tag, the read's time and a seed, so the preview keeps exactly the reads the export keeps and a re-export gives the same file. `fnt_config.json` records `downsampling`, `downsampling_hz` and `downsampling_seed`, and the export log reports how many reads each tag kept.
+
+## Smoothing
+
+Every smoothing method takes a **Smoothing Window** in **Seconds** or **Samples** (reads). A window in reads smooths a different stretch of time on tags with different read rates (31 reads is about 4 s of a 10/1 tag and 40 s of a 1/1 tag); a window in seconds smooths the same stretch of time on every tag. Use Seconds when tags read at different rates.
+
+| Method | Samples | Seconds |
+|--------|---------|---------|
+| Savitzky-Golay | local quadratic over N reads (odd, at most the tag's length) | the same local quadratic fit over the reads within ±W/2 s, on their real times |
+| Rolling Average / Median | centred mean / median of N reads | centred mean / median of the reads within W s |
+| Forward-Backward EWMA | span of N reads, alpha = 2/(N+1); for a Wiser hardware filter value F use N = 2F−1 | span of W s: each read's weight halves every ln(2)·W/2 ≈ 0.35·W s of time, on the real read times |
+
+All are centred (zero-phase), so smoothing adds no lag. Each method keeps its own window in the preview: switching method restores that method's last window (defaults: Savitzky-Golay 31 samples, EWMA 20 samples, rolling 30 s). `fnt_config.json` records the window and its units for every method; configs written before this change, which recorded none for Savitzky-Golay or EWMA, load as what they ran (31 samples, and the EWMA's span in samples).
 
 ## Input data format
 
@@ -65,4 +77,4 @@ Additional columns (e.g., `location_z`, `location_quality`) are preserved during
     Use `smoothed_x` and `smoothed_y` from `<db>_smoothed.csv`, at 1 Hz or finer. Tag read rates can differ several-fold between animals, so time spent anywhere is a sum of per-fix durations, never a count of fixes.
 
 !!! note "Every smoothing method in one file"
-    Tick **Add every smoothing method to the Smoothed CSV** to also write `sg_x/sg_y` (Savitzky-Golay, 31 samples, order 2), `rollmean_x/rollmean_y` (Rolling Average), `rollmedian_x/rollmedian_y` (Rolling Median) and `ewma_x/ewma_y` (Forward-Backward EWMA). All are computed from the same filtered `location_x/location_y`; the rolling methods use the export's Smoothing Window and units and the EWMA uses the same number as its span in samples. `fnt_config.json` records them under `all_smoothing_columns`. FNT's own outputs (zones, contacts, chases, plots, animation) always use `smoothed_x/smoothed_y`, the method chosen in the Smoothing method box.
+    Tick **Add every smoothing method to the Smoothed CSV** to also write `sg_x/sg_y` (Savitzky-Golay, order 2), `rollmean_x/rollmean_y` (Rolling Average), `rollmedian_x/rollmedian_y` (Rolling Median) and `ewma_x/ewma_y` (Forward-Backward EWMA). All are computed from the same filtered `location_x/location_y` with the export's Smoothing Window and units (for EWMA the window is the span). `fnt_config.json` records them under `all_smoothing_columns`. FNT's own outputs (zones, contacts, chases, plots, animation) always use `smoothed_x/smoothed_y`, the method chosen in the Smoothing method box.

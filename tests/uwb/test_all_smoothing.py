@@ -94,7 +94,9 @@ def test_config_records_the_setting_and_parameters(window):
     cfg = window.get_config_dict()
     assert cfg['export_all_smoothing'] is True
     rec = cfg['all_smoothing_columns']
-    assert rec['sg_x/sg_y']['window_samples'] == 31
+    # Every method uses the export's window and units now.
+    assert rec['sg_x/sg_y']['window'] == window.spin_rolling_window.value()
+    assert rec['sg_x/sg_y']['units'] == window.combo_window_units.currentText()
     assert rec['ewma_x/ewma_y']['span'] == window.spin_rolling_window.value()
     assert rec['rollmean_x/rollmean_y']['units'] == \
         window.combo_window_units.currentText()

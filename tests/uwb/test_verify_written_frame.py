@@ -60,6 +60,32 @@ def test_a_missing_time_in_a_long_column_verifies(window, tmp_path):
     assert ok, problems
 
 
+def test_times_across_a_daylight_saving_change_verify(window, tmp_path):
+    """VC-T014 ran across 2026-11-01: its behaviour-event times carry -06:00 and
+    then -07:00, and the read-back raised "Mixed timezones detected", failing the
+    export three times."""
+    t = pd.Series(pd.date_range("2026-10-31 12:00", periods=200, freq="30min", tz="US/Mountain"))
+    df = pd.DataFrame({"bout_start": t, "v": range(200)})
+    p = tmp_path / "x_behavior_events.csv"
+    df.to_csv(p, index=False)
+    text = p.read_text()
+    assert "-06:00" in text and "-07:00" in text
+    ok, problems = window.verify_written_frame(df, str(p), ("v",))
+    assert ok, problems
+
+
+def test_a_broken_time_across_daylight_saving_still_fails(window, tmp_path):
+    t = pd.Series(pd.date_range("2026-10-31 12:00", periods=200, freq="30min", tz="US/Mountain"))
+    df = pd.DataFrame({"bout_start": t, "v": range(200)})
+    p = tmp_path / "x.csv"
+    df.to_csv(p, index=False)
+    lines = p.read_text().splitlines()
+    lines[150] = "2026-1x-02 05:00:00-07:00," + lines[150].split(",")[1]
+    p.write_text("\n".join(lines) + "\n")
+    ok, problems = window.verify_written_frame(df, str(p), ("v",))
+    assert not ok and any("bout_start" in s for s in problems)
+
+
 def test_a_stray_label_still_fails(window, tmp_path):
     df = _daylight()
     p = tmp_path / "x_daylight.csv"
