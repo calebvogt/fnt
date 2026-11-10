@@ -272,6 +272,103 @@ def merge_call_masks(anns):
     return f0, f1, t0, t1, np.logical_or.reduce(placed)
 
 
+def _tight_shape(f0, t0, mask):
+    """``(f0, f1, t0, t1, mask)`` cropped to the set pixels, or None."""
+    m = np.asarray(mask) > 0
+    rows = np.flatnonzero(m.any(axis=1))
+    if rows.size == 0:
+        return None
+    cols = np.flatnonzero(m.any(axis=0))
+    r0, r1 = int(rows[0]), int(rows[-1]) + 1
+    c0, c1 = int(cols[0]), int(cols[-1]) + 1
+    return (int(f0) + r0, int(f0) + r1, int(t0) + c0, int(t0) + c1,
+            np.ascontiguousarray(m[r0:r1, c0:c1]))
+
+
+def same_call_shape(ann, shape) -> bool:
+    """True when ``shape`` (``(f0, f1, t0, t1, mask)``) holds exactly the
+    call's pixels, wherever either box sits and however loosely it fits."""
+    m = np.asarray(ann.get('mask'))
+    h = min(int(ann['f1']) - int(ann['f0']), m.shape[0])
+    w = min(int(ann['t1']) - int(ann['t0']), m.shape[1])
+    a = _tight_shape(ann['f0'], ann['t0'], m[:h, :w])
+    b = _tight_shape(shape[0], shape[2], shape[4])
+    if a is None or b is None:
+        return a is None and b is None
+    return a[:4] == b[:4] and np.array_equal(a[4], b[4])
+
+
+def joint_edit_groups(members, box, painted):
+    """Sort the result of editing several calls' shapes together into calls.
+
+    ``members`` are the calls as they were before the edit; ``box`` and
+    ``painted`` the edited pixels (``(f0, f1, t0, t1)`` and the bool crop over
+    it). The edited pixels are split into connected components, 8-connected
+    -- the same "touch" :func:`merge_call_masks` accepts -- and a component
+    belongs to every member whose original pixels it still holds. Members that
+    share a component (a painted bridge, or pieces that already overlapped)
+    are one call now, chained: A joined to B and B to C is one call.
+
+    Returns ``(groups, strays, gone)``:
+
+    * ``groups``: ``[(member_indices, (f0, f1, t0, t1, mask)), ...]`` in member
+      order, each group's shape the union of its components;
+    * ``strays``: shapes of components holding no member pixel (a stroke that
+      touches none of the calls);
+    * ``gone``: indices of members erased to nothing.
+    """
+    from scipy import ndimage
+    painted = np.asarray(painted) > 0
+    bf0, bf1, bt0, bt1 = (int(v) for v in box)
+    lbl, n = ndimage.label(painted, structure=np.ones((3, 3), bool))
+    touch = []
+    for a in members:
+        m = np.asarray(a['mask']) > 0
+        af0, at0 = int(a['f0']), int(a['t0'])
+        af1 = af0 + min(int(a['f1']) - af0, m.shape[0])
+        at1 = at0 + min(int(a['t1']) - at0, m.shape[1])
+        of0, of1 = max(af0, bf0), min(af1, bf1)
+        ot0, ot1 = max(at0, bt0), min(at1, bt1)
+        labs = set()
+        if of1 > of0 and ot1 > ot0:
+            sub_l = lbl[of0 - bf0:of1 - bf0, ot0 - bt0:ot1 - bt0]
+            sub_m = m[of0 - af0:of1 - af0, ot0 - at0:ot1 - at0]
+            labs = {int(v) for v in np.unique(sub_l[sub_m])} - {0}
+        touch.append(labs)
+    # Union-find over members, joined through the components they share.
+    parent = list(range(len(members)))
+
+    def _root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    owner = {}
+    for i, labs in enumerate(touch):
+        for lab in labs:
+            if lab in owner:
+                ri, rj = _root(i), _root(owner[lab])
+                if ri != rj:
+                    parent[max(ri, rj)] = min(ri, rj)
+            else:
+                owner[lab] = i
+    by_root = {}
+    for i, labs in enumerate(touch):
+        if labs:
+            by_root.setdefault(_root(i), []).append(i)
+    groups = []
+    for root in sorted(by_root):
+        idx = by_root[root]
+        labs = sorted(set().union(*(touch[i] for i in idx)))
+        shape = _tight_shape(bf0, bt0, np.isin(lbl, labs))
+        groups.append((tuple(idx), shape))
+    strays = [_tight_shape(bf0, bt0, lbl == lab)
+              for lab in range(1, n + 1) if lab not in owner]
+    gone = [i for i, labs in enumerate(touch) if not labs]
+    return groups, strays, gone
+
+
 _ROLE_FILE_LABEL = Qt.UserRole + 20   # base filename for the count delegate
 _ROLE_FILE_COUNTS = Qt.UserRole + 21  # (accepted, pending, rejected) or None
 #: Error text when the last inference run FAILED on this recording.
@@ -715,6 +812,10 @@ class MADSpectrogramWidget(SpectrogramWidget):
     request_context_menu = pyqtSignal(int, object)
     # A vertex-edit finished for the given annotation index.
     annotation_edit_finished = pyqtSignal(int)
+    # A joint shape edit (several calls at once) finished: a dict with the
+    # edited pixels ('box', 'mask'), the member ids ('ids') and 'anchor_id'.
+    # The members are back in the list, untouched, when it is emitted.
+    joint_edit_finished = pyqtSignal(object)
     # Left-click selected an annotation (no labeling tool engaged).
     annotation_clicked = pyqtSignal(int)
     # A rubber-band drag selected a set of annotations (indices; [] = cleared).
@@ -739,7 +840,11 @@ class MADSpectrogramWidget(SpectrogramWidget):
         self._editing_ann_idx: Optional[int] = None
         self._edit_hidden_ann = None    # call lifted into _pending while edited
         self._edit_backup = None        # its untouched pixels, for Esc
-        self._temp_erase = False        # right-drag erase inside the brush
+        # A joint edit (several calls lifted into _pending at once): a list of
+        # (original index, call) in index order, or None.
+        self._joint_edit = None
+        self._joint_anchor_id = None
+        self._temp_erase = False       # right-drag erase inside the brush
         self.mask: Optional[np.ndarray] = None
         # Pending (unconfirmed) mask accumulated by brush / eraser / SAM
         # (uint8 {0,1}). Rendered yellow until the user confirms with Enter.
@@ -1460,8 +1565,110 @@ class MADSpectrogramWidget(SpectrogramWidget):
         # window, and mode and button state must not be able to disagree.
         self.update()
 
+    def start_joint_edit(self, indices, anchor_idx=None) -> None:
+        """Edit several calls' shapes in one edit (right-click on one of a
+        multi-selection -> Edit N shapes together).
+
+        For a faint call the model found in pieces (2026-11-09): joining them
+        was Paint a bridge, Enter, select every piece and the bridge, Merge.
+        Here every selected call goes into the pending buffer at once, the
+        brush and eraser work on all of them, and Enter hands the result to
+        the main window (``joint_edit_finished``), which merges what now
+        touches and saves what changed. Bounded to the calls' boxes, like
+        :meth:`start_edit`.
+        """
+        if self.n_freq_bins is None or self.n_time_frames is None:
+            return
+        idxs = sorted({int(i) for i in indices
+                       if 0 <= int(i) < len(self.annotations)})
+        members = []
+        for i in idxs:
+            m = self.annotations[i].get('mask')
+            if m is not None and np.asarray(m).size:
+                members.append((i, self.annotations[i]))
+        if len(members) < 2:
+            if members:
+                self.start_edit(members[0][0])
+            return
+        if self._pending is None:
+            self._pending = np.zeros((self.n_freq_bins, self.n_time_frames),
+                                     dtype=np.uint8)
+        self._zero_pending()
+        for _i, ann in members:
+            m = np.asarray(ann['mask'])
+            f0, t0 = int(ann['f0']), int(ann['t0'])
+            h = min(int(ann['f1']) - f0, self.n_freq_bins - f0, m.shape[0])
+            w = min(int(ann['t1']) - t0, self.n_time_frames - t0, m.shape[1])
+            if h <= 0 or w <= 0:
+                continue
+            self._pending[f0:f0 + h, t0:t0 + w] |= (
+                m[:h, :w] > 0).astype(np.uint8)
+            self._note_pending_region(f0, f0 + h, t0, t0 + w)
+        anchor = next((i for i, _a in members if i == anchor_idx),
+                      members[0][0])
+        self._joint_anchor_id = self.annotations[anchor].get('id')
+        self._joint_edit = members
+        # is_editing() and the right-click guard read this; nothing draws by
+        # it any more (the edited calls are out of the list).
+        self._editing_ann_idx = anchor
+        self._edit_hidden_ann = None
+        self._edit_backup = None
+        for i, _a in reversed(members):
+            self.annotations.pop(i)
+        for _i, ann in members:
+            self._restamp_call(ann)
+        self.update()
+
+    def is_joint_editing(self) -> bool:
+        return self._joint_edit is not None
+
+    def joint_edit_members(self) -> List[dict]:
+        """The calls in the joint edit, as they were when it began."""
+        return [a for _i, a in (self._joint_edit or ())]
+
+    def joint_edit_crop(self):
+        """``(box, bool crop)`` of the joint edit's pixels, or None if every
+        pixel was erased."""
+        box = self.pending_bbox() if self._pending is not None else None
+        if box is None:
+            return None
+        f0, f1, t0, t1 = box
+        return box, self._pending[f0:f1, t0:t1] > 0
+
+    def _end_joint_edit(self):
+        """Put the joint edit's calls back where they were, untouched, and
+        empty the buffer. Returns the edited pixels (as joint_edit_crop)."""
+        crop = self.joint_edit_crop()
+        members = self._joint_edit or []
+        self._joint_edit = None
+        self._editing_ann_idx = None
+        self._edit_hidden_ann = None
+        self._edit_backup = None
+        # Back at their own positions, so Esc leaves the list exactly as it
+        # was (ascending insertion rebuilds the original order).
+        for i, ann in members:
+            self.annotations.insert(min(i, len(self.annotations)), ann)
+        self._zero_pending()
+        self.set_paint_mode(None)
+        for _i, ann in members:
+            self._restamp_call(ann)
+        self.update()
+        return crop, [a for _i, a in members]
+
     def finish_edit(self):
         """Commit the painted mask back onto the call being edited."""
+        if self._joint_edit is not None:
+            anchor_id = self._joint_anchor_id
+            crop, members = self._end_joint_edit()
+            if crop is None:
+                # Erased to nothing: a cancel, as for one call.
+                return
+            box, mask = crop
+            self.joint_edit_finished.emit({
+                'box': box, 'mask': np.array(mask, dtype=bool),
+                'ids': [a.get('id') for a in members],
+                'anchor_id': anchor_id})
+            return
         ai = self._editing_ann_idx
         if ai is None:
             return
@@ -1500,6 +1707,9 @@ class MADSpectrogramWidget(SpectrogramWidget):
 
     def cancel_edit(self):
         """Abandon the edit and put the call back untouched."""
+        if self._joint_edit is not None:
+            self._end_joint_edit()
+            return
         ann = self._edit_hidden_ann
         if ann is not None:
             self.annotations.append(ann)
@@ -2348,9 +2558,10 @@ class MADSpectrogramWidget(SpectrogramWidget):
         # outlines/labels would be illegible clutter and (pre-fix) very slow.
         if (self.view_mode != 'spec' and self.annotations and HAS_CV2
                 and overlays_visible):
+            # No skip for the call being edited: Edit Shape takes it out of
+            # the list, and skipping by its old index hid whichever call moved
+            # into that slot (2026-11-09).
             for ai, ann in enumerate(self.annotations):
-                if ai == self._editing_ann_idx:
-                    continue
                 if self._score_hidden(ann):
                     continue
                 if (ann['t1'] <= t_start or ann['t0'] >= t_end or
@@ -2461,8 +2672,7 @@ class MADSpectrogramWidget(SpectrogramWidget):
             painter.save()
             painter.setClipRect(spec_rect)
             for ai, ann in enumerate(self.annotations):
-                if (ai == self._editing_ann_idx
-                        or ann.get('status') == 'rejected'
+                if (ann.get('status') == 'rejected'
                         or self._score_hidden(ann)):
                     continue
                 if (ann['t1'] <= t_start or ann['t0'] >= t_end or
@@ -6923,6 +7133,8 @@ class MADMainWindow(QMainWindow):
         self.spectrogram.annotation_edit_finished.connect(
             self._on_annotation_edit_finished
         )
+        self.spectrogram.joint_edit_finished.connect(
+            self._on_joint_edit_finished)
         self.spectrogram.annotation_clicked.connect(
             self._on_annotation_clicked
         )
@@ -9343,6 +9555,15 @@ class MADMainWindow(QMainWindow):
 
     def _undo_review_action(self):
         """Reverse the last review action (accept/reject/delete) on this file."""
+        sg_ = getattr(self, 'spectrogram', None)
+        if sg_ is not None and sg_.is_editing():
+            # The calls being edited are out of the list until Enter or Esc
+            # puts them back; restoring a snapshot underneath would have Esc
+            # add them a second time.
+            self.status_bar.showMessage(
+                "Finish the shape edit (Enter) or cancel it (Esc) first — "
+                "U takes back the last stroke")
+            return
         if not self._undo_stack:
             self.status_bar.showMessage("Nothing to undo")
             return
@@ -18118,6 +18339,22 @@ class MADMainWindow(QMainWindow):
         save it as a self-contained training example, then merge it into the
         confirmed buffer."""
         sg = self.spectrogram
+        if sg.is_joint_editing():
+            # A stroke that reaches none of the calls is a bridge that fell
+            # short, not a call: keep the edit open so it can be joined up or
+            # erased, rather than dropping it or saving it as a label.
+            crop = sg.joint_edit_crop()
+            if crop is not None:
+                _g, strays, _gone = joint_edit_groups(
+                    sg.joint_edit_members(), *crop)
+                if strays:
+                    self.status_bar.showMessage(
+                        f"{len(strays)} painted stroke(s) touch none of the "
+                        "calls — join them up or erase them (Esc cancels)")
+                    return
+            sg.finish_edit()
+            self._clear_tool_buttons()
+            return
         if sg.is_editing():
             sg.finish_edit()
             self._clear_tool_buttons()
@@ -18642,9 +18879,12 @@ class MADMainWindow(QMainWindow):
     def _clear_pending(self):
         sg = self.spectrogram
         if sg.is_editing():
+            joint = sg.is_joint_editing()
             sg.cancel_edit()
             self._clear_tool_buttons()
-            self.status_bar.showMessage("Mask edit cancelled — call unchanged")
+            self.status_bar.showMessage(
+                "Shape edit cancelled — calls unchanged" if joint
+                else "Mask edit cancelled — call unchanged")
             return
         if sg.has_pending() or sg.has_sam_prompts():
             sg.clear_pending()
@@ -18658,6 +18898,11 @@ class MADMainWindow(QMainWindow):
         if sg.undo_pending():
             self._refresh_pending_status()
             self._log("Undo: removed last pending mask")
+            return
+        if sg.is_editing():
+            # Nothing painted left to take back. Falling through removed the
+            # last call in the list -- one not being edited (2026-11-09).
+            self.status_bar.showMessage("No stroke to take back")
             return
         if sg.annotations:
             ann = sg.remove_annotation(len(sg.annotations) - 1)
@@ -19109,16 +19354,21 @@ class MADMainWindow(QMainWindow):
         menu = QMenu(self)
         # --- merge: right-click on one of several shift- or box-selected calls
         merge_idx = self._box_sel_indices()
-        a_merge = None
+        a_merge = a_joint = None
         if ann_idx in merge_idx and len(merge_idx) >= 2:
             a_merge = menu.addAction(f"Merge {len(merge_idx)} selected calls")
             if merge_call_masks([sg.annotations[i] for i in merge_idx]) is None:
                 a_merge.setText(f"Merge {len(merge_idx)} selected calls "
                                 "(they must overlap or touch)")
                 a_merge.setEnabled(False)
+            # Paint the joins and merge in one edit (2026-11-09): whatever
+            # touches on Enter becomes one call.
+            a_joint = menu.addAction(
+                f"Edit {len(merge_idx)} shapes together")
             menu.addSeparator()
         a_class = menu.addAction("Edit class…")
-        a_shape = menu.addAction("Edit shape")
+        a_shape = menu.addAction("Edit shape" if a_joint is None
+                                 else "Edit shape (this call only)")
 
         # --- note + tags -------------------------------------------------
         # Only on a judged call. A pending detection is replaced wholesale by
@@ -19187,6 +19437,9 @@ class MADMainWindow(QMainWindow):
         if a_merge is not None and act == a_merge:
             self._merge_calls(merge_idx, ann_idx)
             return
+        if a_joint is not None and act == a_joint:
+            self._start_joint_edit(merge_idx, ann_idx)
+            return
         if a_merge is not None and act is not None:
             # Every other entry acts on this one call. Let the multi-selection
             # go first: an edit or a delete renumbers the calls it points at.
@@ -19219,12 +19472,7 @@ class MADMainWindow(QMainWindow):
             what = self._pred_describe(ann_idx)
             sg.start_edit(ann_idx)
             if sg.is_editing():
-                # Editing is painting: arm the brush through the same path the
-                # Paint button uses, so the button reflects the live mode.
-                self.btn_sam.setChecked(False)
-                self.btn_erase.setChecked(False)
-                self.btn_paint.setChecked(True)
-                self._on_brush_clicked(True)
+                self._arm_edit_brush()
                 self.status_bar.showMessage(
                     "Editing mask — paint to add, E (or right-drag) to erase, "
                     "scroll to resize the brush, Enter to finish, Esc to cancel"
@@ -19232,6 +19480,36 @@ class MADMainWindow(QMainWindow):
                 self._log(f"Edit mask {what}")
         elif act == a_del:
             self._delete_annotation(ann_idx)
+
+    def _arm_edit_brush(self):
+        """Editing is painting: arm the brush through the same path the Paint
+        button uses, so the button reflects the live mode."""
+        self.btn_sam.setChecked(False)
+        self.btn_erase.setChecked(False)
+        self.btn_paint.setChecked(True)
+        self._on_brush_clicked(True)
+
+    def _start_joint_edit(self, indices, anchor_idx=None):
+        """Right-click -> Edit N shapes together: every selected call in one
+        shape edit. Paint the joins, Enter merges whatever touches
+        (:meth:`_on_joint_edit_finished`), Esc leaves all of them as they were.
+        """
+        sg = self.spectrogram
+        idxs = sorted({i for i in indices if 0 <= i < len(sg.annotations)})
+        if len(idxs) < 2 or sg.is_editing():
+            return
+        # The calls leave the list for the edit, so the indices the
+        # multi-selection resolves to stop meaning them.
+        self._clear_box_selection()
+        sg.start_joint_edit(idxs, anchor_idx)
+        if not sg.is_editing():
+            return
+        self._arm_edit_brush()
+        self.status_bar.showMessage(
+            f"Editing {len(idxs)} shapes — paint to join pieces, E (or "
+            "right-drag) to erase; Enter: calls that touch become one call, "
+            "Esc cancels")
+        self._log(f"Edit {len(idxs)} shapes together")
 
     def _edit_annotation_class(self, ann_idx):
         sg = self.spectrogram
@@ -19377,7 +19655,8 @@ class MADMainWindow(QMainWindow):
             self.status_bar.showMessage(
                 f"{n} detection(s) selected — A=accept, R=reject, "
                 "D=delete, S=skip (all)"
-                + ("; right-click one to merge them" if n > 1 else ""))
+                + ("; right-click one to merge them or edit their shapes "
+                   "together" if n > 1 else ""))
             self._log(f"Box-selected {n} detection(s)")
         else:
             self.status_bar.showMessage("Selection cleared")
@@ -19765,11 +20044,14 @@ class MADMainWindow(QMainWindow):
 
         The merged call is saved as one new label example, and every member's
         example, rejection negative and prediction crop goes -- except the crop
-        of the one detection the merged call stays tied to: the right-clicked
-        call's, else the earliest member's. Keeping a model blob_id means the
-        merged call still counts as a detection the model made (QC scoring
-        reads hits from the blob_id) and reopening the file does not show that
-        detection again as pending. Cmd/Ctrl+Z undoes the whole merge.
+        of the one detection the merged call stays tied to: the queued call's
+        in a call queue, else the right-clicked call's, else the earliest
+        member's. Keeping a model blob_id means the merged call still counts
+        as a detection the model made (QC scoring reads hits from the blob_id)
+        and reopening the file does not show that detection again as pending.
+        Cmd/Ctrl+Z undoes the whole merge. Edit N shapes together
+        (:meth:`_on_joint_edit_finished`) saves through the same
+        :meth:`_commit_shape_changes`.
         """
         sg = self.spectrogram
         idxs = sorted({i for i in indices if 0 <= i < len(sg.annotations)})
@@ -19783,59 +20065,15 @@ class MADMainWindow(QMainWindow):
             return False
         if anchor_idx not in idxs:
             anchor_idx = idxs[0]
-        anchor = sg.annotations[anchor_idx]
-        dets = [a for a in [anchor] + sorted(members,
-                                             key=lambda a: (a['t0'], a['f0']))
-                if isinstance(a.get('blob_id'), int)]
-        keep = dets[0] if dets else None
-        default = ((self._project.last_class if self._project
-                    else self._session_last_class) or 'USV')
-        category = anchor.get('category') or default
-        self._snapshot_for_undo("Merge calls", crops=True)
-        # Members go before the merged call is saved: it may take a member's
-        # deterministic example id (the kept detection's), and its neighbours
-        # in the saved patch must not include the pieces it replaces.
-        kept_blob = keep.get('blob_id') if keep else None
-        for a in members:
-            if (isinstance(a.get('blob_id'), int)
-                    and a.get('blob_id') != kept_blob):
-                self._delete_pred_crop(a)
-        for i in reversed(idxs):
-            self._delete_annotation(i, refresh=False)
-        f0, f1, t0, t1, mask = merged
-        try:
-            new_id = self._save_component_example(
-                category, (f0, f1, t0, t1, mask),
-                blob_id=keep.get('blob_id') if keep else None,
-                score=keep.get('score') if keep else None,
-                provenance=keep.get('provenance') if keep else None)
-        except Exception as e:
-            self._undo_review_action()      # put the members back
-            self.status_bar.showMessage(f"Merge failed: {e}")
+        anchor_id = sg.annotations[anchor_idx].get('id')
+        done = self._commit_shape_changes([(members, merged)], [], anchor_id,
+                                          "Merge calls")
+        if done is None:
             return False
-        if self._undo_stack:
-            self._undo_stack[-1].setdefault('minted_ids', set()).add(
-                str(new_id))
-        ann = {'id': new_id,
-               'blob_id': keep.get('blob_id') if keep else new_id,
-               'category': category, 'f0': f0, 'f1': f1, 't0': t0, 't1': t1,
-               'mask': mask, 'status': 'accepted', 'source': 'label',
-               **getattr(self, '_last_example_stats', {})}
-        if keep is not None:
-            ann['score'] = keep.get('score')
-            ann['provenance'] = keep.get('provenance')
-        sg.add_annotation(ann)
-        sg._rebuild_confirmed_mask()
+        new_id = done[members[0].get('id')]
         self._clear_box_selection()
-        self._pred_review_idx = None        # members' positions are gone
-        sg._selected_ann_idx = len(sg.annotations) - 1
+        sg._selected_ann_idx = self._ann_index_by_id(new_id)
         sg.update()
-        if self._project is not None:
-            try:
-                self._project.save()
-            except Exception:
-                pass
-        self._refresh_annotation_list()
         self._select_list_row_for_id(new_id)
         self._update_pred_review_widgets()
         self._log(f"Merged {len(members)} calls into one")
@@ -19843,6 +20081,246 @@ class MADMainWindow(QMainWindow):
             f"Merged {len(members)} calls into one accepted call "
             "(Ctrl+Z undoes)")
         return True
+
+    def _ann_index_by_id(self, ann_id) -> Optional[int]:
+        return next((i for i, a in enumerate(self.spectrogram.annotations)
+                     if a.get('id') == ann_id), None)
+
+    def _commit_shape_changes(self, merges, edits, anchor_id, label):
+        """Save new shapes for calls as ONE undoable step.
+
+        ``merges`` is ``[(member calls, shape), ...]``: each list of calls
+        becomes one accepted call with that ``(f0, f1, t0, t1, mask)`` shape,
+        as Merge makes it. ``edits`` is ``[(call, shape), ...]``: the call
+        takes that shape and is accepted, as Edit shape + Enter saves it (the
+        model's blob_id kept). ``anchor_id`` is the right-clicked call: its
+        class names a merged call, and its detection is kept, after the queued
+        call's. Returns ``{member id: id of the call it is now}``, or None if a
+        save failed (everything is then put back).
+
+        Order matters for undo. Everything the change destroys -- member
+        examples, rejection negatives, prediction crops -- goes before the
+        first save, because undo recognises a minted example by its id being
+        new since that save, and a merged call or an accepted detection's new
+        shape re-saves under a member's deterministic id: destroyed after the
+        first save, that id would count as old and the original never came
+        back. The new shapes are all in the list before any save too, so each
+        saved patch records the final layout as its neighbours.
+        """
+        sg = self.spectrogram
+        default = ((self._project.last_class if self._project
+                    else self._session_last_class) or 'USV')
+        qid = (getattr(self, '_call_queue_ann_id', None)
+               if self._queue_active() else None)
+        plans = []
+        for members, shape in merges:
+            by_time = sorted(members, key=lambda a: (a['t0'], a['f0']))
+            prefer = ([a for a in members if qid is not None
+                       and a.get('id') == qid]
+                      + [a for a in members if a.get('id') == anchor_id]
+                      + by_time)
+            dets = [a for a in prefer if isinstance(a.get('blob_id'), int)]
+            keep = dets[0] if dets else None
+            head = next((a for a in members if a.get('id') == anchor_id),
+                        keep or by_time[0])
+            plans.append({'members': list(members), 'shape': shape,
+                          'keep': keep,
+                          'category': head.get('category') or default})
+        if not plans and not edits:
+            return {}
+        self._snapshot_for_undo(label, crops=True)
+        snap = self._undo_stack[-1] if self._undo_stack else None
+        boxes = []
+        # 1. What the change destroys, before the first save (see above).
+        for p in plans:
+            kept_blob = p['keep'].get('blob_id') if p['keep'] else None
+            for a in p['members']:
+                boxes.append((a['f0'], a['f1'], a['t0'], a['t1']))
+                if (isinstance(a.get('blob_id'), int)
+                        and a.get('blob_id') != kept_blob):
+                    self._delete_pred_crop(a)
+            for a in p['members']:
+                i = next((k for k, x in enumerate(sg.annotations)
+                          if x is a), None)
+                if i is not None:
+                    self._delete_annotation(i, refresh=False)
+        wav = self._active_wav_path()
+        edit_plans = []
+        for a, shape in edits:
+            old_id = a.get('id')
+            bid = a.get('blob_id')
+            edit_plans.append({'ann': a, 'shape': shape, 'old_id': old_id,
+                               'bid': bid,
+                               'is_det': (bid is not None
+                                          and str(bid) != str(old_id))})
+            boxes.append((a['f0'], a['f1'], a['t0'], a['t1']))
+            if a.get('status') == 'rejected':
+                self._drop_rejection_negative(a)
+            if not old_id:
+                continue
+            self._remember_undo_example(old_id)
+            if self._project is not None:
+                from fnt.usv.usv_detector.mad_examples import delete_example
+                try:
+                    delete_example(self._project.training_data_dir, old_id)
+                except Exception:
+                    pass
+            if wav:
+                try:
+                    from fnt.usv.usv_detector.fnt_mask_store import (
+                        masks_sibling_path, td_delete)
+                    td_delete(masks_sibling_path(wav), old_id)
+                except Exception:
+                    pass
+            self._remove_pred_csv_row({'blob_id': old_id})
+        # 2. The final layout, before any save.
+        for e in edit_plans:
+            f0, f1, t0, t1, mask = e['shape']
+            e['ann'].update(f0=f0, f1=f1, t0=t0, t1=t1, mask=mask,
+                            status='accepted')
+            boxes.append((f0, f1, t0, t1))
+        for p in plans:
+            f0, f1, t0, t1, mask = p['shape']
+            keep = p['keep']
+            ann = {'id': None,
+                   'blob_id': keep.get('blob_id') if keep else None,
+                   'category': p['category'], 'f0': f0, 'f1': f1,
+                   't0': t0, 't1': t1, 'mask': mask, 'status': 'accepted',
+                   'source': 'label'}
+            if keep is not None:
+                ann['score'] = keep.get('score')
+                ann['provenance'] = keep.get('provenance')
+            sg.annotations.append(ann)
+            p['ann'] = ann
+            boxes.append((f0, f1, t0, t1))
+        if boxes:
+            sg._restamp_confirmed_region(
+                min(b[0] for b in boxes), max(b[1] for b in boxes),
+                min(b[2] for b in boxes), max(b[3] for b in boxes))
+        # 3. Save.
+        done = {}
+        try:
+            for e in edit_plans:
+                a = e['ann']
+                new_id = self._save_component_example(
+                    a.get('category') or 'USV', e['shape'],
+                    blob_id=e['bid'] if e['is_det'] else None,
+                    score=a.get('score'), provenance=a.get('provenance'))
+                if snap is not None:
+                    snap.setdefault('minted_ids', set()).add(str(new_id))
+                a['id'] = new_id
+                a['blob_id'] = e['bid'] if e['is_det'] else new_id
+                a.setdefault('source', 'label')
+                a.update(getattr(self, '_last_example_stats', {}))
+                done[e['old_id']] = new_id
+            for p in plans:
+                ann, keep = p['ann'], p['keep']
+                new_id = self._save_component_example(
+                    p['category'], p['shape'],
+                    blob_id=keep.get('blob_id') if keep else None,
+                    score=keep.get('score') if keep else None,
+                    provenance=keep.get('provenance') if keep else None)
+                if snap is not None:
+                    snap.setdefault('minted_ids', set()).add(str(new_id))
+                ann['id'] = new_id
+                if keep is None:
+                    ann['blob_id'] = new_id
+                ann.update(getattr(self, '_last_example_stats', {}))
+                for a in p['members']:
+                    done[a.get('id')] = new_id
+        except Exception as e:
+            self._undo_review_action()      # put every call back
+            self.status_bar.showMessage(f"{label} failed: {e}")
+            return None
+        # The queue tracks its call by id, and every changed call has a new
+        # one; carry it over, as Accept and Edit shape do.
+        if qid is not None and qid in done:
+            self._call_queue_ann_id = done[qid]
+            sg.queue_ann_id = done[qid]
+        self._pred_review_idx = None        # members' positions are gone
+        sg.update()
+        if self._project is not None:
+            try:
+                self._project.save()
+            except Exception:
+                pass
+        self._refresh_annotation_list()
+        return done
+
+    def _on_joint_edit_finished(self, res):
+        """Enter on a joint shape edit (Edit N shapes together).
+
+        The edited pixels are split into connected components
+        (:func:`joint_edit_groups`): calls that now touch -- through a painted
+        bridge or because they overlapped already -- become ONE accepted call,
+        as Merge makes it; a call on its own whose shape changed is saved as
+        an edited shape (accepted, as Edit shape + Enter); a call left as it
+        was keeps its status, so a pending detection nobody touched stays
+        pending. One Cmd/Ctrl+Z undoes all of it. In a call queue, a change
+        that holds the queued call counts as deciding it, as Edit shape does.
+        """
+        sg = self.spectrogram
+        if self.audio_data is None or self._active_wav_path() is None:
+            return
+        pos = {a.get('id'): i for i, a in enumerate(sg.annotations)}
+        members = [sg.annotations[pos[i]] for i in (res.get('ids') or ())
+                   if i in pos]
+        if not members:
+            return
+        groups, _strays, gone = joint_edit_groups(
+            members, res['box'], res['mask'])
+        merges = [([members[k] for k in g], shape)
+                  for g, shape in groups if len(g) > 1]
+        edits = [(members[g[0]], shape) for g, shape in groups
+                 if len(g) == 1 and not same_call_shape(members[g[0]], shape)]
+        anchor_id = res.get('anchor_id')
+        note = (f" ({len(gone)} call(s) erased completely left as they were "
+                "— Delete removes a call)" if gone else "")
+        if not merges and not edits:
+            self._reselect_by_id(anchor_id)
+            self.status_bar.showMessage("Shapes unchanged — nothing saved"
+                                        + note)
+            return
+        was = {a.get('id'): a.get('status') for a in members}
+        order = ([a.get('id') for ms, _s in merges for a in ms]
+                 + [a.get('id') for a, _s in edits])
+        qid = (getattr(self, '_call_queue_ann_id', None)
+               if self._queue_active() else None)
+        done = self._commit_shape_changes(merges, edits, anchor_id,
+                                          "Edit shapes together")
+        if done is None:
+            return
+        n_pieces = sum(len(ms) for ms, _s in merges)
+        bits = []
+        if merges:
+            bits.append(f"{n_pieces} calls merged into {len(merges)}")
+        if edits:
+            bits.append(f"{len(edits)} shape(s) edited")
+        self._log("Edit shapes together: " + ", ".join(bits))
+        self.status_bar.showMessage(
+            "; ".join(bits) + " — accepted (Ctrl+Z undoes)" + note)
+        # An edit or merge accepts its calls, so in a call queue it is a
+        # decision, as a single Edit shape is: holding the queued call it
+        # moves on like Accept of that call; during the window walk, deciding
+        # a pending call there continues the walk.
+        if self._queue_active():
+            decided = was_pending = None
+            if qid is not None and qid in done:
+                decided = done[qid]
+                was_pending = was.get(qid) == 'prediction'
+            elif getattr(self, '_queue_window_mode', False):
+                old = next((i for i in order if was.get(i) == 'prediction'),
+                           None)
+                if old is not None:
+                    decided, was_pending = done[old], True
+            if decided is not None:
+                self._after_review_decision(decided, was_pending)
+                return
+        focus = done.get(anchor_id) or done[order[0]]
+        sg._selected_ann_idx = self._ann_index_by_id(focus)
+        sg.update()
+        self._select_list_row_for_id(focus)
+        self._update_pred_review_widgets()
 
     def _on_clear_clicked(self):
         # Discards the in-progress pending mask. Confirmed calls are saved

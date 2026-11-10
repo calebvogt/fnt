@@ -177,6 +177,25 @@ screen, so a wide view doesn't mean waiting through the audio to its left; the
 lead is half a second of listening (15 ms of audio at 0.03x). With nothing
 selected, Play starts at the left edge of the view.
 
+**Fixing a call's shape.** Right-click a call → **Edit shape** to repaint it:
+Paint (P) adds, Eraser (E, or right-drag) removes, Enter saves the new shape and
+accepts the call, Esc leaves it as it was.
+
+**Joining a call that came out in pieces.** A faint or oscillating call often
+comes out of the model as several pieces. Shift-click the pieces (or drag a box
+around them), right-click one of them and choose **Edit N shapes together**:
+every selected call goes into one shape edit. Paint the stretches that join
+them (erase anything that does not belong) and press Enter. Calls that now
+touch, through your stroke or because they already overlapped, become one
+accepted call; it stays tied to the model detection you right-clicked (the
+queued call's, in a call queue). A selected call you did not touch and did not
+join keeps its status, so a pending detection stays pending; one whose shape
+you changed on its own is saved as an edited shape and accepted, as with Edit
+shape. A stroke that reaches none of the calls is a join that fell short:
+Enter says so and leaves the edit open. Esc cancels with nothing changed, and
+one Ctrl+Z undoes the whole edit. **Merge N selected calls** on the same menu
+joins pieces that already touch, without painting.
+
 **Call queues.** A focus list (`--focus list.txt`) can name detections as well
 as recordings: `recording<TAB>detection<TAB>note`, the detection being its
 number (blob_id). Next (N) and Back (B) then walk those calls in the list's
@@ -191,7 +210,8 @@ leaves them undecided (trained as background) and goes to the next queued
 call. Editing a pending call's shape (right-click → Edit shape, then Enter)
 accepts it, so it counts as a decision here too: editing the queued call, or
 a pending call in its window during that walk, moves on exactly as Accept
-would. While you work on one call, MAD reads the queue's next recording in the
+would. The same holds for Edit N shapes together when it changes or joins the
+queued call. While you work on one call, MAD reads the queue's next recording in the
 background, so stepping to it skips the few seconds a 10-minute recording takes
 to decode. Moving forward (deciding, Skip, Next) goes to the next queued call
 still to decide: calls already decided, in the window walk or an earlier
