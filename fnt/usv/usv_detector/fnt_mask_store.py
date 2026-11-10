@@ -642,8 +642,12 @@ PRED_GROUP = "pred_calls"
 #: the next file switch. Running it per recording during a batch is the whole
 #: point of the inference toggle, and that needs somewhere on the crop to put
 #: the answer.
+#: ``joined_from`` (the blob_ids, comma-separated) and ``n_pieces`` mark a
+#: detection that ``mad join-fragments`` made from several (mad_join,
+#: 2026-11-09). They are listed here so a GUI rewrite of the crop keeps them:
+#: a string survives the str() below, where a list attr would not.
 PRED_ATTRS = ("score", "class", "model_name", "threshold", "min_blob_pixels",
-              "harmonic_call_id", "harmonic_n", "f0_hz")
+              "harmonic_call_id", "harmonic_n", "f0_hz", "joined_from", "n_pieces")
 # Read back with them; written only by _store_ridge (computed, never copied).
 _RIDGE_ATTRS = ("ridge_turns", "ridge_rate_hz", "ridge_depth_khz", "ridge_trill")
 

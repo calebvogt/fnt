@@ -8,6 +8,7 @@ be scripted into batch and HPC workflows without the GUI. Installed as the
     mad train      --project my_project/ --split-mode file
     mad embeddings --model weights.pt --input recordings/ --out emb.npz
     mad export     --input recordings/ --out tables/
+    mad join-fragments recordings/ --gap-ms 10 --max-df-khz 5
 
 Heavy deps (torch, segmentation-models-pytorch) are imported lazily by the
 underlying pipeline, so ``mad --help`` stays fast.
@@ -789,6 +790,43 @@ def build_parser() -> argparse.ArgumentParser:
                          "MAD may still be writing (default 10; 0 keeps all).")
     pw.set_defaults(func=_cmd_wheel)
 
+    # join-fragments
+    pj = sub.add_parser('join-fragments',
+                        help="Join pending detections that are pieces of one call "
+                             "(short gap, pitch carrying on across it) into one "
+                             "detection, in the .mad files; reversible with --undo.")
+    pj.add_argument('inputs', nargs='+',
+                    help=".mad files, wav files (their .mad) and/or folders (walked "
+                         "to the bottom).")
+    pj.add_argument('--gap-ms', type=float, default=10.0,
+                    help="Largest gap bridged, ms (default 10).")
+    pj.add_argument('--max-df-khz', type=float, default=5.0,
+                    help="Largest step from the earlier piece's end frequency to "
+                         "the later one's start frequency, kHz (default 5).")
+    pj.add_argument('--end-frames', type=int, default=3,
+                    help="Ridge frames averaged at each end for those "
+                         "frequencies (default 3).")
+    pj.add_argument('--concurrent-fraction', type=float, default=0.5,
+                    help="Pieces overlapping in time by more than this fraction of "
+                         "the shorter must share a frequency band (default 0.5).")
+    pj.add_argument('--band-rule', action='store_true',
+                    help="Also apply inference's band gating (pieces' bands overlap "
+                         "or lie within --band-max-gap-bins).")
+    pj.add_argument('--band-max-gap-bins', type=int, default=8,
+                    help="Band gap allowed by --band-rule, bins (default 8).")
+    pj.add_argument('--no-harmonics', dest='harmonics', action='store_false',
+                    default=True,
+                    help="Leave harmonic grouping as it is (default: regroup the "
+                         "detections the joins affect).")
+    pj.add_argument('--undo', action='store_true',
+                    help="Put back the detections a join replaced, exactly.")
+    pj.add_argument('--dry-run', action='store_true',
+                    help="Report what would change; write nothing.")
+    pj.add_argument('--settle-minutes', type=float, default=10.0,
+                    help="Leave out .mad files written in the last N minutes, which "
+                         "MAD may still be writing (default 10; 0 keeps all).")
+    pj.set_defaults(func=_cmd_join_fragments)
+
     # stop
     pst = sub.add_parser('stop',
                          help="Stop a MAD inference run started with "
@@ -1072,6 +1110,72 @@ def _cmd_wheel(args) -> int:
             pool.join()
     print(f"flagged {n_sq} of {n_dets} detection(s) as wheel squeaks in {n_files} file(s)")
     return 0
+
+
+def _cmd_join_fragments(args) -> int:
+    """Join fragments among the pending detections of the given .mad files
+    (mad_join), or undo it. A line per file that changes, then totals."""
+    import time
+    from .mad_join import JoinConfig, find_stores, join_file, undo_file
+    missing = [p for p in args.inputs if not os.path.exists(p)]
+    if missing:
+        print(f"Not found: {', '.join(missing)}", file=sys.stderr, flush=True)
+        return 2
+    stores = find_stores(args.inputs)
+    if args.settle_minutes:
+        now = time.time()
+        recent = [s for s in stores
+                  if now - os.path.getmtime(s) < 60 * args.settle_minutes]
+        if recent:
+            print(f"Leaving out {len(recent)} .mad file(s) written in the last "
+                  f"{args.settle_minutes:g} min (--settle-minutes)", flush=True)
+        stores = [s for s in stores if s not in recent]
+    cfg = JoinConfig(max_gap_s=args.gap_ms / 1000.0, max_df_khz=args.max_df_khz,
+                     end_frames=args.end_frames,
+                     concurrent_fraction=args.concurrent_fraction,
+                     band_rule=args.band_rule,
+                     band_max_gap_bins=args.band_max_gap_bins)
+    tag = " (dry run)" if args.dry_run else ""
+    n_files = before = after = joined = failed = 0
+    for i, s in enumerate(stores, 1):
+        name = os.path.basename(s)
+        try:
+            if args.undo:
+                r = undo_file(s, dry_run=args.dry_run)
+            else:
+                r = join_file(s, cfg, dry_run=args.dry_run, harmonics=args.harmonics)
+        except Exception as e:
+            failed += 1
+            print(f"[{i}/{len(stores)}] {name}: failed ({e})", file=sys.stderr, flush=True)
+            continue
+        if args.undo:
+            if r['status'] == 'stale':
+                print(f"[{i}/{len(stores)}] {name}: re-analysed since the join; its "
+                      f"copies were out of date and are dropped", flush=True)
+            elif r['status'] == 'ok':
+                n_files += 1
+                joined += r['joins']
+                print(f"[{i}/{len(stores)}] {name}: {r['joins']} joined call(s) "
+                      f"split back{tag}"
+                      + (f", {r['kept']} kept (reviewed since)" if r['kept'] else ""),
+                      flush=True)
+            continue
+        if r['status'] != 'ok':
+            print(f"[{i}/{len(stores)}] {name}: {r['status']}", flush=True)
+            continue
+        n_files += 1
+        before += r['before']
+        after += r['after']
+        joined += r['n_joined']
+        if r['n_joined'] or r['restored']:
+            print(f"[{i}/{len(stores)}] {name}: {r['before']} -> {r['after']} "
+                  f"detection(s), {r['n_joined']} joined{tag}", flush=True)
+    if args.undo:
+        print(f"split {joined} joined call(s) back in {n_files} file(s){tag}")
+    else:
+        print(f"{before} -> {after} detection(s) in {n_files} file(s): "
+              f"{joined} call(s) joined from fragments{tag}")
+    return 1 if failed else 0
 
 
 def main(argv: Optional[List[str]] = None) -> int:

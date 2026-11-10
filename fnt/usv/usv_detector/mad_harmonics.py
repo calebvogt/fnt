@@ -638,9 +638,60 @@ def group_recording(store_path: str, wav_name: str = "",
     excluded: the reviewer has already said those are not calls, and letting
     one anchor a stack would put that decision back in play.
     """
+    from .fnt_mask_store import td_update_meta, update_pred_attrs
+
+    grouped = recording_grouping(store_path, wav_name, cfg)
+    if grouped is None:
+        return None
+    res, example_ids, n_elements = grouped
+    pred_updates: Dict[str, Dict] = {}
+    for eid, fields in grouping_fields(res).items():
+        if eid in example_ids:
+            try:
+                td_update_meta(store_path, eid, fields)
+            except Exception:
+                pass
+        else:
+            pred_updates[eid] = fields
+    if pred_updates:
+        try:
+            update_pred_attrs(store_path, pred_updates)
+        except Exception:
+            pass
+    return {'n_elements': n_elements, 'n_calls': res.n_calls,
+            'n_harmonic': sum(1 for n in res.harmonic_of.values() if n > 1)}
+
+
+def grouping_fields(res: "GroupingResult") -> Dict[str, Dict]:
+    """``{element_id: {harmonic_call_id, harmonic_n, f0_hz}}``: what a grouping
+    stores on each element, as :func:`group_recording` writes it."""
+    f0_of = {c.call_id: c.f0_hz for c in res.calls}
+    return {eid: {'harmonic_call_id': call,
+                  'harmonic_n': int(res.harmonic_of.get(eid, 1)),
+                  'f0_hz': round(f0_of.get(call, 0.0), 2) or ''}
+            for eid, call in res.call_of.items()}
+
+
+def recording_grouping(store_path: str, wav_name: str = "",
+                       cfg: HarmonicConfig = HarmonicConfig()):
+    """The grouping :func:`group_recording` would store, without storing it:
+    ``(GroupingResult, example ids, element count)``, or None when there is
+    nothing to group. Split out (2026-11-09) so ``mad join-fragments`` can
+    regroup a recording and write only the detections its joins affected."""
+    got = recording_elements(store_path, wav_name)
+    if got is None:
+        return None
+    elements, example_ids, forced = got
+    res = group_calls(elements, cfg, forced=forced)
+    return res, example_ids, len(elements)
+
+
+def recording_elements(store_path: str, wav_name: str = ""):
+    """``(elements, example ids, forced)``: what :func:`group_calls` is given
+    for one recording, or None when there is nothing to group."""
     from .fnt_mask_store import (
         example_kind, get_grid_attrs, read_all_pred_masks, td_iter_file_examples,
-        td_iter_meta, td_update_meta, update_pred_attrs)
+        td_iter_meta)
 
     grid = get_grid_attrs(store_path)
     sr = float(grid.get('sample_rate') or 0.0)
@@ -686,25 +737,22 @@ def group_recording(store_path: str, wav_name: str = "",
         return None
 
     forced = _forced_from_store(td_iter_meta(store_path))
-    res = group_calls(elements, cfg, forced=forced)
+    return elements, example_ids, forced
 
-    f0_of = {c.call_id: c.f0_hz for c in res.calls}
-    pred_updates: Dict[str, Dict] = {}
-    for eid, call in res.call_of.items():
-        fields = {'harmonic_call_id': call,
-                  'harmonic_n': int(res.harmonic_of.get(eid, 1)),
-                  'f0_hz': round(f0_of.get(call, 0.0), 2) or ''}
-        if eid in example_ids:
-            try:
-                td_update_meta(store_path, eid, fields)
-            except Exception:
-                pass
+
+def overlap_clusters(elements: Sequence[Element]) -> List[List[Element]]:
+    """Elements in runs that overlap in time, chained (A overlaps B, B
+    overlaps C). :func:`group_calls` only ever relates elements that overlap in
+    time, so grouping each run on its own gives what grouping them all does
+    (manual pins aside) -- and costs a run's square, not the recording's."""
+    order = sorted((e for e in elements if e.times.size), key=lambda e: (e.t0, e.id))
+    out: List[List[Element]] = []
+    end = -math.inf
+    for e in order:
+        if not out or e.t0 > end:
+            out.append([e])
+            end = e.t1
         else:
-            pred_updates[eid] = fields
-    if pred_updates:
-        try:
-            update_pred_attrs(store_path, pred_updates)
-        except Exception:
-            pass
-    return {'n_elements': len(elements), 'n_calls': res.n_calls,
-            'n_harmonic': sum(1 for n in res.harmonic_of.values() if n > 1)}
+            out[-1].append(e)
+            end = max(end, e.t1)
+    return out
