@@ -468,3 +468,75 @@ if __name__ == "__main__":
         if name.startswith("test_"):
             fn()
             print("ok", name)
+
+
+def _decide_on_disk(w, wav, blob_ids, kind="negative"):
+    """Record a decision for ``blob_ids`` the way an earlier session left it:
+    an example carrying the blob_id in the recording's .mad."""
+    from fnt.usv.usv_detector.fnt_mask_store import td_save_example
+    h5 = MS.masks_sibling_path(wav)
+    for b in blob_ids:
+        t = 600 * b                                   # make()'s default layout
+        meta = {"id": f"prev_{b}", "blob_id": b, "source_wav": os.path.basename(wav),
+                "t_start_s": t * HOP / SR, "t_stop_s": (t + 40) * HOP / SR,
+                "f_low_hz": 250 * SR / 1024, "f_high_hz": 270 * SR / 1024,
+                "patch_t_off": t, "patch_f_off": 250}
+        if kind != "label":
+            meta["kind"] = kind
+        td_save_example(h5, np.zeros((20, 40), np.float32),
+                        np.ones((20, 40), np.uint8), meta, example_id=f"prev_{b}")
+
+
+def test_skip_passes_over_decided_calls_and_opening_resumes_on_an_open_one():
+    """2026-11-09: Skip and auto-advance walked onto calls already decided
+    (in the window walk or an earlier session), and reopening started at the
+    saved position. Now both go to the next call still to decide, and the end
+    of the queue wraps to the calls skipped earlier."""
+    w, wavs, root = make()
+    rows = [(0, 1, ""), (1, 1, ""), (2, 1, ""), (0, 2, ""), (1, 2, ""), (2, 2, "")]
+    q = queue_file(root, wavs, rows)
+    _decide_on_disk(w, wavs[0], [1])
+    _decide_on_disk(w, wavs[1], [1, 2])
+    w._settings.remove(f"mad/call_queue_pos/{os.path.normcase(os.path.abspath(q))}")
+    w.focus_recordings([q])
+    settle(w)
+    assert w._call_queue_pos == 2 and selected(w) == ("rec2.wav", "1")
+    assert "4 to decide" not in w._queue_header_html()     # 3 open
+    assert "3 to decide" in w._queue_header_html()
+    w._skip_current_pred()                                  # rec2/1 stays open
+    settle(w)
+    assert selected(w) == ("rec0.wav", "2") and w._call_queue_pos == 3
+    w._auto_advance = True
+    w._reject_current_pred()                                # passes rec1/2 (decided)
+    settle(w)
+    assert w._call_queue_pos == 5 and selected(w) == ("rec2.wav", "2")
+    w._skip_current_pred()                                  # end: wrap to the skipped one
+    settle(w)
+    assert w._call_queue_pos == 2 and selected(w) == ("rec2.wav", "1")
+
+
+def test_a_stale_detection_row_does_not_move_the_queue():
+    """A Detections row naming the recording being replaced must not reopen
+    that recording's first queued call (the queue jumped back to its start)."""
+    w, wavs, root = make()
+    rows = [(0, 1, ""), (1, 1, ""), (0, 2, ""), (1, 2, ""), (0, 3, "")]
+    q = queue_file(root, wavs, rows)
+    w._settings.remove(f"mad/call_queue_pos/{os.path.normcase(os.path.abspath(q))}")
+    w.focus_recordings([q])
+    settle(w)
+    for _ in range(3):
+        w._skip_current_pred()
+        settle(w)
+    assert w._call_queue_pos == 3 and selected(w) == ("rec1.wav", "2")
+    tree = w.annotation_list
+    item = tree.topLevelItem(0)
+    wav, t0, eid, st = item.data(0, M.Qt.UserRole)
+    item.setData(0, M.Qt.UserRole, ("rec0.wav", t0, eid, st))   # a row left from rec0
+    w._on_annotation_list_selected(item)
+    settle(w)
+    assert w._call_queue_pos == 3 and selected(w) == ("rec1.wav", "2")
+    # Picking rec0 in the Audio list opens its next open call, not its first
+    row = next(i for i, p in enumerate(w.audio_files) if p.endswith("rec0.wav"))
+    w.file_list.setCurrentRow(row)
+    settle(w)
+    assert w._call_queue_pos == 4 and selected(w) == ("rec0.wav", "3")

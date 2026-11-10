@@ -193,15 +193,21 @@ accepts it, so it counts as a decision here too: editing the queued call, or
 a pending call in its window during that walk, moves on exactly as Accept
 would. While you work on one call, MAD reads the queue's next recording in the
 background, so stepping to it skips the few seconds a 10-minute recording takes
-to decode. The counter
-reads "Call 37/200", and the queue reopens where it was left. A queue never
+to decode. Moving forward (deciding, Skip, Next) goes to the next queued call
+still to decide: calls already decided, in the window walk or an earlier
+session, are passed over, and after the last call the queue returns to the
+first one you skipped. Back (B) steps one call at a time, decided or not, so
+earlier decisions can be revisited. The counter reads "Call 37/200", the header
+says how many calls are left to decide, and the queue reopens on the first
+undecided call at or after where it was left. A queue never
 looks like an ordinary focus: the window title says "call queue", the line above
 the spectrogram starts with a cyan **CALL QUEUE 37/200** tag, the queued call
 has a dashed cyan frame labelled QUEUED CALL (V hides it with the other
 overlays, so the call can be seen clean), and in the Detections list its row
 is bold cyan with a ▶ while the recording's other detections are dimmed (they
 are context, not part of the queue). Skip (S), the Audio list's Prev / Next and
-clicking a recording all move through the queue too. Use it to judge a
+clicking a recording all move through the queue too; clicking a recording
+opens its next undecided queued call. Use it to judge a
 random sample of detections (an honest precision) or the calls two models
 disagree on. Lines without a detection keep the ordinary per-recording focus.
 

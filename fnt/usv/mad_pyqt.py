@@ -6938,6 +6938,13 @@ class MADMainWindow(QMainWindow):
         self.lbl_view_header.setStyleSheet(
             "color: #9a9a9a; font-size: 9px; padding: 1px 4px;")
         self.lbl_view_header.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        # One long line (a call queue adds a dozen items). As a plain QLabel
+        # its whole text was its minimum width, so a long header pushed the
+        # splitter and squeezed the left panel off its own edge (2026-11-09);
+        # let it be clipped on the right instead.
+        self.lbl_view_header.setSizePolicy(QSizePolicy.Ignored,
+                                           QSizePolicy.Preferred)
+        self.lbl_view_header.setMinimumWidth(1)
         # The 3D view's toggle sits at the right end of this line: it is a
         # view OF the spectrogram, so it belongs above it rather than among the
         # review tools, and the right end of the header was empty.
@@ -9951,6 +9958,13 @@ class MADMainWindow(QMainWindow):
         # switch files if the row names a DIFFERENT one.
         active = self._active_wav_path()
         if not (active and os.path.basename(active) == wav):
+            if self._queue_active():
+                # In a call queue the list only ever shows the recording on
+                # screen; a row naming another one is left over from the
+                # recording being replaced (the switch is asynchronous).
+                # Following it reopened that recording's FIRST queued call --
+                # the queue jumped back toward its start (2026-11-09).
+                return
             for i, p in enumerate(self.audio_files):
                 if os.path.basename(p) == wav:
                     if i != self.current_file_idx:
@@ -10820,6 +10834,10 @@ class MADMainWindow(QMainWindow):
         """
         if self._pred_indices():
             return  # still pending — nothing to prompt
+        if self._queue_active():
+            # A call queue moves through its own list; "next file" would open
+            # some recording's first queued call, far back in the queue.
+            return
         n = self._reviewed_count
         if n <= 0:
             return  # nothing was actually reviewed this file — no prompt
@@ -15604,7 +15622,15 @@ class MADMainWindow(QMainWindow):
         self._focus_keys = keys
         queue = self._build_call_queue(items)
         if queue:
+            self._read_queue_decisions()
             pos = self._saved_queue_pos(items, len(queue))
+            # Resume on a call still to decide: where it was left, else the
+            # first one skipped earlier; a fully decided queue opens where it
+            # was left.
+            nxt = self._queue_next_open(pos)
+            if nxt is None:
+                nxt = self._queue_next_open(0)
+            pos = pos if nxt is None else nxt
             self._show_registry(keep=queue[pos][0],
                                 then=lambda: self._queue_goto(pos))
         else:
@@ -15644,6 +15670,7 @@ class MADMainWindow(QMainWindow):
         the position can be restored next time it is opened."""
         rows = [r for r in self._focus_lines(items) if r[1] is not None]
         self._call_queue = []
+        self._queue_decided = set()
         self._drop_prefetch()
         self._call_queue_pos = 0
         self._call_queue_ann_id = None
@@ -15710,6 +15737,7 @@ class MADMainWindow(QMainWindow):
         queue = getattr(self, '_call_queue', None)
         if not queue:
             return
+        self._note_queue_decisions()       # the recording about to be replaced
         self._queue_window_mode = False
         pos = max(0, min(pos, len(queue) - 1))
         self._call_queue_pos = pos
@@ -15911,8 +15939,13 @@ class MADMainWindow(QMainWindow):
         return crops
 
     def _queue_pos_for_file(self, path: str) -> Optional[int]:
-        """The queue position of ``path``'s call (its first, if it has several
-        -- the first still pending, when one is known to be)."""
+        """The queue position to open for ``path``: the current one if it is
+        that recording's, else its next undecided queued call at or after the
+        current position, else its first undecided one, else its first.
+
+        Never simply its first: a queue interleaves recordings, so a
+        recording's first call is usually near the start of the queue and
+        opening it threw the reviewer back over work already done."""
         key = self._path_key(path)
         hits = [i for i, (p, _, _) in enumerate(getattr(self, '_call_queue', []))
                 if self._path_key(p) == key]
@@ -15920,7 +15953,64 @@ class MADMainWindow(QMainWindow):
             return None
         if self._call_queue_pos in hits:
             return self._call_queue_pos
-        return hits[0]
+        open_ = [i for i in hits if not self._queue_is_decided(i)]
+        ahead = [i for i in open_ if i >= self._call_queue_pos]
+        return (ahead or open_ or hits)[0]
+
+    # --- which queued calls are already decided --------------------------
+    def _read_queue_decisions(self):
+        """(recording key, blob_id) of every queued detection that already has
+        a decision (an accepted or rejected example carrying its blob_id), read
+        from the queued recordings' .mad files when the queue opens."""
+        from fnt.usv.usv_detector.fnt_mask_store import (
+            masks_sibling_path, td_iter_meta)
+        done = set()
+        for path in {p for p, _, _ in self._call_queue}:
+            key = self._path_key(path)
+            try:
+                for meta in td_iter_meta(masks_sibling_path(path)):
+                    bid = meta.get('blob_id')
+                    if bid is not None and not isinstance(bid, bool):
+                        done.add((key, str(bid)))
+            except Exception:
+                continue
+        self._queue_decided = done
+
+    def _note_queue_decisions(self):
+        """Fold the recording on screen into the decided set (its annotations
+        are the live truth for it)."""
+        here = getattr(self, '_loaded_wav_path', None)
+        if here is None or not self._queue_active():
+            return
+        key = self._path_key(here)
+        done = getattr(self, '_queue_decided', None)
+        if done is None:
+            done = self._queue_decided = set()
+        for a in self.spectrogram.annotations:
+            bid = a.get('blob_id')
+            if bid is None:
+                continue
+            if a.get('status') == 'prediction':
+                done.discard((key, str(bid)))
+            else:
+                done.add((key, str(bid)))
+
+    def _queue_is_decided(self, pos: int) -> bool:
+        path, bid, _ = self._call_queue[pos]
+        here = getattr(self, '_loaded_wav_path', None)
+        if here is not None and self._path_key(here) == self._path_key(path):
+            a = next((a for a in self.spectrogram.annotations
+                      if str(a.get('blob_id')) == bid), None)
+            if a is not None and a.get('status') != 'prediction':
+                return True
+        return (self._path_key(path), bid) in getattr(self, '_queue_decided', ())
+
+    def _queue_next_open(self, start: int) -> Optional[int]:
+        """First undecided queued call at or after ``start``, or None."""
+        for p in range(max(0, start), len(self._call_queue)):
+            if not self._queue_is_decided(p):
+                return p
+        return None
 
     def _queue_step_file(self, step: int):
         """The Audio list's Prev/Next in a call queue: the queue's next (or
@@ -16011,20 +16101,43 @@ class MADMainWindow(QMainWindow):
             if n_win:
                 where += (f" &nbsp;·&nbsp; <span style='color:#ff9f40'>"
                           f"{n_win} pending in its training window</span>")
+        left = sum(1 for p in range(len(queue)) if not self._queue_is_decided(p))
         return (f"<span style='background:#00505a; color:#00e5ff'>"
-                f"&nbsp;<b>CALL QUEUE {pos + 1}/{len(queue)}</b>&nbsp;</span>"
+                f"&nbsp;<b>CALL QUEUE {pos + 1}/{len(queue)}</b>"
+                f" · {left} to decide&nbsp;</span>"
                 f" &nbsp;<span style='color:#00e5ff'>{where}"
                 + (f" &nbsp;·&nbsp; {note}" if note else "")
                 + "</span> &nbsp;&nbsp; ")
 
     def _queue_step(self, step: int):
-        """Next (+1) / Back (-1) through the queue; says so at the end."""
-        pos = self._call_queue_pos + step
-        if pos >= len(self._call_queue):
-            self.status_bar.showMessage(
-                f"End of the queue: all {len(self._call_queue)} calls shown")
+        """Next / Skip / auto-advance (+1): the next queued call still to
+        decide -- calls decided earlier (in an earlier session, or in a
+        training-window walk) are passed over. Past the end, back to the first
+        one still undecided, if any. Back (-1) steps one call, decided or not,
+        so earlier decisions can be revisited."""
+        n = len(self._call_queue)
+        if step < 0:
+            pos = self._call_queue_pos + step
+            if pos >= 0:
+                self._queue_goto(pos)
             return
-        if pos < 0:
+        self._note_queue_decisions()
+        pos = self._queue_next_open(self._call_queue_pos + step)
+        if pos is None:
+            first = self._queue_next_open(0)
+            if first is None:
+                self.status_bar.showMessage(
+                    f"End of the queue: all {n} calls decided")
+                return
+            if first == self._call_queue_pos:
+                self.status_bar.showMessage(
+                    "End of the queue: this is the only call still undecided")
+                return
+            left = sum(1 for p in range(n) if not self._queue_is_decided(p))
+            self._queue_goto(first)
+            self.status_bar.showMessage(
+                f"End of the queue — back to the first of {left} skipped "
+                "call(s) still undecided")
             return
         self._queue_goto(pos)
 
