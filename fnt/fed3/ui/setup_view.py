@@ -254,10 +254,14 @@ class SetupView(QWidget):
 
     def _edit(self, new=False):
         text = "" if new else self.protocol_text
+        # A new protocol starts with the FED3s plugged in.
+        connected = [fed_name(n) for n in sorted({self._shown_id(d) for d in self._connected()}
+                                                 - {None, 0})]
         if new or not text:
-            from .editor import DEFAULT_TEMPLATE, TEMPLATES
-            text = TEMPLATES[DEFAULT_TEMPLATE]
-        editor = ProtocolEditor(text, self, path=None if new else self.protocol_path)
+            from .editor import DEFAULT_TEMPLATE, TEMPLATES, with_devices
+            text = with_devices(TEMPLATES[DEFAULT_TEMPLATE], connected)
+        editor = ProtocolEditor(text, self, path=None if new else self.protocol_path,
+                                connected=connected)
         if editor.exec_():
             path = editor.path
             if not path:

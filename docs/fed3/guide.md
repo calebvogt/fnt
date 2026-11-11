@@ -31,8 +31,13 @@ and it picks the run back up.
 A protocol is a short YAML file: the FED3s it uses, by ID (`devices: [FED001,
 FED002]`), and phases, each with a rule and a way to end.
 
+- **Choose the FED3s.** **Devices** in the editor's toolbar shows the
+  protocol's FED3s; click it to change them. Type IDs or ranges (`1-4`, or
+  `FED001, FED007`), or use the ones plugged in. **New…** starts with the
+  FED3s that are connected.
 - **Start from a template.** In Setup, **New…** opens the editor; **New from
-  template** has:
+  template** has the following, each for the FED3s the protocol already lists
+  (the four-patch example keeps its own four):
   - **Classic FED3 modes**, one protocol each: Free feeding, FR1, FR3, FR5,
     Progressive ratio, Extinction, FR1 and PR reversed (right poke),
     Optogenetic stimulation and its reversed version, Timed feeding, and FNT's
@@ -51,29 +56,58 @@ FED002]`), and phases, each with a rule and a way to end.
   - The check catches the same things in text: a phase that only ends on
     rewards no poke can earn is an error, and free feeding with an active poke
     is a warning.
+  - **With several FED3s** the form has a row for each. Leave a row on
+    `same` and that FED3 runs the settings above it, or give it its own
+    active poke, ratio or reward: FR1 on one FED3 and RR2, RR3 and RR4 on
+    three others is one phase. **Runs as** shows what each will do. The form
+    writes the differences as the phase's `per_device` (below).
 - **Edit phase** reads a phase back into the same form and rewrites it, and
   **Remove phase** deletes one. A phase that uses something the form doesn't
-  have (a named rule, a rotation, daily windows, per-device rules in `only`) is edited in
-  the text: the form says what it can't show and takes you to the phase rather
-  than drop it. Comments inside a phase the form rewrites are lost.
+  have (a named rule, a rotation, daily windows, a per-device change to
+  anything but the active poke, ratio or reward) is edited in the text: the
+  form says what it can't show and takes you to the phase rather than drop
+  it. Comments inside a phase the form rewrites are lost.
+- **Ratios are written as you'd say them:** `ratio: FR5`, `ratio: RR3` or
+  `ratio: PR`. The classic FED3 reward (4 kHz tone, blue light bar) is
+  `cue: {reward: classic}`.
+- **Settings every phase shares** go in `every_phase` at the top, so each
+  phase only says what it changes:
+
+  ```yaml
+  every_phase:
+    active: both
+    cue: {reward: classic}
+  phases:
+    - name: FR1
+      until: {rewards: 50, of: each}
+      rule: {ratio: FR1}
+    - name: RR3
+      rule: {ratio: RR3}
+  ```
+
+  To drop something it sets in one phase, write it back there, e.g.
+  `cue: {reward: none}`.
 - **With several FED3s,** every one runs every phase. A phase's `rule` is what
-  they all do, and `only` changes it for the ones it names:
+  they all do, and `per_device` changes it for the ones it names:
 
   ```yaml
   - name: Training
     until: {rewards: 100, of: all}
-    rule: {active: both, ratio: 1}
-    only:
-      FED003, FED004: {ratio: 5}
+    rule: {active: both, ratio: FR1}
+    per_device:
+      FED003, FED004: {ratio: FR5}
   ```
 
   `of` says whose rewards end the phase: `all` moves every FED3 on together
   once each has 100 (FNT checks this, so it must be running), and `each` moves
   each FED3 on by itself when it reaches 100. With several FED3s the check
   warns until you write one.
-- **Older protocols** (`format: fnt-fed3-protocol/1`) still open and run. They
-  used `all` for `rule`, and `devices` for both `only` and `of`; see
-  [design.md](design.md#format-1).
+- **Older protocols** (`format: fnt-fed3-protocol/1` and `/2`) still open and
+  run. Format 2 called `per_device` `only`; format 1 used `all` for `rule`, and
+  `devices` for both `per_device` and `of`. See
+  [design.md](design.md#formats-1-and-2).
+- **Mistakes in the YAML itself** (a tab, a line out of line, `ratio:3`
+  without a space) are reported in plain words at their line.
 - **The check on the right** updates as you type and points at the line of any
   problem.
 - **The timeline below it** shows when each phase will start, and marks the
