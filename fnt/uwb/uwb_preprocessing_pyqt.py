@@ -14517,6 +14517,7 @@ class UWBQuickVisualizationWindow(QWidget):
                     f"Daily animation days restored from the saved settings: "
                     f"{len(wanted & set(self.daily_animation_day_checkboxes))}"
                     f" of {len(self.daily_animation_day_checkboxes)} day(s).")
+        self._relabel_animation_days()
         self._sync_all_days_checkbox()
 
     def on_all_days_clicked(self):
@@ -14712,6 +14713,7 @@ class UWBQuickVisualizationWindow(QWidget):
         if dialog.exec_() != QDialog.Accepted:
             return
         self.tag_identities = dialog.get_identities()
+        self._relabel_animation_days()
         self.log_message(f"Updated identities for {len(self.tag_identities)} tags")
         # The active windows just changed: cached chunks were built under the
         # old ones and the timeline may now cover a different span.
@@ -16337,6 +16339,47 @@ class UWBQuickVisualizationWindow(QWidget):
                 self._animation_tags = sel
                 self.lbl_anim_tags.setText(f"{len(sel)} of {len(tags)} tags")
 
+    @staticmethod
+    def trial_day_numbers(days, first_start=None):
+        """``{date: N}``: each listed date's day of the trial.
+
+        Dates before the trial's first Start are not trial days. A database
+        that still holds an earlier trial's reads (VC-T010's opens on 3/11,
+        its animals went in on 6/6) used to number the first day 'Day 12'.
+        ``first_start`` None, or one that leaves no day, numbers every date.
+        """
+        days = [str(d) for d in days]
+        if first_start is not None:
+            first = pd.Timestamp(first_start).strftime('%Y-%m-%d')
+            days = [d for d in days if d >= first] or days
+        return {d: i + 1 for i, d in enumerate(days)}
+
+    def _first_trial_start(self):
+        """Earliest Start (limited, not Auto) across the configured tags, or
+        None unless every configured tag has one: a tag without a Start has
+        data from the database's first day."""
+        starts = []
+        for info in (self.tag_identities or {}).values():
+            if (IdentityAssignmentDialog._mode_of(info, 'start') != 'manual'
+                    or not info.get('start_time')):
+                return None
+            try:
+                ts = pd.Timestamp(info['start_time'])
+            except (ValueError, TypeError):
+                return None
+            if ts is pd.NaT:
+                return None
+            starts.append(ts.tz_localize(None) if ts.tzinfo is not None else ts)
+        return min(starts) if starts else None
+
+    def _relabel_animation_days(self):
+        """Day boxes carry the trial day number (see trial_day_numbers)."""
+        nums = self.trial_day_numbers(self.daily_animation_day_checkboxes,
+                                      self._first_trial_start())
+        for d, cb in self.daily_animation_day_checkboxes.items():
+            cb.setText(f"Day {nums[d]}: {d}" if d in nums
+                       else f"Before the trial: {d}")
+
     def _snapshot_anim_settings(self):
         """Freeze every animation setting at export time.
 
@@ -16354,8 +16397,9 @@ class UWBQuickVisualizationWindow(QWidget):
         # days 6-7 used to write them as Day1/Day2, which collided with the
         # real days 1-2 on the next run and made an incremental export
         # unreadable.
-        trial_days = list(all_cbs.keys())
-        day_numbers = {d: i + 1 for i, d in enumerate(trial_days)}
+        day_numbers = self.trial_day_numbers(all_cbs.keys(),
+                                             self._first_trial_start())
+        trial_days = list(day_numbers)
         gen_daily = self.chk_daily_animations.isChecked()
         return {
             'trailing_window': self.spin_animation_trail.value(),
