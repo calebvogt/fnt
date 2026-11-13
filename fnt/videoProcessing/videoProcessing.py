@@ -268,7 +268,7 @@ class VideoProcessorWorker(QThread):
                  instance_id=1, skip_already_processed=False,
                  burn_subtitles=False, subtitle_style=None,
                  replace_whitespace=False, filename_prefix="", filename_suffix="",
-                 input_extensions=None, shard=None):
+                 input_extensions=None, shard=None, recover_damaged=True):
         super().__init__()
         self.input_dirs = input_dirs
         self.input_videos = input_videos
@@ -290,6 +290,11 @@ class VideoProcessorWorker(QThread):
         self.filename_suffix = filename_suffix
         self.input_extensions = list(input_extensions) if input_extensions else list(DEFAULT_VIDEO_GLOBS)
         self.shard = shard  # (k, n): only this part of the files (see in_shard)
+        # Damaged AVIs (lost blocks): rebuild at the recording's real length,
+        # black where frames are lost (see avi_recovery), instead of failing or
+        # encoding with the lost frames left out (video then runs ahead of the
+        # camera clock).
+        self.recover_damaged = recover_damaged
         self.should_stop = False
         # Retry transient failures (e.g. network drops reading from a mapped
         # network drive cause FFmpeg to crash mid-read). max_retries is the
@@ -340,6 +345,122 @@ class VideoProcessorWorker(QThread):
         except Exception:
             pass
         return None
+
+    @staticmethod
+    def _media_duration(filepath):
+        """Container duration in seconds via ffprobe, or None."""
+        try:
+            r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                                "-of", "csv=p=0", filepath],
+                               capture_output=True, text=True, timeout=30)
+            return float(r.stdout.strip()) if r.returncode == 0 else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _avi_header_intact(filepath):
+        """Whether an AVI still has its header (the list that leads to its frames)."""
+        from fnt.videoProcessing.avi_recovery import _parse_header
+        try:
+            with open(filepath, "rb") as f:
+                return _parse_header(f.read(1 << 20))[0] is not None
+        except OSError:
+            return True
+
+    def _probe_gaps(self, video, name):
+        """Lost stretches of a video with its own timestamps (frame_gaps), or None.
+        Reports them; the encode then draws their frames black."""
+        from fnt.videoProcessing import frame_gaps as G
+        fg = G.probe(video)
+        if fg and fg.gaps:
+            self.progress_update.emit(
+                f"  🩹 {name}: {len(fg.gaps):,} stretch(es) of lost frames "
+                f"({fg.lost_s:,.1f} s); they stay at their real time, drawn black")
+        return fg
+
+    def _write_gap_csv(self, fg, partial_file, name):
+        """The frames CSV (recovered_frames/, as for damaged AVIs) of an encode whose
+        lost stretches were drawn black."""
+        from fnt.videoProcessing import frame_gaps as G
+        from fnt.videoProcessing import avi_recovery as R
+        try:
+            rows, n, black = G.frame_rows(fg, self.frame_rate)
+            res = R.RecoveryResult(partial_file, n, n - black, black, rows,
+                                   {"fps": self.frame_rate, "gaps": len(fg.gaps)})
+            rep_dir = os.path.join(os.path.dirname(partial_file), "recovered_frames")
+            os.makedirs(rep_dir, exist_ok=True)
+            out_name = os.path.splitext(os.path.basename(partial_file[:-len(".partial")]))[0]
+            R.write_frames_csv(res, os.path.join(rep_dir, out_name + "_frames.csv"))
+            self.progress_update.emit(
+                f"  🩹 {name}: {black:,} of {n:,} frames black — see proc/recovered_frames/")
+        except Exception as e:
+            self.progress_update.emit(f"  🩹 {name}: frames CSV not written: {e}")
+
+    def _lost_time(self, source, output):
+        """Seconds the encode is shorter than its source, when that is more than a
+        few seconds (frames lost in the source were left out), else 0."""
+        src, out = self._media_duration(source), self._media_duration(output)
+        if not src or not out:
+            return 0
+        lost = src - out
+        return lost if lost > max(5.0, 0.005 * src) else 0
+
+    def _recover_avi(self, avi, original, partial_file):
+        """Rebuild ``avi`` into ``partial_file`` at its real length (avi_recovery):
+        surviving frames in place, black where frames are lost. ``original`` is
+        the file's own path (its folder is searched for an intact recording of the
+        same recorder when the header is lost). Writes a frames CSV beside the
+        outputs (recovered_frames/). Returns True on success."""
+        from fnt.videoProcessing import avi_recovery as R
+        name = os.path.basename(original)
+        try:
+            with open(avi, "rb") as f:
+                data = f.read()
+            ref = None
+            if R._parse_header(data)[0] is None:
+                ref = R.find_reference(original)
+                self.progress_update.emit(
+                    f"  🩹 header lost; using {os.path.basename(ref['path'])} for its settings"
+                    if ref else "  🩹 header lost and no intact recording beside it to borrow from")
+            amap = R.map_avi(avi, data, ref)
+            if amap is None:
+                self.progress_update.emit(f"  🩹 {name}: nothing can be placed in time; not recoverable")
+                return False
+            usable = sum(len(r) for r in R.frame_runs(amap))
+            self.progress_update.emit(
+                f"  🩹 {name}: {usable:,} of {amap.total_frames:,} frames survive "
+                f"({usable / max(1, amap.total_frames):.0%}); rebuilding at real length…")
+            tmp = partial_file + ".recovering"
+            step = [0]
+
+            def prog(done, total):
+                if done * 10 // max(1, total) > step[0]:
+                    step[0] = done * 10 // max(1, total)
+                    self.progress_update.emit(f"    {done:,}/{total:,} frames")
+
+            res = R.recover_avi(avi, tmp, self.build_raw_encoder_command,
+                                gray=self.grayscale, fps=self.frame_rate, progress=prog,
+                                should_stop=lambda: self.should_stop, data=data, amap=amap)
+            if res is None:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+                self.progress_update.emit(f"  🩹 {name}: rebuild failed")
+                return False
+            os.replace(tmp, partial_file)
+            rep_dir = os.path.join(os.path.dirname(partial_file), "recovered_frames")
+            os.makedirs(rep_dir, exist_ok=True)
+            out_name = os.path.splitext(os.path.basename(partial_file[:-len(".partial")]))[0]
+            R.write_frames_csv(res, os.path.join(rep_dir, out_name + "_frames.csv"))
+            est = sum(b - a + 1 for a, b, k, h in res.rows if h == "estimated")
+            self.progress_update.emit(
+                f"  🩹 {name}: {res.recovered:,}/{res.total_frames:,} frames recovered "
+                f"({res.recovered / res.total_frames:.1%}), {res.black:,} black"
+                + (f", {est:,} placed by estimate" if est else "")
+                + " — see proc/recovered_frames/")
+            return True
+        except Exception as e:
+            self.progress_update.emit(f"  🩹 {name}: rebuild error: {e}")
+            return False
 
     def _copy_to_failed(self, video_file, parent_dir):
         """Copy a failed video file to proc_failed_copies/ directory."""
@@ -643,8 +764,16 @@ class VideoProcessorWorker(QThread):
                             tmp_dir, os.path.basename(sub_file))
                         shutil.copy2(sub_file, local_sub_copy)
 
+            is_avi = video_file.lower().endswith(".avi")
+            # Videos with their own timestamps (mp4, mkv, ...): frames lost in the
+            # source leave a jump that the fps filter fills with copies of the last
+            # frame; find the jumps first so the encode draws those frames black
+            gaps = None
+            if self.recover_damaged and not is_avi:
+                gaps = self._probe_gaps(ffmpeg_input, video_filename)
+
             # Build FFmpeg command based on settings
-            cmd = self.build_ffmpeg_command(ffmpeg_input, partial_file)
+            cmd = self.build_ffmpeg_command(ffmpeg_input, partial_file, gaps=gaps)
 
             # When burning subtitles we run ffmpeg from the video's own folder so
             # the .smi can be referenced by basename in the filtergraph (avoids
@@ -756,7 +885,26 @@ class VideoProcessorWorker(QThread):
                     for ln in list(recent_lines)[-12:]:
                         self.progress_update.emit(f"    │ {ln}")
                     self.progress_update.emit("    ────────────────────────")
-                return False  # the partial output is removed in finally
+                if not (self.recover_damaged and is_avi and not self.should_stop
+                        and self._recover_avi(ffmpeg_input, video_file, partial_file)):
+                    return False  # the partial output is removed in finally
+            elif self.recover_damaged and is_avi:
+                why = None
+                if not self._avi_header_intact(ffmpeg_input):
+                    why = "its header is lost, so FFmpeg read only what it could guess"
+                else:
+                    lost = self._lost_time(ffmpeg_input, partial_file)
+                    if lost:
+                        why = (f"the encode is {lost:,.0f} s shorter than the recording (frames "
+                               f"lost in the source were left out, so the video runs ahead of "
+                               f"its clock)")
+                if why:
+                    self.progress_update.emit(f"⚠️ {video_filename}: {why}")
+                    if not self._recover_avi(ffmpeg_input, video_file, partial_file):
+                        self.progress_update.emit(
+                            "  keeping the shortened encode")
+            elif gaps and gaps.gaps:
+                self._write_gap_csv(gaps, partial_file, video_filename)
 
             # --- Post-processing verification: confirm output resolution ---
             if self.resolution == "1080p":
@@ -815,8 +963,9 @@ class VideoProcessorWorker(QThread):
                 "-preset", self.preset,                # speed preset
                 "-crf", str(self.crf_quality)]         # quality (0-51): lower is better
 
-    def build_ffmpeg_command(self, input_file, output_file):
-        """Build the FFmpeg command based on user settings with SLEAP-compatible frame handling"""
+    def build_ffmpeg_command(self, input_file, output_file, gaps=None):
+        """Build the FFmpeg command based on user settings with SLEAP-compatible frame handling.
+        ``gaps`` (frame_gaps.FrameGaps): stretches of lost frames, drawn black."""
         
         # Get resolution dimensions
         if self.resolution == "1080p":
@@ -842,7 +991,14 @@ class VideoProcessorWorker(QThread):
             "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709",
             f"fps={self.frame_rate}",
         ]
-        
+        # Lost stretches: the fps filter repeats the last frame across them; paint
+        # those frames black (t is still the source's time here)
+        if gaps is not None:
+            from fnt.videoProcessing.frame_gaps import blackout_filter
+            box = blackout_filter(gaps, self.frame_rate)
+            if box:
+                video_filters.append(box)
+
         # Add audio option
         if self.remove_audio:
             cmd.append("-an")  # Remove audio
@@ -908,6 +1064,25 @@ class VideoProcessorWorker(QThread):
         # writes to "<output>.partial" (see process_single_file).
         cmd.extend(["-vf", video_filter, "-f", self.output_format, output_file])
 
+        return cmd
+
+
+    def build_raw_encoder_command(self, width, height, pix_fmt, fps, output_file):
+        """FFmpeg command that encodes raw frames from stdin (width x height,
+        ``pix_fmt``, at ``fps``) with this run's settings: frame rate, scaling and
+        padding, grayscale, encoder. Used to rebuild damaged AVIs; no audio."""
+        width_t, height_t = self._target_resolution()
+        vf = [f"fps={self.frame_rate}",
+              f"scale={width_t}:{height_t}:force_original_aspect_ratio=decrease:eval=frame",
+              f"pad={width_t}:{height_t}:-1:-1:color=black"]
+        if self.grayscale:
+            vf.append("format=gray")
+        cmd = ["ffmpeg", "-y", "-nostdin", "-v", "error",
+               "-f", "rawvideo", "-pix_fmt", pix_fmt, "-s", f"{width}x{height}",
+               "-r", f"{fps:g}", "-i", "pipe:"]
+        cmd += self._encoder_args() + ["-pix_fmt", "yuv420p", "-an",
+                                       "-movflags", "+faststart",
+                                       "-vf", ",".join(vf), "-f", self.output_format, output_file]
         return cmd
 
 
@@ -1467,6 +1642,20 @@ class VideoProcessingGUI(QMainWindow):
         group_layout.addWidget(self.subtitle_style_btn, row, 1, 1, 1)
         row += 1
 
+        # Damaged AVIs: rebuild at real length
+        self.recover_check = QCheckBox("Keep damaged videos at their real length (lost frames black)")
+        self.recover_check.setChecked(True)
+        self.recover_check.setToolTip(
+            "When an AVI has lost blocks (FFmpeg cannot open it, or its encode comes out "
+            "shorter than the recording), rebuild it from the frames that survive, each at "
+            "its real time, with black where frames are lost, so the video stays in step "
+            "with the camera clock. In an mp4, mkv or other video with its own timestamps, "
+            "frames lost in the source are drawn black instead of repeating the last frame "
+            "before them. A frames CSV in proc/recovered_frames/ lists what is recovered "
+            "and what is black.")
+        group_layout.addWidget(self.recover_check, row, 0, 1, 2)
+        row += 1
+
         # Remove whitespace from output filenames option
         self.replace_whitespace_check = QCheckBox("Remove whitespace from filenames")
         self.replace_whitespace_check.setChecked(False)
@@ -1988,7 +2177,7 @@ class VideoProcessingGUI(QMainWindow):
         self.log_message("Starting video preprocessing...")
         self.log_message(f"Settings: {frame_rate} fps, {resolution}, {codec}, Preset: {preset}, CRF: {crf_quality}, Format: {output_format}")
         self.log_message(f"Input types: {self.input_types_combo.currentText()}")
-        self.log_message(f"Options: Grayscale: {grayscale}, Remove Audio: {remove_audio}, Contrast: {apply_clahe}, Remove Whitespace: {replace_whitespace}")
+        self.log_message(f"Options: Grayscale: {grayscale}, Remove Audio: {remove_audio}, Contrast: {apply_clahe}, Remove Whitespace: {replace_whitespace}, Keep damaged videos at real length: {self.recover_check.isChecked()}")
         if filename_prefix or filename_suffix:
             self.log_message(
                 f"Filename: prefix='{filename_prefix}', suffix='{filename_suffix}'")
@@ -2021,7 +2210,8 @@ class VideoProcessingGUI(QMainWindow):
             filename_prefix=filename_prefix,
             filename_suffix=filename_suffix,
             input_extensions=input_extensions,
-            shard=getattr(self, '_shard', None)
+            shard=getattr(self, '_shard', None),
+            recover_damaged=self.recover_check.isChecked(),
         )
         self.worker.progress_update.connect(self.log_message)
         self.worker.file_progress.connect(self.update_file_progress)
