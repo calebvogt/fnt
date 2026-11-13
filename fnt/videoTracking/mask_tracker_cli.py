@@ -75,6 +75,9 @@ def add_inference_settings(g) -> None:
     g.add_argument("--conf", type=float, default=None, help="Confidence threshold.")
     g.add_argument("--max-disappear", dest="max_disappear", default=None, metavar="N",
                    help="Frames a track may go undetected before it ends: 'never' or N.")
+    g.add_argument("--frame-step", dest="frame_step", type=int, default=None, metavar="N",
+                   help="Detect and track every Nth frame (1 = every frame). Frame numbers "
+                        "and times stay the video's; e.g. 3 on 30 fps video = 10 per second.")
     g.add_argument("--iou", type=float, default=None, help="IoU threshold for matching.")
     g.add_argument("--matching", choices=["hungarian", "greedy"], default=None)
     g.add_argument("--resolution", default=None, metavar="PX",
@@ -98,7 +101,8 @@ def add_inference_settings(g) -> None:
 #: (flag, dest) of add_inference_settings's value flags, for settings_argv.
 _VALUE_FLAGS = [("--settings-from", "settings_from"), ("--parallel", "parallel"),
                 ("--max-objects", "max_objects"), ("--conf", "conf"),
-                ("--max-disappear", "max_disappear"), ("--iou", "iou"),
+                ("--max-disappear", "max_disappear"), ("--frame-step", "frame_step"),
+                ("--iou", "iou"),
                 ("--matching", "matching"), ("--resolution", "resolution"),
                 ("--infer-device", "infer_device"), ("--classifier", "classifier"),
                 ("--nc-threshold", "nc_threshold"), ("--cls-window", "cls_window"),
@@ -146,6 +150,7 @@ def inference_settings(args) -> Dict:
         "infer_device": "device", "masks": "use_masks", "tracked_video": "create_tracked_video",
         "save_masks": "save_masks", "preview": "show_preview", "nc_threshold": "nc_threshold",
         "cls_window": "cls_window", "min_bout": "min_bout", "uncertain_gap": "uncertain_gap",
+        "frame_step": "frame_step",
     }
     for a, k in flags.items():
         v = getattr(args, a, None)

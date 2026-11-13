@@ -881,15 +881,36 @@ class AnnotationPreviewWidget(QWidget):
         if obj is not None:
             self._combine(obj)
 
-    def _begin_stroke(self, ix: float, iy: float, erase: bool):
+    def _touches(self, obj: Dict, ix: float, iy: float, r: float) -> bool:
+        """Whether ``obj``'s mask has a pixel within ``r`` px of (ix, iy)."""
+        m = obj.get("mask")
+        if m is None:
+            return False
+        r = max(1, int(round(r)))
+        x, y = int(ix), int(iy)
+        y0, y1 = max(0, y - r), min(m.shape[0], y + r + 1)
+        x0, x1 = max(0, x - r), min(m.shape[1], x + r + 1)
+        if y0 >= y1 or x0 >= x1:
+            return False
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        return bool((m[y0:y1, x0:x1] & ((yy - y) ** 2 + (xx - x) ** 2 <= r * r)).any())
+
+    def _begin_stroke(self, ix: float, iy: float, erase: bool, new_object: bool = False):
         self._painting = True
         self._paint_erasing = erase
         self._stroke_snapshot = {"created": [], "snap": {}}
         if not erase:
-            # On a pending object: that one. Elsewhere: the object being edited
-            # (a stroke started just off it extended a new object, which then
-            # took the Eraser's focus); a new object only when none is.
-            target = self.object_at(ix, iy) or self.focus_object()
+            # On a pending object: that one. Touching the object being edited
+            # (within the brush, so a stroke started just off its edge extends
+            # it rather than starting a new object that then takes the Eraser's
+            # focus): that one. Anywhere else, or with Shift: a new object, so
+            # an animal next to the one being edited gets its own mask instead
+            # of being merged into it.
+            target = None if new_object else self.object_at(ix, iy)
+            if target is None and not new_object:
+                f = self.focus_object()
+                if f is not None and self._touches(f, ix, iy, self.brush_radius + 2):
+                    target = f
             if target is None:
                 target = self._new_object()
                 self._stroke_snapshot["created"].append(target["id"])
@@ -899,6 +920,10 @@ class AnnotationPreviewWidget(QWidget):
             # The Eraser works on the object being edited; with none, on the one
             # under the brush.
             target = self.focus_object() if self._focus_id is not None else None
+            if target is not None and not self._touches(target, ix, iy, self.brush_radius + 2):
+                # Off the object being edited: the one under the brush, if any
+                # (a Paint stroke beside it may have started a new object)
+                target = self.object_at(ix, iy) or target
             if target is None:
                 target = self.object_at(ix, iy)
             self._paint_target = target["id"] if target is not None else None
@@ -994,10 +1019,12 @@ class AnnotationPreviewWidget(QWidget):
                     return oi, pi
         return None
 
-    def _find_annotation_at(self, wx: float, wy: float) -> Optional[int]:
+    def _find_annotation_at(self, wx: float, wy: float, labels: bool = True) -> Optional[int]:
+        """The mask under widget point (wx, wy); with ``labels``, a mask's name
+        label (and its dot) picks it too."""
         pt = QPointF(wx, wy)
-        # A mask's name label (and its dot) picks it too.
-        for oi, rect in reversed(list(getattr(self, "_label_rects", {}).items())):
+        for oi, rect in (reversed(list(getattr(self, "_label_rects", {}).items()))
+                         if labels else ()):
             if oi < len(self.annotations) and rect.contains(pt):
                 return oi
         for oi in range(len(self.annotations) - 1, -1, -1):
@@ -1181,8 +1208,11 @@ class AnnotationPreviewWidget(QWidget):
                 self.update()
 
             elif self.drawing_mode in ("paint", "erase"):
-                self._edit_saved_mask_at(event.x(), event.y(), ix, iy)
-                self._begin_stroke(ix, iy, erase=self.drawing_mode == "erase")
+                shift = bool(event.modifiers() & Qt.ShiftModifier)
+                if not shift:
+                    self._edit_saved_mask_at(event.x(), event.y(), ix, iy)
+                self._begin_stroke(ix, iy, erase=self.drawing_mode == "erase",
+                                   new_object=shift and self.drawing_mode == "paint")
             elif self.drawing_mode == "ai":
                 # In SAM mode a click places a point (on release, so a drag
                 # still pans), as in MAD; see mouseReleaseEvent.
@@ -1197,7 +1227,10 @@ class AnnotationPreviewWidget(QWidget):
         edits it; clicking a saved mask with the Eraser used to do nothing."""
         if self.object_at(ix, iy) is not None or self._ai_objects:
             return          # a mask is being edited: strokes stay on it
-        idx = self._find_annotation_at(wx, wy)
+        # Only the mask itself, not its name label: on a small animal the label
+        # covers its neighbour, and painting that neighbour grabbed this mask
+        # and merged the two (2026-11-12, two voles side by side).
+        idx = self._find_annotation_at(wx, wy, labels=False)
         if idx is not None:
             self.edit_as_pending_requested.emit(idx)
 
@@ -4746,7 +4779,8 @@ class MaskTrackerWindow(QMainWindow):
             "Manual: click to place vertices, Enter to accept.\n"
             "SAM (M): click each mouse; a click on or near a pending one adds to\n"
             "  it (Shift+click = new one), right-click excludes; Enter saves each as\n"
-            "  its own mask. Paint (P) / Eraser (X): drag, wheel = brush size.\n"
+            "  its own mask. Paint (P) / Eraser (X): drag, wheel = brush size; a\n"
+            "  stroke away from the mask being edited starts a new one (Shift: always).\n"
             "  U undoes a click or stroke; Shift+right-click drops an object.\n"
             "Edit Mask (right-click a saved mask), or Paint / Eraser on it, brings\n"
             "  it back (dashed) to reshape; Enter saves and turns the tool off.\n"
@@ -6080,6 +6114,23 @@ class MaskTrackerWindow(QMainWindow):
         row2.addWidget(self.combo_track_disappear)
         row2.addWidget(QLabel("frames"))
         settings_vbox.addLayout(row2)
+
+        row_step = QHBoxLayout()
+        row_step.addWidget(QLabel("Analyse every:"))
+        self.spin_track_step = QSpinBox()
+        self.spin_track_step.setRange(1, 300)
+        self.spin_track_step.setValue(1)
+        self.spin_track_step.setStyleSheet(self._spin_style)
+        self.spin_track_step.setToolTip(
+            "Detect and track every Nth frame only (1 = every frame).\n"
+            "3 on a 30 fps video = 10 positions per second, about 3x faster.\n"
+            "Frame numbers and times in the trajectories stay the video's;\n"
+            "the tracked video shows the analysed frames at fps / N.\n"
+            "Max disappear then counts analysed frames."
+        )
+        row_step.addWidget(self.spin_track_step)
+        row_step.addWidget(QLabel("frame(s)"))
+        settings_vbox.addLayout(row_step)
 
         row3 = QHBoxLayout()
         row3.addWidget(QLabel("IoU threshold:"))
@@ -13336,6 +13387,7 @@ class MaskTrackerWindow(QMainWindow):
             "use_masks": self.chk_track_masks.isChecked(),
             "device": device,
             "save_masks": self.chk_save_masks.isChecked(),
+            "frame_step": self.spin_track_step.value(),
         }
 
         if self.chk_behavior_cls.isChecked():
@@ -13492,6 +13544,9 @@ class MaskTrackerWindow(QMainWindow):
         if "iou_match_threshold" in d:
             self.spin_track_iou.setValue(float(d["iou_match_threshold"]))
             note("iou_match_threshold")
+        if "frame_step" in d:
+            self.spin_track_step.setValue(max(1, int(d["frame_step"] or 1)))
+            note("frame_step")
         if "matching_algorithm" in d:
             for i in range(self.combo_track_matching.count()):
                 if self.combo_track_matching.itemText(i).lower().startswith(d["matching_algorithm"]):

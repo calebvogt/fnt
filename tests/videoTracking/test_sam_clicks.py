@@ -18,7 +18,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
-from PyQt5.QtCore import QEvent, QPoint, QPointF, Qt  # noqa: E402
+from PyQt5.QtCore import QEvent, QPoint, QPointF, QRectF, Qt  # noqa: E402
 from PyQt5.QtGui import QKeyEvent, QMouseEvent, QWheelEvent  # noqa: E402
 from PyQt5.QtWidgets import QApplication  # noqa: E402
 
@@ -296,6 +296,39 @@ def test_a_stroke_does_not_pull_in_a_saved_mask_while_one_is_edited():
     w._clear_drawing()
     drag_img(w, (70, 70), (75, 75))               # nothing being edited: it comes back
     assert pulled == [0]
+
+
+def test_painting_a_neighbour_does_not_grab_a_mask_by_its_label():
+    """Two voles side by side (2026-11-12): the first's name label lay over the
+    second, and a Paint stroke on the second brought the first back and merged
+    them. Only the mask itself picks a saved mask now."""
+    w, _ = preview("paint")
+    w.annotations.append(G.AnnotationObject(
+        [(50, 50), (70, 50), (70, 60), (50, 60)], "vole", ann_id=7, inferred=True))
+    w._label_rects = {0: QRectF(*w._img_to_widget(72, 50), 40, 30)}   # label beside it
+    pulled = []
+    w.edit_as_pending_requested.connect(pulled.append)
+    w.brush_radius = 2
+    drag_img(w, (75, 55), (85, 55))               # on the label, off the mask
+    assert pulled == [] and len(w._ai_objects) == 1      # a new object of its own
+    w._clear_drawing()
+    drag_img(w, (55, 55), (60, 55))               # on the mask itself: it comes back
+    assert pulled == [0]
+
+
+def test_a_stroke_away_from_the_edited_object_starts_a_new_one():
+    w, _ = preview("paint")
+    w.brush_radius = 2
+    w.add_pending_mask(blob(10, 10, 30, 30))      # vole 1 being edited
+    drag_img(w, (31, 20), (33, 20))               # just off its edge: extends it
+    assert len(w._ai_objects) == 1
+    drag_img(w, (60, 20), (70, 20))               # its neighbour: a new object
+    assert len(w._ai_objects) == 2
+    assert int(w._ai_objects[0]["mask"][:, 50:].sum()) == 0     # vole 1 unchanged there
+    x, y = w._img_to_widget(25, 25)               # Shift: new even on top of one
+    send(w, QEvent.MouseButtonPress, x, y, mods=Qt.ShiftModifier)
+    send(w, QEvent.MouseButtonRelease, x, y, mods=Qt.ShiftModifier)
+    assert len(w._ai_objects) == 3
 
 
 if __name__ == "__main__":

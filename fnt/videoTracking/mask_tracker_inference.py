@@ -45,6 +45,12 @@ class MaskInferenceConfig:
     # identity swap or re-running behavior classification means re-detecting
     # the whole video.
     save_masks: bool = True
+    # Detect and track every Nth frame only (1: every frame). The frames in
+    # between are read but not analysed, so frame numbers and times stay those
+    # of the video; trajectories hold the analysed frames, and the tracked
+    # video plays them at fps / N (same length as the source).
+    # max_disappeared_frames counts analysed frames.
+    frame_step: int = 1
 
 
 _SYSTEM_PROFILE_CACHE: Optional[Dict] = None
@@ -867,9 +873,11 @@ def run_inference_on_video(
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 
+        step = max(1, int(getattr(config, "frame_step", 1) or 1))
         rec.update(frames=total_frames, fps=fps, width=w, height=h)
         print(f"[MTT Inference] Video: {os.path.basename(video_path)}")
-        print(f"[MTT Inference]   {total_frames} frames, {fps:.1f} fps, {w}x{h}")
+        print(f"[MTT Inference]   {total_frames} frames, {fps:.1f} fps, {w}x{h}"
+              + (f", every {step}th frame analysed ({fps / step:.2f} per s)" if step > 1 else ""))
         print(f"[MTT Inference]   confidence={config.confidence_threshold}, "
               f"max_detections={config.max_detections}, "
               f"max_disappear={'never' if config.max_disappeared_frames == 0 else config.max_disappeared_frames}, "
@@ -884,7 +892,7 @@ def run_inference_on_video(
         writer = None
         if create_tracked_video:
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(annotated_path, fourcc, fps, (w, h))
+            writer = cv2.VideoWriter(annotated_path, fourcc, fps / step, (w, h))
 
         if config.save_masks:
             from .track_store import TrackMaskWriter, tracks_path_for
@@ -915,6 +923,15 @@ def run_inference_on_video(
                 break
 
             t0 = time.time()
+            if step > 1 and frame_idx % step:
+                # Between analysed frames: decoded (the codec needs it) but
+                # not converted, detected or drawn.
+                if not cap.grab():
+                    break
+                frame_idx += 1
+                if progress:
+                    progress(frame_idx, total_frames)
+                continue
             ret, frame = cap.read()
             if not ret:
                 break
@@ -948,7 +965,7 @@ def run_inference_on_video(
                 writer.write(annotated)
             t5 = time.time()
 
-            if frame_callback and (frame_idx % 3 == 0 or frame_idx == 0):
+            if frame_callback and ((frame_idx // step) % 3 == 0 or frame_idx == 0):
                 annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
                 frame_callback(annotated_rgb, frame_idx)
 

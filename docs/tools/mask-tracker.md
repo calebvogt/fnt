@@ -220,8 +220,15 @@ Folders are searched recursively. The project is the one the model folder is in
 (`--project` for a model kept elsewhere). Every Inference setting has a flag
 (`--masks`/`--no-masks`, `--tracked-video`/`--no-tracked-video`,
 `--save-masks`, `--preview`, `--infer-device`, `--resolution`, `--max-disappear`,
-`--iou`, `--matching`, `--classifier` and its four settings); one not given keeps
-the tab's value. Videos that already have a `<video>_MaskTracker` folder are left
+`--frame-step`, `--iou`, `--matching`, `--classifier` and its four settings); one
+not given keeps the tab's value.
+
+**Analyse every Nth frame** (`--frame-step N`, default 1) detects and tracks
+only every Nth frame: 3 on 30 fps video gives 10 positions per second at about a
+third of the model time (every frame is still decoded). Frame numbers and
+`time_s` in `trajectories.csv` stay the video's, speeds use the real time between
+analysed frames, and the tracked video shows the analysed frames at fps / N, so it
+keeps the source's length. **Max disappear** then counts analysed frames. Videos that already have a `<video>_MaskTracker` folder are left
 out; `--redo` tracks them again after moving their old folders to
 `_TO_DELETE_tracking/` beside them. `--quit-when-done` closes the window at
 the end.

@@ -115,6 +115,29 @@ def test_tracking_folders_never_count_as_videos(tracked, tmp_path):
     assert R.find_track_videos([str(tmp_path)]) == [video]
 
 
+# --- every Nth frame ------------------------------------------------------------
+
+def test_every_nth_frame_keeps_the_video_frame_numbers(monkeypatch, tmp_path):
+    monkeypatch.setattr(MI, "MaskRCNNInference", _FakeModel)
+    monkeypatch.setattr(MI, "_detect_architecture", lambda d: "maskrcnn")
+    video = str(tmp_path / "cam1.avi")
+    make_video(video)
+    cfg = MI.MaskInferenceConfig(confidence_threshold=0.4, max_detections=1, use_masks=True,
+                                 save_masks=False, frame_step=3)
+    res = MI.run_inference_on_video(video, str(tmp_path / "model"), cfg, create_tracked_video=True)
+    import pandas as pd
+    df = pd.read_csv(res["csv_path"])
+    # analysed: frames 0, 3, 6, 9 (the model's 4th call, frame 9, finds nothing)
+    assert sorted(df["frame"]) == [0, 3, 6]
+    assert list(df["time_s"]) == pytest.approx([0.0, 0.2, 0.4])          # 15 fps video
+    assert df["speed"].dropna().gt(0).all()
+    rec = R.read_run_settings(res["output_dir"])
+    assert rec["frames_processed"] == N_FRAMES and rec["settings"]["frame_step"] == 3
+    cap = cv2.VideoCapture(res["annotated_video"])
+    assert int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) == 4 and cap.get(cv2.CAP_PROP_FPS) == pytest.approx(5)
+    cap.release()
+
+
 # --- settings from the command line ---------------------------------------------
 
 def _track_args(argv):
@@ -126,13 +149,13 @@ def test_every_setting_has_a_flag():
                      "--iou", "0.4", "--matching", "greedy", "--resolution", "512",
                      "--infer-device", "cuda", "--no-masks", "--no-tracked-video",
                      "--save-masks", "--no-preview", "--classifier", "none",
-                     "--parallel", "auto"])
+                     "--parallel", "auto", "--frame-step", "3"])
     d = C.inference_settings(a)
     assert d == {"confidence_threshold": 0.6, "max_detections": 2, "max_disappeared_frames": 0,
                  "iou_match_threshold": 0.4, "matching_algorithm": "greedy", "inference_size": 512,
                  "device": "cuda", "use_masks": False, "create_tracked_video": False,
                  "save_masks": True, "show_preview": False, "classifier_dir": None,
-                 "parallel": "auto"}
+                 "parallel": "auto", "frame_step": 3}
     assert C.inference_settings(_track_args([])) == {}       # nothing given: the tab's values
 
 
@@ -217,7 +240,7 @@ def test_settings_go_into_the_inference_tab(monkeypatch):
         "confidence_threshold": 0.65, "max_detections": 1, "max_disappeared_frames": 45,
         "iou_match_threshold": 0.25, "matching_algorithm": "greedy", "inference_size": 512,
         "device": "cpu", "use_masks": True, "save_masks": False, "create_tracked_video": False,
-        "show_preview": False, "classifier_dir": None, "parallel": "3"})
+        "show_preview": False, "classifier_dir": None, "parallel": "3", "frame_step": 3})
     assert win.spin_track_confidence.value() == pytest.approx(0.65)
     assert win.spin_track_max_det.value() == 1
     assert win.combo_track_disappear.currentText() == "45"
@@ -227,6 +250,7 @@ def test_settings_go_into_the_inference_tab(monkeypatch):
     assert win.chk_track_masks.isChecked() and not win.chk_save_masks.isChecked()
     assert not win.chk_create_tracked_video.isChecked() and not win.chk_inference_preview.isChecked()
     assert win.chk_parallel_videos.isChecked() and win.spin_parallel_videos.value() == 3
+    assert win.spin_track_step.value() == 3
     win.close()
 
 
