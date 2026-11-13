@@ -10991,8 +10991,16 @@ class MADMainWindow(QMainWindow):
             # (each decision widens it, so it is re-read every time), then move
             # on through the queue -- not through this recording's other
             # detections; the end-of-file prompt is for per-recording review.
-            if self._auto_advance and was_pending:
-                left = self._queue_window_pending()
+            # Re-deciding the queued call itself counts too: a queue of earlier
+            # decisions to check (2026-11-09, flipping Sophia's labels) is
+            # worked through by flipping them, and each flip is that item done.
+            is_queued = decided_id == getattr(self, '_call_queue_ann_id', None)
+            if self._auto_advance and (was_pending or is_queued):
+                # A judging-only queue (--no-window-walk: e.g. scoring two
+                # models' disagreements) wants each decision to move straight
+                # to the next queued call; its neighbours are not being taught.
+                left = (self._queue_window_pending()
+                        if getattr(self, '_queue_window_walk', True) else [])
                 if left:
                     self._queue_window_mode = True
                     self._center_and_select_ann(left[0])
@@ -16015,9 +16023,24 @@ class MADMainWindow(QMainWindow):
             self.spectrogram.queue_ann_id = None
             self.spectrogram._selected_ann_idx = None
             self.spectrogram.update()
-            self.status_bar.showMessage(
-                f"Call {self._call_queue_pos + 1}/{n}: detection {bid} is no "
-                f"longer in {os.path.basename(path)} — Next (N) moves on")
+            # The queued detection was deleted (e.g. as a harmonic sliver): go on
+            # to the next call in the direction of travel rather than leaving an
+            # empty selection on the recording's start (2026-11-09: reopening on
+            # a deleted call showed no call at all).
+            step = getattr(self, '_queue_dir', 1)
+            nxt = self._call_queue_pos + step
+            if 0 <= nxt < n:
+                self.status_bar.showMessage(
+                    f"Call {self._call_queue_pos + 1}/{n}: detection {bid} was "
+                    f"deleted — on to call {nxt + 1}")
+                QTimer.singleShot(0, lambda p=nxt: self._queue_goto(p))
+            else:
+                self.status_bar.showMessage(
+                    f"Call {self._call_queue_pos + 1}/{n}: detection {bid} is no "
+                    f"longer in {os.path.basename(path)}")
+            self._mark_queue_row()
+            self._update_view_header()
+            return
         else:
             self._call_queue_ann_id = anns[idx].get('id')
             self.spectrogram.queue_ann_id = self._call_queue_ann_id
@@ -16026,6 +16049,22 @@ class MADMainWindow(QMainWindow):
                 f"Call {self._call_queue_pos + 1}/{n}: "
                 f"{os.path.basename(path)}, detection {bid}"
                 + (f" — {note}" if note else ""))
+            # Back on a queued call that was decided in an earlier session (or
+            # before Back/Next): its training-window walk resumes where it was
+            # left, so the pending neighbours are selected one by one and their
+            # decisions move on through the window, then the queue (2026-11-09:
+            # reopening left the walk off -- nothing selected, decisions on the
+            # neighbours advanced through the recording instead).
+            left = (self._queue_window_pending()
+                    if self._auto_advance
+                    and getattr(self, '_queue_window_walk', True) else [])
+            if left:
+                self._queue_window_mode = True
+                self._center_and_select_ann(left[0])
+                self.status_bar.showMessage(
+                    f"Call {self._call_queue_pos + 1}/{n} is decided; "
+                    f"{len(left)} pending detection(s) left in its training "
+                    "window (Skip leaves them as background and moves on)")
         self._mark_queue_row()
         self._update_view_header()
         self._update_pred_review_widgets()
@@ -16337,6 +16376,7 @@ class MADMainWindow(QMainWindow):
         one still undecided, if any. Back (-1) steps one call, decided or not,
         so earlier decisions can be revisited."""
         n = len(self._call_queue)
+        self._queue_dir = 1 if step >= 0 else -1   # a deleted queued call is passed over this way
         if step < 0:
             pos = self._call_queue_pos + step
             if pos >= 0:
@@ -19866,6 +19906,29 @@ class MADMainWindow(QMainWindow):
         self._delete_annotation(sel)
         self._log("Deleted detection")
         self.status_bar.showMessage("Deleted detection (D)")
+        # In a call queue, deleting the queued call or a pending call during its
+        # training-window walk continues the walk, then the queue -- like
+        # Accept / Reject (2026-11-09: Delete jumped to the recording's next
+        # pending detection, outside the window).
+        deleted_queued = (ann.get('id') is not None
+                          and ann.get('id') == getattr(self, '_call_queue_ann_id', None))
+        if (self._queue_active() and self._auto_advance and was_pending
+                and (deleted_queued or getattr(self, '_queue_window_mode', False))):
+            self._reviewed_count += 1
+            left = ([] if deleted_queued
+                    or not getattr(self, '_queue_window_walk', True)
+                    else self._queue_window_pending())
+            if left:
+                self._queue_window_mode = True
+                self._center_and_select_ann(left[0])
+                self._update_view_header()
+                self.status_bar.showMessage(
+                    f"Deleted detection (D) — {len(left)} pending detection(s) "
+                    "left in the training window")
+            else:
+                self._queue_window_mode = False
+                self._queue_step(+1)
+            return
         # Advance only when Auto-advance is ON (jump to the next pending). When
         # OFF, stay put — don't move/recenter; just clear the now-stale
         # selection so Back (B) / Next (N) drive navigation.
@@ -22577,6 +22640,13 @@ def _launch_parser():
                         "paths, bare filenames, and/or .txt files listing "
                         "them one per line. The project keeps every "
                         "recording; File > Show All Recordings returns.")
+    p.add_argument("--no-window-walk", action="store_true",
+                   help="With a call-queue --focus: Accept / Reject move "
+                        "straight to the next queued call, without first "
+                        "walking the pending detections in the decided call's "
+                        "training window. For judging-only queues (e.g. two "
+                        "models' disagreements) whose neighbours are not "
+                        "being labelled for training.")
     g = p.add_argument_group(
         "post-training inference",
         "Detection settings for --infer-after, set in the panel before the "
@@ -22675,6 +22745,7 @@ def main(argv=None):
                 path = os.path.join(path, PROJECT_INFO_FILENAME)
             win._open_project_from_path(path)
             if args.focus and win._project is not None:
+                win._queue_window_walk = not args.no_window_walk
                 shown, missing = win.focus_recordings(args.focus)
                 msg = f"Focus: {shown} recording(s)"
                 if missing:

@@ -360,6 +360,28 @@ def _bbox_from_meta(meta):
     return f0, f1, t0, t1
 
 
+def _replace_with_retry(src: str, dst: str, attempts: int = 20,
+                        delay_s: float = 1.5) -> None:
+    """``os.replace`` that waits out a brief lock on ``dst``.
+
+    On Windows the swap fails with WinError 5 while any process holds the old
+    store open, even just to read it — another MAD window, an inference run on
+    the same project, or a virus scanner on the share. Those reads last a
+    moment, so retry for ~30 s before giving up; a store that stays locked
+    still raises, leaving the previous store in place.
+    """
+    import os
+    import time
+    for i in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == attempts - 1:
+                raise
+            time.sleep(delay_s)
+
+
 def rebuild_training_store(training_data_dir: str, wav_paths) -> int:
     """Rebuild the consolidated training store from the per-recording sidecars.
 
@@ -430,7 +452,7 @@ def rebuild_training_store(training_data_dir: str, wav_paths) -> int:
                 f"{len(failed)} label(s) could not be copied. "
                 f"First error — {failed[0]}")
         if n:
-            os.replace(tmp, store)      # atomic swap; old store until now
+            _replace_with_retry(tmp, store)  # atomic swap; old store until now
         else:
             _drop_tmp()
             if os.path.isfile(store):

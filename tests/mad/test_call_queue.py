@@ -192,6 +192,101 @@ def test_skip_leaves_the_training_window_and_moves_on():
     assert selected(w) == ("rec2.wav", "3") and not w._queue_window_mode
 
 
+def test_returning_to_a_decided_queued_call_resumes_its_window_walk():
+    """2026-11-09: the queue reopened on a call decided last session whose
+    training window still held a pending detection; nothing was selected and
+    deciding the neighbour moved through the recording, not the queue."""
+    w, wavs, root = make([600, 700, 1600])
+    q = queue_file(root, wavs, [(0, 1, ""), (2, 3, "")])
+    w._settings.remove(f"mad/call_queue_pos/{os.path.normcase(os.path.abspath(q))}")
+    w.focus_recordings([q])
+    settle(w)
+    w._auto_advance = True
+    w._reject_current_pred()                          # queued call decided ...
+    settle(w)
+    assert selected(w) == ("rec0.wav", "2")
+    w._queue_goto(1)                                  # ... left without its window
+    settle(w)
+    w._queue_goto(0)                                  # back, as on reopening
+    settle(w)
+    assert selected(w) == ("rec0.wav", "2") and w._queue_window_mode
+    w._accept_current_pred()
+    settle(w)
+    assert selected(w) == ("rec2.wav", "3") and w._call_queue_pos == 1
+
+
+def test_flipping_an_already_decided_queued_call_moves_on():
+    """2026-11-09: a queue of earlier decisions to check (Sophia's labels);
+    flipping the queued call's decision is that item done, so it moves on."""
+    w, wavs, root = make([600, 1600])
+    q = queue_file(root, wavs, [(0, 1, ""), (2, 2, "")])
+    w._settings.remove(f"mad/call_queue_pos/{os.path.normcase(os.path.abspath(q))}")
+    w.focus_recordings([q])
+    settle(w)
+    w._auto_advance = True
+    w._reject_current_pred()                          # an earlier labeller's decision
+    settle(w)
+    assert selected(w) == ("rec2.wav", "2")
+    w._queue_goto(0)
+    settle(w)
+    assert selected(w) == ("rec0.wav", "1")
+    w._accept_current_pred()                          # the flip
+    settle(w)
+    assert selected(w) == ("rec2.wav", "2") and w._call_queue_pos == 1
+
+
+def test_deleting_inside_the_window_walk_stays_in_the_walk_then_the_queue():
+    """2026-11-09: Delete (D) on a pending call during the window walk jumped
+    to the recording's next pending detection, outside the window."""
+    w, wavs, root = make([600, 700, 1600])
+    q = queue_file(root, wavs, [(0, 1, ""), (2, 3, "")])
+    w._settings.remove(f"mad/call_queue_pos/{os.path.normcase(os.path.abspath(q))}")
+    w.focus_recordings([q])
+    settle(w)
+    w._auto_advance = True
+    w._reject_current_pred()                          # queued call decided
+    settle(w)
+    assert selected(w) == ("rec0.wav", "2")           # its window neighbour
+    w._delete_selected_annotation()                   # delete the sliver
+    settle(w)
+    assert selected(w) == ("rec2.wav", "3") and w._call_queue_pos == 1   # not rec0's blob 3
+
+
+def test_a_deleted_queued_call_is_passed_over_in_the_direction_of_travel():
+    """2026-11-09: the queue reopened on a call deleted last session and
+    showed nothing selected. Opening (or Next) moves on past it; Back moves
+    back past it."""
+    w, wavs, root = make([600, 1600])
+    q = queue_file(root, wavs, [(0, 1, ""), (1, 9, ""), (2, 2, "")])   # blob 9: no such detection
+    w._settings.remove(f"mad/call_queue_pos/{os.path.normcase(os.path.abspath(q))}")
+    w.focus_recordings([q])
+    settle(w)
+    assert selected(w) == ("rec0.wav", "1")
+    w._pred_next()
+    settle(w); settle(w)
+    assert selected(w) == ("rec2.wav", "2") and w._call_queue_pos == 2
+    w._pred_prev()
+    settle(w); settle(w)
+    assert selected(w) == ("rec0.wav", "1") and w._call_queue_pos == 0
+
+
+def test_no_window_walk_moves_straight_to_the_next_queued_call():
+    """--no-window-walk (judging-only queues, 2026-11-09): a decision goes
+    straight to the next queued call even with pending neighbours in the
+    decided call's training window."""
+    w, wavs, root = make([600, 700, 1600])
+    q = queue_file(root, wavs, [(0, 1, ""), (2, 3, "")])
+    w._settings.remove(f"mad/call_queue_pos/{os.path.normcase(os.path.abspath(q))}")
+    w._queue_window_walk = False
+    w.focus_recordings([q])
+    settle(w)
+    w._auto_advance = True
+    w._reject_current_pred()
+    settle(w)
+    assert selected(w) == ("rec2.wav", "3") and not w._queue_window_mode
+    w._queue_window_walk = True
+
+
 def test_the_position_is_remembered():
     w, wavs, root = make()
     q = queue_file(root, wavs, [(0, 1, ""), (1, 1, ""), (2, 1, "")])
