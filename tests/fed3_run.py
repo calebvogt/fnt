@@ -821,13 +821,15 @@ def fault_checks(root):
     world.run_for(40)
     check("a low battery is flagged", ("FED021", "battery") in problems(world),
           f"{problems(world)}")
-    before = world.engine.snapshot()["published"]
+    # A new snapshot, not a later "published": that's real time, and Windows'
+    # clock can show the same value for all five steps.
+    before = world.engine.snapshot()
     real = world.engine._check_problems
     world.engine._check_problems = lambda: 1 / 0
     world.run_for(5)
     snap = world.engine.snapshot()
     check("an error in a step is shown as a problem, and the snapshot still goes out",
-          ("", "engine") in problems(world) and snap["published"] > before)
+          ("", "engine") in problems(world) and snap is not before)
     world.engine._check_problems = real
     world.run_for(5)
     check("and clears when the steps work again", ("", "engine") not in problems(world))
