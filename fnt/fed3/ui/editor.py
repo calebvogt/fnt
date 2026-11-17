@@ -3,9 +3,12 @@
 The file is the protocol, so the editor edits the file. A form covers the
 common settings of a phase without typing YAML: **Add phase** writes a new
 one, **Edit phase** reads one back into the form and rewrites it, and
-**Remove phase** deletes one. Everything else (rotation, daily windows, named
-rules) is written in the text, with problems reported against their line as
-you go; the form says so rather than touch a phase it can't show in full.
+**Remove phase** deletes one. With several FED3s the form also sets each one's
+active poke, ratio and reward, written as the phase's ``per_device``. **Devices**
+rewrites the file's list of FED3s, and templates take that list. Everything
+else (rotation, daily windows, named rules) is written in the text, with
+problems reported against their line as you go; the form says so rather than
+touch a phase it can't show in full.
 """
 import json
 import re
@@ -17,9 +20,9 @@ from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QFont, QTextCursor
 from PyQt5.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
-    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
-    QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QSplitter, QVBoxLayout,
-    QWidget,
+    QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSpinBox,
+    QSplitter, QVBoxLayout, QWidget,
 )
 
 from .. import protocol as proto
@@ -44,6 +47,10 @@ END_AMOUNTS = {"after": "24h", "at": "19:00", "rewards": "100", "pokes": "500",
 FLASH_TARGETS = ["poke", "bar", "pokes", "poke_l", "poke_r"]
 COLOURS = list(proto.BUILTIN_COLORS)
 CLICK_SLOTS = ("counted", "timeout", "depleted")
+ACTIVE = ["both", "left", "right", "none"]
+RATIO_KINDS = ["fixed", "random", "progressive"]
+# What the form sets for one FED3 (the phase's `only`); the rest is in the text.
+ONLY_KEYS = ("active", "ratio_kind", "ratio", "reward")
 
 # What a phase means when it doesn't say: the rule defaults (design.md, Part 1).
 RULE_DEFAULTS = {
@@ -58,8 +65,10 @@ RULE_DEFAULTS = {
 NEW_PHASE = dict(RULE_DEFAULTS, name="New phase", ends="after", amount="24h",
                  fallback="7d", day=0, side="any", active="both")
 
-# The classic FED3 reward cue: a 4 kHz tone and the blue light.
-CLASSIC_CUE = {"tone": True, "flash": True, "flash_target": "bar", "flash_ms": 1000}
+# The classic FED3 reward cue, the protocol's built-in `classic`: a 4 kHz tone
+# and the blue light bar.
+CLASSIC_CUE = {"tone": True, "tone_hz": 4000, "tone_ms": 200, "flash": True,
+               "flash_target": "bar", "flash_color": "blue", "flash_ms": 1000}
 
 
 def _plain(text):
@@ -91,7 +100,7 @@ def _seconds(text):
 
 REWARD_ENDS = ("rewards", "all_rewards")
 EACH_ENDS = ("rewards", "pokes")         # each device on its own
-V2_KEYS = proto.KEY_NAMES[proto.FORMAT]
+CURRENT_KEYS = proto.KEY_NAMES[proto.FORMAT]
 
 
 def syntax_of(text):
@@ -103,7 +112,7 @@ def syntax_of(text):
         doc = None
     doc = doc if isinstance(doc, dict) else {}
     fmt = doc.get("format")
-    keys = proto.KEY_NAMES.get(fmt, V2_KEYS) if isinstance(fmt, str) else V2_KEYS
+    keys = proto.KEY_NAMES.get(fmt, CURRENT_KEYS) if isinstance(fmt, str) else CURRENT_KEYS
     devices = doc.get("devices")
     return keys, isinstance(devices, list) and len(devices) > 1
 
@@ -113,13 +122,21 @@ def can_earn(s):
     return not s["free_feed"] and s["active"] != "none"
 
 
+def every_poke_earns(s):
+    """Whether every counted poke is a reward, on every FED3: FR1 throughout."""
+    return all(rule.get("ratio_kind", s["ratio_kind"]) == "fixed"
+               and rule.get("ratio", s["ratio"]) == 1
+               for rule in [{}, *s.get("only", {}).values()])
+
+
 def coherent(s):
     """The settings with everything that can't apply taken out.
 
     Free feeding keeps a pellet in the well, so no poke is active and nothing
     is earned; with nothing earned the ratio, timeout, quota, reward and its
-    cues mean nothing. A click needs the thing it marks: a counted poke that
-    isn't yet a reward, a timeout, a quota.
+    cues mean nothing, and neither do per-device changes to them. A FED3's
+    change that matches the shared rule is no change. A click needs the thing
+    it marks: a counted poke that isn't yet a reward, a timeout, a quota.
     """
     s = dict(s)
     if s["free_feed"]:
@@ -130,7 +147,15 @@ def coherent(s):
                  click_counted=False, click_timeout=False, click_depleted=False)
     if s["ratio_kind"] == "progressive":
         s["ratio"] = 1
-    if s["ratio_kind"] == "fixed" and s["ratio"] == 1:
+    only = {}
+    for name, rule in (s.get("only") or {}).items() if can_earn(s) else ():
+        rule = {k: v for k, v in rule.items() if k in ONLY_KEYS and v != s[k]}
+        if rule.get("ratio_kind", s["ratio_kind"]) == "progressive":
+            rule.pop("ratio", None)
+        if rule:
+            only[name] = rule
+    s["only"] = only
+    if every_poke_earns(s):
         s["click_counted"] = False          # every counted poke is a reward
     if not s["timeout"]:
         s["click_timeout"] = False
@@ -139,17 +164,39 @@ def coherent(s):
     return s
 
 
-def phase_yaml(s, indent=2, keys=V2_KEYS, several=False):
+def ratio_text(kind, ratio):
+    """A ratio as the file writes it: ``FR5``, ``RR3`` or ``PR``."""
+    return "PR" if kind == "progressive" else f"{'RR' if kind == 'random' else 'FR'}{ratio}"
+
+
+def _cue_actions(s):
+    """The reward cue's actions, as the file writes them."""
+    actions = []
+    if s["tone"]:
+        actions.append(f"tone: {{hz: {s['tone_hz']}, ms: {s['tone_ms']}}}")
+    if s["flash"]:
+        actions.append(f"flash: {{target: {s['flash_target']}, color: {s['flash_color']}, "
+                       f"ms: {s['flash_ms']}}}")
+    if s["bnc"]:
+        actions.append(f"bnc: {{width: {s['bnc_width']}, hz: {s['bnc_hz']}, "
+                       f"count: {s['bnc_count']}}}")
+    return actions
+
+
+def phase_yaml(s, indent=2, keys=CURRENT_KEYS, several=False, base=None):
     """One phase list item, from the form's settings. ``keys`` are the key
     names of the file's format; ``several`` says the protocol has more than one
-    device, so an end on counts is written as each device's own."""
+    device, so an end on counts is written as each device's own. ``base`` is
+    what the phase starts from (the file's every_phase): only what differs
+    from it is written, apart from the active poke."""
     s = coherent(s)
+    base = base or RULE_DEFAULTS
     pad = " " * indent
     lines = [f"{pad}- name: {_plain(s['name'].strip() or 'New phase')}"]
     amount = str(s.get("amount", "")).strip().strip('"\'')
     day = f", day: {s['day']}" if s.get("day") else ""
     side = f", side: {s['side']}" if s.get("side", "any") != "any" else ""
-    each = ", of: each" if several and keys == V2_KEYS else ""     # format 1 had no each
+    each = ", of: each" if several and keys["of"] == "of" else ""     # format 1 had no each
     until = {
         "after": f"{{after: {_plain(amount)}}}",
         "at": f"{{at: {json.dumps(amount)}{day}}}",
@@ -163,56 +210,87 @@ def phase_yaml(s, indent=2, keys=V2_KEYS, several=False):
         until = (f"[{every}, {{after: {_plain(fallback)}}}]" if fallback else every)
     if until:
         lines.append(f"{pad}  until: {until}")
-    rule = [f"active: {s['active']}"]
-    if s["ratio_kind"] != "fixed":
-        rule.append(f"ratio_kind: {s['ratio_kind']}")
-    if s["ratio"] != 1 and s["ratio_kind"] != "progressive":
-        rule.append(f"ratio: {s['ratio']}")
-    if s["timeout"]:
-        rule.append(f"timeout: {sch.format_seconds(s['timeout'])}")
-    if s["quota"]:
-        rule.append(f"quota: {s['quota']}")
-        rule.append(f"quota_period: {_plain(str(s['quota_period']).strip() or '1h')}")
-    if s["free_feed"]:
-        rule.append("free_feed: 1")
-    if s["reward"] == "none":
-        rule.append("reward: none")
-    actions = []
-    if s["tone"]:
-        actions.append(f"tone: {{hz: {s['tone_hz']}, ms: {s['tone_ms']}}}")
-    if s["flash"]:
-        actions.append(f"flash: {{target: {s['flash_target']}, color: {s['flash_color']}, "
-                       f"ms: {s['flash_ms']}}}")
-    if s["bnc"]:
-        actions.append(f"bnc: {{width: {s['bnc_width']}, hz: {s['bnc_hz']}, "
-                       f"count: {s['bnc_count']}}}")
-    cues = []
-    if actions:
-        cues.append("reward:")
-        cues += [f"  - {action}" for action in actions]
-    cues += [f"{slot}: [click]" for slot in CLICK_SLOTS if s[f"click_{slot}"]]
+    rule, cues = [f"active: {s['active']}"], []
+    if s["free_feed"] != base["free_feed"]:
+        rule.append(f"free_feed: {int(s['free_feed'])}")
+    if can_earn(s):         # otherwise nothing is earned, and the rest doesn't matter
+        ratio = ratio_text(s["ratio_kind"], s["ratio"])
+        if ratio != ratio_text(base["ratio_kind"], base["ratio"]):
+            rule.append(f"ratio: {ratio}")
+        if s["timeout"] != base["timeout"]:
+            rule.append(f"timeout: {sch.format_seconds(s['timeout'])}")
+        if s["quota"] != base["quota"] or (s["quota"] and s["quota_period"] != base["quota_period"]):
+            rule.append(f"quota: {s['quota']}")
+            if s["quota"]:
+                rule.append(f"quota_period: {_plain(str(s['quota_period']).strip() or '1h')}")
+        if s["reward"] != base["reward"]:
+            rule.append(f"reward: {s['reward']}")
+        actions = _cue_actions(s)
+        if actions != _cue_actions(base):
+            if actions == _cue_actions(dict(RULE_DEFAULTS, **CLASSIC_CUE)):
+                cues.append("reward: classic")
+            elif actions:
+                cues.append("reward:")
+                cues += [f"  - {action}" for action in actions]
+            else:
+                cues.append("reward: none")
+        cues += [f"{slot}: {'[click]' if s[f'click_{slot}'] else 'none'}"
+                 for slot in CLICK_SLOTS if s[f"click_{slot}"] != base[f"click_{slot}"]]
     lines.append(f"{pad}  {keys['rule']}:")
     lines += [f"{pad}    {line}" for line in rule]
     if cues:
         lines.append(f"{pad}    cue:")
         lines += [f"{pad}      {line}" for line in cues]
+    # FED3s given the same change share one key: "FED002, FED003: {ratio: RR3}".
+    groups = {}
+    for name, change in s["only"].items():
+        written = []
+        if "active" in change:
+            written.append(f"active: {change['active']}")
+        if {"ratio_kind", "ratio"} & set(change):
+            written.append("ratio: " + ratio_text(change.get("ratio_kind", s["ratio_kind"]),
+                                                  change.get("ratio", s["ratio"])))
+        if "reward" in change:
+            written.append(f"reward: {change['reward']}")
+        groups.setdefault(", ".join(written), []).append(name)
+    if groups:
+        lines.append(f"{pad}  {keys['only']}:")
+        lines += [f"{pad}    {', '.join(names)}: {{{written}}}"
+                  for written, names in groups.items()]
     return "\n".join(lines) + "\n"
 
 
-def settings_from_phase(mapping, keys=V2_KEYS):
+def every_phase_of(text):
+    """What each phase starts from, as form settings, and what of the file's
+    every_phase the form can't show (then the form can't write phases for it)."""
+    base, missing = dict(RULE_DEFAULTS), []
+    try:
+        doc = yaml.load(text, Loader=proto._Loader)   # noqa: S506 - a SafeLoader
+    except yaml.YAMLError:
+        return base, missing
+    rule = doc.get("every_phase") if isinstance(doc, dict) else None
+    if isinstance(rule, dict):
+        _read_rule(rule, base, missing)
+    elif rule is not None:
+        missing.append(f"every_phase: {_flow(rule)}")
+    return base, [f"the protocol's every_phase ({m})" for m in missing]
+
+
+def settings_from_phase(mapping, keys=CURRENT_KEYS, devices=None, base=None):
     """Read a phase back into the form: ``(settings, what the form can't show)``.
 
     ``mapping`` is the phase as YAML read it, written with the key names
-    ``keys``. The second value lists what the form would lose; the phase can be
-    edited in the form only when it's empty.
+    ``keys``; ``devices`` is the file's list of FED3s, and ``base`` what each
+    phase starts from (see every_phase_of). The second value lists what the
+    form would lose; the phase can be edited in the form only when it's empty.
     """
-    s = dict(RULE_DEFAULTS, ends="never", amount="", fallback="", day=0, side="any")
+    s = dict(base or RULE_DEFAULTS, ends="never", amount="", fallback="", day=0,
+             side="any", only={})
     missing = []
     if not isinstance(mapping, dict):
         return s, ["it isn't written as a mapping"]
     s["name"] = str(mapping.get("name", ""))
-    for key, what in ((keys["only"], "per-device rules"), ("rotate", "a rotation"),
-                      ("daily", "daily windows")):
+    for key, what in (("rotate", "a rotation"), ("daily", "daily windows")):
         if key in mapping:
             missing.append(what)
     _read_until(mapping.get("until"), s, missing, keys["of"])
@@ -223,7 +301,38 @@ def settings_from_phase(mapping, keys=V2_KEYS):
         _read_rule(rule, s, missing)
     else:
         missing.append("its rule")
+    if keys["only"] in mapping:
+        _read_only(mapping[keys["only"]], s, missing, devices or [])
     return s, missing
+
+
+def _read_only(only, s, missing, devices):
+    """Per-device changes the form can show: ``ONLY_KEYS``, for FED3s in ``devices``."""
+    if not isinstance(only, dict):
+        missing.append("its per-device rules")
+        return
+    if not can_earn(s):
+        missing.append("per-device rules in a phase where no poke is active")
+        return
+    for key, rule in only.items():
+        names = [str(n).strip() for n in
+                 (key if isinstance(key, (list, tuple)) else str(key).split(","))]
+        who = ", ".join(names)
+        if not isinstance(rule, dict) or set(rule) - set(ONLY_KEYS):
+            missing.append(f"the rule for {who}, {_flow(rule)}")
+            continue
+        outside = [name for name in names if name not in devices]
+        if outside:
+            missing.append(f"a rule for {', '.join(outside)}, which isn't in devices")
+            continue
+        read, problems = dict(RULE_DEFAULTS), []
+        _read_rule(rule, read, problems)
+        if problems:
+            missing.append(f"the rule for {who}, {_flow(rule)}")
+            continue
+        written = set(rule) | ({"ratio_kind"} if isinstance(rule.get("ratio"), str) else set())
+        for name in names:
+            s["only"][name] = {k: read[k] for k in written}
 
 
 def _read_until(until, s, missing, scope="of"):
@@ -259,8 +368,14 @@ def _read_until(until, s, missing, scope="of"):
 
 def _read_rule(rule, s, missing):
     for key, value in rule.items():
+        shorthand = proto.RATIO_SHORTHAND.fullmatch(value.strip()) \
+            if key == "ratio" and isinstance(value, str) else None
         if key in ("active", "ratio_kind", "reward") and isinstance(value, str):
             s[key] = value
+        elif shorthand:
+            s["ratio_kind"] = proto.RATIO_KIND_OF[(shorthand[1] or "PR").upper()]
+            if shorthand[2]:
+                s["ratio"] = int(shorthand[2])
         elif key in ("ratio", "quota") and isinstance(value, int) and not isinstance(value, bool):
             s[key] = value
         elif key == "timeout" and _duration_text(value) is not None:
@@ -282,19 +397,23 @@ def _read_rule(rule, s, missing):
 
 
 def _read_cues(cues, s, missing):
+    """A phase's cues replace the ones it started from, slot by slot."""
     for slot, cue in cues.items():
-        if cue == "none":
-            continue
-        if slot in CLICK_SLOTS and cue in ("click", ["click"]):
-            s[f"click_{slot}"] = True
+        if slot == "reward" and cue in ("none", "classic"):
+            s.update(tone=False, flash=False, bnc=False)
+            if cue == "classic":
+                s.update(CLASSIC_CUE)
+        elif slot in CLICK_SLOTS and cue in ("none", "click", ["click"]):
+            s[f"click_{slot}"] = cue != "none"
         elif slot == "reward" and isinstance(cue, list) and _read_reward_cue(cue, s):
             continue
-        else:
+        elif cue != "none":
             missing.append(f"the {slot} cue {_flow(cue)}")
 
 
 def _read_reward_cue(actions, s):
     """The reward cue's tone, flash and BNC train; False if it has anything else."""
+    s.update(tone=False, flash=False, bnc=False)
     seen = set()
     for action in actions:
         if not (isinstance(action, dict) and len(action) == 1):
@@ -333,6 +452,85 @@ def _flow(value):
     """A value as one line of YAML, to name it in a message."""
     text = yaml.safe_dump(_plain_data(value), default_flow_style=True, width=1000)
     return text.strip().removesuffix("...").strip()
+
+
+# ---------------------------------------------------------------------------
+# The list of FED3s
+# ---------------------------------------------------------------------------
+
+def devices_of(text):
+    """The FED3s ``text`` lists in ``devices``, or [] when it can't be read."""
+    try:
+        doc = yaml.load(text, Loader=proto._Loader)   # noqa: S506 - a SafeLoader
+    except yaml.YAMLError:
+        return []
+    devices = doc.get("devices") if isinstance(doc, dict) else None
+    return [str(d) for d in devices] if isinstance(devices, list) else []
+
+
+def parse_devices(text):
+    """FED3 IDs as someone types them: ``1-4``, ``FED001, FED007`` or ``2 5 9``.
+
+    Returns ``(names, problem)``: the names in the order typed, without
+    repeats, or ``([], why not)``.
+    """
+    names = []
+    for part in re.split(r"[,\s]+", re.sub(r"\s*-\s*", "-", text.strip())):
+        if not part:
+            continue
+        match = re.fullmatch(r"(?:FED)?(\d{1,3})(?:-(?:FED)?(\d{1,3}))?", part, re.IGNORECASE)
+        if not match:
+            return [], f"'{part}' isn't a FED3 ID: write 7, FED007 or a range such as 1-4"
+        lo, hi = int(match[1]), int(match[2] or match[1])
+        if not 1 <= lo <= hi <= 999:
+            return [], f"'{part}' isn't an ID or range of IDs from 1 to 999"
+        names += [f"FED{n:03d}" for n in range(lo, hi + 1) if f"FED{n:03d}" not in names]
+    return (names, None) if names else ([], "list at least one FED3")
+
+
+def device_span(names):
+    """``FED001–FED004, FED007``: the names, with runs of consecutive IDs shortened."""
+    runs = []
+    for name in names:
+        number = int(name[3:]) if proto.DEVICE_NAME.fullmatch(name) else None
+        if runs and number is not None and runs[-1][1] is not None \
+                and number == runs[-1][1] + 1:
+            runs[-1][1] = number
+            runs[-1][2] = name
+        else:
+            runs.append([name, number, name])
+    return ", ".join(first if first == last else
+                     f"{first}{', ' if int(last[3:]) - int(first[3:]) == 1 else '–'}{last}"
+                     for first, _, last in runs)
+
+
+def set_devices(text, names):
+    """``text`` with its ``devices`` list replaced by ``names``, on one line.
+    A comment after a one-line list is kept."""
+    lines = text.splitlines(keepends=True)
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+    new = f"devices: [{', '.join(names)}]"
+    start = next((i for i, line in enumerate(lines) if re.match(r"devices\s*:", line)), None)
+    if start is None:
+        at = next((i for i, line in enumerate(lines)
+                   if re.match(r"(colors|cues|rules|phases|checks)\s*:", line)), len(lines))
+        lines.insert(at, new + "\n")
+        return "".join(lines)
+    comment = re.search(r"\]\s*(#.*)$", lines[start].rstrip("\n"))
+    end = start + 1
+    while end < len(lines) and lines[end].strip() and lines[end].startswith((" ", "\t", "-")):
+        end += 1                                        # a block list, "- FED001" per line
+    lines[start:end] = [new + (f"   {comment[1]}" if comment else "") + "\n"]
+    return "".join(lines)
+
+
+def with_devices(text, names):
+    """A template for ``names``: its one FED3 becomes these. A template that
+    names several FED3s of its own (it gives them different rules) keeps them."""
+    if names and devices_of(text) == ["FED001"]:
+        return set_devices(text, names)
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -500,7 +698,7 @@ CLASSIC = {
         "poke.",
         active="right", reward="none", bnc=True, **CLASSIC_CUE),
     "Timed feeding": """\
-format: fnt-fed3-protocol/2
+format: fnt-fed3-protocol/3
 name: Timed feeding 19:00-21:00
 description: >
   Classic FED3 Timed feeding: free feeding between two clock times each
@@ -530,7 +728,7 @@ UNSUPPORTED = {"Light tracking": "Light tracking needs a poke light that stays o
 
 EXAMPLES = {
     "FR1, both pokes, with a cue": """\
-format: fnt-fed3-protocol/2
+format: fnt-fed3-protocol/3
 name: FR1 both pokes
 devices: [FED001]
 phases:
@@ -543,30 +741,30 @@ phases:
           - flash: {target: poke, color: blue, ms: 500}
 """,
     "Step up the ratio by rewards": """\
-format: fnt-fed3-protocol/2
+format: fnt-fed3-protocol/3
 name: FR1 to FR5, both pokes
 devices: [FED001]
 
-cues:
-  reward:
-    - tone: {hz: 4000, ms: 200}
-    - flash: {target: poke, color: blue, ms: 500}
-
-rules:
-  base: {active: both, cue: {reward: reward}}
+# Every phase starts from this, so each only says what it changes.
+every_phase:
+  active: both
+  cue:
+    reward:
+      - tone: {hz: 4000, ms: 200}
+      - flash: {target: poke, color: blue, ms: 500}
 
 phases:
   - name: FR1
-    until: {rewards: 50}
-    rule: {use: base, ratio: 1}
+    until: {rewards: 50, of: each}
+    rule: {ratio: FR1}
   - name: FR3
-    until: {rewards: 100}
-    rule: {use: base, ratio: 3}
+    until: {rewards: 100, of: each}
+    rule: {ratio: FR3}
   - name: FR5
-    rule: {use: base, ratio: 5}
+    rule: {ratio: FR5}
 """,
     "Four-patch competition": """\
-format: fnt-fed3-protocol/2
+format: fnt-fed3-protocol/3
 name: Four-patch competition
 description: >
   Two rich and two poor patches that each refill hourly. Which patches are
@@ -582,8 +780,8 @@ rules:
   patch:
     active: both
     cue: {reward: reward, depleted: [click]}
-  rich: {use: patch, ratio: 1, quota: 30, quota_period: 1h}
-  poor: {use: patch, ratio: 5, quota: 10, quota_period: 1h}
+  rich: {use: patch, ratio: FR1, quota: 30, quota_period: 1h}
+  poor: {use: patch, ratio: FR5, quota: 10, quota_period: 1h}
 
 phases:
   - name: Habituation
@@ -643,17 +841,23 @@ class PhaseDialog(QDialog):
     """The common settings of one phase, written out as YAML.
 
     ``places`` (phase names) adds a choice of where a new phase goes; editing
-    passes ``settings`` read from the phase instead.
+    passes ``settings`` read from the phase instead. With several ``devices``
+    a table sets what differs for each FED3. ``base`` is what each phase starts
+    from (the file's every_phase): a new phase starts there, and only what
+    differs from it is written.
     """
 
-    def __init__(self, parent=None, settings=None, places=None, note="", keys=V2_KEYS,
-                 several=False):
+    def __init__(self, parent=None, settings=None, places=None, note="", keys=CURRENT_KEYS,
+                 several=False, devices=None, base=None):
         super().__init__(parent)
         editing = settings is not None
         self.setWindowTitle("Edit a phase" if editing else "Add a phase")
         self.places = places or []
-        self.keys, self.several = keys, several
-        s = dict(NEW_PHASE, **(settings or {}))
+        self.devices = list(devices or [])
+        self.keys, self.several = keys, several or len(self.devices) > 1
+        self.base = base or RULE_DEFAULTS
+        inherited = {k: v for k, v in self.base.items() if v != RULE_DEFAULTS[k]}
+        s = {**NEW_PHASE, **inherited, **(settings or {})}
         if not editing and self.places:
             s["ends"], s["amount"] = "never", ""     # it goes last, and the last runs until Stop
         form = QFormLayout(self)
@@ -669,7 +873,7 @@ class PhaseDialog(QDialog):
 
         self.ends = QComboBox()
         for key, label in ENDS:
-            if several and key in EACH_ENDS:
+            if self.several and key in EACH_ENDS:
                 label += " (each device on its own)"
             self.ends.addItem(label, key)
         self.amount = QLineEdit()
@@ -689,10 +893,10 @@ class PhaseDialog(QDialog):
                                  self.fallback_label, self.fallback))
 
         self.active = QComboBox()
-        self.active.addItems(["both", "left", "right", "none"])
+        self.active.addItems(ACTIVE)
         form.addRow("Active poke", self.active)
         self.kind = QComboBox()
-        self.kind.addItems(["fixed", "random", "progressive"])
+        self.kind.addItems(RATIO_KINDS)
         self.ratio = _spin(1, 999, 1)
         form.addRow("Ratio", _row(self.kind, "ratio", self.ratio))
         self.timeout = _spin(0, 3600, 0, " s")
@@ -732,6 +936,45 @@ class PhaseDialog(QDialog):
             ("depleted", "pokes after the quota is used"))}
         form.addRow("Click on", _row(*self.clicks.values()))
 
+        # One row per FED3: "same" keeps the setting above, anything else is
+        # written for that FED3 under the phase's `only`.
+        self.per_device = {}
+        if len(self.devices) > 1 or (s.get("only") and self.devices):
+            grid = QGridLayout()
+            grid.setContentsMargins(0, 0, 0, 0)
+            for col, title in enumerate(("", "Active poke", "Ratio", "", "A reward", "Runs as")):
+                header = QLabel(title)
+                header.setObjectName("muted")
+                grid.addWidget(header, 0, col)
+            for row, name in enumerate(self.devices, start=1):
+                widgets = {
+                    "active": self._same_combo([(a, a) for a in ACTIVE]),
+                    "ratio_kind": self._same_combo([(k, k) for k in RATIO_KINDS]),
+                    "ratio": _spin(0, 999, 0),
+                    "reward": self._same_combo([("pellet", "pellet"), ("no pellet", "none")]),
+                }
+                widgets["ratio"].setSpecialValueText("same")
+                summary = QLabel()
+                summary.setObjectName("muted")
+                for col, widget in enumerate((QLabel(name), *widgets.values(), summary)):
+                    grid.addWidget(widget, row, col)
+                self.per_device[name] = (widgets, summary)
+            grid.setColumnStretch(5, 1)
+            table = QWidget()
+            table.setLayout(grid)
+            scroll = QScrollArea()
+            scroll.setWidget(table)
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QScrollArea.NoFrame)
+            scroll.setMinimumHeight(min(table.sizeHint().height() + 4, 260))   # up to ~8 rows
+            form.addRow("Per device", scroll)
+            self.per_device_note = QLabel(
+                "'same' uses the settings above; anything else applies to that FED3 alone "
+                f"(the file lists it under {keys['only']}).")
+            self.per_device_note.setObjectName("muted")
+            self.per_device_note.setWordWrap(True)
+            form.addRow("", self.per_device_note)
+
         self.hint = QLabel(note)
         self.hint.setObjectName("muted")
         self.hint.setWordWrap(True)
@@ -753,7 +996,29 @@ class PhaseDialog(QDialog):
         for box in (self.tone, self.flash, self.bnc):
             box.toggled.connect(self._enable)
         self.quota.valueChanged.connect(self._enable)
+        for widgets, _ in self.per_device.values():
+            for key, widget in widgets.items():
+                (widget.valueChanged if key == "ratio" else
+                 widget.currentIndexChanged).connect(self._enable)
         self._load(s)
+
+    @staticmethod
+    def _same_combo(choices):
+        """A choice for one FED3, starting with "same": the shared setting."""
+        box = QComboBox()
+        box.addItem("same", None)
+        for label, value in choices:
+            box.addItem(label, value)
+        return box
+
+    def _device_change(self, name):
+        """What the table changes for one FED3, as keys of ``ONLY_KEYS``."""
+        widgets, _ = self.per_device[name]
+        change = {key: widget.currentData() for key, widget in widgets.items()
+                  if key != "ratio" and widget.currentData() is not None}
+        if widgets["ratio"].value():
+            change["ratio"] = widgets["ratio"].value()
+        return change
 
     def _load(self, s):
         self.ends.blockSignals(True)
@@ -784,6 +1049,13 @@ class PhaseDialog(QDialog):
         self.bnc_count.setValue(s["bnc_count"])
         for slot, box in self.clicks.items():
             box.setChecked(s[f"click_{slot}"])
+        for name, (widgets, _) in self.per_device.items():
+            change = (s.get("only") or {}).get(name, {})
+            for key, widget in widgets.items():
+                if key == "ratio":
+                    widget.setValue(change.get("ratio", 0))
+                else:
+                    widget.setCurrentIndex(max(widget.findData(change.get(key)), 0))
         self._enable()
         self._update_hint()
 
@@ -845,11 +1117,31 @@ class PhaseDialog(QDialog):
             widget.setEnabled(earn and self.flash.isChecked())
         for widget in (self.bnc_width, self.bnc_hz, self.bnc_count):
             widget.setEnabled(earn and self.bnc.isChecked())
-        every_poke = self.kind.currentText() == "fixed" and self.ratio.value() == 1
+        shared = {"ratio_kind": self.kind.currentText(), "ratio": self.ratio.value(),
+                  "only": {name: self._device_change(name) for name in self.per_device}}
+        for name, (widgets, summary) in self.per_device.items():
+            change = shared["only"][name]
+            for widget in widgets.values():
+                widget.setEnabled(earn)
+            widgets["ratio"].setEnabled(
+                earn and change.get("ratio_kind", shared["ratio_kind"]) != "progressive")
+            summary.setText(self._summary(change) if earn else "")
+        every_poke = every_poke_earns(shared)
         self.clicks["counted"].setEnabled(earn and not every_poke)
         self.clicks["timeout"].setEnabled(earn and self.timeout.value() > 0)
         self.clicks["depleted"].setEnabled(earn and self.quota.value() > 0)
         self._update_hint()
+
+    def _summary(self, change):
+        """What one FED3 runs, as the cards and timeline say it: ``RR2 · both``."""
+        s = dict(self.settings(), **change)
+        period = _duration_text(s["quota_period"])
+        rule = dict(sch.DEFAULTS, active=s["active"], ratio_kind=s["ratio_kind"],
+                    ratio=str(s["ratio"]), reward=s["reward"], timeout=str(s["timeout"]),
+                    quota=str(s["quota"]), free_feed="1" if s["free_feed"] else "0",
+                    quota_period=str(_seconds(period)) if period
+                    else sch.DEFAULTS["quota_period"])
+        return sch.summarize(rule)
 
     def _update_hint(self):
         notes = [self._note] if getattr(self, "_note", "") else []
@@ -883,6 +1175,7 @@ class PhaseDialog(QDialog):
             "bnc": self.bnc.isChecked(), "bnc_width": self.bnc_width.value(),
             "bnc_hz": self.bnc_hz.value(), "bnc_count": self.bnc_count.value(),
             **{f"click_{slot}": box.isChecked() for slot, box in self.clicks.items()},
+            "only": {name: self._device_change(name) for name in self.per_device},
         })
 
     def before(self):
@@ -891,7 +1184,48 @@ class PhaseDialog(QDialog):
         return index - 1 if index > 0 else None
 
     def yaml(self, indent=2):
-        return phase_yaml(self.settings(), indent, self.keys, self.several)
+        return phase_yaml(self.settings(), indent, self.keys, self.several, self.base)
+
+
+class DevicesDialog(QDialog):
+    """The protocol's FED3s, typed as IDs or ranges. ``connected`` offers the
+    FED3s plugged in now."""
+
+    def __init__(self, names, parent=None, connected=None):
+        super().__init__(parent)
+        self.setWindowTitle("The protocol's FED3s")
+        layout = QVBoxLayout(self)
+        intro = QLabel("Every FED3 listed here runs every phase. Type IDs or ranges: "
+                       "1-4, or FED001, FED007.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        self.line = QLineEdit(", ".join(names))
+        layout.addWidget(self.line)
+        self.reading = QLabel()
+        self.reading.setObjectName("muted")
+        self.reading.setWordWrap(True)
+        layout.addWidget(self.reading)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        if connected:
+            plugged = buttons.addButton(f"Use the connected ones ({device_span(connected)})",
+                                        QDialogButtonBox.ResetRole)
+            plugged.clicked.connect(lambda: self.line.setText(", ".join(connected)))
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        self.ok = buttons.button(QDialogButtonBox.Ok)
+        layout.addWidget(buttons)
+        self.line.textChanged.connect(self._read)
+        self._read()
+
+    def _read(self):
+        names, problem = parse_devices(self.line.text())
+        self.reading.setText(problem or f"{sch.plural(len(names), 'FED3')}: "
+                                        f"{device_span(names)}")
+        self.reading.setStyleSheet(f"color: {theme.BAD};" if problem else "")
+        self.ok.setEnabled(not problem)
+
+    def names(self):
+        return parse_devices(self.line.text())[0]
 
 
 # ---------------------------------------------------------------------------
@@ -900,10 +1234,11 @@ class PhaseDialog(QDialog):
 
 class ProtocolEditor(QDialog):
     """Edit a protocol. ``running`` locks it to edits a running run accepts:
-    ``edit_check(text)`` says why the run can't take the text, or None."""
+    ``edit_check(text)`` says why the run can't take the text, or None.
+    ``connected`` names the FED3s plugged in, for the Devices choice."""
 
     def __init__(self, text="", parent=None, path=None, running=False, t0=None,
-                 edit_check=None):
+                 edit_check=None, connected=None):
         super().__init__(parent)
         self.setWindowTitle("Edit protocol" if not running else "Edit the running protocol")
         self.resize(1200, 760)
@@ -911,11 +1246,18 @@ class ProtocolEditor(QDialog):
         self.running = running
         self.t0 = t0
         self.edit_check = edit_check
+        self.connected = list(connected or [])
         self.compiled = None
         self.problems = []
 
         layout = QVBoxLayout(self)
         tools = QHBoxLayout()
+        # The FED3s, which a running run can't change.
+        self.devices_button = theme.quiet(QPushButton())
+        self.devices_button.setToolTip("The FED3s this protocol uses. Templates take this "
+                                       "list, and Add phase can set each one's rule.")
+        self.devices_button.clicked.connect(self._change_devices)
+        self.devices_button.setVisible(not running)
         if not running:
             templates = theme.quiet(QPushButton("New from template ▾"))
             menu = QMenu(templates)
@@ -932,6 +1274,7 @@ class ProtocolEditor(QDialog):
                 examples.addAction(name, lambda n=name: self._use_template(n))
             templates.setMenu(menu)
             tools.addWidget(templates)
+        tools.addWidget(self.devices_button)
         add = theme.quiet(QPushButton("Add phase…"))
         add.clicked.connect(self._add_phase)
         tools.addWidget(add)
@@ -1037,9 +1380,18 @@ class ProtocolEditor(QDialog):
         self._check()
 
     def _use_template(self, name):
-        self._set_text(TEMPLATES[name])
+        """The template, for the FED3s the protocol already lists."""
+        self._set_text(with_devices(TEMPLATES[name], devices_of(self.text()) or self.connected))
+
+    def _change_devices(self):
+        dialog = DevicesDialog(devices_of(self.text()), self, connected=self.connected)
+        if dialog.exec_() == QDialog.Accepted:
+            self._set_text(set_devices(self.text(), dialog.names()))
 
     def _check(self):
+        names = devices_of(self.text())
+        self.devices_button.setText(f"Devices: {device_span(names)}…" if names
+                                    else "Devices…")
         self.compiled, self.problems = proto.check(self.text())
         errors = [p for p in self.problems if p.level == "error"]
         self.problem_list.clear()
@@ -1107,7 +1459,15 @@ class ProtocolEditor(QDialog):
                                     "Fix the YAML first, so the phases can be found.")
             return
         keys, several = syntax_of(self.text())
-        dialog = PhaseDialog(self, places=[b.name for b in blocks], keys=keys, several=several)
+        base, missing = every_phase_of(self.text())
+        if missing:
+            QMessageBox.information(self, "Add a phase", "Every phase starts from the "
+                                    "protocol's every_phase, and the form can't show all of "
+                                    "it:\n\n  • " + "\n  • ".join(missing) +
+                                    "\n\nWrite the new phase in the text instead.")
+            return
+        dialog = PhaseDialog(self, places=[b.name for b in blocks], keys=keys, several=several,
+                             devices=devices_of(self.text()), base=base)
         if dialog.exec_() != QDialog.Accepted:
             return
         self._set_text(insert_phase(self.text(), dialog.yaml, dialog.before()))
@@ -1118,7 +1478,10 @@ class ProtocolEditor(QDialog):
             return
         block = blocks[index]
         keys, several = syntax_of(self.text())
-        settings, missing = settings_from_phase(block.mapping, keys)
+        devices = devices_of(self.text())
+        base, missing = every_phase_of(self.text())
+        settings, in_phase = settings_from_phase(block.mapping, keys, devices, base)
+        missing += in_phase
         if missing:
             box = QMessageBox(QMessageBox.Information, "Edit a phase",
                               f"The form can't show everything in '{block.name}', so it "
@@ -1133,7 +1496,8 @@ class ProtocolEditor(QDialog):
         lines = self.text().splitlines()[block.start:block.end]
         note = ("Comments inside this phase will be removed."
                 if any(line.lstrip().startswith("#") or " #" in line for line in lines) else "")
-        dialog = PhaseDialog(self, settings=settings, note=note, keys=keys, several=several)
+        dialog = PhaseDialog(self, settings=settings, note=note, keys=keys, several=several,
+                             devices=devices, base=base)
         if dialog.exec_() != QDialog.Accepted:
             return
         self._set_text(replace_phase(self.text(), index, dialog.yaml(block.indent)))

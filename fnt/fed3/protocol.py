@@ -22,15 +22,21 @@ import yaml
 
 from . import schedule as sch
 
-FORMAT = "fnt-fed3-protocol/2"
-# Format 1 is still read, so runs and files written before format 2 keep
-# loading. It called a phase's rule `all`, its per-device rules `devices`, and
-# whose counts end a phase `devices` too; format 2 calls them rule, only and of.
+FORMAT = "fnt-fed3-protocol/3"
+# Older formats are still read, so runs and files written before keep loading.
+# Format 1 called a phase's rule `all`, its per-device rules `devices`, and
+# whose counts end a phase `devices` too; format 2 called them rule, only and
+# of; format 3 calls the per-device rules per_device.
+FORMAT_2 = "fnt-fed3-protocol/2"
 FORMAT_1 = "fnt-fed3-protocol/1"
 KEY_NAMES = {
-    FORMAT: {"rule": "rule", "only": "only", "of": "of"},
+    FORMAT: {"rule": "rule", "only": "per_device", "of": "of"},
+    FORMAT_2: {"rule": "rule", "only": "only", "of": "of"},
     FORMAT_1: {"rule": "all", "only": "devices", "of": "devices"},
 }
+# FR5, RR3, PR: a ratio as people write it, standing for ratio_kind and ratio.
+RATIO_SHORTHAND = re.compile(r"(FR|RR)(\d+)|PR", re.IGNORECASE)
+RATIO_KIND_OF = {"FR": "fixed", "RR": "random", "PR": "progressive"}
 MAX_PROTOCOL_NAME = 60
 DEVICE_NAME = re.compile(r"FED(?!000)\d{3}")     # a FED3's ID, as on its screen and in FNT
 BUILTIN_COLORS = {
@@ -40,9 +46,13 @@ BUILTIN_COLORS = {
     "blue": (0, 0, 30, 0),
 }
 RESERVED_CUES = ("none", "click")
+# Named cues every protocol has; in format 3 a file can't redefine them.
+BUILTIN_CUES = {
+    "classic": "tone:4000:200+flash:bar:0:0:30:0:1000",   # the classic FED3 reward
+}
 
 TOP_KEYS = ("format", "name", "description", "devices", "colors", "cues",
-            "rules", "phases", "checks")
+            "rules", "every_phase", "phases", "checks")
 ROTATE_KEYS = ("every", "at", "mode", "assign")
 CHECK_KEYS = ("no_pellets",)
 CUE_SLOTS = ("reward", "counted", "inactive", "timeout", "depleted")
@@ -131,6 +141,34 @@ _Loader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _constru
 _Loader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_SEQUENCE_TAG, _construct_seq)
 
 
+def _yaml_problem(exc):
+    """PyYAML's complaint in words someone writing a protocol can act on."""
+    problem = str(getattr(exc, "problem", None) or exc)
+    context = str(getattr(exc, "context", None) or "")
+    if "'\\t'" in problem:
+        return "a tab; indent with spaces"
+    if problem.startswith("expected <block end>"):
+        return ("this line isn't lined up with the ones around it: keys side by side "
+                "start in the same column, and a key inside another is indented further")
+    if problem == "mapping values are not allowed here":
+        return ("a ':' where YAML didn't expect one: two keys on one line need braces "
+                "(until: {rewards: 100}), or the line above is missing its ':' "
+                "(active: both)")
+    if context.startswith("while parsing a flow"):
+        return "a { } or [ ] here is missing a comma between entries, or its closing bracket"
+    if context.startswith("while scanning a quoted"):
+        return "a quote that is never closed"
+    return problem
+
+
+def _missing_space(value):
+    """The fix for ``ratio:3``, which YAML reads as one word, not a key and a value."""
+    match = re.fullmatch(r"([A-Za-z_][\w.]*):(\S.*)", value.strip()) \
+        if isinstance(value, str) else None
+    return (f"'{value.strip()}' needs a space after the colon: {match[1]}: {match[2]}"
+            if match else None)
+
+
 # ---------------------------------------------------------------------------
 # The parsed protocol
 # ---------------------------------------------------------------------------
@@ -201,6 +239,7 @@ class PhaseSpec:
     rotate: Rotation | None
     daily: list
     line: int | None = None
+    until_written: bool = False     # it has an until, even one with errors
 
     @property
     def needs_fnt(self):
@@ -216,6 +255,7 @@ class Protocol:
     checks: dict
     rule_settings: dict = field(default_factory=dict)    # named rule -> settings
     warnings: list = field(default_factory=list)
+    every_phase: dict = field(default_factory=dict)      # what each phase starts from
 
     @property
     def needs_seed(self):
@@ -230,9 +270,10 @@ class _Parser:
     def __init__(self):
         self.problems = []
         self.colors = dict(BUILTIN_COLORS)
-        self.cues = {}
+        self.cues = {name: sch.parse_cue(text) for name, text in BUILTIN_CUES.items()}
         self.rule_specs = {}
         self.rules = {}
+        self.every_phase = {}
         self.devices = []
         self.format = FORMAT
         self.keys = KEY_NAMES[FORMAT]
@@ -246,13 +287,17 @@ class _Parser:
         self.problems.append(Problem(message, line, "warning"))
 
     def unknown_keys(self, mapping, allowed, where):
-        # Format 1's names, written in a format 2 file.
-        renamed = ({"all": "rule", "devices": "only"} if self.format == FORMAT
-                   and "rule" in allowed else {})
+        # An older format's names, written in a newer file.
+        renamed = {}
+        if "rule" in allowed:
+            for older, keys in KEY_NAMES.items():
+                if older != self.format:
+                    renamed.update({keys[k]: self.keys[k] for k in ("rule", "only")
+                                    if keys[k] != self.keys[k] and keys[k] not in allowed})
         for key in mapping:
             if key not in allowed:
                 if key in renamed:
-                    suffix = f"; in {FORMAT} it is called '{renamed[key]}'"
+                    suffix = f"; in {self.format} it is called '{renamed[key]}'"
                 else:
                     hint = difflib.get_close_matches(str(key), allowed, n=1)
                     suffix = f"; did you mean '{hint[0]}'?" if hint else ""
@@ -261,7 +306,8 @@ class _Parser:
     def expect_map(self, value, line, what):
         if isinstance(value, _Map):
             return value
-        self.error(line, f"{what} must be a mapping (key: value)")
+        hint = _missing_space(value)
+        self.error(line, hint or f"{what} must be a mapping (key: value)")
         return None
 
     # -- scalars --------------------------------------------------------
@@ -401,7 +447,9 @@ class _Parser:
                 return None
             text = str(seconds)
         elif isinstance(value, bool):
-            self.error(line, f"{key} can't be true/false")
+            none = "; for no active poke write none" if key == "active" else ""
+            self.error(line, f"{key} can't be true/false (YAML reads yes, no, on and off "
+                             f"that way){none}")
             return None
         else:
             text = str(value)
@@ -412,6 +460,9 @@ class _Parser:
             return None
 
     def named_rule(self, name, line, stack=()):
+        if _missing_space(name):
+            self.error(line, _missing_space(name))
+            return {}
         if not isinstance(name, str) or name not in self.rule_specs:
             known = list(self.rule_specs)
             hint = difflib.get_close_matches(str(name), known, n=1)
@@ -451,10 +502,16 @@ class _Parser:
                         text = self.cue(cue, cues.line_of(slot))
                         if text is not None:
                             settings[f"cue.{slot}"] = text
+            elif key == "ratio" and isinstance(item, str):
+                settings.update(self.ratio_shorthand(item, mapping, key_line))
             elif key in RULE_KEYS:
                 text = self.rule_value(key, item, key_line)
                 if text is not None:
                     settings[key] = text
+            elif key in (self.keys["only"], "until", "rotate", "daily", "name"):
+                self.error(key_line, f"{key} belongs to the phase, not inside its "
+                                     f"{self.keys['rule']}: move it left to line up "
+                                     f"with {self.keys['rule']}")
             elif key in ("light", "lights"):
                 self.error(key_line, "there are no steady lights; flash them "
                                      "from a cue, e.g. cue: {reward: [flash: "
@@ -464,6 +521,22 @@ class _Parser:
                 suffix = f"; did you mean '{hint[0]}'?" if hint else ""
                 self.error(key_line, f"unknown rule key '{key}'{suffix}")
         return settings
+
+    def ratio_shorthand(self, text, mapping, line):
+        """``ratio: RR3`` as the settings it stands for: kind and ratio."""
+        match = RATIO_SHORTHAND.fullmatch(text.strip())
+        if not match:
+            self.error(line, f"ratio is a whole number, or FR, RR or PR as in FR5, RR3 "
+                             f"or PR, not {text!r}")
+            return {}
+        if "ratio_kind" in mapping:
+            self.error(line, f"ratio: {text} already says the kind; remove ratio_kind")
+            return {}
+        kind = RATIO_KIND_OF[(match[1] or "PR").upper()]
+        if match[2] is None:
+            return {"ratio_kind": kind}
+        ratio = self.rule_value("ratio", match[2], line)
+        return {"ratio_kind": kind, "ratio": ratio} if ratio is not None else {}
 
     def device_keys(self, mapping, where):
         """``mapping``'s entries as (device names, value, line). A key names one
@@ -682,7 +755,7 @@ class _Parser:
                                     "phase") if only_key in mapping else {}
         rotate = self.rotation(mapping["rotate"], mapping.line_of("rotate")) \
             if "rotate" in mapping else None
-        if devices and rule_key not in mapping and not rotate:
+        if devices and rule_key not in mapping and not rotate and not self.every_phase:
             # The rest run the defaults, which is almost never what was meant.
             left = [d for d in self.devices if d not in devices]
             if left:
@@ -708,7 +781,8 @@ class _Parser:
             if len(daily) > sch.MAX_WINDOWS:
                 self.error(mapping.line_of("daily"), f"at most {sch.MAX_WINDOWS} "
                                                      f"daily windows per phase")
-        phase = PhaseSpec(name, until, all_rule, devices, rotate, daily, mapping.line)
+        phase = PhaseSpec(name, until, all_rule, devices, rotate, daily, mapping.line,
+                          until_written="until" in mapping)
         if rotate:
             self.check_rotation_length(phase, mapping)
         return phase
@@ -737,8 +811,7 @@ class _Parser:
                 loader.dispose()
         except yaml.YAMLError as exc:
             mark = getattr(exc, "problem_mark", None)
-            self.error(mark.line + 1 if mark else None,
-                       f"not valid YAML: {getattr(exc, 'problem', exc)}")
+            self.error(mark.line + 1 if mark else None, f"not valid YAML: {_yaml_problem(exc)}")
             return None
         for line, key in loader.duplicates:
             self.error(line, f"'{key}' appears twice")
@@ -788,7 +861,8 @@ class _Parser:
         if "cues" in root:
             cues = self.expect_map(root["cues"], root.line_of("cues"), "cues")
             for cname, value in (cues or {}).items():
-                if cname in RESERVED_CUES:
+                # Before format 3 a file could have its own 'classic', so it still can.
+                if cname in RESERVED_CUES or (cname in BUILTIN_CUES and self.format == FORMAT):
                     self.error(cues.line_of(cname), f"'{cname}' is built in; "
                                                     "choose another name")
                     continue
@@ -800,6 +874,8 @@ class _Parser:
             self.rule_specs = dict(rules or {})
             for rname in self.rule_specs:
                 self.named_rule(rname, rules.line_of(rname))
+        if "every_phase" in root:
+            self.every_phase = self.rule(root["every_phase"], root.line_of("every_phase"))
 
         phases = []
         raw_phases = root.get("phases")
@@ -821,7 +897,8 @@ class _Parser:
             if last and phase.until:
                 self.error(phase.line, f"'{phase.name}' is the last phase, which "
                                        "runs until Stop; remove its until")
-            if not last and not phase.until:
+            if not last and not phase.until and not phase.until_written:
+                # (An until with errors has already been reported.)
                 self.error(phase.line, f"'{phase.name}' never ends, so the phases "
                                        "after it can't run; give it an until")
             if phase.needs_fnt and not any(not c.needs_fnt for c in phase.until):
@@ -838,7 +915,8 @@ class _Parser:
                     checks["no_pellets"] = self.duration(
                         raw["no_pellets"], raw.line_of("no_pellets"), "no_pellets")
 
-        return Protocol(name, str(description).strip(), devices, phases, checks)
+        return Protocol(name, str(description).strip(), devices, phases, checks,
+                        every_phase=dict(self.every_phase))
 
 
 def load(text):
@@ -932,6 +1010,7 @@ def compile_protocol(protocol, seed=None):
                                             period, untils, [], assignment))
                 for device in protocol.devices:
                     rule = dict(sch.DEFAULTS)
+                    rule.update(protocol.every_phase)
                     rule.update(spec.all)
                     rule.update(protocol.rule_settings[assignment[device]])
                     rule.update(spec.devices.get(device, {}))
@@ -942,6 +1021,7 @@ def compile_protocol(protocol, seed=None):
                                         [c for c in spec.until if c.needs_fnt], {}))
             for device in protocol.devices:
                 rule = dict(sch.DEFAULTS)
+                rule.update(protocol.every_phase)
                 rule.update(spec.all)
                 rule.update(spec.devices.get(device, {}))
                 rules_per_device[device].append(rule)

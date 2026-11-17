@@ -28,7 +28,7 @@ from fnt.fed3.ui.window import FedWindow                 # noqa: E402
 
 RESULTS = []
 PROTOCOL = """\
-format: fnt-fed3-protocol/2
+format: fnt-fed3-protocol/3
 name: Window test
 devices: [FED001, FED002]
 phases:
@@ -136,7 +136,7 @@ def run_checks(app, tmp):
     form.timeout.setValue(30)
     check("a timeout makes its click available", form.clicks["timeout"].isEnabled())
     compiled, problems = proto.check(
-        "format: fnt-fed3-protocol/2\nname: x\ndevices: [FED001]\nphases:\n"
+        "format: fnt-fed3-protocol/3\nname: x\ndevices: [FED001]\nphases:\n"
         "  - name: a\n    until: {rewards: 5}\n    rule: {active: none}\n  - name: b\n")
     check("the checker refuses the same thing written in the text",
           compiled is None and any("only ends on rewards" in p.message for p in problems))
@@ -145,7 +145,7 @@ def run_checks(app, tmp):
 
     print("\n--- the form with several devices, and in format 1 files ---")
     keys, several = ed.syntax_of(PROTOCOL)
-    check("a two-device protocol is several devices, in format 2",
+    check("a two-device protocol is several devices, in the current format",
           keys == proto.KEY_NAMES[proto.FORMAT] and several)
     form = PhaseDialog(places=["Free", "FR1"], keys=keys, several=several)
     check("ends on counts say each device moves on alone",
@@ -167,6 +167,139 @@ def run_checks(app, tmp):
                           keys=keys, several=True)
     check("every device's rewards is written with of: all",
           "[{rewards: 9, of: all}, {after: 2d}]" in every)
+
+    print("\n--- choosing the FED3s, and a rule for each ---")
+    check("IDs can be typed as numbers, names or ranges",
+          ed.parse_devices("1-3, fed007 9")
+          == (["FED001", "FED002", "FED003", "FED007", "FED009"], None)
+          and ed.parse_devices("1 - 2")[0] == ["FED001", "FED002"])
+    check("and anything else says what's wrong",
+          "isn't a FED3 ID" in ed.parse_devices("1, x")[1]
+          and ed.parse_devices("0-2")[1] and ed.parse_devices(" ")[1])
+    check("runs of IDs are shown short",
+          ed.device_span(["FED001", "FED002", "FED003", "FED007", "FED008"])
+          == "FED001–FED003, FED007, FED008")
+    block_list = "name: x\ndevices:\n  - FED001\n  - FED002\n\nphases: []\n"
+    check("Devices rewrites the list, one written line by line too",
+          ed.set_devices(block_list, ["FED003"]) == "name: x\ndevices: [FED003]\n\nphases: []\n")
+    check("and keeps a comment after it",
+          ed.set_devices("devices: [FED001]  # cage A\n", ["FED002"])
+          == "devices: [FED002]   # cage A\n")
+    four = ["FED001", "FED002", "FED003", "FED004"]
+    for name, text in TEMPLATES.items():
+        compiled, problems = proto.check(ed.with_devices(text, four))
+        check(f"template '{name}' for four FED3s checks without a warning",
+              compiled is not None and not problems, "; ".join(p.message for p in problems))
+    check("a template that names its own FED3s keeps them",
+          ed.with_devices(TEMPLATES["Four-patch competition"], ["FED009"])
+          == TEMPLATES["Four-patch competition"])
+    cued = ed.with_devices(TEMPLATES["FR1, both pokes, with a cue"], four)
+    form = PhaseDialog(places=["FR1"], devices=four)
+    check("with several FED3s the form has a row for each",
+          list(form.per_device) == four)
+    form.name.setText("Mixed")
+    form.place.setCurrentIndex(1)          # before FR1, so it ends after 24h
+    form.tone.setChecked(True)
+    for name, ratio in (("FED002", 2), ("FED003", 3), ("FED004", 3)):
+        widgets, _ = form.per_device[name]
+        widgets["ratio_kind"].setCurrentIndex(widgets["ratio_kind"].findData("random"))
+        widgets["ratio"].setValue(ratio)
+    widgets, _ = form.per_device["FED001"]
+    widgets["active"].setCurrentIndex(widgets["active"].findData("both"))   # same as above
+    check("each row says what that FED3 runs",
+          [summary.text() for _, summary in form.per_device.values()]
+          == ["FR1 · both", "RR2 · both", "RR3 · both", "RR3 · both"])
+    check("a random ratio on one FED3 makes the counted click available",
+          form.clicks["counted"].isEnabled())
+    mixed = ed.insert_phase(cued, form.yaml, form.before())
+    compiled, problems = proto.check(mixed)
+    check("it writes per_device as FR/RR/PR, FED3s with the same change sharing a key",
+          "    per_device:\n      FED002: {ratio: RR2}\n"
+          "      FED003, FED004: {ratio: RR3}\n" in mixed
+          and "FED001" not in mixed.split("per_device:")[1].split("- name: FR1")[0])
+    check("which the checker accepts and compiles per FED3",
+          compiled is not None
+          and [compiled.schedules[d].phases[0].rule["ratio"] for d in four] == ["1", "2", "3", "3"]
+          and compiled.schedules["FED003"].phases[0].rule["ratio_kind"] == "random",
+          "; ".join(p.message for p in problems))
+    block = ed.phase_blocks(mixed)[0]
+    settings, missing = ed.settings_from_phase(block.mapping, devices=four)
+    again = PhaseDialog(settings=settings, devices=four)
+    check("Edit phase reads the per-device rules back as they were written",
+          not missing and again.yaml(block.indent)
+          == "".join(mixed.splitlines(keepends=True)[block.start:block.end]))
+    again.free.setChecked(True)
+    check("free feeding switches the table off and drops it",
+          not again.per_device["FED002"][0]["ratio"].isEnabled()
+          and again.settings()["only"] == {} and "per_device:" not in again.yaml())
+    for phase, why in (
+            ("  - name: a\n    per_device: {FED002: {timeout: 30s}}\n", "timeout"),
+            ("  - name: a\n    per_device: {FED009: {ratio: 2}}\n", "isn't in devices"),
+            ("  - name: a\n    rule: {active: none}\n    per_device: {FED002: {active: left}}\n",
+             "no poke is active")):
+        text = "format: fnt-fed3-protocol/3\nname: x\ndevices: [FED001, FED002]\nphases:\n" + phase
+        settings, missing = ed.settings_from_phase(ed.phase_blocks(text)[0].mapping,
+                                                   devices=["FED001", "FED002"])
+        check(f"the form leaves to the text a per-device rule it can't show ({why})",
+              any(why in m for m in missing), "; ".join(missing))
+    print("\n--- the form writes FR/RR/PR, classic and every_phase ---")
+    check("the classic templates use the classic cue and the short ratio",
+          "        reward: classic\n" in TEMPLATES["FR1"]
+          and "      ratio: RR3\n" in TEMPLATES["Random ratio"]
+          and "      ratio: PR\n" in TEMPLATES["Progressive ratio"])
+    settings, missing = ed.settings_from_phase(ed.phase_blocks(TEMPLATES["FR1"])[0].mapping)
+    check("and the form reads classic back as the tone and light bar",
+          not missing and settings["tone"] and settings["flash_target"] == "bar"
+          and settings["flash_ms"] == 1000)
+    stepped = TEMPLATES["Step up the ratio by rewards"]
+    base, missing = ed.every_phase_of(stepped)
+    check("every_phase is read as where each phase starts",
+          not missing and base["active"] == "both" and base["tone"]
+          and base["flash_target"] == "poke")
+    blocks = ed.phase_blocks(stepped)
+    settings, missing = ed.settings_from_phase(blocks[1].mapping, base=base)
+    check("so a phase that only says ratio: FR3 shows the cue it inherits",
+          not missing and settings["ratio"] == 3 and settings["tone"]
+          and settings["active"] == "both")
+    form = PhaseDialog(settings=settings, base=base)
+    check("and is written back as only what differs",
+          form.yaml(blocks[1].indent) == "  - name: FR3\n    until: {rewards: 100}\n"   # one FED3
+                                         "    rule:\n      active: both\n      ratio: FR3\n")
+    form.tone.setChecked(False)
+    form.flash.setChecked(False)
+    form.ratio.setValue(1)
+    quiet = form.yaml(blocks[1].indent)
+    check("turning off what it inherits writes none, and FR1 is written when it isn't the base",
+          "      cue:\n        reward: none\n" in quiet and "ratio" not in quiet)
+    compiled, problems = proto.check(ed.replace_phase(stepped, 1, quiet))
+    check("which the checker compiles to no cue on that phase only",
+          compiled and compiled.schedules["FED001"].phases[1].rule["cue.reward"] == "none"
+          and compiled.schedules["FED001"].phases[0].rule["cue.reward"] != "none",
+          "; ".join(p.message for p in problems))
+    new = PhaseDialog(places=[b.name for b in blocks], base=base)
+    check("a new phase starts from every_phase",
+          new.active.currentText() == "both" and new.tone.isChecked())
+    odd = stepped.replace("  active: both\n", "  active: both\n  min_poke_ms: 50\n", 1)
+    check("an every_phase the form can't show is named, so the form stays out",
+          any("min_poke_ms" in m for m in ed.every_phase_of(odd)[1]))
+    v2 = PROTOCOL.replace(proto.FORMAT, proto.FORMAT_2)
+    keys, _ = ed.syntax_of(v2)
+    form = PhaseDialog(places=["Free", "FR1"], keys=keys, devices=["FED001", "FED002"])
+    widgets, _ = form.per_device["FED002"]
+    widgets["ratio_kind"].setCurrentIndex(widgets["ratio_kind"].findData("random"))
+    widgets["ratio"].setValue(2)
+    check("a format 2 file gets only rather than per_device",
+          "    only:\n      FED002: {ratio: RR2}\n" in form.yaml())
+
+    editor = ed.ProtocolEditor(TEMPLATES["FR1"], connected=four)
+    check("the editor shows the protocol's FED3s", editor.devices_button.text()
+          == "Devices: FED001…")
+    editor._set_text(ed.set_devices(editor.text(), four))
+    editor._use_template("FR3")
+    check("and a template takes them",
+          ed.devices_of(editor.text()) == four
+          and editor.devices_button.text() == "Devices: FED001–FED004…")
+    editor.close()
 
     v1 = (PROTOCOL.replace(proto.FORMAT, proto.FORMAT_1).replace("rule: ", "all: "))
     keys, several = ed.syntax_of(v1)
