@@ -28,12 +28,10 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 
 from . import schedule as sch
+from .schedule import COLUMNS, HEADER, iso, parse_iso, parse_row     # noqa: F401 - used through here too
 
-FIRMWARE = "3.1"
+FIRMWARE = "3.2"
 PROTO = 3
-HEADER = ("time,ms,seq,phase,event,side,outcome,left,right,pellets,"
-          "phase_rewards,phase_left,phase_right,retrieval_ms,poke_ms,detail")
-COLUMNS = HEADER.split(",")
 
 DISPENSE_SECONDS = 1.0          # motor turn until the pellet reaches the well
 JAM_RETRY_SECONDS = 600
@@ -43,26 +41,10 @@ STAGING_TIMEOUT_SECONDS = 10
 TIME_JUMP_LIMIT_SECONDS = 600
 CATCH_UP_SECONDS = 60           # a phase change this late is logged as catch-up
 MAX_INPUT = 128
+BACKLOG_BYTES = 1024            # rows kept while the card refuses them
 RUN_ID = re.compile(r"[A-Za-z0-9]{1,8}")
 IDLE_FILE = "IDLE.CSV"
 BATTERY, TEMPERATURE, HUMIDITY = "4.10", "22.0", "40"
-
-
-def iso(moment):
-    return moment.isoformat(timespec="seconds")
-
-
-ISO = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(Z|[+-]\d{2}:\d{2})")
-
-
-def parse_iso(text):
-    """``YYYY-MM-DDTHH:MM:SS`` with ``Z`` or ``±HH:MM``, as the firmware accepts."""
-    if not isinstance(text, str) or not ISO.fullmatch(text):
-        return None
-    try:
-        return datetime.fromisoformat(text)
-    except ValueError:
-        return None
 
 
 def progressive_requirement(rewards):
@@ -100,6 +82,12 @@ class Card:
     def remove(self, name):
         self.files.pop(name, None)
 
+    def end_line(self, name):
+        """End a last line that was cut off, so the next row starts its own."""
+        text = self.read(name)
+        if text and not text.endswith("\n"):
+            self.files[name] = text + "\n"
+
 
 def _kv(text):
     return dict(line.split("=", 1) for line in (text or "").splitlines() if "=" in line)
@@ -134,6 +122,7 @@ class SimDevice:
 
     def advance(self, seconds):
         """Let simulated time pass, handling everything that falls due."""
+        self._card_check()
         target = self.world + timedelta(seconds=seconds)
         while True:
             upcoming = [t for t in self._wakeups() if self.world < t <= target]
@@ -146,6 +135,7 @@ class SimDevice:
 
     def poke(self, side, ms=100):
         """An animal breaks one poke's beam for ``ms`` milliseconds."""
+        self._card_check()
         side = side.upper()[0]
         rule = self._rule()
         hold = {"side": side, "start": self.world, "millis": self.millis(),
@@ -179,6 +169,7 @@ class SimDevice:
 
     def retrieve(self):
         """The animal takes the pellet from the well."""
+        self._card_check()
         if self.well != "full":
             return False
         self.well = "empty"
@@ -222,6 +213,10 @@ class SimDevice:
     # ------------------------------------------------------------------
 
     def _save_device(self, device_id, zone):
+        # Without the card, what's in memory is the defaults (ID 1), not this
+        # device's own: writing it would replace the real ID on the card.
+        if not getattr(self, "card_loaded", True):
+            return
         minutes = int(zone.total_seconds()) // 60
         sign = "-" if minutes < 0 else "+"
         offset = f"{sign}{abs(minutes) // 60:02d}:{abs(minutes) % 60:02d}"
@@ -243,9 +238,17 @@ class SimDevice:
         self.last_retrieve = None
         self.jammed = False
         self.jam_retry_at = None
+        self.next_status = self.world + timedelta(seconds=STATUS_EVERY_SECONDS)
+        self._load_card(cause)
+
+    def _load_card(self, cause):
+        """Everything that comes from the card: the ID, the schedule, the run
+        and the counts. At boot, and again (cause ``card``) if the card wasn't
+        readable then and has come back."""
+        self.card_loaded = not self.card.failing
+        self.backlog = []           # rows from before belong to the no-card defaults' file
         self.timeout_until = None
         self.counters = {"L": 0, "R": 0, "shared": 0}
-        self.next_status = self.world + timedelta(seconds=STATUS_EVERY_SECONDS)
 
         device = _kv(self.card.read("DEVICE.TXT"))
         self.device_id = int(device.get("id", 1))
@@ -284,17 +287,25 @@ class SimDevice:
         self._row("boot", detail=f"reset={cause};ratio counters reset")
         self._tick()
 
+    def _card_check(self):
+        """The card is read once, at boot. If it wasn't ready then, the device
+        is on the no-card defaults; when the card answers, load what it holds."""
+        if not self.card_loaded and not self.card.failing:
+            self._load_card("card")
+
     def _restore_counts(self):
         self.seq = 0
         self.left = self.right = self.pellets = 0
         self.phase_rewards = self.phase_left = self.phase_right = 0
         self.quota_used, self.quota_period = 0, None
+        # A row cut off by a power cut is ended, so the next starts on its own
+        # line, and passed over: the counts come from the last whole row.
+        self.card.end_line(self.file)
         lines = (self.card.read(self.file) or "").splitlines()
         if not lines:
             self.card.append(self.file, HEADER)
             return
-        rows = [dict(zip(COLUMNS, line.split(",", len(COLUMNS) - 1)))
-                for line in lines[1:]]
+        rows = [row for row in map(parse_row, lines[1:]) if row]
         if not rows:
             return
         last = rows[-1]
@@ -349,10 +360,26 @@ class SimDevice:
             self.phase_left, self.phase_right, retrieval_ms, poke_ms, detail,
         ]
         line = ",".join(str(v) for v in values)
-        if self.card.append(self.file, line):
+        self._flush_backlog()       # rows the card refused earlier go first
+        if not self.backlog and self.card.append(self.file, line):
             self.output.append(f"ROW,{line}")
+            return
+        self.output.append("ERR,SD,append failed")
+        # Kept until the card answers again. With no room left the row is
+        # lost and its number goes to the next one: the file never has a gap
+        # in seq, which FNT would wait on.
+        if sum(len(kept) + 1 for kept in self.backlog) + len(line) + 1 <= BACKLOG_BYTES:
+            self.backlog.append(line)
         else:
-            self.output.append("ERR,SD,append failed")
+            self.seq -= 1
+
+    def _flush_backlog(self):
+        if not self.backlog or self.card.failing:
+            return
+        for line in self.backlog:
+            self.card.append(self.file, line)
+            self.output.append(f"ROW,{line}")
+        self.backlog = []
 
     # ------------------------------------------------------------------
     # Rules and pokes
@@ -553,6 +580,7 @@ class SimDevice:
         return times
 
     def _tick(self):
+        self._flush_backlog()
         if self.dispense_due and self.world >= self.dispense_due:
             self._finish_dispense()
         self._check_time()
@@ -576,6 +604,7 @@ class SimDevice:
     def command(self, line):
         """Handle one command line; returns (and sends) the reply lines."""
         before = len(self.output)
+        self._card_check()
         self._command(line.rstrip("\r\n"))
         return self.output[before:]
 
@@ -595,6 +624,8 @@ class SimDevice:
         if head == "ID":
             if not re.fullmatch(r"\d{1,3}", arg) or not 1 <= int(arg) <= 999:
                 return self._reply("ERR,BAD_ID,1-999")
+            if not self.card_loaded:
+                return self._reply("ERR,SD,the ID is kept on the card")
             self.device_id = int(arg)
             self._save_device(self.device_id, self.rtc().utcoffset())
             return self._reply(f"ID,id={self.device_id}")
@@ -656,7 +687,7 @@ class SimDevice:
             "id": self.device_id, "fw": FIRMWARE,
             "time": iso(self.rtc()) if self.clock_set else "",
             "clock": "ok" if self.clock_set else "unset",
-            "sd": "err" if self.card.failing else "ok",
+            "sd": "err" if self.card.failing or self.backlog else "ok",
             "run": self.run_id, "ended": int(self.ended),
             "sched": self._crc_text(self.sched_crc),
             "next_sched": "-" if self.next_crc is None else f"{self.next_crc:08x}",
@@ -758,18 +789,23 @@ class SimDevice:
             self.card.remove("NEXT.TXT")
             self.schedule, self.sched_crc = self.next_schedule, self.next_crc
             self.next_schedule, self.next_crc = None, None
+        self._flush_backlog()
+        self.backlog = []            # what the card still refuses belonged to the old file
         self.run_id, self.t0, self.ended = run_id, t0.astimezone(self.zone), False
         self.lights = False          # a run starts with the lights as its cues leave them
         self.file = f"{run_id}.CSV"
-        self.card.write(self.file, HEADER + "\n")
-        self.seq = self.left = self.right = self.pellets = 0
         self.phase, self.phase_start = 0, self.t0
-        self.phase_rewards = self.phase_left = self.phase_right = 0
-        self.quota_used, self.quota_period = 0, None
         self.counters = {"L": 0, "R": 0, "shared": 0}
         self.timeout_until = None
+        # A run this card already holds rows for (the device lost its place in
+        # it, and FNT started it again) carries on in the same file, with seq
+        # and the totals from its last row. The file is never started over:
+        # it may be the only copy. A new run finds no file and gets a header.
+        resumed = len((self.card.read(self.file) or "").splitlines()) > 1
+        self._restore_counts()
         self._save_run()
-        self._row("run_start", detail=f"t0={iso(self.t0)};{self.schedule.phases[0].name}")
+        self._row("run_start", detail=f"t0={iso(self.t0)};{self.schedule.phases[0].name}"
+                                      f"{';resumed' if resumed else ''}")
         self._reply(f"RUN,run={run_id},file={self.file},phase=0")
         self._tick()
 
@@ -804,6 +840,8 @@ class SimDevice:
             return self._reply(f"ERR,NO_FILE,{run_id}")
         last = 0
         for line in text.splitlines()[1:]:
+            if not parse_row(line):
+                continue            # a row cut off by a power cut
             seq = int(line.split(",", 3)[2])
             if seq >= int(start):
                 self._reply(f"ROW,{line}")

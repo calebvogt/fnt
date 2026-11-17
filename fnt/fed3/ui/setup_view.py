@@ -505,7 +505,11 @@ class SetupView(QWidget):
         self.snapshot = snapshot or {}
         connected = self._connected()
         preflight = self.snapshot.get("preflight", {})
-        if self.starting and (preflight or time.monotonic() - self.starting > STARTING_FOR):
+        # Start comes back when pre-flight has answered, or, with no answer, once
+        # the engine is clearly no longer in it: it publishes nothing while it is.
+        fresh = time.monotonic() - self.snapshot.get("published", 0.0) < 2.0
+        if self.starting and (preflight or (fresh and
+                                            time.monotonic() - self.starting > STARTING_FOR)):
             self.starting = 0.0
         self._show_rows(preflight)
         self._show_notes(connected)
@@ -528,7 +532,8 @@ class SetupView(QWidget):
                             if d.get("run_label") and not d.get("live_run")})
         old = [p["message"] + (f" ({p['device']})" if p["device"] else "")
                for p in self.snapshot.get("problems", [])
-               if p["active"] and (p["kind"] == "firmware" or p["kind"].startswith("resume"))]
+               if p["active"] and (p["kind"] in ("firmware", "engine")
+                                   or p["kind"].startswith("resume"))]
         text = []
         if old:
             text.append("⚠ " + "\n⚠ ".join(old))

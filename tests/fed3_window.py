@@ -210,6 +210,55 @@ def run_checks(app, tmp):
     check("a plot with no pellets yet spans the run, not some other day",
           abs(left - t0) < timedelta(seconds=1)
           and abs(right - t0 - timedelta(hours=3)) < timedelta(seconds=1), f"{left} to {right}")
+    import tempfile
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, "FED001.csv")
+        start = datetime(2026, 11, 2, 21, tzinfo=timezone.utc)
+        with open(path, "w", encoding="ascii") as handle:
+            handle.write("time,ms,seq,phase,event,side,outcome\n")
+            for n in range(480):        # a pellet an hour for 20 days
+                handle.write(f"{(start + timedelta(hours=n)).isoformat()},0,{n + 1},0,dispense,,\n")
+        plot = PelletPlot()
+        now = start + timedelta(days=20)
+        plot.update_plot({"run_id": "S", "copies": {"FED001": path}, "binding": {"FED001": 1},
+                          "t0": t0}, timezone.utc, now, span_hours=24)
+        left, right = (num2date(x) for x in plot.axes.get_xlim())
+        low, high = plot.axes.get_ylim()
+        check("the last 24 hours shows that day, with the count axis starting where it began",
+              abs(right - left - timedelta(hours=24)) < timedelta(seconds=1)
+              and 450 < low < 460 and 480 <= high < 490, f"{left} to {right}, {low:.0f}-{high:.0f}")
+        # Two devices move to Reversal together on day 3; FED002 moves to a
+        # third phase on its own on day 5 (a catch-up row, written late).
+        changed = start + timedelta(days=3)
+        rows = {"FED001": [(changed, 1, "Reversal")],
+                "FED002": [(changed + timedelta(seconds=20), 1, "Reversal"),
+                           (start + timedelta(days=6), 2,
+                            f"Extinction;catch-up;start={(start + timedelta(days=5)).isoformat()}")]}
+        copies = {}
+        for logical, changes in rows.items():
+            copies[logical] = os.path.join(folder, f"{logical}p.csv")
+            with open(copies[logical], "w", encoding="ascii") as handle:
+                handle.write("time,ms,seq,phase,event,side,outcome,left,right,pellets,"
+                             "phase_rewards,phase_left,phase_right,retrieval_ms,poke_ms,detail\n")
+                for n, (moment, phase, detail) in enumerate(changes):
+                    handle.write(f"{moment.isoformat()},0,{n + 1},{phase},phase,,,0,0,0,"
+                                 f"0,0,0,,,{detail}\n")
+        plot = PelletPlot()
+        plot.update_plot({"run_id": "P", "copies": copies, "binding": {"FED001": 1, "FED002": 2},
+                          "t0": t0}, timezone.utc, now)
+        lines = sorted((line.get_xdata()[0], line.get_color())
+                       for line in plot.axes.lines)
+        names = [text.get_text().strip() for text in plot.axes.texts]
+        check("a phase change shared by the devices is one line, named once",
+              len(lines) == 2 and abs(lines[0][0] - changed) < timedelta(minutes=1)
+              and lines[0][1] == theme.TEXT and names[0] == "2: Reversal", f"{lines} {names}")
+        check("one device's own change is in its colour, where its phase began",
+              abs(lines[1][0] - start - timedelta(days=5)) < timedelta(seconds=1)
+              and lines[1][1] == theme.SERIES[1] and names[1] == "3: Extinction", f"{lines} {names}")
+    from fnt.fed3.ui.window import stale_note
+    check("a fresh snapshot needs no warning", stale_note({"published": 100.0}, 103.0) == "")
+    check("one the engine hasn't replaced for a while says how old it is",
+          "hasn't updated for" in stale_note({"published": 100.0}, 190.0))
     from fnt.fed3.ui.run_view import pellet_waiting
     check("a card knows a pellet is waiting from the live rows, before STATUS says",
           pellet_waiting([{"event": "dispense"}, {"event": "clock"}], {"well": "0"})
@@ -377,7 +426,16 @@ def run_checks(app, tmp):
     more = [b for b in card.findChildren(QPushButton) if b.text() == "More ▾"][0]
     check("the rarer ones behind More",
           [a.text() for a in more.menu().actions()] == ["Play a cue…", "Set its clock now…"])
+    asked, real_question = [], QMessageBox.question
+    QMessageBox.question = lambda parent, title, text, *a: asked.append(title) or QMessageBox.No
     [b for b in card.findChildren(QPushButton) if b.text() == "Feed"][0].click()
+    wait(app, lambda: False, 1)
+    check("Feed on a running FED3 asks first, and No feeds nothing",
+          asked == ["Feed FED001"]
+          and not any("FED001  feed by hand" in line for line in window.log.lines()))
+    QMessageBox.question = lambda *a: QMessageBox.Yes
+    [b for b in card.findChildren(QPushButton) if b.text() == "Feed"][0].click()
+    QMessageBox.question = real_question
     check("Feed feeds, and the log says so",
           wait(app, lambda: any("FED001  feed by hand" in line for line in window.log.lines()), 10))
 

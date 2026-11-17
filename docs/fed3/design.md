@@ -1,11 +1,9 @@
 # FED3 v3: device rule, schedules and protocol files
 
-> [!WARNING]
-> **Draft.** Nothing here is implemented yet. This document is the contract
-> between three pieces that will be built against it: the FED3 firmware
-> (`fnt-fed3`, v3), the FNT protocol compiler and run monitor, and the FNT FED
-> tab. There is no compatibility with the legacy FED3 library's modes, commands
-> or file format.
+This document is the contract between three pieces built against it: the FED3
+firmware (`fnt-fed3`, v3), the FNT protocol compiler and run monitor
+(`fnt/fed3`), and the FNT FED tab. There is no compatibility with the legacy
+FED3 library's modes, commands or file format.
 
 ## Goals
 
@@ -107,9 +105,19 @@ same thing wherever it is in the schedule.
   (`FEED`) isn't retried: nobody is owed it, and on the bench a retry would run
   the motor every 10 minutes on an empty hopper. At most one
   dispense is ever owed, so rewards earned while jammed don't pile up.
+- **A reward isn't a pellet.** Between a `jam` row and the retry that
+  succeeds, a poke that meets the ratio is still logged as `reward`, uses up
+  quota and counts toward `rewards=`, and delivers nothing. Count pellets
+  from `dispense` rows, and read rewards between a `jam` and the next
+  `dispense` as unpaid.
+- **The well** counts as empty once its beam has stayed clear for 200 ms, so
+  a pellet that's nudged isn't taken for a retrieval. `retrieval_ms` includes
+  that 200 ms.
 
 **A blank or corrupt card** boots into a one-phase schedule of the defaults:
-FR1, left poke, no cues.
+FR1, left poke, no cues. So does a card that isn't readable at power-on, but
+only until it answers: the device then loads what the card holds and carries
+on with its run (see recovery, Part 2).
 
 ### Cues
 
@@ -257,6 +265,7 @@ needs it.
 
 | Problem | What the device does |
 | --- | --- |
+| A reading of the RTC more than 5 s from where the last reading and `millis()` put it (a glitch on the I2C bus comes back as any date at all) | It isn't believed until three readings in a row agree with each other. Until then the device counts on from the last good reading. A wrong date in the future would otherwise end every timed phase left. |
 | The clock lost power (the RTC reports `lostPower()`) | Status reports `clock=unset`. The device keeps the current phase's rule but ignores windows and time conditions until the clock is set. FNT sets it automatically as soon as it sees `clock=unset`, then the device catches up. |
 | A time change of more than 10 minutes during a run | Refused with `ERR,TIME_JUMP`. FNT asks you to confirm and then sends `TIME!:`. This stops a mistyped clock from catching up through a week of phases. |
 | Small corrections from automatic sync | Applied, and logged as a `clock` row showing the before and after times. |
@@ -269,7 +278,7 @@ needs it.
 | `SCHED.TXT` | The schedule in force. | On upload during a run, and at `RUN:BEGIN`. |
 | `NEXT.TXT` | A schedule uploaded outside a run, waiting for `RUN:BEGIN`. | On upload outside a run. |
 | `RUN.TXT` | Run id, t0, data file, ended flag, current phase number and phase start time. | At `RUN:BEGIN` and `RUN:END`, and at each phase change. |
-| `<run id>.CSV` | The run's rows. Before the first run ever, rows go to `IDLE.CSV`. | Every event. |
+| `<run id>.CSV` | The run's rows. Before the first run ever, rows go to `IDLE.CSV`. | Every event. Never started over: a `RUN:BEGIN` for a run the card already has rows for carries on in the same file. |
 
 Every file except the data file is written to a temporary name and then
 renamed, so a power cut leaves either the old version or the new one, never a
@@ -285,6 +294,14 @@ partial file.
 | Partial progress towards a ratio | Not kept: the ratio counter restarts at 0, and the `boot` row says so |
 
 It then catches up as described above.
+
+**When the card lets the device down:**
+
+| Problem | What the device does |
+| --- | --- |
+| The card isn't readable at power-on (a slow card, a brown-out) | It runs the no-card defaults (ID 1, FR1 on the left poke) and reports `sd=err`. It refuses `ID:` and writes nothing that would replace what's on the card. The moment the card answers, it loads its ID, schedule, run and counts exactly as at boot, sends `BOOT,…,reset=card,…` and writes a `boot` row with `reset=card`. |
+| The card refuses a row | `ERR,SD,append failed` is sent. The row is kept in memory (up to 1 KB of rows) and written, in order, when the card answers; it's sent as `ROW` then. With no room left a row is lost, and its number goes to the next row: `seq` never has a gap. |
+| The last row was cut off by a power cut | It's ended with a newline and left as it is. Counts come from the last whole row, and `READ` passes over it. |
 
 **After `RUN:END`** the device stays in its current phase, including its daily
 windows, so timed feeding keeps working. No more phase changes happen, and the
@@ -311,7 +328,7 @@ These are newline-terminated ASCII lines at 115200 baud.
 
 | Command | Reply | Purpose |
 | --- | --- | --- |
-| `PING` | `PONG,id=<n>,fw=3.0,proto=3` | Discovery. FNT refuses `proto` ≠ 3. |
+| `PING` | `PONG,id=<n>,fw=3.2,proto=3` | Discovery. FNT refuses `proto` ≠ 3. |
 | `STATUS` | `STATUS,…` (below) | Full state. FNT polls it every 30 s. |
 | `TIME:<iso with offset>` | `TIME,before=<iso>,after=<iso>` | Set the clock and its UTC offset. During a run a jump over 10 min is refused with `ERR,TIME_JUMP`; `TIME!:` overrides that. |
 | `ID:<n>` | `ID,id=<n>` | Set and save the ID (1-999), as the boot menu does: hold both pokes while `FED3 ID` shows at power-on, then left −1, right +1, saved after 4 s idle. Not offered during a run or after a watchdog restart. |
@@ -321,7 +338,7 @@ These are newline-terminated ASCII lines at 115200 baud.
 | `RUN:BEGIN,<run_id>,<t0 iso>,<crc>` | `RUN,run=<id>,file=<name>,phase=0` | Start a run (see below). |
 | `RUN:END` | `RUN,run=<id>,ended=1` | Log `run_end`. Phase changes stop; the current phase and its windows continue (Part 2). |
 | `GOTO:<from>,<to>` | `PHASE,n=<to>,name=<name>` | Move from phase `from` to phase `to`. Ignored with `ERR,GOTO_STALE` if the device is no longer in `from`, so a delayed or repeated `GOTO` can't skip a phase or move a device backwards. |
-| `READ:<run_id>,<from_seq>` | `ROW,…` lines, then `READ_END,run=<id>,last=<seq>` | Re-send rows from `from_seq` onward. These interleave safely with live rows. |
+| `READ:<run_id>,<from_seq>` | `ROW,…` lines, then `READ_END,run=<id>,last=<seq>` | Re-send rows from `from_seq` onward, a few at a time between everything else the device does, so other commands are answered meanwhile. These interleave safely with live rows. `last` is the last row replayed; a replay cut short by a card error ends early, with a lower `last`. A `RUN:BEGIN` ends a replay. |
 | `FEED` | `FEED,result=<started\|pellet_in_well\|jam>` | Dispense once by hand. The outcome follows as a `dispense` (`detail=manual`) or `jam` row. Counts as a pellet but not a reward. |
 | `TEST:<cue>` | `OK` | Play a cue with the same syntax as `cue.*`. |
 | `LIGHTS:on`, `LIGHTS:off` | `LIGHTS,on=<0\|1>` | The bar and both pokes white and steady, to find a device on the bench (firmware 3.1). Cues flash over them. Off at boot and at `RUN:BEGIN`, so a run never starts lit. |
@@ -348,17 +365,22 @@ These are newline-terminated ASCII lines at 115200 baud.
    file).
 3. It promotes `NEXT.TXT`, zeroes all counters, opens `<run id>.CSV`, logs
    `run_start`, and enters phase 0 with t0 as its start time.
+4. If the card already has rows for that run id (the device lost its place in
+   the run, and FNT started it again), the file is kept: `seq` and the totals
+   carry on from its last row, the `run_start` row's detail ends `;resumed`,
+   and time conditions catch up from t0 as after a power cut.
 
-Run ids are 8 characters, so file names stay valid on any FAT card.
+Run ids are up to 8 letters and digits, so file names stay valid on any FAT
+card.
 
 ### Device → host
 
 | Line | When |
 | --- | --- |
 | `ROW,<SD row>` | Every row written to the card, the moment it is written, and again in reply to `READ`. |
-| `BOOT,fw=…,reset=<power\|watchdog\|software\|external>,clock=<ok\|unset>,sched=<crc\|default>,run=<id\|->` | At startup. |
+| `BOOT,fw=…,reset=<power\|watchdog\|software\|external\|card>,clock=<ok\|unset>,sched=<crc\|default>,run=<id\|->` | At startup; and with `reset=card` when a card that wasn't readable at power-on has been loaded. A restart drops USB, so FNT rarely sees this line: it reads restarts from `boot` rows. |
 | `STATUS,id=,fw=,time=,clock=ok\|unset,sd=ok\|err,run=,ended=0\|1,sched=,next_sched=,phase=,phase_name=,phase_start=,next=,file=,seq=,l=,r=,pellets=,phase_rewards=,phase_left=,phase_right=,depleted=0\|1,well=0\|1,jam=0\|1,uptime=,batt=,temp=,hum=,lights=0\|1` | In reply to `STATUS`. `sched` and `next_sched` are crcs (`-` if none). `next` describes the soonest `UNTIL`, for example `at=2026-10-20T19:00-07:00` or `rewards=37/100`. |
-| `ERR,<code>,<detail>` | Bad command or bad value, or an SD write failure (`ERR,SD,…`). |
+| `ERR,<code>,<detail>` | Bad command or bad value, or an SD write failure (`ERR,SD,…`). `ERR,SD,append failed` is not a reply: it's sent whenever the card refuses a row, and can arrive between a command and its reply. |
 
 `crc` is CRC-32 (the `zlib.crc32` polynomial) of the schedule's lines, each
 ending in `\n`. FNT compiles the same text, so a single number shows whether a
@@ -384,7 +406,7 @@ time,ms,seq,phase,event,side,outcome,left,right,pellets,phase_rewards,phase_left
 | `phase_rewards`, `phase_left`, `phase_right` | Totals for the phase, which `UNTIL` and the quota use. |
 | `retrieval_ms` | On `retrieve` rows: the time from dispense to retrieval, however long it was. Nothing times out; the row is written whenever the well clears. |
 | `poke_ms` | On `poke` rows: how long the beam was broken. |
-| `detail` | `;`-separated, never commas. `phase`: the name, plus `;goto` or `;catch-up;start=<iso>`. `dispense`: `free`, `manual` or `retry` (blank for a reward). `jam`: what was being dispensed. `boot`: `reset=<cause>;ratio counters reset`. `clock`: `from=<iso>;to=<iso>`. `run_start`: `t0=<iso>;<first phase>`. `status` (hourly): `batt=…;temp=…;hum=…`. `poke`: `held` if the beam stayed broken past 60 s. |
+| `detail` | `;`-separated, never commas. `phase`: the name, plus `;goto` or `;catch-up;start=<iso>`. `dispense`: `free`, `manual` or `retry` (blank for a reward). `jam`: what was being dispensed. `boot`: `reset=<cause>;ratio counters reset` (`reset=card`: the card wasn't readable at power-on and has now been loaded). `clock`: `from=<iso>;to=<iso>`. `run_start`: `t0=<iso>;<first phase>`, plus `;resumed` if the card already held rows for the run. `status` (hourly): `batt=…;temp=…;hum=…`. `poke`: `held` if the beam stayed broken past 60 s. |
 
 ### Firmware changes needed to keep these promises
 
@@ -396,18 +418,19 @@ time,ms,seq,phase,event,side,outcome,left,right,pellets,phase_rewards,phase_left
   retry every 10 minutes rather than giving up for good.
 - **SD failure:** if the card can't be read, the device stays in the current
   phase (it can't read the next one), keeps running, reports `sd=err`, and
-  retries.
+  retries. Rows it couldn't write are kept and written when it can (Part 2).
 - **Output:** whole lines go out with `Serial.write(buf, len)`, with no
   `if (Serial)` checks, which cost 10 ms each.
 - **SD:** the card is initialised once at boot instead of on every row, and
   there is no 100 ms LED blink per row.
-- **Display:** shows the phase name, the counts and the next change, and is
-  redrawn on change only.
+- **Display:** shows the ID, the battery voltage, the phase name, the counts,
+  and one line of state (`SD CARD ERROR`, `JAM - retrying`, `LOW BATTERY`,
+  else `running` or `idle`); redrawn on change only.
 - **LEDs:** turned off and the motor-driver enable line released after every
   flash.
 - **Removed:** the 14 modes, the `MODE`/`NEW_TRIAL`/`SYNC`/`LIGHTS`/file-transfer
-  commands, the event queue, the pending-command slot, the boot ID menu and
-  `start.csv`/`stop.csv`.
+  commands, the event queue, the pending-command slot and
+  `start.csv`/`stop.csv`. (The boot ID menu is kept; see `ID:`.)
 
 ---
 
@@ -673,7 +696,12 @@ A device that fails blocks Start unless you remove it from the run explicitly.
 
 **Running**
 - FNT polls `STATUS`, keeps a live copy of the rows and fills any gap with
-  `READ`.
+  `READ`. The replay comes in over as many engine steps as it takes; nothing
+  waits on it. If the device has replayed past a number the copy is still
+  waiting for, that row isn't on the card: the copy carries on and the lost
+  rows are flagged by number.
+- A copy left with a torn last line (the PC lost power mid-write) is cut back
+  to its last whole row when the run is picked up, and the rest is read again.
 - FNT checks the conditions that need it.
 - FNT flags problems on screen.
 - Manual actions are logged with their source.
@@ -703,8 +731,8 @@ records when it took effect.
   each device, the `time`, `seq` and `detail` of its `run_end` row, so the rows
   recorded after Stop can be told apart even when a device ended late or had no
   clock.
-- FNT never sends `RUN:BEGIN` for a run a device reports as ended: the device
-  would start that run's file over. A run left running in `run.json` whose
+- FNT never sends `RUN:BEGIN` for a run a device reports as ended: it would
+  start the run's phases again from t0. A run left running in `run.json` whose
   devices already ended it (FNT closed mid-Stop) is flagged, and Stop finishes
   it.
 
@@ -726,11 +754,24 @@ state, and the run header shows a count of open problems.
 - `jam`;
 - watchdog reset;
 - `sd=err`;
+- a card that wasn't readable at power-on (`reset=card`), or that refused a
+  row (`ERR,SD,append failed`), even though `sd=ok` again by the next poll;
+- rows that never reached the card, by number;
+- battery under 3.55 V;
 - `clock=unset`;
 - schedule crc mismatch;
 - clock drift over 60 s;
 - the device being in a different run;
+- FNT's copy behind the card for 10 minutes without catching up;
 - `checks.no_pellets`.
+
+A watchdog reset is read from the `boot` row in the data, replayed rows
+included, because the `BOOT` line of a restart is rarely seen (USB drops).
+
+**The window itself** says so, in red in the bar across the top, if the engine
+hasn't published a new snapshot for 10 seconds (it's waiting on a FED3 that
+doesn't answer, or stuck): what's on screen is then as old as that. An error
+inside an engine step is shown as a problem and the step is retried.
 
 A problem stays flagged until you acknowledge it, even if it has cleared, so
 an overnight jam is still visible at the morning check.
@@ -745,7 +786,6 @@ an overnight jam is still visible at the morning check.
   sched/FED001.txt  # each device's compiled schedule
   log.csv           # FNT actions, uploads, problems, disconnects (UTC)
   FED001.csv        # byte-identical copy of the device's data file
-  P2_FED007.csv
   …
 ```
 
@@ -764,7 +804,7 @@ their own (clock sync, data copying, port scanning, recovery) has no button.
 
 ```
 fnt/fed3/
-  schedule.py     # the device schedule format, limits and timing rules
+  schedule.py     # the device schedule format, limits and timing rules; the data file's columns
   protocol.py     # parse, check, compile, preview. Pure Python, no Qt.
   device_sim.py   # a FED3 on firmware v3, simulated: the firmware's spec
   link.py         # one serial port and the v3 line protocol (no threads)
@@ -895,7 +935,8 @@ same file. Nothing else would change.
     (which asks first: it's for jumps over 10 minutes, which the device
     refuses mid-run until confirmed).
 - **Plot**, across the top at full width: cumulative pellets per device against standard
-  time, with phase changes and Stop marked.
+  time, with phase changes and Stop marked, over the whole run, the last 7
+  days or the last 24 hours.
 - **Log**, along the bottom of the window in every state: phase changes,
   problems, uploads and manual actions, coloured by kind, and collapsible.
 

@@ -1444,10 +1444,12 @@ def main():
 
     # Dump a native-crash traceback to ~/.fnt/faulthandler_crash.log. This is
     # the ACTUAL entry point (the `fnt` console script), so the crash logger
-    # must be installed here — not only in the standalone UWB main().
+    # must be installed here — not only in the standalone UWB main(). It comes
+    # from tool_host, not the UWB module: importing that pulls in cv2, pandas,
+    # scipy and matplotlib, seconds of startup for a window nobody opened yet.
     try:
-        from fnt.uwb.uwb_preprocessing_pyqt import _install_faulthandler
-        _install_faulthandler()
+        from fnt.tool_host import install_faulthandler
+        install_faulthandler("launcher")
     except Exception as _e:
         print(f"[FNT] faulthandler not installed: {_e}")
 

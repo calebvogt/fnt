@@ -12,10 +12,14 @@ from matplotlib.dates import DateFormatter
 from matplotlib.ticker import MaxNLocator
 from matplotlib.figure import Figure
 
-from ..device_sim import parse_iso
+from ..schedule import parse_iso
 from . import theme
 
 REFRESH_SECONDS = 10
+# Phase changes this close together on different devices draw as one line.
+SAME_CHANGE = timedelta(minutes=10)
+# How much of the run the plot shows: (label, hours back from now; None for all of it).
+SPANS = (("the whole run", None), ("the last 7 days", 7 * 24), ("the last 24 hours", 24))
 
 
 class LocalTime(tzinfo):
@@ -68,12 +72,12 @@ class PelletPlot(FigureCanvasQTAgg):
     def _reset(self):
         self.sizes = {}
         self.series = {}
-        self.phase_marks = []
+        self.phase_marks = []       # (moment, phase index, phase name, logical)
         self.stop_mark = None
         self.last_draw = 0.0
 
-    def _read(self, logical, path, mark_phases):
-        """New rows since the last read: (dispense times, phase-change times)."""
+    def _read(self, logical, path, mark_stop):
+        """New rows since the last read: dispense times and phase changes."""
         try:
             size = os.path.getsize(path)
         except OSError:
@@ -97,12 +101,18 @@ class PelletPlot(FigureCanvasQTAgg):
                 continue
             if parts[4] == "dispense":
                 times.append(moment)
-            elif parts[4] == "phase" and mark_phases:
-                self.phase_marks.append(moment)
-            elif parts[4] == "run_end" and mark_phases and self.stop_mark is None:
+            elif parts[4] == "phase":
+                # detail is the last column: "name[;reason][;start=<when>]". A
+                # catch-up row is written late; start= is when the phase began.
+                detail = line.rsplit(",", 1)[-1].strip().split(";")
+                for item in detail[1:]:
+                    if item.startswith("start="):
+                        moment = parse_iso(item[6:]) or moment
+                self.phase_marks.append((moment, int(parts[3] or 0), detail[0], logical))
+            elif parts[4] == "run_end" and mark_stop and self.stop_mark is None:
                 self.stop_mark = moment
 
-    def update_plot(self, run, zone, now):
+    def update_plot(self, run, zone, now, span_hours=None):
         if run["run_id"] != self.run_id:    # a new run: same device names, new data
             self.run_id = run["run_id"]
             self._reset()
@@ -110,7 +120,7 @@ class PelletPlot(FigureCanvasQTAgg):
             return
         self.last_draw = time.monotonic()
         for n, (logical, path) in enumerate(run["copies"].items()):
-            self._read(logical, path, mark_phases=n == 0)
+            self._read(logical, path, mark_stop=n == 0)
         ax = self.axes
         ax.clear()
         ax.set_facecolor(theme.PANEL)
@@ -121,9 +131,17 @@ class PelletPlot(FigureCanvasQTAgg):
         # none, matplotlib would otherwise pick a week, or some other day.
         t0 = run["t0"].astimezone(zone)
         end = max(now.astimezone(zone), t0 + timedelta(hours=1))
-        ax.set_xlim(t0, end)
+        # A span shows the end of the run, with the count axis starting where
+        # the lowest line enters it, so a day's pellets aren't a flat line on
+        # top of three weeks' worth.
+        start = max(t0, end - timedelta(hours=span_hours)) if span_hours else t0
+        ax.set_xlim(start, end)
         most = max((len(times) for times in self.series.values()), default=0)
-        ax.set_ylim(0, max(most, 1) * 1.08)       # a little headroom over the top count
+        least = min((sum(t < start for t in times) for times in self.series.values()),
+                    default=0) if start > t0 else 0
+        # A little headroom over the top count, more when phase names sit there.
+        headroom = 1.18 if self.phase_marks else 1.08
+        ax.set_ylim(least, least + max(most - least, 1) * headroom)
         ax.yaxis.set_major_locator(MaxNLocator(nbins=4, integer=True))
         for n, logical in enumerate(run["binding"]):
             times = [t.astimezone(zone) for t in self.series.get(logical, [])]
@@ -134,8 +152,7 @@ class PelletPlot(FigureCanvasQTAgg):
             ys = [0, *range(1, len(times) + 1), len(times)]
             ax.step(xs, ys, where="post", color=theme.SERIES[n % len(theme.SERIES)],
                     label=logical, linewidth=1.5)
-        for mark in self.phase_marks:
-            ax.axvline(mark.astimezone(zone), color=theme.MUTED, linewidth=0.8, linestyle=":")
+        self._draw_phases(ax, run, zone, start, end)
         if self.stop_mark:
             # The devices keep feeding after Stop, so data carries on past it.
             ax.axvline(self.stop_mark.astimezone(zone), color=theme.BAD, linewidth=1,
@@ -153,3 +170,33 @@ class PelletPlot(FigureCanvasQTAgg):
         self.figure.autofmt_xdate()
         self.figure.tight_layout()
         self.draw_idle()
+
+    def _draw_phases(self, ax, run, zone, start, end):
+        """A line where the protocol moves on to another phase, named at the top.
+        Devices that change together share one line; one that changes on its
+        own gets a line in its colour."""
+        colours = {logical: theme.SERIES[n % len(theme.SERIES)]
+                   for n, logical in enumerate(run["binding"])}
+        changes = []        # [moment, phase, name, {logical}]
+        for moment, phase, name, logical in sorted(self.phase_marks, key=lambda m: m[0]):
+            for change in changes:
+                if change[1] == phase and abs(moment - change[0]) <= SAME_CHANGE:
+                    change[3].add(logical)
+                    break
+            else:
+                changes.append([moment, phase, name, {logical}])
+        named = set()
+        for moment, phase, name, logicals in changes:
+            x = moment.astimezone(zone)
+            if not start <= x <= end:
+                continue
+            alone = len(logicals) == 1 and len(colours) > 1
+            colour = colours.get(next(iter(logicals)), theme.TEXT) if alone else theme.TEXT
+            # Solid, so it isn't mistaken for Stop's dashed line.
+            ax.axvline(x, color=colour, linewidth=1.2, alpha=0.6)
+            if phase in named:      # name each phase once, at its first line
+                continue
+            named.add(phase)
+            ax.text(x, 0.98, f" {phase + 1}: {name}", transform=ax.get_xaxis_transform(),
+                    ha="left", va="top", fontsize=8, color=colour, clip_on=True,
+                    bbox={"facecolor": theme.PANEL, "edgecolor": "none", "pad": 1})

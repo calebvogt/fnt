@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 
 from . import protocol as proto
 from . import schedule as sch
-from .device_sim import COLUMNS, HEADER, iso, parse_iso
+from .schedule import HEADER, iso, parse_iso, parse_row
 from .link import DeviceLink, LinkError, SerialTransport, candidate_ports, error, fields
 
 SCAN_EVERY = 5.0
@@ -43,6 +43,10 @@ DRIFT_TOLERANCE = 2.0           # seconds of clock error corrected silently
 DRIFT_PROBLEM = 60.0            # seconds of clock error worth flagging
 TIME_JUMP_LIMIT = 600.0         # the firmware refuses bigger jumps mid-run
 READ_RETRY = 20.0
+READ_STALLED = 30.0             # a replay with no row for this long has stopped
+COPY_STALLED = 600.0            # a copy behind its card this long, getting nowhere, is flagged
+LOW_BATTERY = 3.55              # volts; flagged below this, cleared above BATTERY_OK
+BATTERY_OK = 3.65
 RECENT_ROWS = 50                # of a run's rows kept for its card: enough to find the last event
 RETRY_OPEN = 15.0
 RUN_FILE = "run.json"
@@ -93,6 +97,9 @@ class Device:
     last_row: dict = field(default_factory=dict)
     last_pellet: datetime | None = None
     drift: float | None = None
+    # While a READ is being answered: (run id, the highest seq the device had
+    # when it was sent). Rows up to that seq are the replay; later ones are live.
+    replay: tuple | None = None
 
 
 class DataCopy:
@@ -111,22 +118,42 @@ class DataCopy:
         self.next_seq = 1
         self.pending = {}
         self.read_requested = -1e9
+        self.stalled_since = None   # when it was first behind its card without moving
+        self.stalled_at = 0         # next_seq then
         self.last_pellet = None     # time of the last dispense row copied
         # The latest rows, parsed. From the file too, so a run picked back up
         # after FNT restarts shows its history, not just what arrived since.
         self.recent = deque(maxlen=RECENT_ROWS)
-        if os.path.exists(path):
-            with open(path, encoding="ascii", newline="") as handle:
-                lines = handle.read().splitlines()
-            if len(lines) > 1:
-                self.next_seq = int(lines[-1].split(",")[2]) + 1
-            self.recent.extend(parse_row(line) for line in lines[1:][-RECENT_ROWS:])
-            for line in reversed(lines[1:]):
-                if self._note_pellet(line):
-                    break
-        else:
+        lines = self._whole_rows() if os.path.exists(path) else []
+        if not lines:
             with open(path, "w", encoding="ascii", newline="") as handle:
                 handle.write(HEADER + "\n")
+        if len(lines) > 1:
+            self.next_seq = int(lines[-1].split(",")[2]) + 1
+        self.recent.extend(parse_row(line) for line in lines[1:][-RECENT_ROWS:])
+        for line in reversed(lines[1:]):
+            if self._note_pellet(line):
+                break
+
+    def _whole_rows(self):
+        """The file's lines, after cutting it back to its last whole row.
+
+        A PC that lost power mid-write leaves a torn last line (or worse). The
+        card has every row, so anything from the first damaged line on is
+        dropped here and asked for again."""
+        with open(self.path, "rb") as handle:
+            data = handle.read()
+        lines, kept = [], 0
+        for raw in data.splitlines(keepends=True):
+            line = raw.decode("ascii", "replace").rstrip("\r\n")
+            if not raw.endswith(b"\n") or not (parse_row(line) if lines else line == HEADER):
+                break
+            lines.append(line)
+            kept += len(raw)
+        if kept < len(data):
+            with open(self.path, "r+b") as handle:
+                handle.truncate(kept)
+        return lines
 
     @property
     def gap(self):
@@ -134,10 +161,25 @@ class DataCopy:
 
     def add(self, row_text):
         """Take one row (without ``ROW,``). Returns the rows written."""
-        seq = int(row_text.split(",", 3)[2])
+        row = parse_row(row_text)
+        if row is None:
+            return []
+        seq = int(row["seq"])
         if seq < self.next_seq or seq in self.pending:
             return []
         self.pending[seq] = row_text
+        return self._write()
+
+    def skip_gap(self):
+        """Carry on past numbers that aren't on the card. Call only once the
+        device has replayed everything it holds from ``next_seq`` on.
+
+        Returns ((first, last) missing, the rows then written)."""
+        missing = (self.next_seq, min(self.pending) - 1)
+        self.next_seq = min(self.pending)
+        return missing, self._write()
+
+    def _write(self):
         written = []
         with open(self.path, "a", encoding="ascii", newline="") as handle:
             while self.next_seq in self.pending:
@@ -157,10 +199,6 @@ class DataCopy:
                 self.last_pellet = moment
             return True
         return False
-
-
-def parse_row(text):
-    return dict(zip(COLUMNS, text.split(",", len(COLUMNS) - 1)))
 
 
 def run_id_now(moment):
@@ -338,6 +376,21 @@ class Engine:
     # ------------------------------------------------------------------
 
     def step(self):
+        """One pass. Whatever goes wrong in it is shown, and the snapshot is
+        still published, so the window never sits on a stale one unawares."""
+        try:
+            self._step()
+            self._clear("", "engine")
+        except Exception as exc:          # noqa: BLE001 - shown as a problem
+            self._problem("", "engine", "", f"FNT hit an error and is retrying: {exc!r}")
+        finally:
+            try:
+                self._flush_log()
+            except OSError as exc:
+                self._problem("", "engine", "", f"FNT can't write its log: {exc}")
+            self._publish()
+
+    def _step(self):
         self._run_commands()
         tick = self.monotonic()
         if tick - self.last_scan >= SCAN_EVERY:
@@ -355,8 +408,7 @@ class Engine:
         for run in self._stopped_runs():
             self._stopped_step(run)
         self._check_problems()
-        self._flush_log()
-        self._publish()
+        self._check_copies()
 
     def _event(self, device, text):
         self.events.append((self.now(), device, text))
@@ -469,7 +521,7 @@ class Engine:
             if len(ports) > 1:
                 self._problem(key, "duplicate_id", key,
                               f"two FED3s are numbered {device_id} ({', '.join(ports)}); "
-                              "renumber one in Setup")
+                              "renumber one in Setup (one in the running run, after Stop)")
             else:
                 self._clear(key, "duplicate_id")
 
@@ -505,7 +557,10 @@ class Engine:
         device.status_at = self.monotonic()
         status = device.status
         reported = status.get("id", "")
-        if reported.isdigit() and device.id is not None and int(reported) != device.id:
+        # A FED3 that can't read its card reports the default ID, not its own
+        # (which is on the card), so a change isn't believed while sd=err.
+        if (reported.isdigit() and device.id is not None and int(reported) != device.id
+                and status.get("sd") != "err"):
             # Changed on the FED3 itself, outside FNT.
             self._log(f"FED{int(reported):03d}", "ID changed on the FED3",
                       f"{device.port} was FED{device.id:03d}")
@@ -532,6 +587,15 @@ class Engine:
             self._problem(name, "jam", name, "jammed: retrying every 10 minutes")
         else:
             self._clear(name, "jam")
+        try:
+            battery = float(status.get("batt", "nan"))
+        except ValueError:
+            battery = float("nan")
+        if 0 < battery < LOW_BATTERY:
+            self._problem(name, "battery", name, f"battery low ({battery:.2f} V): charge it, "
+                                                 "or check its USB power")
+        elif battery >= BATTERY_OK:
+            self._clear(name, "battery")
 
     def _sync_clock(self, device, force=False):
         target = self.now().astimezone(self.zone).replace(microsecond=0)
@@ -560,27 +624,41 @@ class Engine:
     # Lines from devices
     # ------------------------------------------------------------------
 
-    def _on_line(self, device, line, reading_run=None):
+    def _on_line(self, device, line):
         if line.startswith("BOOT,"):
             info = fields(line)
             name = self._name(device)
             device.run = info.get("run", "-")
             device.status_at = -1e9          # read STATUS on the next step
-            if info.get("reset") == "watchdog":
-                self._problem(name, "watchdog", name,
-                              "restarted by its watchdog (a firmware hang)", active=False)
+            device.replay = None             # a replay doesn't survive a restart
+            if device.link:
+                device.link.replaying = None
+            self._flag_boot(name, info.get("reset"))
             self._log(name, "boot", f"reset={info.get('reset')}")
+            return
+        if line.startswith("READ_END,"):
+            self._replay_done(device, fields(line))
+            return
+        if line.startswith("ERR,NO_FILE"):
+            device.replay = None
+            return
+        if line.startswith("ERR,SD"):
+            # A row its card refused. STATUS says sd=ok again after the next
+            # row that's written, so this is the only word of it.
+            name = self._name(device)
+            self._problem(name, "sd", name, "SD card refused a row")
             return
         if not line.startswith("ROW,"):
             return
         text = line[4:]
         row = parse_row(text)
+        if row is None:                      # damaged on its way, or not a whole row
+            return
         name = self._name(device)
-        target = reading_run or device.run
-        if reading_run:
+        if device.replay and int(row["seq"]) <= device.replay[1]:
             # A replayed row: it belongs in the copy, but it isn't news. Only
             # live rows say what the device is doing now.
-            self._copy_row(device, target, text)
+            self._copy_row(device, device.replay[0], text)
             return
         device.last_row = row
         if row["event"] == "run_start":
@@ -600,11 +678,47 @@ class Engine:
             logical = run.logical_for(device.id)
             if logical:
                 for written in run.copies[logical].add(text):
-                    self._note_end(run, logical, parse_row(written))
+                    self._note_row(run, logical, parse_row(written))
 
-    def _note_end(self, run, logical, row):
-        """Record in run.json where a device's run ended in its data, so rows
-        recorded after Stop can be told apart: every row after it in seq."""
+    def _flag_boot(self, name, reset):
+        """A restart that shouldn't happen. One flag until it's acknowledged."""
+        if reset == "watchdog":
+            self._problem(name, "watchdog", name,
+                          "restarted by its watchdog (a firmware hang)", active=False)
+        elif reset == "card":
+            self._problem(name, "sd_boot", name, "its SD card wasn't ready at power-on; it "
+                          "ran the defaults until the card answered", active=False)
+
+    def _replay_done(self, device, info):
+        """READ_END: the device has sent every row it holds from where the
+        copy was. Numbers the copy is still waiting on aren't on the card (a
+        row it refused), so the copy carries on past them and says so."""
+        device.replay = None
+        run = self._run_by_id(info.get("run"))
+        logical = run.logical_for(device.id) if run and device.id is not None else None
+        if not logical:
+            return
+        copy = run.copies[logical]
+        last = info.get("last", "")
+        # Only if the replay got at least as far as the rows being held: one cut
+        # short (the card failing mid-read) proves nothing about what's before them.
+        if not copy.gap or not last.isdigit() or int(last) < min(copy.pending):
+            return
+        (first, end), written = copy.skip_gap()
+        for text in written:
+            self._note_row(run, logical, parse_row(text))
+        rows = f"row {first}" if first == end else f"rows {first}-{end}"
+        self._problem(logical, "lost_rows", logical,
+                      f"{rows} never reached its SD card (the card refused them)", active=False)
+
+    def _note_row(self, run, logical, row):
+        """What a row newly in a copy means for the run's record: a restart
+        that should be flagged (replayed rows too: on real hardware a restart
+        drops USB, so its BOOT line is rarely seen), and where the run ended
+        in the data, so rows recorded after Stop can be told apart: every row
+        after it in seq."""
+        if row["event"] == "boot":
+            self._flag_boot(logical, row["detail"].split(";")[0].partition("=")[2])
         if row["event"] != "run_end" or logical in run.ended:
             return
         run.ended[logical] = {"time": row["time"] or None, "seq": int(row["seq"]),
@@ -618,10 +732,9 @@ class Engine:
     def _problem(self, device, kind, subject, message, active=True):
         key = f"{device}:{kind}"
         existing = self.problems.get(key)
-        if existing and existing.active and not existing.acknowledged:
-            existing.message = message
-            return
-        if existing and existing.active and existing.acknowledged:
+        # Still going, or (for something that happened rather than is
+        # happening) not yet acknowledged: the same problem, not a new one.
+        if existing and (existing.active or not (active or existing.acknowledged)):
             existing.message = message
             return
         self.problems[key] = Problem(key, device, kind, message, self.now(), active)
@@ -652,7 +765,8 @@ class Engine:
         for logical, device_id in self.run.ids.items():
             device = self.device_by_id(device_id)
             if device is None or tick - device.link.last_heard > OFFLINE_AFTER:
-                self._problem(logical, "offline", logical, "not connected")
+                self._problem(logical, "offline", logical, "not connected: check its cable "
+                              "and power (it keeps running the protocol by itself)")
                 continue
             self._clear(logical, "offline")
             status = device.status
@@ -677,6 +791,33 @@ class Engine:
                                   f"no pellet for {sch.format_seconds(int(quiet) // 60 * 60)}")
                 else:
                     self._clear(logical, "no_pellets")
+
+    def _behind(self, run, logical):
+        """How many rows a device has written that aren't in its copy, or None
+        if it isn't connected and in that run."""
+        device = self.device_by_id(run.ids[logical])
+        if device is None or device.status.get("run") != run.run_id:
+            return None
+        try:
+            return max(int(device.status.get("seq", 0)) - (run.copies[logical].next_seq - 1), 0)
+        except ValueError:
+            return None
+
+    def _check_copies(self):
+        """Flag a copy that's behind its card and has stopped catching up."""
+        tick = self.monotonic()
+        runs = ([self.run] if self.run else []) + list(self.stopped.values())
+        for run in runs:
+            for logical, copy in run.copies.items():
+                behind = self._behind(run, logical)
+                if not behind or copy.next_seq != copy.stalled_at:
+                    copy.stalled_at, copy.stalled_since = copy.next_seq, tick
+                    if run is self.run:
+                        self._clear(logical, "copy")
+                elif tick - copy.stalled_since > COPY_STALLED and run is self.run:
+                    self._problem(logical, "copy", logical,
+                                  f"FNT's copy is {behind} rows behind its card and isn't "
+                                  "catching up; the card still has every row")
 
     def _can_dispense(self, logical, status):
         try:
@@ -770,8 +911,8 @@ class Engine:
 
     def _begin(self, logical, device):
         """Put one device into the run. Safe to repeat."""
-        if device is None:
-            return False
+        if device is None or self._replaying(device):
+            return False        # not while it's replaying another file's rows
         crc = f"{self.run.crcs[logical]:08x}"
         command = f"RUN:BEGIN,{self.run.run_id},{iso(self.run.t0)},{crc}"
         reply = self._call(device, command)
@@ -784,6 +925,8 @@ class Engine:
         if reply.startswith("RUN,"):
             device.run = self.run.run_id
             self.run.started[logical] = True
+            device.last_row = {}        # the last run's rows say nothing about this one
+            device.replay = None
             self._read_status(device)
             self._fill_gaps(self.run, logical, device, force=True)
             return True
@@ -834,8 +977,12 @@ class Engine:
                     change["missed"].remove(logical)
                     changed = True
                     continue
-                reply = self._call(device, f"GOTO:{change['from']},{change['to']}")
-                self._read_status(device)
+                try:
+                    reply = self._call(device, f"GOTO:{change['from']},{change['to']}")
+                    self._read_status(device)
+                except LinkError as exc:
+                    self._disconnect(device, str(exc))
+                    continue
                 if reply.startswith("PHASE,") or error(reply):
                     change["missed"].remove(logical)
                     changed = True
@@ -854,14 +1001,30 @@ class Engine:
                               and device.status.get("run") == run.run_id)
         if not (force or behind):
             return
-        if self.monotonic() - copy.read_requested < READ_RETRY and not force:
+        link, tick = device.link, self.monotonic()
+        if self._replaying(device):
             return
-        copy.read_requested = self.monotonic()
-        device.link.on_line = lambda line, d=device: self._on_line(d, line, run.run_id)
-        try:
-            self._call(device, f"READ:{run.run_id},{copy.next_seq}", timeout=30)
-        finally:
-            device.link.on_line = lambda line, d=device: self._on_line(d, line)
+        if tick - copy.read_requested < READ_RETRY and not force:
+            return
+        copy.read_requested = tick
+        # The replay arrives between the device's other lines, over as many
+        # steps as it takes (_on_line, _replay_done): weeks of rows after a
+        # long gap don't hold up the other devices or the window.
+        known = max(seq, int(device.last_row.get("seq", 0) or 0)
+                    if device.run == run.run_id else 0)
+        device.replay = (run.run_id, known)
+        link.read(f"READ:{run.run_id},{copy.next_seq}")
+
+    def _replaying(self, device):
+        """Whether a READ's rows are still coming in. One that has sent nothing
+        for READ_STALLED has stopped (the device restarted, or lost the file)."""
+        link = device.link
+        if link.replaying is None:
+            return False
+        if self.monotonic() - link.replaying < READ_STALLED:
+            return True
+        link.replaying, device.replay = None, None
+        return False
 
     def _reupload(self, logical, device):
         phase = int(device.status.get("phase", 0))
@@ -1316,6 +1479,7 @@ class Engine:
                             for l, s in self.run.compiled.schedules.items()},
                 "seed": self.run.seed, "stopped_at": self.run.stopped_at,
                 "current": self.current_phases(),
+                "behind": {l: self._behind(self.run, l) for l in self.run.ids},
             }
         snapshot = {
             "state": self.state, "now": self.now(), "zone": self.zone,
@@ -1323,6 +1487,9 @@ class Engine:
             "problems": [vars(p).copy() for p in self.problems.values()],
             "events": list(self.events)[-100:], "event_count": self.event_count,
             "edit_result": dict(self.edit_result) if self.edit_result else None,
+            # Real time, whatever clock the engine runs on: how the window
+            # knows this snapshot is fresh.
+            "published": time.monotonic(),
         }
         with self.lock:
             self._snapshot = snapshot

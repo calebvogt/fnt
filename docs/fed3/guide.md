@@ -1,9 +1,9 @@
 # Running FED3 experiments
 
 > [!WARNING]
-> **Alpha.** This works end to end against simulated devices and the
-> firmware's logic built for a PC. It has not yet been run on FED3 hardware;
-> see the bench checklist in the `fnt-fed3` README first.
+> **Alpha.** Everything here is tested against simulated devices and the
+> firmware's logic built for a PC. Before a first run, work through the bench
+> checklist in the `fnt-fed3` README on a spare FED3.
 
 The FED3s run the experiment themselves. FNT writes the protocol, starts the
 run, keeps a copy of the data, and shows you what each device is doing. If the
@@ -12,9 +12,13 @@ and it picks the run back up.
 
 ## Before the first run
 
-1. **Flash every FED3 with firmware v3** (`fnt-fed3`; 3.1 adds **Lights**).
-   - Devices on older firmware show up in FED3 with a warning and aren't used.
-   - On 3.0 everything works except Lights.
+1. **Flash every FED3 with firmware 3.2** (`fnt-fed3`).
+   - Devices on firmware older than 3.0 show up in FED3 with a warning and
+     aren't used.
+   - 3.0 and 3.1 still run, but use 3.2 for anything longer than a bench test:
+     on older firmware a card that isn't ready at power-on leaves the FED3 on
+     the defaults (and can cost it its ID), and a row the card refuses stalls
+     FNT's copy until FNT skips it.
 2. **Give each one its own ID.** A FED3's ID is its one name: on its screen,
    in your protocols, in its data file and on FNT's screens, e.g. `FED007`.
    A newly flashed FED3 is FED001. Set it either way; it's kept on the SD card,
@@ -148,22 +152,27 @@ Stopped**, with a note on the current step.
     flashing as it goes up (dimmed while the device isn't connected);
   - beside it, its current phase and rule, rewards this phase, when the phase
     ends, its last event, and its port, battery and temperature;
-  - any problem: a jam, offline, a watchdog restart, a dead SD card, a clock
-    that's wrong, no pellets for too long, or the wrong schedule.
+  - any problem: a jam, offline, a watchdog restart, a dead SD card (or one
+    that wasn't ready at power-on, or refused a row), a low battery, a clock
+    that's wrong, no pellets for too long, the wrong schedule, or FNT's copy
+    falling behind the card.
 
   A problem stays on the card, outlined in red, until you press
   **Acknowledge**, even if it has cleared, so an overnight jam is still visible
   in the morning.
-- **Feed** on a card dispenses a pellet by hand (recorded as manual: a pellet,
-  not a reward). **More ▾** has **Play a cue…** and **Set its clock now…**,
+- **Feed** on a card dispenses a pellet by hand, after asking (recorded as
+  manual: a pellet, not a reward). **More ▾** has **Play a cue…** and **Set its clock now…**,
   which sets the clock even across a big jump, after asking.
 - **The counts on the drawing** are left pokes, pellets and right pokes, as
   labelled under it.
 - **The plot** runs across the top at full width: cumulative pellets per
-  device, with phase changes dotted and Stop dashed. The menu in its title
-  draws the time axis in standard time (as the devices keep it), local time
-  with daylight saving, or UTC. The cards flow below it in as many columns as
-  fit.
+  device, with a line where each phase begins (named at the top) and Stop
+  dashed in red. A FED3 that changes phase on its own gets a line in its
+  colour. The menu in its title draws the time axis in standard time (as the
+  devices keep it), local time with daylight saving, or UTC; the one beside
+  it shows the whole run, the last 7 days or the last 24 hours. At the daily
+  check, the last 24 hours shows a FED3 that stopped overnight, which three
+  weeks of pellets would hide. The cards flow below it in as many columns as fit.
 - **Temperature and humidity** show only on a FED3 fitted with an AHT20
   sensor; without one the device reports `nan` and the card leaves them out.
 - **The log** runs along the bottom of the window, newest last: problems in red,
@@ -181,6 +190,16 @@ Stopped**, with a note on the current step.
 - **Phases FNT moves** (counts across devices, or by hand): a FED3 that's
   unplugged at that moment is moved on as soon as it's back.
 - **Advance phase** appears only when the current phase ends by hand.
+- **If the bar across the top turns red** (`FNT hasn't updated for …`), what's
+  on screen is that old: FNT is waiting on a FED3 that isn't answering, or is
+  stuck. The FED3s carry on. If it doesn't clear in a minute or two, close and
+  reopen FED3; it picks the run back up.
+- **Keep FNT open, and reopen it after the PC restarts.** Nothing starts it
+  for you: after an update or a power cut the FED3s carry on, but nothing is
+  copied and phases that need FNT wait until FED3 is open again.
+- **Power.** The firmware doesn't sleep, so a FED3 on battery alone lasts days,
+  not weeks: run long trials on USB power. Its screen shows the battery
+  voltage, and FNT flags one under 3.55 V.
 - **Closing the window** doesn't stop the run. The devices keep running and
   recording to their SD cards; when you reopen FED3, FNT copies what it
   missed.

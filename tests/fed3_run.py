@@ -157,6 +157,7 @@ def main():
     try:
         run_checks(root)
         guard_checks(os.path.join(root, "guards"))
+        fault_checks(os.path.join(root, "faults"))
     finally:
         shutil.rmtree(root, ignore_errors=True)
     passed = sum(RESULTS)
@@ -621,6 +622,217 @@ def guard_checks(root):
           f"{len(cant)}")
     check("another Adafruit board is asked once, then left alone", OtherBoard.pings == 1,
           f"{OtherBoard.pings} PINGs")
+
+
+FAULTS = """\
+format: fnt-fed3-protocol/2
+name: Faults
+devices: [FED001, FED003]
+phases:
+  - name: One
+    until: {rewards: 2, of: each}
+    rule: {active: left}
+  - name: Two
+    rule: {active: left, ratio: 2}
+"""
+
+
+def card_file(world, port):
+    """(card, name) of the data file a device is writing."""
+    device = world.device(port)
+    return device.card, device.file
+
+
+def drop_row(world, port, seq):
+    """Take one row off a device's card, as firmware 3.1 left it when the card
+    refused a row: the number was used, and the row was never written."""
+    card, name = card_file(world, port)
+    lines = card.files[name].splitlines(keepends=True)
+    text = "".join(line for line in lines if line.split(",")[2:3] != [str(seq)])
+    if hasattr(card, "path"):           # the firmware core's card is a folder
+        with open(os.path.join(card.path, name), "w", encoding="ascii", newline="") as f:
+            f.write(text)
+    else:
+        card.files[name] = text
+
+
+def away(world, port, fn):
+    """Something a device does while unplugged. What it sends then goes
+    nowhere: the simulated port would otherwise hand it over on reconnect."""
+    result = world.act(port, fn)
+    world.transports[port].pending.clear()
+    return result
+
+
+class Trickle(dev.SimTransport):
+    """A FED3 that replays a file the way a real one does: a few rows at a
+    time, between everything else. A poll gets what has arrived (``budget``
+    lines a step); waiting for a reply gets whatever comes before it."""
+
+    budget = 0
+
+    def readline(self, timeout):
+        if not timeout:
+            if self.budget <= 0:
+                return None
+            self.budget -= 1
+        return super().readline(timeout)
+
+
+class LowBattery:
+    """A FED3 whose battery has run down."""
+
+    closed = False
+
+    def write(self, line):
+        self.reply = {"PING": "PONG,id=21,fw=3.2,proto=3"}.get(
+            line, "STATUS,id=21,clock=ok,sd=ok,run=-,ended=1,jam=0,batt=3.41" if line == "STATUS"
+            else "TIME,before=unset,after=2026-10-20T09:00:00-07:00")
+
+    def readline(self, timeout):
+        reply, self.reply = getattr(self, "reply", None), None
+        return reply
+
+    def close(self):
+        self.closed = True
+
+
+def fault_checks(root):
+    os.makedirs(root)
+    print("\n--- a FED3 that powers up before its card is ready ---")
+    world = World(root, ids=(1, 3))
+    world.run_for(10)
+    world.engine.submit("start", protocol_text=FAULTS, binding={"FED001": 1, "FED003": 3})
+    world.run_for(10)
+    feed(world, "COM3", 1)
+    feed(world, "COM4", 3)
+    world.run_for(40)
+    world.device("COM4").card.failing = True
+    world.act("COM4", lambda d: d.reboot("power"))
+    world.run_for(45)                   # long enough for FNT to read its STATUS and set its clock
+    ids = {d["port"]: d["id"] for d in world.engine.snapshot()["devices"] if d["connected"]}
+    check("while it can't read its card, FNT doesn't take the default ID for a new one",
+          ids == {"COM3": 1, "COM4": 3} and ("FED001", "duplicate_id") not in problems(world),
+          f"{ids}")
+    world.device("COM4").card.failing = False
+    world.run_for(60)
+    check("with the card back it's in the run again, in its phase, under its own ID",
+          seen(world, 3, "run") == world.engine.run.run_id and seen(world, 3, "phase") == "1"
+          and seen(world, 3, "id") == "3", f"{seen(world, 3, 'run')} id {seen(world, 3, 'id')}")
+    check("its card still says who it is",
+          world.device("COM4").card.files["DEVICE.TXT"].startswith("id=3\n"))
+    check("the copy matches the card", copy_text(world, "FED003") == world.card_rows("COM4"))
+    check("and it's flagged", ("FED003", "sd_boot") in problems(world, active=False),
+          f"{problems(world, active=False)}")
+
+    print("\n--- rows a card refused ---")
+    world.device("COM4").card.failing = True
+    world.act("COM4", lambda d: d.poke("R"))
+    world.run_for(2, step=1)
+    world.device("COM4").card.failing = False
+    world.run_for(40)
+    check("a refused row is flagged even though STATUS says the card is fine again",
+          ("FED003", "sd") in problems(world, active=False)
+          and seen(world, 3, "sd") == "ok")
+    check("and reaches the copy once the card takes it",
+          copy_text(world, "FED003") == world.card_rows("COM4"))
+    # Firmware 3.1 used the row's number and never wrote it: a gap on the card.
+    world.unplug("COM4")
+    world.run_for(5)
+    for _ in range(3):
+        away(world, "COM4", lambda d: d.poke("R"))
+    lost = world.engine.run.copies["FED003"].next_seq + 1
+    drop_row(world, "COM4", lost)
+    world.plug("COM4")
+    world.run_for(60)
+    feed(world, "COM4", 2)
+    world.run_for(60)
+    copy = world.engine.run.copies["FED003"]
+    check("a number missing from the card doesn't hold the copy up for good",
+          not copy.gap and copy_text(world, "FED003") == world.card_rows("COM4"),
+          f"waiting at {copy.next_seq}, {len(copy.pending)} rows held")
+    lost_rows = [p["message"] for p in world.engine.snapshot()["problems"]
+                 if p["kind"] == "lost_rows"]
+    check("and the lost row is flagged by number", lost_rows and f"row {lost} " in lost_rows[0],
+          f"{lost_rows}")
+
+    print("\n--- a restart nobody saw ---")
+    world.unplug("COM3")
+    world.run_for(5)
+    away(world, "COM3", lambda d: d.reboot("watchdog"))     # its BOOT line goes to nobody
+    world.plug("COM3")
+    world.run_for(60)
+    check("a watchdog restart is flagged from its row in the data",
+          ("FED001", "watchdog") in problems(world, active=False))
+
+    print("\n--- FNT's copy after the PC lost power mid-write ---")
+    feed(world, "COM3", 2)
+    world.run_for(30)
+    folder = world.engine.run.folder
+    with open(world.engine.run.copies["FED001"].path, "a", encoding="ascii") as f:
+        f.write("2026-10-20T09:0")
+    world.engine = world.new_engine()
+    check("a torn last line doesn't stop the run being picked up",
+          world.engine.resume_latest() == folder and world.engine.state == "running")
+    feed(world, "COM3", 1)
+    world.run_for(60)
+    check("and the copy matches the card again",
+          copy_text(world, "FED001") == world.card_rows("COM3"))
+
+    print("\n--- catching up on a long file ---")
+    world.unplug("COM3")
+    world.run_for(5)
+    for _ in range(150):
+        away(world, "COM3", lambda d: d.poke("R"))
+    slow = world.transports["COM3"] = Trickle(world.device("COM3"))
+    world.plug("COM3")
+    for _ in range(40):                 # until it's found and the READ is sent
+        world.run_for(1, step=1)
+        found = world.engine.device_by_id(1)
+        if found and found.link.replaying is not None:
+            break
+    partial = []
+    for _ in range(12):
+        slow.budget = 5
+        world.run_for(1, step=1)
+        partial.append(world.engine.run.copies["FED001"].next_seq)
+    check("the rows come in over many steps, none of them waiting on the replay",
+          len(set(partial)) > 5 and copy_text(world, "FED001") != world.card_rows("COM3"),
+          f"{partial[:4]}...")
+    # Every replayed row is one of those pokes; live, there was only the clock being set.
+    check("replayed rows go to the copy without passing for what the device just did",
+          found.last_row.get("event") != "poke", f"{found.last_row.get('event')}")
+    behind = world.engine.snapshot()["run"]["behind"]["FED001"]
+    check("the snapshot says how far behind the copy is", behind and behind > 0, f"{behind}")
+    world.act("COM3", lambda d: d.poke("L"))
+    slow.budget = 100000
+    world.run_for(1, step=1)
+    news = next(d["last_row"] for d in world.engine.snapshot()["devices"] if d["id"] == 1)
+    check("a row written during the replay is news",
+          news.get("side") == "L", f"{news.get('seq')} {news.get('side')}")
+    world.run_for(120)
+    check("and the copy ends up matching the card",
+          copy_text(world, "FED001") == world.card_rows("COM3")
+          and world.engine.snapshot()["run"]["behind"]["FED001"] == 0)
+
+    print("\n--- the engine, when something breaks ---")
+    world.transports["COM7"] = LowBattery()
+    world.plugged["COM7"] = True
+    world.run_for(40)
+    check("a low battery is flagged", ("FED021", "battery") in problems(world),
+          f"{problems(world)}")
+    before = world.engine.snapshot()["published"]
+    real = world.engine._check_problems
+    world.engine._check_problems = lambda: 1 / 0
+    world.run_for(5)
+    snap = world.engine.snapshot()
+    check("an error in a step is shown as a problem, and the snapshot still goes out",
+          ("", "engine") in problems(world) and snap["published"] > before)
+    world.engine._check_problems = real
+    world.run_for(5)
+    check("and clears when the steps work again", ("", "engine") not in problems(world))
+    world.engine.submit("stop")
+    world.run_for(5)
 
 
 if __name__ == "__main__":
