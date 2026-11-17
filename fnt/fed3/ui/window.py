@@ -12,6 +12,7 @@ back up.
 import argparse
 import os
 import sys
+import time
 
 from PyQt5.QtCore import QSettings, Qt, QTimer
 from PyQt5.QtWidgets import (
@@ -27,6 +28,7 @@ from .setup_view import SetupView
 from .stage_bar import StageBar
 
 POLL_MS = 250
+STALE_AFTER = 10.0      # seconds without a new snapshot before the window says so
 LOG_HEIGHT = 170
 
 
@@ -105,7 +107,9 @@ class FedWindow(QMainWindow):
         if not snapshot:
             return
         self.log.update_log(snapshot)
-        self.stage.set_stage(snapshot["state"], self._stage_note(snapshot))
+        stale = stale_note(snapshot, time.monotonic())
+        self.stage.set_stage(snapshot["state"], stale or self._stage_note(snapshot),
+                             alert=bool(stale))
         if snapshot["state"] == "setup":
             if self.stack.currentWidget() is not self.setup_view:
                 self.stack.setCurrentWidget(self.setup_view)
@@ -143,6 +147,18 @@ class FedWindow(QMainWindow):
             if device.link:
                 device.link.close()
         event.accept()
+
+
+def stale_note(snapshot, now):
+    """Why the screen can't be trusted, if the engine has stopped sending
+    snapshots (it's waiting on a FED3 that doesn't answer, or stuck): what's
+    shown is as old as the last one. Empty when it's fresh."""
+    age = now - snapshot.get("published", now)
+    if age < STALE_AFTER:
+        return ""
+    ago = f"{int(age)} s" if age < 120 else format_delta(age)
+    return (f"⚠ FNT hasn't updated for {ago}: what's below is as it was then. "
+            "The FED3s carry on by themselves.")
 
 
 def main(argv=None):

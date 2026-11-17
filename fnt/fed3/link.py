@@ -2,9 +2,14 @@
 
 The device handles one command at a time and answers it before reading the
 next, so a reply is simply the first line after a command that isn't a ``ROW``
-or ``BOOT`` (a ``READ`` ends at ``READ_END``). ``ROW`` and ``BOOT`` lines can
-arrive at any moment, including between a command and its reply; they go to
-``on_line``.
+or ``BOOT``. ``ROW`` and ``BOOT`` lines (and ``ERR,SD,append failed``, for a row
+the card refused) can arrive at any moment, including between a command and
+its reply; they go to ``on_line``.
+
+A ``READ`` is the exception: the device replays the file a few rows at a time
+between everything else it does, and ends with ``READ_END``. :meth:`read`
+sends one and returns at once; the rows and the ``READ_END`` go to ``on_line``
+as they arrive, so catching up on a long file never holds the engine up.
 
 There is no thread here. The run engine calls :meth:`poll` for unsolicited
 lines and :meth:`call` for commands, all from its own loop.
@@ -13,7 +18,8 @@ from __future__ import annotations
 
 import time
 
-UNSOLICITED = ("ROW,", "BOOT,")
+UNSOLICITED = ("ROW,", "BOOT,", "ERR,SD,append")
+REPLAY_END = ("READ_END,", "ERR,NO_FILE")
 CANDIDATE_VIDS = {0x239A}           # Adafruit: the FED3's Feather M0
 
 
@@ -79,10 +85,30 @@ class DeviceLink:
         self.clock = clock
         self.last_heard = clock()
         self.closed = False
+        # When the last row of a READ sent with read() arrived (or when it was
+        # sent), until its READ_END; None when no replay is under way.
+        self.replaying = None
 
     def _dispatch(self, line):
         self.last_heard = self.clock()
+        if self.replaying is not None:
+            if line.startswith(REPLAY_END):
+                self.replaying = None
+            elif line.startswith("ROW,"):
+                self.replaying = self.clock()
         self.on_line(line)
+
+    def _unsolicited(self, line):
+        return line.startswith(UNSOLICITED) or (self.replaying is not None
+                                                and line.startswith(REPLAY_END))
+
+    def read(self, command):
+        """Send a ``READ`` and return without waiting for the replay. Its rows,
+        then its ``READ_END`` (or ``ERR,NO_FILE``), go to on_line as they come."""
+        self.poll()
+        self.transport.write(command)
+        self.replaying = self.clock()
+        self.poll()
 
     def poll(self, limit=200):
         """Hand every line already waiting to on_line, without blocking."""
@@ -106,7 +132,7 @@ class DeviceLink:
             line = self._readline(max(0.0, deadline - time.monotonic()))
             if line is None:
                 raise LinkError(f"no reply to {command.split(':')[0]}")
-            if line.startswith(UNSOLICITED):
+            if self._unsolicited(line):
                 self._dispatch(line)
                 continue
             self.last_heard = self.clock()

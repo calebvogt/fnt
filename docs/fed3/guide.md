@@ -1,9 +1,9 @@
 # Running FED3 experiments
 
 > [!WARNING]
-> **Alpha.** This works end to end against simulated devices and the
-> firmware's logic built for a PC. It has not yet been run on FED3 hardware;
-> see the bench checklist in the `fnt-fed3` README first.
+> **Alpha.** Everything here is tested against simulated devices and the
+> firmware's logic built for a PC. Before a first run, work through the bench
+> checklist in the `fnt-fed3` README on a spare FED3.
 
 The FED3s run the experiment themselves. FNT writes the protocol, starts the
 run, keeps a copy of the data, and shows you what each device is doing. If the
@@ -12,9 +12,13 @@ and it picks the run back up.
 
 ## Before the first run
 
-1. **Flash every FED3 with firmware v3** (`fnt-fed3`; 3.1 adds **Lights**).
-   - Devices on older firmware show up in FED3 with a warning and aren't used.
-   - On 3.0 everything works except Lights.
+1. **Flash every FED3 with firmware 3.2** (`fnt-fed3`).
+   - Devices on firmware older than 3.0 show up in FED3 with a warning and
+     aren't used.
+   - 3.0 and 3.1 still run, but use 3.2 for anything longer than a bench test:
+     on older firmware a card that isn't ready at power-on leaves the FED3 on
+     the defaults (and can cost it its ID), and a row the card refuses stalls
+     FNT's copy until FNT skips it.
 2. **Give each one its own ID.** A FED3's ID is its one name: on its screen,
    in your protocols, in its data file and on FNT's screens, e.g. `FED007`.
    A newly flashed FED3 is FED001. Set it either way; it's kept on the SD card,
@@ -31,8 +35,13 @@ and it picks the run back up.
 A protocol is a short YAML file: the FED3s it uses, by ID (`devices: [FED001,
 FED002]`), and phases, each with a rule and a way to end.
 
+- **Choose the FED3s.** **Devices** in the editor's toolbar shows the
+  protocol's FED3s; click it to change them. Type IDs or ranges (`1-4`, or
+  `FED001, FED007`), or use the ones plugged in. **New…** starts with the
+  FED3s that are connected.
 - **Start from a template.** In Setup, **New…** opens the editor; **New from
-  template** has:
+  template** has the following, each for the FED3s the protocol already lists
+  (the four-patch example keeps its own four):
   - **Classic FED3 modes**, one protocol each: Free feeding, FR1, FR3, FR5,
     Progressive ratio, Extinction, FR1 and PR reversed (right poke),
     Optogenetic stimulation and its reversed version, Timed feeding, and FNT's
@@ -51,29 +60,58 @@ FED002]`), and phases, each with a rule and a way to end.
   - The check catches the same things in text: a phase that only ends on
     rewards no poke can earn is an error, and free feeding with an active poke
     is a warning.
+  - **With several FED3s** the form has a row for each. Leave a row on
+    `same` and that FED3 runs the settings above it, or give it its own
+    active poke, ratio or reward: FR1 on one FED3 and RR2, RR3 and RR4 on
+    three others is one phase. **Runs as** shows what each will do. The form
+    writes the differences as the phase's `per_device` (below).
 - **Edit phase** reads a phase back into the same form and rewrites it, and
   **Remove phase** deletes one. A phase that uses something the form doesn't
-  have (a named rule, a rotation, daily windows, per-device rules in `only`) is edited in
-  the text: the form says what it can't show and takes you to the phase rather
-  than drop it. Comments inside a phase the form rewrites are lost.
+  have (a named rule, a rotation, daily windows, a per-device change to
+  anything but the active poke, ratio or reward) is edited in the text: the
+  form says what it can't show and takes you to the phase rather than drop
+  it. Comments inside a phase the form rewrites are lost.
+- **Ratios are written as you'd say them:** `ratio: FR5`, `ratio: RR3` or
+  `ratio: PR`. The classic FED3 reward (4 kHz tone, blue light bar) is
+  `cue: {reward: classic}`.
+- **Settings every phase shares** go in `every_phase` at the top, so each
+  phase only says what it changes:
+
+  ```yaml
+  every_phase:
+    active: both
+    cue: {reward: classic}
+  phases:
+    - name: FR1
+      until: {rewards: 50, of: each}
+      rule: {ratio: FR1}
+    - name: RR3
+      rule: {ratio: RR3}
+  ```
+
+  To drop something it sets in one phase, write it back there, e.g.
+  `cue: {reward: none}`.
 - **With several FED3s,** every one runs every phase. A phase's `rule` is what
-  they all do, and `only` changes it for the ones it names:
+  they all do, and `per_device` changes it for the ones it names:
 
   ```yaml
   - name: Training
     until: {rewards: 100, of: all}
-    rule: {active: both, ratio: 1}
-    only:
-      FED003, FED004: {ratio: 5}
+    rule: {active: both, ratio: FR1}
+    per_device:
+      FED003, FED004: {ratio: FR5}
   ```
 
   `of` says whose rewards end the phase: `all` moves every FED3 on together
   once each has 100 (FNT checks this, so it must be running), and `each` moves
   each FED3 on by itself when it reaches 100. With several FED3s the check
   warns until you write one.
-- **Older protocols** (`format: fnt-fed3-protocol/1`) still open and run. They
-  used `all` for `rule`, and `devices` for both `only` and `of`; see
-  [design.md](design.md#format-1).
+- **Older protocols** (`format: fnt-fed3-protocol/1` and `/2`) still open and
+  run. Format 2 called `per_device` `only`; format 1 used `all` for `rule`, and
+  `devices` for both `per_device` and `of`. See
+  [design.md](design.md#formats-1-and-2).
+- **Mistakes in the YAML itself** (a tab, a line out of line, `ratio:3`
+  without a space) are reported in plain words at their line.
 - **The check on the right** updates as you type and points at the line of any
   problem.
 - **The timeline below it** shows when each phase will start, and marks the
@@ -148,22 +186,27 @@ Stopped**, with a note on the current step.
     flashing as it goes up (dimmed while the device isn't connected);
   - beside it, its current phase and rule, rewards this phase, when the phase
     ends, its last event, and its port, battery and temperature;
-  - any problem: a jam, offline, a watchdog restart, a dead SD card, a clock
-    that's wrong, no pellets for too long, or the wrong schedule.
+  - any problem: a jam, offline, a watchdog restart, a dead SD card (or one
+    that wasn't ready at power-on, or refused a row), a low battery, a clock
+    that's wrong, no pellets for too long, the wrong schedule, or FNT's copy
+    falling behind the card.
 
   A problem stays on the card, outlined in red, until you press
   **Acknowledge**, even if it has cleared, so an overnight jam is still visible
   in the morning.
-- **Feed** on a card dispenses a pellet by hand (recorded as manual: a pellet,
-  not a reward). **More ▾** has **Play a cue…** and **Set its clock now…**,
+- **Feed** on a card dispenses a pellet by hand, after asking (recorded as
+  manual: a pellet, not a reward). **More ▾** has **Play a cue…** and **Set its clock now…**,
   which sets the clock even across a big jump, after asking.
 - **The counts on the drawing** are left pokes, pellets and right pokes, as
   labelled under it.
 - **The plot** runs across the top at full width: cumulative pellets per
-  device, with phase changes dotted and Stop dashed. The menu in its title
-  draws the time axis in standard time (as the devices keep it), local time
-  with daylight saving, or UTC. The cards flow below it in as many columns as
-  fit.
+  device, with a line where each phase begins (named at the top) and Stop
+  dashed in red. A FED3 that changes phase on its own gets a line in its
+  colour. The menu in its title draws the time axis in standard time (as the
+  devices keep it), local time with daylight saving, or UTC; the one beside
+  it shows the whole run, the last 7 days or the last 24 hours. At the daily
+  check, the last 24 hours shows a FED3 that stopped overnight, which three
+  weeks of pellets would hide. The cards flow below it in as many columns as fit.
 - **Temperature and humidity** show only on a FED3 fitted with an AHT20
   sensor; without one the device reports `nan` and the card leaves them out.
 - **The log** runs along the bottom of the window, newest last: problems in red,
@@ -181,6 +224,16 @@ Stopped**, with a note on the current step.
 - **Phases FNT moves** (counts across devices, or by hand): a FED3 that's
   unplugged at that moment is moved on as soon as it's back.
 - **Advance phase** appears only when the current phase ends by hand.
+- **If the bar across the top turns red** (`FNT hasn't updated for …`), what's
+  on screen is that old: FNT is waiting on a FED3 that isn't answering, or is
+  stuck. The FED3s carry on. If it doesn't clear in a minute or two, close and
+  reopen FED3; it picks the run back up.
+- **Keep FNT open, and reopen it after the PC restarts.** Nothing starts it
+  for you: after an update or a power cut the FED3s carry on, but nothing is
+  copied and phases that need FNT wait until FED3 is open again.
+- **Power.** The firmware doesn't sleep, so a FED3 on battery alone lasts days,
+  not weeks: run long trials on USB power. Its screen shows the battery
+  voltage, and FNT flags one under 3.55 V.
 - **Closing the window** doesn't stop the run. The devices keep running and
   recording to their SD cards; when you reopen FED3, FNT copies what it
   missed.

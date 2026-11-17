@@ -31,9 +31,11 @@ class StageBar(QWidget):
         row.addSpacing(12)
         row.addWidget(self.note, 1)
         self.state = None
+        self.alert = False
         self.set_stage("setup")
 
-    def set_stage(self, state, note=""):
+    def set_stage(self, state, note="", alert=False):
+        """``alert`` shows the note as a warning: what's on screen can't be trusted."""
         if state != self.state:
             self.state = state
             current = self.steps[state][0]
@@ -51,3 +53,6 @@ class StageBar(QWidget):
                               " border-radius: 9px; color: white;")
                 label.setStyleSheet(style)
         self.note.setText(note)
+        if alert != self.alert:
+            self.alert = alert
+            self.note.setStyleSheet(f"color: {theme.BAD}; font-weight: bold;" if alert else "")

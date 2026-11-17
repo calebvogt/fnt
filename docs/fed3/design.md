@@ -1,11 +1,9 @@
 # FED3 v3: device rule, schedules and protocol files
 
-> [!WARNING]
-> **Draft.** Nothing here is implemented yet. This document is the contract
-> between three pieces that will be built against it: the FED3 firmware
-> (`fnt-fed3`, v3), the FNT protocol compiler and run monitor, and the FNT FED
-> tab. There is no compatibility with the legacy FED3 library's modes, commands
-> or file format.
+This document is the contract between three pieces built against it: the FED3
+firmware (`fnt-fed3`, v3), the FNT protocol compiler and run monitor
+(`fnt/fed3`), and the FNT FED tab. There is no compatibility with the legacy
+FED3 library's modes, commands or file format.
 
 ## Goals
 
@@ -55,9 +53,10 @@ in firmware.
 
 ## Part 1: the rule
 
-Each phase sets every key below. Any key a phase doesn't mention takes its
-default, not its value from the previous phase, so a phase always means the
-same thing wherever it is in the schedule.
+Each phase sets every key below. Any key a phase doesn't mention takes the
+protocol's `every_phase` value (Part 4), or else its default, never its value
+from the previous phase, so a phase always means the same thing wherever it is
+in the schedule.
 
 ### Keys
 
@@ -107,9 +106,19 @@ same thing wherever it is in the schedule.
   (`FEED`) isn't retried: nobody is owed it, and on the bench a retry would run
   the motor every 10 minutes on an empty hopper. At most one
   dispense is ever owed, so rewards earned while jammed don't pile up.
+- **A reward isn't a pellet.** Between a `jam` row and the retry that
+  succeeds, a poke that meets the ratio is still logged as `reward`, uses up
+  quota and counts toward `rewards=`, and delivers nothing. Count pellets
+  from `dispense` rows, and read rewards between a `jam` and the next
+  `dispense` as unpaid.
+- **The well** counts as empty once its beam has stayed clear for 200 ms, so
+  a pellet that's nudged isn't taken for a retrieval. `retrieval_ms` includes
+  that 200 ms.
 
 **A blank or corrupt card** boots into a one-phase schedule of the defaults:
-FR1, left poke, no cues.
+FR1, left poke, no cues. So does a card that isn't readable at power-on, but
+only until it answers: the device then loads what the card holds and carries
+on with its run (see recovery, Part 2).
 
 ### Cues
 
@@ -136,6 +145,9 @@ output replaces the one already playing. Every cue is triggered by a poke.
 `none` (the default for every cue) plays nothing.
 
 ### What replaces the old modes
+
+In a protocol file the first three are written `ratio: FR5`, `ratio: PR` and
+`ratio: RR3` (Part 4).
 
 | Old mode | Rule |
 | --- | --- |
@@ -257,6 +269,7 @@ needs it.
 
 | Problem | What the device does |
 | --- | --- |
+| A reading of the RTC more than 5 s from where the last reading and `millis()` put it (a glitch on the I2C bus comes back as any date at all) | It isn't believed until three readings in a row agree with each other. Until then the device counts on from the last good reading. A wrong date in the future would otherwise end every timed phase left. |
 | The clock lost power (the RTC reports `lostPower()`) | Status reports `clock=unset`. The device keeps the current phase's rule but ignores windows and time conditions until the clock is set. FNT sets it automatically as soon as it sees `clock=unset`, then the device catches up. |
 | A time change of more than 10 minutes during a run | Refused with `ERR,TIME_JUMP`. FNT asks you to confirm and then sends `TIME!:`. This stops a mistyped clock from catching up through a week of phases. |
 | Small corrections from automatic sync | Applied, and logged as a `clock` row showing the before and after times. |
@@ -269,7 +282,7 @@ needs it.
 | `SCHED.TXT` | The schedule in force. | On upload during a run, and at `RUN:BEGIN`. |
 | `NEXT.TXT` | A schedule uploaded outside a run, waiting for `RUN:BEGIN`. | On upload outside a run. |
 | `RUN.TXT` | Run id, t0, data file, ended flag, current phase number and phase start time. | At `RUN:BEGIN` and `RUN:END`, and at each phase change. |
-| `<run id>.CSV` | The run's rows. Before the first run ever, rows go to `IDLE.CSV`. | Every event. |
+| `<run id>.CSV` | The run's rows. Before the first run ever, rows go to `IDLE.CSV`. | Every event. Never started over: a `RUN:BEGIN` for a run the card already has rows for carries on in the same file. |
 
 Every file except the data file is written to a temporary name and then
 renamed, so a power cut leaves either the old version or the new one, never a
@@ -285,6 +298,14 @@ partial file.
 | Partial progress towards a ratio | Not kept: the ratio counter restarts at 0, and the `boot` row says so |
 
 It then catches up as described above.
+
+**When the card lets the device down:**
+
+| Problem | What the device does |
+| --- | --- |
+| The card isn't readable at power-on (a slow card, a brown-out) | It runs the no-card defaults (ID 1, FR1 on the left poke) and reports `sd=err`. It refuses `ID:` and writes nothing that would replace what's on the card. The moment the card answers, it loads its ID, schedule, run and counts exactly as at boot, sends `BOOT,…,reset=card,…` and writes a `boot` row with `reset=card`. |
+| The card refuses a row | `ERR,SD,append failed` is sent. The row is kept in memory (up to 1 KB of rows) and written, in order, when the card answers; it's sent as `ROW` then. With no room left a row is lost, and its number goes to the next row: `seq` never has a gap. |
+| The last row was cut off by a power cut | It's ended with a newline and left as it is. Counts come from the last whole row, and `READ` passes over it. |
 
 **After `RUN:END`** the device stays in its current phase, including its daily
 windows, so timed feeding keeps working. No more phase changes happen, and the
@@ -311,7 +332,7 @@ These are newline-terminated ASCII lines at 115200 baud.
 
 | Command | Reply | Purpose |
 | --- | --- | --- |
-| `PING` | `PONG,id=<n>,fw=3.0,proto=3` | Discovery. FNT refuses `proto` ≠ 3. |
+| `PING` | `PONG,id=<n>,fw=3.2,proto=3` | Discovery. FNT refuses `proto` ≠ 3. |
 | `STATUS` | `STATUS,…` (below) | Full state. FNT polls it every 30 s. |
 | `TIME:<iso with offset>` | `TIME,before=<iso>,after=<iso>` | Set the clock and its UTC offset. During a run a jump over 10 min is refused with `ERR,TIME_JUMP`; `TIME!:` overrides that. |
 | `ID:<n>` | `ID,id=<n>` | Set and save the ID (1-999), as the boot menu does: hold both pokes while `FED3 ID` shows at power-on, then left −1, right +1, saved after 4 s idle. Not offered during a run or after a watchdog restart. |
@@ -321,7 +342,7 @@ These are newline-terminated ASCII lines at 115200 baud.
 | `RUN:BEGIN,<run_id>,<t0 iso>,<crc>` | `RUN,run=<id>,file=<name>,phase=0` | Start a run (see below). |
 | `RUN:END` | `RUN,run=<id>,ended=1` | Log `run_end`. Phase changes stop; the current phase and its windows continue (Part 2). |
 | `GOTO:<from>,<to>` | `PHASE,n=<to>,name=<name>` | Move from phase `from` to phase `to`. Ignored with `ERR,GOTO_STALE` if the device is no longer in `from`, so a delayed or repeated `GOTO` can't skip a phase or move a device backwards. |
-| `READ:<run_id>,<from_seq>` | `ROW,…` lines, then `READ_END,run=<id>,last=<seq>` | Re-send rows from `from_seq` onward. These interleave safely with live rows. |
+| `READ:<run_id>,<from_seq>` | `ROW,…` lines, then `READ_END,run=<id>,last=<seq>` | Re-send rows from `from_seq` onward, a few at a time between everything else the device does, so other commands are answered meanwhile. These interleave safely with live rows. `last` is the last row replayed; a replay cut short by a card error ends early, with a lower `last`. A `RUN:BEGIN` ends a replay. |
 | `FEED` | `FEED,result=<started\|pellet_in_well\|jam>` | Dispense once by hand. The outcome follows as a `dispense` (`detail=manual`) or `jam` row. Counts as a pellet but not a reward. |
 | `TEST:<cue>` | `OK` | Play a cue with the same syntax as `cue.*`. |
 | `LIGHTS:on`, `LIGHTS:off` | `LIGHTS,on=<0\|1>` | The bar and both pokes white and steady, to find a device on the bench (firmware 3.1). Cues flash over them. Off at boot and at `RUN:BEGIN`, so a run never starts lit. |
@@ -348,17 +369,22 @@ These are newline-terminated ASCII lines at 115200 baud.
    file).
 3. It promotes `NEXT.TXT`, zeroes all counters, opens `<run id>.CSV`, logs
    `run_start`, and enters phase 0 with t0 as its start time.
+4. If the card already has rows for that run id (the device lost its place in
+   the run, and FNT started it again), the file is kept: `seq` and the totals
+   carry on from its last row, the `run_start` row's detail ends `;resumed`,
+   and time conditions catch up from t0 as after a power cut.
 
-Run ids are 8 characters, so file names stay valid on any FAT card.
+Run ids are up to 8 letters and digits, so file names stay valid on any FAT
+card.
 
 ### Device → host
 
 | Line | When |
 | --- | --- |
 | `ROW,<SD row>` | Every row written to the card, the moment it is written, and again in reply to `READ`. |
-| `BOOT,fw=…,reset=<power\|watchdog\|software\|external>,clock=<ok\|unset>,sched=<crc\|default>,run=<id\|->` | At startup. |
+| `BOOT,fw=…,reset=<power\|watchdog\|software\|external\|card>,clock=<ok\|unset>,sched=<crc\|default>,run=<id\|->` | At startup; and with `reset=card` when a card that wasn't readable at power-on has been loaded. A restart drops USB, so FNT rarely sees this line: it reads restarts from `boot` rows. |
 | `STATUS,id=,fw=,time=,clock=ok\|unset,sd=ok\|err,run=,ended=0\|1,sched=,next_sched=,phase=,phase_name=,phase_start=,next=,file=,seq=,l=,r=,pellets=,phase_rewards=,phase_left=,phase_right=,depleted=0\|1,well=0\|1,jam=0\|1,uptime=,batt=,temp=,hum=,lights=0\|1` | In reply to `STATUS`. `sched` and `next_sched` are crcs (`-` if none). `next` describes the soonest `UNTIL`, for example `at=2026-10-20T19:00-07:00` or `rewards=37/100`. |
-| `ERR,<code>,<detail>` | Bad command or bad value, or an SD write failure (`ERR,SD,…`). |
+| `ERR,<code>,<detail>` | Bad command or bad value, or an SD write failure (`ERR,SD,…`). `ERR,SD,append failed` is not a reply: it's sent whenever the card refuses a row, and can arrive between a command and its reply. |
 
 `crc` is CRC-32 (the `zlib.crc32` polynomial) of the schedule's lines, each
 ending in `\n`. FNT compiles the same text, so a single number shows whether a
@@ -384,7 +410,7 @@ time,ms,seq,phase,event,side,outcome,left,right,pellets,phase_rewards,phase_left
 | `phase_rewards`, `phase_left`, `phase_right` | Totals for the phase, which `UNTIL` and the quota use. |
 | `retrieval_ms` | On `retrieve` rows: the time from dispense to retrieval, however long it was. Nothing times out; the row is written whenever the well clears. |
 | `poke_ms` | On `poke` rows: how long the beam was broken. |
-| `detail` | `;`-separated, never commas. `phase`: the name, plus `;goto` or `;catch-up;start=<iso>`. `dispense`: `free`, `manual` or `retry` (blank for a reward). `jam`: what was being dispensed. `boot`: `reset=<cause>;ratio counters reset`. `clock`: `from=<iso>;to=<iso>`. `run_start`: `t0=<iso>;<first phase>`. `status` (hourly): `batt=…;temp=…;hum=…`. `poke`: `held` if the beam stayed broken past 60 s. |
+| `detail` | `;`-separated, never commas. `phase`: the name, plus `;goto` or `;catch-up;start=<iso>`. `dispense`: `free`, `manual` or `retry` (blank for a reward). `jam`: what was being dispensed. `boot`: `reset=<cause>;ratio counters reset` (`reset=card`: the card wasn't readable at power-on and has now been loaded). `clock`: `from=<iso>;to=<iso>`. `run_start`: `t0=<iso>;<first phase>`, plus `;resumed` if the card already held rows for the run. `status` (hourly): `batt=…;temp=…;hum=…`. `poke`: `held` if the beam stayed broken past 60 s. |
 
 ### Firmware changes needed to keep these promises
 
@@ -396,18 +422,19 @@ time,ms,seq,phase,event,side,outcome,left,right,pellets,phase_rewards,phase_left
   retry every 10 minutes rather than giving up for good.
 - **SD failure:** if the card can't be read, the device stays in the current
   phase (it can't read the next one), keeps running, reports `sd=err`, and
-  retries.
+  retries. Rows it couldn't write are kept and written when it can (Part 2).
 - **Output:** whole lines go out with `Serial.write(buf, len)`, with no
   `if (Serial)` checks, which cost 10 ms each.
 - **SD:** the card is initialised once at boot instead of on every row, and
   there is no 100 ms LED blink per row.
-- **Display:** shows the phase name, the counts and the next change, and is
-  redrawn on change only.
+- **Display:** shows the ID, the battery voltage, the phase name, the counts,
+  and one line of state (`SD CARD ERROR`, `JAM - retrying`, `LOW BATTERY`,
+  else `running` or `idle`); redrawn on change only.
 - **LEDs:** turned off and the motor-driver enable line released after every
   flash.
 - **Removed:** the 14 modes, the `MODE`/`NEW_TRIAL`/`SYNC`/`LIGHTS`/file-transfer
-  commands, the event queue, the pending-command slot, the boot ID menu and
-  `start.csv`/`stop.csv`.
+  commands, the event queue, the pending-command slot and
+  `start.csv`/`stop.csv`. (The boot ID menu is kept; see `ID:`.)
 
 ---
 
@@ -421,7 +448,7 @@ folder.
 ### Structure
 
 ```yaml
-format: fnt-fed3-protocol/2
+format: fnt-fed3-protocol/3
 name: Short name
 description: Free text.
 devices: [FED001, FED002]   # FED3 IDs: the same name on the device, in data and in FNT
@@ -440,11 +467,15 @@ rules:                   # optional named rules
     cue: {reward: reward_flash}
   rich: {use: base, quota: 30, quota_period: 1h}
 
+every_phase:             # optional; the rule each phase starts from
+  active: both
+  cue: {reward: classic}
+
 phases:                  # run in order; the last one runs until Stop
   - name: …
     until: …             # when this phase ends (omit on the last phase)
     rule: …              # the rule every device runs
-    only: {FED002: …}    # changes to the rule for some devices
+    per_device: {FED002: …}   # changes to the rule for some devices
     rotate: …            # reassign rules between devices periodically
     daily: […]           # clock-time windows inside this phase
 
@@ -453,8 +484,8 @@ checks:                  # optional; what the GUI flags as a problem
 ```
 
 `devices` means one thing: the list of FED3s at the top. Every device in it
-runs every phase, so a phase's `rule` is what they all do; `only` changes it
-for the devices it names.
+runs every phase, so a phase's `rule` is what they all do; `per_device`
+changes it for the devices it names.
 
 ### Rules in the file
 
@@ -462,24 +493,47 @@ A rule is either a mapping of the keys from Part 1, or the name of an entry in
 `rules`. `use: <name>` inside a mapping starts from that named rule; the keys
 written beside it override it.
 
-`only` (in a phase or a daily window) maps FED3s to rules. A key can name
-several FED3s, separated by commas, to give them one rule:
+**Ratios** are written as people say them: `ratio: FR5`, `ratio: RR3` or
+`ratio: PR`, which set `ratio_kind` and `ratio` together (in any case, so `rr3`
+works too). A plain number, `ratio: 5`, sets only the number and keeps the kind
+the rule already has; `ratio_kind` can still be written out, but not beside the
+short form.
+
+**`every_phase`** is the rule each phase starts from, so a cue or
+`active: both` used throughout is written once. A phase's `rule` changes only
+what it names; to drop something every_phase sets, write it back, e.g.
+`cue: {reward: none}`. It can be a mapping or the name of a rule.
+
+`per_device` (in a phase or a daily window) maps FED3s to rules. A key can
+name several FED3s, separated by commas, to give them one rule:
 
 ```yaml
-rule: {active: both, ratio: 1}
-only:
-  FED001, FED002: {ratio: 5}        # FR5 on both pokes, for these two
+rule: {active: both, ratio: FR1}
+per_device:
+  FED001, FED002: {ratio: FR5}      # FR5 on both pokes, for these two
   FED003: {active: left}            # FR1 on the left poke
 ```
 
-Each FED3 may appear in `only` once. Inside `{ }` a comma separates entries,
-so there a key naming several FED3s needs quotes, `{"FED001, FED002": rich}`,
-or is written as a list, `{[FED001, FED002]: rich}`. A phase with `only` and
-no `rule` runs the defaults (FR1 on the left poke) on the devices `only`
-leaves out, which the checker warns about.
+Each FED3 may appear in `per_device` once. Inside `{ }` a comma separates
+entries, so there a key naming several FED3s needs quotes,
+`{"FED001, FED002": rich}`, or is written as a list,
+`{[FED001, FED002]: rich}`. A phase with `per_device` and no `rule` runs
+`every_phase` (or, without one, the defaults: FR1 on the left poke) on the
+devices `per_device` leaves out; without `every_phase` the checker warns about
+it.
 
-`cue.*` keys are written as a nested `cue:` mapping. A cue is a named cue, or a
-list of actions where each action is either a one-key mapping or `click`:
+`cue.*` keys are written as a nested `cue:` mapping. A cue is `none`,
+`click`, a named cue, or a list of actions where each action is either a
+one-key mapping or `click`. **`classic`** is built in: the classic FED3 reward,
+a 4 kHz tone for 200 ms and the light bar blue for 1 s
+(`tone:4000:200+flash:bar:0:0:30:0:1000`). From format 3 a file can't define
+its own `classic`.
+
+```yaml
+cue: {reward: classic, counted: [click]}
+```
+
+A cue written out in full:
 
 ```yaml
 cue:
@@ -559,7 +613,7 @@ rotate:
     FED003, FED004: poor
 ```
 
-`assign` names devices the same way `only` does.
+`assign` names devices the same way `per_device` does.
 
 FNT expands a rotation into consecutive phases (`Competition 1`,
 `Competition 2`, …), one per period, with each device given its own
@@ -579,12 +633,12 @@ start to the next boundary.
 ```yaml
 daily:
   - {from: "07:00", to: "19:00", rule: {free_feed: 1}}
-  - {from: "20:00", to: "22:00", only: {FED002: {ratio: 3}}}
+  - {from: "20:00", to: "22:00", per_device: {FED002: {ratio: 3}}}
 ```
 
 A window overrides keys from the phase's rule between two clock times every
-day, for every device (`rule`), for some (`only`), or both. A device `only`
-leaves out keeps the phase's rule during the window. A window may cross
+day, for every device (`rule`), for some (`per_device`), or both. A device
+`per_device` leaves out keeps the phase's rule during the window. A window may cross
 midnight. Windows within a phase may not overlap; this is checked when the
 file is loaded.
 
@@ -592,27 +646,42 @@ file is loaded.
 
 Each phase's rule for a device is built by merging, in this order (later wins):
 1. the built-in defaults;
-2. the phase's `rule`;
-3. the phase's rotation assignment for that device;
-4. the phase's `only` entry for that device.
+2. the protocol's `every_phase`;
+3. the phase's `rule`;
+4. the phase's rotation assignment for that device;
+5. the phase's `per_device` entry for that device.
 
 `daily` windows become `WINDOW` lines.
 
-### Format 1
+### Formats 1 and 2
 
-Files written as `format: fnt-fed3-protocol/1` still load, so older protocols
-and runs keep working, but FNT writes format 2. Format 1 used other names for
-the same three things:
+Files written as `format: fnt-fed3-protocol/1` or `/2` still load, so older
+protocols and runs keep working, but FNT writes format 3. The older formats
+used other names for the same things:
 
-| Format 1 | Format 2 |
-| --- | --- |
-| phase or window `all:` | `rule:` |
-| phase or window `devices: {FED001: …}` | `only: {FED001: …}` |
-| `until: {rewards: 100, devices: all}` | `until: {rewards: 100, of: all}` |
-| `until: {rewards: 100}` | `until: {rewards: 100, of: each}` |
+| Format 1 | Format 2 | Format 3 |
+| --- | --- | --- |
+| phase or window `all:` | `rule:` | `rule:` |
+| phase or window `devices: {FED001: …}` | `only: {FED001: …}` | `per_device: {FED001: …}` |
+| `until: {rewards: 100, devices: all}` | `until: {rewards: 100, of: all}` | the same |
+| `until: {rewards: 100}` | `until: {rewards: 100, of: each}` | the same |
 
-To move a file to format 2, change its first line and these keys. The form in
-the editor writes whichever format the file it's editing uses.
+`every_phase`, the built-in `classic` cue and `ratio: FR5`/`RR3`/`PR` work in
+every format; only from format 3 is `classic` reserved, so an older file with
+its own `classic` cue keeps it. To move a file to format 3, change its first
+line and these keys; the checker names any old key it finds. The form in the
+editor writes whichever format the file it's editing uses.
+
+### Mistakes in the YAML
+
+PyYAML's own errors are reworded: a tab, a line out of line with the ones
+around it, two keys on one line (`until: rewards: 100`), a missing `:` on the
+line above, a `{ }` missing a comma or bracket, and a quote never closed each
+get a message saying what to do. `ratio:3` (no space, which YAML reads as one
+word) is pointed to `ratio: 3`; `per_device` or `until` indented inside `rule`
+is told to move left; `active: no` (YAML reads it as false) is told to write
+`none`. An `until` with an error isn't also reported as a phase that never
+ends.
 
 ### Checks
 
@@ -631,12 +700,12 @@ line:
   - out-of-range values;
   - overlapping windows;
   - a phase that can never end;
-  - a device name that isn't declared, or one given twice in `only` or
+  - a device name that isn't declared, or one given twice in `per_device` or
     `assign`;
   - a schedule over the device limits.
 
   It warns about a count condition without `of` when there are several
-  devices, and a phase whose `only` leaves devices on the defaults. It also
+  devices, and a phase whose `per_device` leaves devices on the defaults. It also
   lists the phases that need FNT.
 - `fnt-fed compile protocol.yaml` prints each device's schedule.
 - `fnt-fed preview protocol.yaml --days 21` prints the timeline. Count
@@ -673,7 +742,12 @@ A device that fails blocks Start unless you remove it from the run explicitly.
 
 **Running**
 - FNT polls `STATUS`, keeps a live copy of the rows and fills any gap with
-  `READ`.
+  `READ`. The replay comes in over as many engine steps as it takes; nothing
+  waits on it. If the device has replayed past a number the copy is still
+  waiting for, that row isn't on the card: the copy carries on and the lost
+  rows are flagged by number.
+- A copy left with a torn last line (the PC lost power mid-write) is cut back
+  to its last whole row when the run is picked up, and the rest is read again.
 - FNT checks the conditions that need it.
 - FNT flags problems on screen.
 - Manual actions are logged with their source.
@@ -703,8 +777,8 @@ records when it took effect.
   each device, the `time`, `seq` and `detail` of its `run_end` row, so the rows
   recorded after Stop can be told apart even when a device ended late or had no
   clock.
-- FNT never sends `RUN:BEGIN` for a run a device reports as ended: the device
-  would start that run's file over. A run left running in `run.json` whose
+- FNT never sends `RUN:BEGIN` for a run a device reports as ended: it would
+  start the run's phases again from t0. A run left running in `run.json` whose
   devices already ended it (FNT closed mid-Stop) is flagged, and Stop finishes
   it.
 
@@ -726,11 +800,24 @@ state, and the run header shows a count of open problems.
 - `jam`;
 - watchdog reset;
 - `sd=err`;
+- a card that wasn't readable at power-on (`reset=card`), or that refused a
+  row (`ERR,SD,append failed`), even though `sd=ok` again by the next poll;
+- rows that never reached the card, by number;
+- battery under 3.55 V;
 - `clock=unset`;
 - schedule crc mismatch;
 - clock drift over 60 s;
 - the device being in a different run;
+- FNT's copy behind the card for 10 minutes without catching up;
 - `checks.no_pellets`.
+
+A watchdog reset is read from the `boot` row in the data, replayed rows
+included, because the `BOOT` line of a restart is rarely seen (USB drops).
+
+**The window itself** says so, in red in the bar across the top, if the engine
+hasn't published a new snapshot for 10 seconds (it's waiting on a FED3 that
+doesn't answer, or stuck): what's on screen is then as old as that. An error
+inside an engine step is shown as a problem and the step is retried.
 
 A problem stays flagged until you acknowledge it, even if it has cleared, so
 an overnight jam is still visible at the morning check.
@@ -745,7 +832,6 @@ an overnight jam is still visible at the morning check.
   sched/FED001.txt  # each device's compiled schedule
   log.csv           # FNT actions, uploads, problems, disconnects (UTC)
   FED001.csv        # byte-identical copy of the device's data file
-  P2_FED007.csv
   …
 ```
 
@@ -764,7 +850,7 @@ their own (clock sync, data copying, port scanning, recovery) has no button.
 
 ```
 fnt/fed3/
-  schedule.py     # the device schedule format, limits and timing rules
+  schedule.py     # the device schedule format, limits and timing rules; the data file's columns
   protocol.py     # parse, check, compile, preview. Pure Python, no Qt.
   device_sim.py   # a FED3 on firmware v3, simulated: the firmware's spec
   link.py         # one serial port and the v3 line protocol (no threads)
@@ -848,12 +934,18 @@ The file is the protocol, so the editor edits the file:
   active poke, ratio, timeout, quota, free feeding, pellet or none, reward tone,
   flash and BNC train, clicks). It writes the YAML for you, so a new phase
   never needs typing. With several devices, an end on rewards or pokes is
-  labelled "each device on its own" and written with `of: each`. In a format 1
-  file the form writes format 1 keys.
+  labelled "each device on its own" and written with `of: each`. With several
+  devices it has a row per FED3 for its active poke, ratio and reward, written
+  as `per_device`. Ratios are written `FR5`, `RR3` or `PR`, the classic cue as
+  `classic`, and with an `every_phase` only what differs from it. In a format
+  1 or 2 file the form writes that format's keys.
+- **Devices:** the toolbar shows the protocol's FED3s and rewrites the list;
+  templates take it.
 - **Edit phase / Remove phase:** the same form, filled from a phase's YAML, or
   deleting its lines. A phase the form can't show in full (named rules,
-  rotation, windows, per-device rules in `only`) is edited in the text instead; the form
-  never drops what it can't show.
+  rotation, windows, per-device changes beyond the active poke, ratio and
+  reward, an `every_phase` with other keys) is edited in the text instead; the
+  form never drops what it can't show.
 - **During a run** the editor opens on the running protocol and **Apply to
   running devices** sends it. The engine refuses an edit that changes a
   finished phase or moves a device's current phase.
@@ -895,7 +987,8 @@ same file. Nothing else would change.
     (which asks first: it's for jumps over 10 minutes, which the device
     refuses mid-run until confirmed).
 - **Plot**, across the top at full width: cumulative pellets per device against standard
-  time, with phase changes and Stop marked.
+  time, with phase changes and Stop marked, over the whole run, the last 7
+  days or the last 24 hours.
 - **Log**, along the bottom of the window in every state: phase changes,
   problems, uploads and manual actions, coloured by kind, and collapsible.
 
@@ -910,27 +1003,26 @@ run**.
 ### 1. Both pokes, stepping up the ratio by count
 
 ```yaml
-format: fnt-fed3-protocol/2
+format: fnt-fed3-protocol/3
 name: FR1 to FR5, both pokes
 devices: [FED001]
 
-cues:
-  reward:
-    - tone: {hz: 4000, ms: 200}
-    - flash: {target: poke, color: blue, ms: 500}
-
-rules:
-  base: {active: both, cue: {reward: reward}}
+every_phase:
+  active: both
+  cue:
+    reward:
+      - tone: {hz: 4000, ms: 200}
+      - flash: {target: poke, color: blue, ms: 500}
 
 phases:
   - name: FR1
     until: {rewards: 50}
-    rule: {use: base, ratio: 1}
+    rule: {ratio: FR1}
   - name: FR3
     until: {rewards: 100}
-    rule: {use: base, ratio: 3}
+    rule: {ratio: FR3}
   - name: FR5
-    rule: {use: base, ratio: 5}
+    rule: {ratio: FR5}
 ```
 
 This compiles to:
@@ -950,7 +1042,7 @@ SET active=both ratio=5 cue.reward=tone:4000:200+flash:poke:0:0:30:0:500
 ### 2. Four-patch competition with depletion and daily reshuffle
 
 ```yaml
-format: fnt-fed3-protocol/2
+format: fnt-fed3-protocol/3
 name: Four-patch competition
 description: >
   Two rich and two poor patches that each refill hourly. Which patches are
@@ -966,8 +1058,8 @@ rules:
   patch:
     active: both
     cue: {reward: reward, depleted: [click]}
-  rich: {use: patch, ratio: 1, quota: 30, quota_period: 1h}
-  poor: {use: patch, ratio: 5, quota: 10, quota_period: 1h}
+  rich: {use: patch, ratio: FR1, quota: 30, quota_period: 1h}
+  poor: {use: patch, ratio: FR5, quota: 10, quota_period: 1h}
 
 phases:
   - name: Habituation
@@ -1003,7 +1095,7 @@ one is short unless Training happens to end at 19:00.
 ### 3. Timed feeding
 
 ```yaml
-format: fnt-fed3-protocol/2
+format: fnt-fed3-protocol/3
 name: Timed feeding 19:00-21:00
 devices: [FED001]
 phases:
@@ -1029,7 +1121,8 @@ It also keeps working after Stop.
 | Blank card | FR1, left poke. |
 | After Stop | The device keeps running its current phase, including daily windows. |
 | Where the schedule runs | On the device; FNT only checks conditions that span devices. |
-| Several devices in a phase | One `rule` for all of them, `only` for exceptions, and `of` on a count condition saying whose counts end it (format 2). |
+| Several devices in a phase | One `rule` for all of them, `per_device` for exceptions, and `of` on a count condition saying whose counts end it (format 3; `only` in format 2). |
+| Repeated settings | `every_phase` holds what every phase shares; phases still never inherit from the phase before. |
 | Notifications | None. The GUI flags problems until they're acknowledged. |
 | `status` rows | Hourly. |
 | Limits | 256 phases, 8 daily windows and 6 `until` lines per phase. |

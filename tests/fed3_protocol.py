@@ -260,7 +260,7 @@ def main():
   - name: One
     until: {after: 1d}
     rule: base
-    only: {FED002: {use: base, ratio: 3, cue: {counted: [click]}}}
+    per_device: {FED002: {use: base, ratio: 3, cue: {counted: [click]}}}
   - name: Two
     rule: {active: none, free_feed: true}
 """, extra="""\
@@ -278,13 +278,13 @@ rules:
     check("other devices are untouched by it", a["ratio"] == "1" and a["cue.counted"] == "none")
     check("true becomes 1", compiled.schedules["FED001"].phases[1].rule["free_feed"] == "1")
 
-    print("\n--- several devices: rule, only and of ---")
+    print("\n--- several devices: rule, per_device and of ---")
     three = (f"format: {proto.FORMAT}\nname: Test\ndevices: [FED001, FED002, FED003]\n"
              "phases:\n")
     grouped = three + """\
   - name: Only
     rule: {active: both}
-    only:
+    per_device:
       FED001, FED002: {ratio: 5}
 """
     compiled, problems = proto.check(grouped)
@@ -301,14 +301,14 @@ rules:
     check("an unquoted group inside { } says to quote it",
           has_error(grouped.replace("\n      FED001, FED002: {ratio: 5}",
                                     " {FED001, FED002: {ratio: 5}}"), "needs quotes"))
-    check("a FED3 given twice in only is refused",
+    check("a FED3 given twice in per_device is refused",
           has_error(grouped + "      FED002: {ratio: 2}\n", "FED002 is given twice"))
     check("a key that is a mapping is an error, not a crash",
           has_error(grouped.replace("FED001, FED002:", "{a: b}:"), "a key is a name"))
 
-    left_out = three + "  - name: Only\n    only: {FED001: {ratio: 5}}\n"
-    check("only without a rule warns that the others run the defaults",
-          any(level == "warning" and "FED002, FED003 are not in only" in m
+    left_out = three + "  - name: Only\n    per_device: {FED001: {ratio: 5}}\n"
+    check("per_device without a rule warns that the others run the defaults",
+          any(level == "warning" and "FED002, FED003 are not in per_device" in m
               for _, level, m in problems_of(left_out)))
     check("but not when the phase has a rule",
           not any(level == "warning" for _, level, _ in problems_of(grouped)))
@@ -348,7 +348,7 @@ phases:
       - {{from: "19:00", to: "21:00", all: {{free_feed: 1}}, devices: {{FED001: {{ratio: 2}}}}}}
   - name: Two
 """
-    v2 = (v1.replace(proto.FORMAT_1, proto.FORMAT).replace("all: ", "rule: ")
+    v2 = (v1.replace(proto.FORMAT_1, proto.FORMAT_2).replace("all: ", "rule: ")
           .replace("devices: {", "only: {").replace("devices: all", "of: all")
           .replace("{rewards: 30}", "{rewards: 30, of: each}"))
     old, old_problems = proto.check(v1)
@@ -362,6 +362,91 @@ phases:
           == [c.devices for c in new.protocol.phases[0].until] == ["all", None])
     check("format 1 has no rule key", has_error(v1.replace("all: {active", "rule: {active"),
                                                 "unknown key 'rule'"))
+
+    print("\n--- format 2 still loads; format 3 calls only per_device ---")
+    v3 = v2.replace(proto.FORMAT_2, proto.FORMAT).replace("only: {", "per_device: {")
+    newest, newest_problems = proto.check(v3)
+    check("the same file in format 3 compiles to the same schedules",
+          newest and not newest_problems and all(
+              newest.schedules[d].text() == new.schedules[d].text() for d in ("FED001", "FED002")),
+          f"{newest_problems}")
+    check("only in a format 3 file is pointed to per_device",
+          has_error(v3.replace("per_device: {", "only: {", 1), "it is called 'per_device'"))
+    check("and per_device in a format 2 file to only",
+          has_error(v2.replace("only: {", "per_device: {", 1), "it is called 'only'"))
+
+    print("\n--- FR5, RR3 and PR ---")
+    for written, kind, ratio in (("FR5", "fixed", "5"), ("RR3", "random", "3"),
+                                 ("pr", "progressive", "1"), ("rr12", "random", "12")):
+        compiled, problems = proto.check(protocol_text(f"  - name: One\n    rule: {{ratio: {written}}}\n"))
+        rule = compiled.schedules["FED001"].phases[0].rule if compiled else {}
+        check(f"ratio: {written} is {kind}, ratio {ratio}",
+              rule.get("ratio_kind") == kind and rule.get("ratio") == ratio, f"{problems}")
+    shorthand = protocol_text("""\
+  - name: One
+    rule: {ratio: RR4}
+    per_device: {FED002: {ratio: FR2}}
+""")
+    compiled, _ = proto.check(shorthand)
+    check("per FED3 too, replacing the kind as well as the number",
+          [(compiled.schedules[d].phases[0].rule["ratio_kind"],
+            compiled.schedules[d].phases[0].rule["ratio"]) for d in ("FED001", "FED002")]
+          == [("random", "4"), ("fixed", "2")])
+    long_form = protocol_text("  - name: One\n    rule: {ratio_kind: random, ratio: 4}\n"
+                              "    per_device: {FED002: {ratio_kind: fixed, ratio: 2}}\n")
+    check("which is exactly the long form", proto.check(long_form)[0].schedules["FED002"].text()
+          == compiled.schedules["FED002"].text())
+    check("a plain number still keeps the kind it inherits",
+          proto.check(shorthand.replace("{ratio: FR2}", "{ratio: 2}"))[0]
+          .schedules["FED002"].phases[0].rule["ratio_kind"] == "random")
+    check("the shorthand and ratio_kind together are refused",
+          has_error(protocol_text("  - name: One\n    rule: {ratio: RR3, ratio_kind: fixed}\n"),
+                    "already says the kind"))
+    check("anything else is explained",
+          has_error(protocol_text("  - name: One\n    rule: {ratio: VR3}\n"), "FR5, RR3 or PR")
+          and has_error(protocol_text("  - name: One\n    rule: {ratio: RR0}\n"), "between 1"))
+
+    print("\n--- the classic cue, and every_phase ---")
+    classic = protocol_text("  - name: One\n    rule: {cue: {reward: classic}}\n")
+    compiled, problems = proto.check(classic)
+    check("classic is the 4 kHz tone and the blue light bar for 1 s",
+          compiled and compiled.schedules["FED001"].phases[0].rule["cue.reward"]
+          == "tone:4000:200+flash:bar:0:0:30:0:1000", f"{problems}")
+    check("a format 3 file can't define its own classic",
+          has_error(protocol_text("  - name: One\n", extra="cues:\n  classic: [click]\n"),
+                    "'classic' is built in"))
+    old_classic = (protocol_text("  - name: One\n    rule: {cue: {reward: classic}}\n",
+                                 extra="cues:\n  classic: [{tone: {hz: 2000, ms: 50}}]\n")
+                   .replace(proto.FORMAT, proto.FORMAT_2))
+    compiled, _ = proto.check(old_classic)
+    check("a format 2 file that had one keeps it",
+          compiled and compiled.schedules["FED001"].phases[0].rule["cue.reward"]
+          == "tone:2000:50")
+    based = protocol_text("""\
+  - name: Train
+    until: {after: 1d}
+    rule: {ratio: FR1}
+  - name: Test
+    rule: {ratio: RR3, cue: {reward: none}}
+    per_device: {FED002: {ratio: FR3}}
+""", extra="every_phase: {active: both, cue: {reward: classic}}\n")
+    compiled, problems = proto.check(based)
+    rules = {(d, n): compiled.schedules[d].phases[n].rule for d in ("FED001", "FED002")
+             for n in (0, 1)}
+    check("every_phase is where each phase starts",
+          all(r["active"] == "both" for r in rules.values())
+          and rules["FED001", 0]["cue.reward"].startswith("tone:4000"), f"{problems}")
+    check("a phase changes what it says, and per_device goes on top",
+          rules["FED001", 1]["cue.reward"] == "none" and rules["FED001", 1]["ratio_kind"] == "random"
+          and rules["FED002", 1]["ratio_kind"] == "fixed" and rules["FED002", 1]["active"] == "both")
+    check("so per_device without a rule doesn't warn about the defaults",
+          not proto.check(based.replace("    rule: {ratio: RR3, cue: {reward: none}}\n", ""))[1])
+    check("every_phase can be a named rule",
+          proto.check(based.replace("every_phase: {active: both, cue: {reward: classic}}",
+                                    "rules:\n  base: {active: both}\nevery_phase: base"))[0]
+          .schedules["FED002"].phases[0].rule["active"] == "both")
+    check("and is checked like any rule",
+          has_error(based.replace("active: both", "active: sideways"), "must be one of"))
 
     print("\n--- rotation ---")
     rotating = protocol_text("""\
@@ -455,7 +540,7 @@ rules:
     rule: {active: none}
     daily:
       - {from: "19:00", to: "21:00", rule: {free_feed: 1}}
-      - {from: "22:00", to: "23:00", only: {FED002: {ratio: 3}}}
+      - {from: "22:00", to: "23:00", per_device: {FED002: {ratio: 3}}}
 """)
     compiled, _ = proto.check(text)
     a_windows = compiled.schedules["FED001"].phases[0].windows
@@ -535,7 +620,7 @@ rules:
     check("an unknown device is found",
           has_error(protocol_text("""\
   - name: Only
-    only: {C: {ratio: 2}}
+    per_device: {C: {ratio: 2}}
 """), "not in devices"))
     check("rules that use each other in a loop are found",
           has_error(protocol_text("""\
@@ -562,6 +647,25 @@ rules:
 """), "twice", line=7))
     check("broken YAML gives its line",
           has_error(protocol_text("  - name: [unclosed\n"), "not valid YAML"))
+    for written, fragment, why in (
+            ("  - name: a\n\trule: {active: both}\n", "a tab; indent with spaces", "a tab"),
+            ("  - name: a\n    rule:\n      active: both\n     per_device:\n"
+             "        FED002: {ratio: 2}\n", "isn't lined up", "a line out of line"),
+            ("  - name: a\n    until: rewards: 10\n  - name: b\n", "need braces",
+             "two keys on one line"),
+            ("  - name: a\n    rule:\n      ratio:3\n", "needs a space after the colon: ratio: 3",
+             "no space after a colon"),
+            ("  - name: a\n    rule:\n      active: both\n      per_device:\n"
+             "        FED002: {ratio: 2}\n", "belongs to the phase, not inside its rule",
+             "per_device inside rule"),
+            ("  - name: a\n    rule: {active: no}\n", "write none", "active: no")):
+        check(f"YAML mistakes are said plainly: {why}",
+              has_error(protocol_text(written), fragment),
+              "; ".join(m for _, _, m in problems_of(protocol_text(written))))
+    bad_until = protocol_text("  - name: a\n    until: {after: 48}\n  - name: b\n")
+    check("an until with an error isn't also reported as never ending",
+          has_error(bad_until, "after must be a duration")
+          and not has_error(bad_until, "never ends"))
     check("a protocol too long for the device is refused",
           has_error(protocol_text("""\
   - name: Hourly

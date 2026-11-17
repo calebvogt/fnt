@@ -83,6 +83,129 @@ def status(device):
     return dict(f.split("=", 1) for f in line.split(",")[1:])
 
 
+def tear(device, name, text):
+    """Leave ``text`` at the end of a file with no newline, as a power cut does
+    to the row being written."""
+    card = device.card
+    if hasattr(card, "path"):           # the firmware core's card is a folder
+        with open(os.path.join(card.path, name), "a", encoding="ascii") as handle:
+            handle.write(text)
+    else:
+        card.files[name] += text
+
+
+def card_checks():
+    """What a card that drops out, or a row cut off, must not cost."""
+    two = """\
+  - name: One
+    until: {rewards: 2, of: each}
+    rule: {ratio: 1}
+  - name: Two
+    rule: {ratio: 2}
+"""
+    print("\n--- a card that isn't ready at power-on ---")
+    device, _, _ = fresh(two)
+    for _ in range(3):
+        device.poke("L")
+        device.advance(2)
+        device.retrieve()
+    before = status(device)
+    device.card.failing = True
+    device.reboot("power")
+    away = status(device)
+    check("without its card the device is on the defaults, and says the card is the problem",
+          away["run"] == "-" and away["sched"] == "default" and away["sd"] == "err")
+    device.command("TIME:2026-10-20T09:00:30-07:00")
+    check("its ID can't be set meanwhile", device.command("ID:9")[-1].startswith("ERR,SD"))
+    device.card.failing = False
+    device.advance(1)
+    back = status(device)
+    check("when the card answers, it loads its run and carries on where it was",
+          (back["run"], back["phase"], back["pellets"], back["id"])
+          == (before["run"], before["phase"], before["pellets"], "3"),
+          f"{back['run']} phase {back['phase']} id {back['id']}")
+    check("and says so", any(line.startswith("BOOT,") and "reset=card" in line
+                             for line in device.output)
+          and rows(device, "boot")[-1]["detail"].startswith("reset=card"))
+    check("its ID on the card was never replaced by the default",
+          device.card.files["DEVICE.TXT"].startswith("id=3\n"), device.card.files["DEVICE.TXT"])
+    seqs = [int(r["seq"]) for r in rows(device)]
+    check("and seq carries on from the card", seqs == list(range(1, len(seqs) + 1)))
+
+    print("\n--- a card that drops out for a moment ---")
+    device, _, _ = fresh(two)
+    device.poke("L")
+    device.advance(2)
+    device.card.failing = True
+    device.retrieve()
+    device.poke("R")
+    check("rows the card refuses are reported", device.output[-1] == "ERR,SD,append failed")
+    sent = len([line for line in device.output if line.startswith("ROW,")])
+    device.card.failing = False
+    device.advance(2)
+    data = rows(device)
+    check("and written, in order, once it answers",
+          [r["event"] for r in data][-2:] == ["retrieve", "poke"]
+          and [int(r["seq"]) for r in data] == list(range(1, len(data) + 1)))
+    check("and sent to the host then",
+          len([line for line in device.output if line.startswith("ROW,")]) == sent + 2
+          and sent_rows(device) == device.card.files["RUN1.CSV"].splitlines()[1:])
+    check("STATUS says the card is fine again", status(device)["sd"] == "ok")
+    device.card.failing = True
+    for _ in range(40):
+        device.poke("R")
+    device.card.failing = False
+    device.poke("R")
+    device.advance(2)
+    data = rows(device)
+    check("a long outage loses rows, but never leaves a gap in seq",
+          [int(r["seq"]) for r in data] == list(range(1, len(data) + 1))
+          and int(data[-1]["right"]) == 42 and len(rows(device, "poke")) < 43,
+          f"{len(rows(device, 'poke'))} of 43 pokes on the card")
+
+    print("\n--- a run started again on a card that already holds it ---")
+    device, compiled, _ = fresh(two)
+    for _ in range(3):
+        device.poke("L")
+        device.advance(2)
+        device.retrieve()
+    device.command("RUN:END")
+    kept = device.card.files["RUN1.CSV"]
+    crc = compiled.schedules["FED001"].crc()
+    reply = device.command(f"RUN:BEGIN,RUN1,{dev.iso(at(20, 9))},{crc:08x}")[-1]
+    now = device.card.files["RUN1.CSV"]
+    check("the file isn't started over", reply.startswith("RUN,") and now.startswith(kept)
+          and len(now) > len(kept))
+    data = rows(device)
+    check("seq and the totals carry on, and the row says it resumed",
+          [int(r["seq"]) for r in data] == list(range(1, len(data) + 1))
+          and data[-1]["event"] == "run_start" and data[-1]["detail"].endswith(";resumed")
+          and data[-1]["pellets"] == kept.splitlines()[-1].split(",")[9] != "0",
+          data[-1]["detail"])
+
+    print("\n--- a row cut off by a power cut ---")
+    device, _, _ = fresh(two)
+    device.poke("L")
+    device.advance(2)
+    device.retrieve()
+    whole = rows(device)
+    tear(device, "RUN1.CSV", "2026-10-20T09:0")
+    device.reboot("power")
+    device.poke("L")
+    device.advance(2)
+    lines = device.card.files["RUN1.CSV"].splitlines()
+    data = [r for r in map(dev.parse_row, lines[1:]) if r]
+    check("the counts come from the last whole row",
+          int(data[len(whole)]["seq"]) == int(whole[-1]["seq"]) + 1
+          and data[len(whole)]["event"] == "boot" and data[-1]["pellets"] == "2",
+          f"seq {data[len(whole)]['seq']}")
+    check("the next row starts on a line of its own, and the torn one stays as it was",
+          lines[len(whole) + 1] == "2026-10-20T09:0" and len(data) == len(lines) - 2)
+    replay = [line for line in device.command("READ:RUN1,1") if line.startswith("ROW,")]
+    check("and READ passes over it", [line[4:] for line in replay]
+          == [line for line in lines[1:] if dev.parse_row(line)])
+
+
 def main(make=None):
     global MAKE
     if make is not None:
@@ -90,12 +213,12 @@ def main(make=None):
     print("--- boot ---")
     device = MAKE(device_id=3, now=at(20, 9))
     out = device.take()
-    check("a boot announces itself", out[0].startswith("BOOT,fw=3.1,reset=power,clock=ok"))
+    check("a boot announces itself", out[0].startswith("BOOT,fw=3.2,reset=power,clock=ok"))
     check("and is logged", out[1].startswith("ROW,") and ",boot," in out[1])
     check("a blank card logs to IDLE.CSV with a header",
           device.card.files["IDLE.CSV"].startswith(dev.HEADER + "\n"))
     check("PING answers with id and protocol",
-          device.command("PING") == ["PONG,id=3,fw=3.1,proto=3"])
+          device.command("PING") == ["PONG,id=3,fw=3.2,proto=3"])
     check("a blank card runs FR1 on the left",
           sch.summarize(device.rule()) == "FR1 · left")
     check("ID renumbers and is kept", device.command("ID:12") == ["ID,id=12"]
@@ -585,6 +708,7 @@ def main(make=None):
     check("every row reached the host",
           sent_rows(device) == device.card.files["RUN1.CSV"].splitlines()[1:])
 
+    card_checks()
     passed = sum(RESULTS)
     print(f"\n{passed}/{len(RESULTS)} checks passed")
     return 0 if all(RESULTS) else 1

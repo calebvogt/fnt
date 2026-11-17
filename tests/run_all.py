@@ -16,6 +16,10 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SKIP = {"run_all.py", "__init__.py", "conftest.py"}
+# Seconds one suite may run before it is killed and counted as failed. The
+# slowest (fed3_window) takes about 11 s locally; a hung Qt thread would
+# otherwise eat the job's whole timeout and the suites after it never report.
+SUITE_TIMEOUT = float(os.environ.get("FNT_SUITE_TIMEOUT", "120"))
 
 
 def suites():
@@ -46,15 +50,20 @@ def main():
     results = []
     for name in suites():
         print(f"\n=== {name} " + "=" * max(0, 60 - len(name)), flush=True)
-        code = subprocess.call([sys.executable, os.path.join(HERE, name)],
-                               env=env)
+        try:
+            code = subprocess.run([sys.executable, os.path.join(HERE, name)],
+                                  env=env, timeout=SUITE_TIMEOUT).returncode
+        except subprocess.TimeoutExpired:
+            print(f"\n{name} still running after {SUITE_TIMEOUT:g} s; killed.",
+                  flush=True)
+            code = "timeout"
         results.append((name, code))
 
     failed = [name for name, code in results if code]
     print("\n" + "=" * 66)
     for name, code in results:
         verdict = "PASS" if not code else f"FAIL ({code})"
-        print(f"  {verdict:>10}  {name}")
+        print(f"  {verdict:>14}  {name}")
     print(f"\n{len(results) - len(failed)}/{len(results)} suites passed")
     return 1 if failed else 0
 

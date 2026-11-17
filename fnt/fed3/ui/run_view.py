@@ -16,18 +16,19 @@ from PyQt5.QtWidgets import (
 )
 
 from .. import protocol as proto
-from ..device_sim import parse_iso
+from ..schedule import parse_iso
 from ..run import check_edit
 from . import theme
 from .editor import ProtocolEditor, format_delta
 from .fed_graphic import FedGraphic
 from .health import health, readings
-from .plot import PelletPlot, zones
+from .plot import SPANS, PelletPlot, zones
 
 CARD_WIDTH = 370                # cards reflow into as many columns as fit
 TEST_CUE = "tone:4000:200+flash:bar:0:0:30:0:500"
 # What a card's "last:" reports: what the animal and the run did, not housekeeping
 # (clock corrections, hourly status rows, boots).
+BEHIND_SHOWN = 20               # rows a copy is behind its card before the card says so
 CARD_EVENTS = ("poke", "dispense", "retrieve", "jam", "phase", "run_start", "run_end")
 
 
@@ -94,6 +95,7 @@ class DeviceCard(QFrame):
         self.engine = engine
         self.problem_keys = []
         self.device = None
+        self.running = False
         layout = QVBoxLayout(self)
         layout.setSpacing(4)
 
@@ -143,6 +145,12 @@ class DeviceCard(QFrame):
         layout.addLayout(self.problem_box)
 
     def _feed(self):
+        # In a run a pellet by hand changes what the animal got, so not on one click.
+        if self.running and QMessageBox.question(
+                self, f"Feed {self.logical}",
+                f"Dispense one pellet on {self.logical} now?\n\nIt's recorded as a manual "
+                "dispense: a pellet, not a reward.") != QMessageBox.Yes:
+            return
         self.engine.submit("feed", device=self.logical)
 
     def _test(self):
@@ -176,7 +184,11 @@ class DeviceCard(QFrame):
         # The card is titled with the FED3's ID; say so only if it's been renumbered since.
         current = f"FED{device['id']:03d}" if device else ""
         self.fed.setText(f"now {current}" if current and current != self.logical else "")
+        self.running = run["state"] == "running"
         health_text, colour = card_health(device)
+        behind = run.get("behind", {}).get(self.logical)
+        if behind and behind > BEHIND_SHOWN:
+            health_text += f" · copying its card: {behind} rows to go"
         self.health.setText(health_text)
         self.health.setStyleSheet(f"color: {colour};")
         self.graphic.set_state(card_counts(latest), connected)
@@ -353,6 +365,14 @@ class RunView(QWidget):
         self.zone_box.setToolTip("The time zone of the plot's time axis")
         self.zone_box.currentIndexChanged.connect(self._zone_changed)
         title.addWidget(self.zone_box)
+        self.span_box = QComboBox()
+        self.span_box.setToolTip("How much of the run the plot shows. At the daily check, "
+                                 "the last 24 hours shows a FED3 that stopped overnight.")
+        for label, hours in SPANS:
+            self.span_box.addItem(label, hours)
+        self.span_box.currentIndexChanged.connect(self._zone_changed)
+        title.addWidget(QLabel("over"))
+        title.addWidget(self.span_box)
         title.addStretch()
         layout.addLayout(title)
         self.plot = PelletPlot()
@@ -501,7 +521,8 @@ class RunView(QWidget):
         general = [p for p in problems if not p["device"] and not p["acknowledged"]]
         self.banner.setText("\n".join(f"⚠ {p['message']}" for p in general))
         self.banner.setVisible(bool(general))
-        self.plot.update_plot(run, self._plot_zone(zone, now), now)
+        self.plot.update_plot(run, self._plot_zone(zone, now), now,
+                              span_hours=self.span_box.currentData())
         self._edit_answered(snapshot)
 
     def _build_cards(self, run):

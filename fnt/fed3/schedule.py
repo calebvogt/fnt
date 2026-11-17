@@ -28,6 +28,20 @@ MAX_CUE_ACTIONS = 3
 
 SECONDS_PER_DAY = 86400
 
+# The data file: one row per event, under this header (design.md, Part 3).
+HEADER = ("time,ms,seq,phase,event,side,outcome,left,right,pellets,"
+          "phase_rewards,phase_left,phase_right,retrieval_ms,poke_ms,detail")
+COLUMNS = HEADER.split(",")
+
+
+def parse_row(text):
+    """One data row as ``{column: text}``, or None if it isn't a whole row
+    (a row cut off by a power cut, a line damaged on its way)."""
+    parts = text.split(",", len(COLUMNS) - 1)
+    if len(parts) != len(COLUMNS) or not parts[2].isdigit():
+        return None
+    return dict(zip(COLUMNS, parts))
+
 
 class ScheduleError(ValueError):
     """A schedule line the device would refuse."""
@@ -230,6 +244,23 @@ def format_seconds(seconds):
 def plural(count, noun):
     """``1 phase``, ``3 phases``."""
     return f"{count} {noun}{'' if count == 1 else 's'}"
+
+
+def iso(moment):
+    return moment.isoformat(timespec="seconds")
+
+
+ISO = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(Z|[+-]\d{2}:\d{2})")
+
+
+def parse_iso(text):
+    """``YYYY-MM-DDTHH:MM:SS`` with ``Z`` or ``±HH:MM``, as the firmware accepts."""
+    if not isinstance(text, str) or not ISO.fullmatch(text):
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
 
 
 def standard_timezone():
