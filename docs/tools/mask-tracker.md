@@ -281,3 +281,30 @@ python -m fnt.videoTracking.mask_tracker_cli unpack-session --session <session f
 merges the labels back frame by frame (the project's `annotations.json` is
 backed up first). A frame whose labels changed in the project since packing
 stops the merge, unless `--force`; `--dry-run` reports without writing.
+
+## Zones in finished tracks (ROI Tool)
+
+FNT's **ROI Tool** (`python -m fnt.sleapProcessing.sleap_roi_tool_pyqt`, or the main GUI)
+measures time, entries and distance in zones drawn on each video: for an open field, the
+tracking area, a scale bar (e.g. one floor edge, 39.5 cm) and the floor's four corners;
+the centre zone is the floor shrunk to half its area. It reads a Mask Tracker track
+(`<video>_MaskTracker/<video>_trajectories.csv`, or an older `trajectories.csv`), a SLEAP
+analysis CSV or a SimpleTracker CSV. Folders or videos named on the command line open
+already loaded.
+
+A video's drawing is saved as `<video>_roiConfig.json` as soon as the video is added to the
+queue (in the `_MaskTracker` folder for a Mask Tracker track), so a cancelled run or a closed
+window loses nothing. A saved drawing loaded for another kind of track keeps only the
+keypoints that track has (a Mask Tracker track names its animals `vole_1`, ...).
+
+Saved drawings run without the window:
+
+```bash
+python -m fnt.sleapProcessing.roi_cli <folders or roiConfig.json files> --source mtt --workers 8
+```
+
+Every video's CSVs (position coordinates, zone occupancy, `<video>_roiSummary.csv`) are
+written first, a few seconds each, then the tracking plots and tracked videos, which take
+minutes each, `--workers` at a time. `--data-only` stops after the CSVs; `--visuals-only`
+makes only the plots and videos. Outputs go where the window put them; the drawing itself is
+not rewritten. Folders named like backups or to-delete are skipped.

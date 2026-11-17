@@ -2424,8 +2424,11 @@ class ROIToolGUI(QMainWindow):
         # Check for MTT trajectories.csv (new consolidated format, or legacy trajectories_detailed.csv)
         mtt_dir = folder / f"{stem}_MaskTracker"
         mtt_csv = mtt_dir / "trajectories.csv"
+        mtt_csv_named = mtt_dir / f"{stem}_trajectories.csv"   # Mask Tracker's current name
         mtt_csv_legacy = mtt_dir / "trajectories_detailed.csv"
-        if mtt_csv.exists():
+        if mtt_csv_named.exists():
+            sources["mtt"] = str(mtt_csv_named)
+        elif mtt_csv.exists():
             sources["mtt"] = str(mtt_csv)
         elif mtt_csv_legacy.exists():
             sources["mtt"] = str(mtt_csv_legacy)
@@ -2864,7 +2867,7 @@ class ROIToolGUI(QMainWindow):
                         config.scale_bar_cm = config_dict.get('scale_bar_cm', None)
                         config.pixels_per_cm = config_dict.get('pixels_per_cm', None)
                         saved_kps = config_dict.get('selected_keypoints', [])
-                        if saved_kps:
+                        if saved_kps:   # checked against this tracking's keypoints in update_keypoint_checkboxes
                             config.selected_keypoints = saved_kps
                         self.lbl_instructions.setText("✓ Loaded previous ROI configuration")
                         self.lbl_instructions.setStyleSheet("color: #4caf50; font-size: 14px; font-weight: bold; margin: 10px;")
@@ -2880,6 +2883,12 @@ class ROIToolGUI(QMainWindow):
             self.keypoint_layout.itemAt(i).widget().setParent(None)
 
         self.keypoint_checkboxes.clear()
+
+        # Drop selected keypoints this tracking doesn't have (e.g. bodyCenter/hatCenter from a SLEAP
+        # configuration loaded for a Mask Tracker track, which names its animals vole_1, ...);
+        # processing would otherwise fail after writing the position coordinates
+        if config.available_keypoints:
+            config.selected_keypoints = [k for k in config.selected_keypoints if k in config.available_keypoints]
 
         # Auto-select if only one keypoint available and none selected yet
         if len(config.available_keypoints) == 1 and not config.selected_keypoints:
@@ -3574,6 +3583,27 @@ class ROIToolGUI(QMainWindow):
             f"Configuration applied to {applied} other video(s)."
         )
 
+    def _save_config_file(self, config):
+        """Write <video>_roiConfig.json where processing will put it: beside a Mask Tracker / SimpleTracker
+        CSV, else in <video>_roiAnalysis[_SLEAP]/ (both are where try_load_config looks)."""
+        try:
+            stem = os.path.splitext(os.path.basename(config.video_path))[0]
+            if config.data_source in ("mtt", "st"):
+                folder = os.path.dirname(config.csv_path)
+            else:
+                suffix = "_roiAnalysis_SLEAP" if config.data_source == "sleap" else "_roiAnalysis"
+                folder = os.path.join(os.path.dirname(config.video_path), stem + suffix)
+            os.makedirs(folder, exist_ok=True)
+            # same name as ROIProcessor.get_output_path gives it (SLEAP: with the predictions' date part)
+            video_base, csv_base = os.path.basename(config.video_path), os.path.basename(config.csv_path)
+            name = stem
+            if csv_base.startswith(video_base) and '.predictions' in csv_base[len(video_base):]:
+                name = stem + csv_base[len(video_base):].split('.predictions')[0]
+            with open(os.path.join(folder, f"{name}_roiConfig.json"), "w") as f:
+                json.dump(config.to_config_dict(), f, indent=2)
+        except Exception as e:
+            self.lbl_status.setText(f"Could not save the ROI configuration: {e}")
+
     def add_current_video_to_queue(self):
         """Add current video to processing queue and navigate to next."""
         if not self.video_configs:
@@ -3588,7 +3618,10 @@ class ROIToolGUI(QMainWindow):
         
         # Save current UI settings to this video's config
         self.save_ui_settings_to_config(config)
-        
+        # Write the drawing to disk now, so it survives a cancelled run or a closed window
+        # (and roi_cli can process it without the GUI)
+        self._save_config_file(config)
+
         # Add to queue if not already there
         if self.current_config_idx not in self.processing_queue:
             self.processing_queue.append(self.current_config_idx)
@@ -3769,6 +3802,18 @@ def main():
     app = QApplication(sys.argv)
     window = ROIToolGUI()
     window.show()
+    # folders or videos named on the command line are loaded as if added with Add Folder / Add Videos
+    videos = []
+    for arg in sys.argv[1:]:
+        p = Path(arg)
+        if p.is_dir():
+            videos += sorted(str(v) for ext in ('.mp4', '.avi', '.mov') for v in p.glob(f'*{ext}'))
+        elif p.is_file():
+            videos.append(str(p))
+    if videos:
+        window._add_videos_batch(videos)
+        if window.video_list.count():
+            window.video_list.setCurrentRow(0)
     sys.exit(app.exec_())
 
 
