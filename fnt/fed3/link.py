@@ -11,6 +11,12 @@ between everything else it does, and ends with ``READ_END``. :meth:`read`
 sends one and returns at once; the rows and the ``READ_END`` go to ``on_line``
 as they arrive, so catching up on a long file never holds the engine up.
 
+A reply can also be held up on its way: a line that fills its last 64-byte USB
+packet sits in Windows' serial driver until the device sends something else,
+and firmware before the fix ends such lines without a short packet. A command
+that has heard nothing for ``NUDGE_AFTER`` gets one ``PING`` behind it; the
+held reply comes out ahead of the ``PONG``, which is dropped.
+
 There is no thread here. The run engine calls :meth:`poll` for unsolicited
 lines and :meth:`call` for commands, all from its own loop.
 """
@@ -21,6 +27,7 @@ import time
 UNSOLICITED = ("ROW,", "BOOT,", "ERR,SD,append")
 REPLAY_END = ("READ_END,", "ERR,NO_FILE")
 CANDIDATE_VIDS = {0x239A}           # Adafruit: the FED3's Feather M0
+NUDGE_AFTER = 1.0                   # seconds of silence before a held reply is pushed out
 
 
 class LinkError(Exception):
@@ -88,6 +95,16 @@ class DeviceLink:
         # When the last row of a READ sent with read() arrived (or when it was
         # sent), until its READ_END; None when no replay is under way.
         self.replaying = None
+        self.nudges = 0             # PINGs sent to push a reply out, whose PONG is still to come
+        self.held = 0               # replies that came only after a nudge
+
+    def _nudged(self, line):
+        """Whether this is the PONG of a nudge, dropped here."""
+        if self.nudges and line.startswith("PONG,"):
+            self.nudges -= 1
+            self.last_heard = self.clock()
+            return True
+        return False
 
     def _dispatch(self, line):
         self.last_heard = self.clock()
@@ -116,7 +133,8 @@ class DeviceLink:
             line = self._readline(0)
             if line is None:
                 return
-            self._dispatch(line)
+            if not self._nudged(line):
+                self._dispatch(line)
 
     def call(self, command, timeout=None):
         """Send one command and return its reply line.
@@ -127,11 +145,24 @@ class DeviceLink:
         self.poll()
         self.transport.write(command)
         deadline = time.monotonic() + (timeout or self.timeout)
+        # PING's own reply is too short to be held, and its PONG is the answer.
+        can_nudge = command != "PING"
+        nudged = False
         reading = command.startswith("READ:")
         while True:
-            line = self._readline(max(0.0, deadline - time.monotonic()))
+            wait = deadline
+            if can_nudge and not nudged:
+                wait = min(deadline, time.monotonic() + NUDGE_AFTER)
+            line = self._readline(max(0.0, wait - time.monotonic()))
+            if line is None and wait < deadline:
+                self.transport.write("PING")
+                self.nudges += 1
+                nudged = True
+                continue
             if line is None:
                 raise LinkError(f"no reply to {command.split(':')[0]}")
+            if self._nudged(line):
+                continue
             if self._unsolicited(line):
                 self._dispatch(line)
                 continue
@@ -139,6 +170,8 @@ class DeviceLink:
             if reading and not line.startswith(("READ_END,", "ERR,")):
                 self.on_line(line)
                 continue
+            if nudged:
+                self.held += 1
             return line
 
     def _readline(self, timeout):

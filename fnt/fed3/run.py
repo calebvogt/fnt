@@ -49,6 +49,8 @@ LOW_BATTERY = 3.55              # volts; flagged below this, cleared above BATTE
 BATTERY_OK = 3.65
 RECENT_ROWS = 50                # of a run's rows kept for its card: enough to find the last event
 RETRY_OPEN = 15.0
+STEADY_AFTER = 300.0            # a connection this long ends a run of drops
+DROPS_SUMMARY_EVERY = 3600.0    # while drops go on, the log counts them this often
 RUN_FILE = "run.json"
 RUN_FORMAT = "fnt-fed3-run/1"
 # FEED's result -> (what happened, the log's result): what the log says, not the reply.
@@ -100,6 +102,15 @@ class Device:
     # While a READ is being answered: (run id, the highest seq the device had
     # when it was sent). Rows up to that seq are the replay; later ones are live.
     replay: tuple | None = None
+    connected_at: float = -1e9
+    connected_since: datetime | None = None
+    # A connection that drops before STEADY_AFTER starts a run of drops: the
+    # first is logged, the rest are counted (reason -> times) and logged together.
+    drops: dict | None = None
+    drops_since: datetime | None = None
+    drops_logged_at: float = -1e9
+    drops_logged: int = 0
+    held_noted: bool = False        # a reply it held up has been logged
 
 
 class DataCopy:
@@ -403,6 +414,7 @@ class Engine:
                     self._maintain(device)
                 except LinkError as exc:
                     self._disconnect(device, str(exc))
+            self._check_drops(device)
         if self.run and self.state == RUNNING:
             self._run_step()
         for run in self._stopped_runs():
@@ -499,8 +511,10 @@ class Engine:
         device.id = int(info["id"])
         device.firmware = info.get("fw", "")
         device.status_at = -1e9
+        device.connected_at, device.connected_since = self.monotonic(), self.now()
         self._clear(device.port, "firmware")
-        self._log(self._name(device), "connected", f"{device.port}, FED{device.id:03d}")
+        if device.drops is None:
+            self._log(self._name(device), "connected", f"{device.port}, FED{device.id:03d}")
         self._duplicate_ids()
 
     def _disconnect(self, device, why):
@@ -508,8 +522,44 @@ class Engine:
             device.link.close()
         device.link = None
         if device.connected:
-            self._log(self._name(device), "disconnected", why)
+            tick = self.monotonic()
+            if device.drops is not None:
+                device.drops[why] = device.drops.get(why, 0) + 1
+            else:
+                self._log(self._name(device), "disconnected", why)
+                # Dropped soon after connecting: until a connection lasts,
+                # more drops are counted rather than logged one by one.
+                if tick - device.connected_at < STEADY_AFTER:
+                    device.drops, device.drops_since = {}, self.now()
+                    device.drops_logged_at, device.drops_logged = tick, 0
         device.connected = False
+
+    def _local(self, moment):
+        return f"{moment.astimezone(self.zone):%Y-%m-%d %H:%M:%S}"
+
+    def _drops_text(self, device):
+        count = sum(device.drops.values())
+        reasons = ", ".join(f"{why} ×{n}" if len(device.drops) > 1 else why
+                            for why, n in sorted(device.drops.items(), key=lambda kv: -kv[1]))
+        return (f"dropped {count} more time{'s' if count != 1 else ''} since "
+                f"{self._local(device.drops_since)} ({reasons})")
+
+    def _check_drops(self, device):
+        """End a run of drops once a connection has lasted, or count it in the
+        log every DROPS_SUMMARY_EVERY while it goes on."""
+        if device.drops is None:
+            return
+        tick = self.monotonic()
+        if device.connected and tick - device.connected_at >= STEADY_AFTER:
+            detail = f"{device.port}, FED{device.id:03d}, since {self._local(device.connected_since)}"
+            if device.drops:
+                detail += f"; {self._drops_text(device)}"
+            self._log(self._name(device), "connected", detail)
+            device.drops = None
+        elif (tick - device.drops_logged_at >= DROPS_SUMMARY_EVERY
+                and sum(device.drops.values()) > device.drops_logged):
+            self._log(self._name(device), "still dropping", self._drops_text(device))
+            device.drops_logged_at, device.drops_logged = tick, sum(device.drops.values())
 
     def _duplicate_ids(self):
         seen = {}
@@ -540,7 +590,13 @@ class Engine:
         return None
 
     def _call(self, device, command, timeout=None):
-        return device.link.call(command, timeout)
+        reply = device.link.call(command, timeout)
+        if device.link.held and not device.held_noted:
+            device.held_noted = True
+            self._log(self._name(device), "reply held up",
+                      f"the {command.split(':')[0]} reply waited in USB until FNT sent a PING "
+                      "after it; updating the FED3's firmware fixes this")
+        return reply
 
     def _maintain(self, device):
         tick = self.monotonic()
@@ -729,13 +785,18 @@ class Engine:
     # Problems
     # ------------------------------------------------------------------
 
-    def _problem(self, device, kind, subject, message, active=True):
+    def _problem(self, device, kind, subject, message, active=True, repeat_quietly=False):
         key = f"{device}:{kind}"
         existing = self.problems.get(key)
         # Still going, or (for something that happened rather than is
         # happening) not yet acknowledged: the same problem, not a new one.
         if existing and (existing.active or not (active or existing.acknowledged)):
             existing.message = message
+            return
+        # Back before anyone acknowledged it clearing: still on screen, so
+        # not logged again (a device dropping every few seconds).
+        if existing and repeat_quietly and not existing.acknowledged:
+            existing.message, existing.active = message, True
             return
         self.problems[key] = Problem(key, device, kind, message, self.now(), active)
         self._log(device, "problem", message, "flagged")
@@ -766,7 +827,8 @@ class Engine:
             device = self.device_by_id(device_id)
             if device is None or tick - device.link.last_heard > OFFLINE_AFTER:
                 self._problem(logical, "offline", logical, "not connected: check its cable "
-                              "and power (it keeps running the protocol by itself)")
+                              "and power (it keeps running the protocol by itself)",
+                              repeat_quietly=True)
                 continue
             self._clear(logical, "offline")
             status = device.status

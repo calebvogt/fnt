@@ -267,7 +267,7 @@ To separate the experiment from what came after it:
 | `protocol.yaml` | The protocol exactly as started, plus `protocol.v2.yaml` and so on after edits. |
 | `sched/FED<nnn>.txt` | What each FED3 was sent. |
 | `FED<nnn>.csv` | A byte-identical copy of that FED3's data file for the run, including what it recorded after Stop. |
-| `log.csv` | Everything FNT did and noticed, in UTC. |
+| `log.csv` | Everything FNT did and noticed, in UTC. A FED3 that keeps dropping soon after it connects isn't logged every time: the first drop is, then a `still dropping` count every hour, then one `connected` line with the total once it has stayed connected for 5 minutes. |
 
 The data columns are described in [design.md](design.md), Part 3.
 

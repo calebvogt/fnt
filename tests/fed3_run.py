@@ -6,6 +6,7 @@ What matters here is what a lab would discover at the end of a run:
 - whether phases that need FNT moved when they should;
 - whether every problem stayed on screen until someone saw it.
 """
+import csv
 import json
 import os
 import shutil
@@ -158,6 +159,7 @@ def main():
         run_checks(root)
         guard_checks(os.path.join(root, "guards"))
         fault_checks(os.path.join(root, "faults"))
+        drop_checks(os.path.join(root, "drops"))
     finally:
         shutil.rmtree(root, ignore_errors=True)
     passed = sum(RESULTS)
@@ -833,6 +835,81 @@ def fault_checks(root):
     world.engine._check_problems = real
     world.run_for(5)
     check("and clears when the steps work again", ("", "engine") not in problems(world))
+    world.engine.submit("stop")
+    world.run_for(5)
+
+
+
+class Dropping(dev.SimTransport):
+    """A FED3 that answers PING and one STATUS, then stops answering STATUS:
+    each connection lasts about 30 s, as when Windows held its replies."""
+
+    dropping = False
+    statuses = 0
+
+    def write(self, line):
+        from fnt.fed3.link import LinkError
+        if line == "PING":
+            self.statuses = 0
+        elif line == "STATUS" and self.dropping:
+            self.statuses += 1
+            if self.statuses > 1:
+                raise LinkError("no reply to STATUS")
+        super().write(line)
+
+
+ONE = """\
+format: fnt-fed3-protocol/2
+name: One FED3
+devices: [FED001]
+phases:
+  - name: One
+    rule: {active: left}
+"""
+
+
+def log_rows(world, device):
+    with open(os.path.join(world.engine.run.folder, "log.csv"), encoding="utf-8") as handle:
+        return [row for row in csv.DictReader(handle) if row["device"] == device]
+
+
+def drop_checks(root):
+    os.makedirs(root)
+    print("\n--- a FED3 that keeps dropping ---")
+    world = World(root, ids=(1,))
+    flaky = world.transports["COM3"] = Dropping(world.device("COM3"))
+    world.run_for(10)
+    world.engine.submit("start", protocol_text=ONE, binding={"FED001": 1})
+    world.run_for(400)
+    flaky.dropping = True
+    world.run_for(2 * 3600 + 300)
+    rows = log_rows(world, "FED001")
+    actions = [row["action"] for row in rows]
+    drops = actions.count("disconnected")
+    check("two hours of drops every half minute log the first two, not each one",
+          drops == 2 and actions.count("connected") == 1, f"{actions}")
+    check("the log counts them every hour while they go on",
+          actions.count("still dropping") == 2
+          and "no reply to STATUS" in rows[actions.index("still dropping")]["detail"],
+          f"{[row['detail'] for row in rows if row['action'] == 'still dropping']}")
+    check("offline is flagged once, though it clears with each reconnect",
+          actions.count("problem") == 1 and ("FED001", "offline") in problems(world, active=False),
+          f"{actions.count('problem')}")
+    flaky.dropping = False
+    world.run_for(400)
+    rows = log_rows(world, "FED001")
+    last = rows[-1]
+    check("once it stays connected, one line says so and how often it dropped",
+          last["action"] == "connected" and "more times since" in last["detail"]
+          and "(no reply to STATUS)" in last["detail"], f"{last}")
+    world.run_for(60)
+    world.unplug("COM3")
+    world.run_for(30)
+    world.plug("COM3")
+    world.run_for(30)
+    actions = [row["action"] for row in log_rows(world, "FED001")]
+    check("after that an unplug is logged as usual, and so is coming back",
+          actions[-2:] == ["disconnected", "connected"], f"{actions[-4:]}")
     world.engine.submit("stop")
     world.run_for(5)
 
