@@ -317,6 +317,11 @@ device keeps logging to the same data file until the next `RUN:BEGIN`.
 
 These are newline-terminated ASCII lines at 115200 baud.
 - Input lines can be up to 128 bytes.
+- A device line that would end exactly on a 64-byte USB packet ends `\r\n`
+  instead: Windows holds a write that fills its last packet until the next
+  one arrives. Older firmware doesn't do this, so FNT sends a `PING` after
+  any command that has heard nothing for 1 s, which pushes a held reply out
+  ahead of its `PONG`, and logs once per device that it had to.
 - Every device line is `TYPE,` followed by comma-separated `key=value` fields,
   except `ROW`, which carries an SD row verbatim.
 - `ERR,<code>,<detail>`: the detail is the rest of the line and may contain

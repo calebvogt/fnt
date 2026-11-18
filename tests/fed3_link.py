@@ -30,6 +30,8 @@ class Responder(threading.Thread):
         self.device = device
         self.chunk = chunk          # write replies a few bytes at a time
         self.silent = False
+        self.hold = False           # keep the next reply until another command comes
+        self.held = []
         self.lock = threading.Lock()
         self.stopping = False
 
@@ -65,7 +67,12 @@ class Responder(threading.Thread):
                     continue
                 with self.lock:
                     self.device.command(line.decode())
-                    self.send(self.device.take())
+                    lines = self.device.take()
+                    if self.hold:
+                        self.hold, self.held = False, lines
+                        continue
+                    self.send(self.held + lines)
+                    self.held = []
 
 
 def main():
@@ -113,6 +120,18 @@ def main():
     rows = [s for s in seen if s.startswith("ROW,")]
     check("READ returns READ_END, with its rows on on_line",
           end.startswith("READ_END,run=-") and len(rows) >= 2)
+
+    print("\n--- a reply held up on its way ---")
+    seen.clear()
+    responder.hold = True
+    started = time.monotonic()
+    status = fields(link.call("STATUS"))
+    check("a reply held until the device sends again is pushed out by a PING",
+          status.get("id") == "5" and link.held == 1 and time.monotonic() - started < 1.8,
+          f"{time.monotonic() - started:.2f} s")
+    check("and that PING's PONG isn't taken for the next reply",
+          link.call("PING") == "PONG,id=5,fw=3.2,proto=3" and link.nudges == 0
+          and not any(s.startswith("PONG") for s in seen))
 
     print("\n--- failures ---")
     responder.silent = True
