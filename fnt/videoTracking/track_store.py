@@ -76,6 +76,62 @@ def _require_h5():
         )
 
 
+# Windows paths past 260 characters (MAX_PATH): HDF5 opens files through the old
+# API and fails on them ("No such file or directory"), and so do Python's open()
+# and os.path.exists unless long paths are switched on system-wide. A video with
+# a long name in a deep folder (VoleCosm NVR exports) passes that limit with
+# "<video>_MaskTracker/<video>_tracks.h5". Such files are opened through a Python
+# file object on the extended-length path (\\?\...) instead.
+_MAX_PATH = 259
+_EXTENDED = "\\\\?\\"          # \\?\
+
+
+def long_path(path: str) -> str:
+    """``path`` in a form Windows opens whatever its length."""
+    if os.name != "nt":
+        return path
+    p = os.path.abspath(path)
+    if len(p) <= _MAX_PATH or p.startswith(_EXTENDED):
+        return p
+    if p.startswith("\\\\"):                  # \\server\share\...
+        return _EXTENDED + "UNC\\" + p[2:]
+    return _EXTENDED + p
+
+
+class _FileObjH5(h5py.File if _HAS_H5 else object):
+    """An HDF5 file opened through a Python file object, closed with it."""
+
+    def close(self):
+        try:
+            super().close()
+        finally:
+            fobj = self.__dict__.pop("_fnt_fobj", None)
+            if fobj is not None:
+                fobj.close()
+
+
+def open_h5(path: str, mode: str = "r"):
+    """``h5py.File(path, mode)``, also for paths too long for Windows' old API."""
+    _require_h5()
+    lp = long_path(path)
+    if not lp.startswith(_EXTENDED):
+        return h5py.File(path, mode)
+    if mode == "a":
+        mode = "r+" if os.path.exists(lp) else "w"
+    fobj = open(lp, {"r": "rb", "r+": "r+b", "w": "w+b"}[mode])
+    try:
+        f = _FileObjH5(fobj, mode)
+    except Exception:
+        fobj.close()
+        raise
+    f.__dict__["_fnt_fobj"] = fobj
+    return f
+
+
+def store_exists(path: str) -> bool:
+    return os.path.exists(long_path(path))
+
+
 def tracks_path_for(video_path: str, output_dir: Optional[str] = None) -> str:
     """Path of the track store belonging to a video."""
     stem = Path(video_path).stem
@@ -114,7 +170,7 @@ class TrackMaskWriter:
         _require_h5()
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         self.path = path
-        self._f = h5py.File(path, "w")
+        self._f = open_h5(path, "w")
         self._f.attrs["schema_version"] = SCHEMA_VERSION
         self._f.attrs["video_name"] = os.path.basename(video_path)
         self._f.attrs["video_path"] = video_path
@@ -252,10 +308,10 @@ class TrackMaskReader:
 
     def __init__(self, path: str):
         _require_h5()
-        if not os.path.exists(path):
+        if not store_exists(path):
             raise FileNotFoundError(f"No track store at {path}")
         self.path = path
-        self._f = h5py.File(path, "r")
+        self._f = open_h5(path, "r")
         a = self._f.attrs
         self.schema_version = int(a.get("schema_version", 0))
         self.video_name = str(a.get("video_name", ""))
@@ -385,7 +441,7 @@ class TrackMaskReader:
     def reopen(self):
         """Re-acquire the read handle after it was dropped for a write."""
         if self._f is None:
-            self._f = h5py.File(self.path, "r")
+            self._f = open_h5(self.path, "r")
 
     def close(self):
         if self._f is not None:
@@ -467,7 +523,7 @@ def trajectories_dataframe(
 def apply_identity_edits(path: str, new_object_ids: np.ndarray):
     """Persist a corrected /object_id column, leaving mask pixels untouched."""
     _require_h5()
-    with h5py.File(path, "a") as f:
+    with open_h5(path, "a") as f:
         ds = f["object_id"]
         if ds.shape[0] != new_object_ids.shape[0]:
             raise ValueError(

@@ -611,8 +611,15 @@ class MultiObjectTracker:
                 at_limit = (self.config.max_detections > 0
                             and len(self.active_tracks) >= self.config.max_detections)
                 if at_limit:
+                    # As many tracks as animals: the detection is one of them seen again elsewhere, so it
+                    # continues the nearest track that has no detection on this frame. A track already
+                    # given a detection this frame is never taken over (that put two animals under one
+                    # ID and dropped one); with every track taken, the detection is an extra and is left out.
+                    free = [tid for tid in self.active_tracks if tid not in matched]
+                    if not free:
+                        continue
                     best_tid = min(
-                        self.active_tracks,
+                        free,
                         key=lambda tid: np.sqrt(
                             (self.active_tracks[tid]["centroid"][0] - det["centroid"][0])**2
                             + (self.active_tracks[tid]["centroid"][1] - det["centroid"][1])**2
@@ -636,7 +643,11 @@ class MultiObjectTracker:
         self, dist_matrix, track_ids, current_dets, max_dist, frame_idx, fps,
     ) -> Tuple[set, set]:
         from scipy.optimize import linear_sum_assignment
-        row_indices, col_indices = linear_sum_assignment(dist_matrix)
+        # Pairs beyond max_dist can never match, so they must not steer the assignment: left at their
+        # distance, a far-off pair could make the total smaller by giving a nearby track the wrong detection
+        # (a swap). A prohibitive cost leaves them out.
+        gated = np.where(dist_matrix <= max_dist, dist_matrix, 1e9)
+        row_indices, col_indices = linear_sum_assignment(gated)
 
         matched_rows = set()
         used_cols = set()
@@ -866,6 +877,12 @@ def run_inference_on_video(
                                           inference_size=config.inference_size,
                                           use_masks=config.use_masks)
         inference.load_model()
+        if hasattr(inference, "use_source"):      # per-trial ROI, if the model has them
+            inference.use_source(video_path)
+            r = getattr(inference, "roi", None)
+            if r is not None and getattr(getattr(inference, "_roi_all", None), "by_folder", None):
+                print(f"[MTT Inference]   ROI for this video: {r.describe()}")
+            rec["roi"] = r.to_dict() if r is not None else None
 
         cap = cv2.VideoCapture(video_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -1008,7 +1025,11 @@ def run_inference_on_video(
             tracks_h5 = mask_writer.path
             n_mask_rows = mask_writer.n_rows
             mask_writer.close()
-            size_mb = os.path.getsize(tracks_h5) / (1024 * 1024)
+            from .track_store import long_path
+            # long_path: a store path past Windows' 260 characters (NVR camera
+            # names) made getsize raise here, after every frame was tracked
+            # and before the CSV was written.
+            size_mb = os.path.getsize(long_path(tracks_h5)) / (1024 * 1024)
             print(f"[MTT Inference] Masks: {n_mask_rows} detections -> "
                   f"{os.path.basename(tracks_h5)} ({size_mb:.1f} MB)")
 

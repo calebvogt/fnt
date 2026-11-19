@@ -46,7 +46,8 @@ class YOLOInference:
             if self._inference_size == 0:
                 self._inference_size = config.get("imgsz", 640)
             from .mtt_roi import ROI
-            self.roi = ROI.from_dict(config.get("roi"))
+            self._roi_all = ROI.from_dict(config.get("roi"))
+            self.roi = self._roi_all.for_source(None) if self._roi_all is not None else None
 
         weights_path = os.path.join(self.model_dir, "weights_best.pt")
         if not os.path.exists(weights_path):
@@ -59,6 +60,13 @@ class YOLOInference:
         print(f"[YOLO Inference] Model loaded on {device}, "
               f"inference={imgsz}px, {mask_str}"
               + (f", ROI: {self.roi.describe()}" if self.roi is not None else ""))
+
+    def use_source(self, path: str) -> None:
+        """Prepare frames of the video (or training frame) at ``path`` with its
+        trial folder's own ROI, when the model was trained with per-trial ones."""
+        roi_all = getattr(self, "_roi_all", None)
+        if roi_all is not None and roi_all.by_folder:
+            self.roi = roi_all.for_source(path)
 
     def _resolve_device(self) -> str:
         import torch

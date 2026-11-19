@@ -22,6 +22,7 @@ padded), ``low_fps`` frames a second where the ratio is uncertain (``lo`` < rati
 from __future__ import annotations
 
 import os
+import re
 import struct
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -151,10 +152,17 @@ def second_levels(fs: FrameSizes, fps: Optional[float] = None) -> np.ndarray:
     return out
 
 
+_NVR_CAMERA = re.compile(r"^([^_]+_Camera\d+)_", re.I)
+
+
 def camera_key(video: str) -> Tuple[str, str]:
     """Videos of one camera: the same folder and the same name prefix (before the first
-    underscore) -- as order_coarse_to_fine groups them."""
-    return os.path.dirname(os.path.abspath(video)), os.path.basename(video).split("_")[0]
+    underscore, e.g. CAM13) -- as order_coarse_to_fine groups them. Recorder names that
+    put the camera second (VoleCosm_Camera1_{...}_<time>.mp4, several cameras in one
+    folder) keep it: VoleCosm_Camera1."""
+    name = os.path.basename(video)
+    m = _NVR_CAMERA.match(name)
+    return os.path.dirname(os.path.abspath(video)), (m.group(1) if m else name.split("_")[0])
 
 
 def activity_ratios(videos: Sequence[str], baseline_s: float = DEFAULT_GATE["baseline_s"],

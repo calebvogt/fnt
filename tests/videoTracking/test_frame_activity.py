@@ -133,5 +133,14 @@ def test_read_ahead_reads_the_right_frames(tmp_path):
         assert np.array_equal(seen[si], truth[fi]), fi
 
 
+def test_camera_key_keeps_a_recorders_camera_number():
+    """CAM13_<time>.mp4: the prefix; VoleCosm_Camera3_{guid}_<time>.mp4 (all cameras
+    of a trial in one folder): the camera, not just "VoleCosm"."""
+    assert A.camera_key("x/CAM13_2024-01-01_120000.mp4")[1] == "CAM13"
+    k1 = A.camera_key("x/VoleCosm_Camera1_{68E5-1}_20260520112500(001)_processed.mp4")
+    k3 = A.camera_key("x/VoleCosm_Camera3_{68E5-3}_20260520112500(001)_processed.mp4")
+    assert k1[1] == "VoleCosm_Camera1" and k3[1] == "VoleCosm_Camera3" and k1[0] == k3[0]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

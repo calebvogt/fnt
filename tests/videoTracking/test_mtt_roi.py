@@ -294,5 +294,37 @@ def test_mask_tracker_draws_and_saves_the_roi(monkeypatch):
     w.close()
 
 
+def test_an_open_window_keeps_settings_changed_elsewhere():
+    """An ROI saved by another window or a script while this one is open
+    survives this one's next save (it rewrites only what it changed)."""
+    from PyQt5.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    import fnt.videoTracking.mask_tracker_gui as G
+    d = tempfile.mkdtemp(prefix="mtt_cfg_")
+    os.makedirs(os.path.join(d, "training_frames"))
+    path = os.path.join(d, "project_config.json")
+    with open(path, "w") as fh:
+        json.dump({"project_dir": d, "video_paths": [], "categories": ["mouse"],
+                   "source_videos": []}, fh)
+    w = G.MaskTrackerWindow()
+    w._launched = True
+    w._load_project(path)
+    with open(path) as fh:                       # elsewhere: an ROI drawn
+        cfg = json.load(fh)
+    cfg["roi"] = ROI(include=[[(0, 0), (99, 0), (99, 49)]], frame_size=(200, 100)).to_dict()
+    with open(path, "w") as fh:
+        json.dump(cfg, fh)
+    w._categories = ["mouse", "vole"]            # here: a class added, then saved
+    w._autosave_project_config()
+    with open(path) as fh:
+        saved = json.load(fh)
+    assert saved["categories"] == ["mouse", "vole"] and "include" in saved["roi"]
+    w._project_config.pop("roi")                 # here: the ROI removed: that wins
+    w._save_project_config()
+    with open(path) as fh:
+        assert "roi" not in json.load(fh)
+    w.close()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

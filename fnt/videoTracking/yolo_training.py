@@ -96,8 +96,11 @@ def convert_coco_to_yolo(
 
     Returns the path to data.yaml.
     """
-    from .mtt_roi import ROI
-    roi_obj = ROI.from_dict(roi)
+    from .mtt_roi import ROI, frame_source, frame_sources
+    roi_all = ROI.from_dict(roi)
+    # Per-trial outlines: each frame uses its source video's trial folder's.
+    sources = (frame_sources(str(Path(images_dir).parent))
+               if roi_all is not None and roi_all.by_folder else {})
     n_dropped = 0
     with open(coco_json) as f:
         coco = json.load(f)
@@ -133,6 +136,8 @@ def convert_coco_to_yolo(
         src = os.path.join(images_dir, fname)
         dst = os.path.join(output_dir, "images", split, fname)
         origin, out_w, out_h = (0, 0), w, h
+        roi_obj = (roi_all.for_source(frame_source(fname, sources))
+                   if roi_all is not None else None)
         if roi_obj is not None:
             img = cv2.imdecode(np.fromfile(src, np.uint8), cv2.IMREAD_COLOR) \
                 if os.path.exists(src) else None
@@ -207,8 +212,8 @@ def convert_coco_to_yolo(
         f.write(yaml_content)
 
     print(f"[YOLO Convert] {len(train_ids)} train, {len(val_ids)} val images")
-    if roi_obj is not None:
-        print(f"[YOLO Convert] ROI: {roi_obj.describe()}; "
+    if roi_all is not None:
+        print(f"[YOLO Convert] ROI: {roi_all.describe()}; "
               f"{n_dropped} label(s) outside it dropped")
     print(f"[YOLO Convert] {len(cat_names)} classes: {cat_names}")
     print(f"[YOLO Convert] data.yaml: {data_yaml_path}")

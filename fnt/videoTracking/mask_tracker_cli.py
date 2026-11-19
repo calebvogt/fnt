@@ -15,8 +15,6 @@ project is not open in the GUI: both write ``project_config.json``.
 Mask Tracker window (the Inference tab, several videos at once with
 ``--parallel auto``), with every Inference setting as a flag;
 ``--settings-from`` repeats an earlier run's settings from its output folder.
-``track-summary --videos V...`` writes each video folder's
-``MaskTracker_summary.csv`` (see :mod:`fnt.videoTracking.mtt_runs`).
 
 ``pack-session --project P --focus LIST --out DIR`` copies a focus list's frames
 and labels into a portable session folder that opens as a project on any
@@ -372,17 +370,12 @@ def _parser():
     t_.add_argument("--project", default=None,
                     help="Project to open (default: the one the model folder is in).")
     t_.add_argument("--redo", action="store_true",
-                    help="Track videos that already have output too (their output folder is "
-                         "moved to _TO_DELETE_tracking/ first, not deleted).")
+                    help="Track videos that already have a track too: the files tracking wrote in each "
+                         "<video>_MaskTracker folder are moved to _TO_DELETE_tracking/ first (not deleted); the "
+                         "folder and other tools' files in it (the ROI Tool's drawing) stay.")
     add_inference_settings(t_.add_argument_group("settings"))
-    ts = sub.add_parser("track-summary",
-                        help="Write MaskTracker_summary.csv in each video folder (one row per "
-                             "tracked video: frames, frames without a detection, tracks, speed, "
-                             "settings) and print it.")
-    ts.add_argument("--videos", nargs="+", required=True,
-                    help="Video folders (searched recursively), files and/or .txt lists.")
     x_ = sub.add_parser("exits",
-                        help="Draw each camera's exits (e.g. an entrance tube's mouth) on its "
+                        help="Draw each camera's exits (the openings in the wall where animals come and go) on its "
                              "median frame; saved as exits.json in each video folder.")
     x_.add_argument("--videos", nargs="+", required=True,
                     help="Video files and/or folders (searched recursively).")
@@ -392,39 +385,11 @@ def _parser():
     return p
 
 
-def summary_folders(items) -> List[str]:
-    """Every folder holding videos named by ``items`` (folders searched recursively)."""
-    from .mtt_runs import OUTPUT_SUFFIX, find_track_videos
-    folders = []
-    for it in items:
-        if os.path.isdir(it):
-            for root, dirs, _ in os.walk(it):
-                dirs[:] = [d for d in dirs if not d.endswith(OUTPUT_SUFFIX)]
-                folders.append(root)
-    folders += [os.path.dirname(v) for v in
-                find_track_videos([i for i in items if not os.path.isdir(i)])]
-    seen, out = set(), []
-    for f in folders:
-        k = os.path.normcase(os.path.abspath(f))
-        if k not in seen:
-            seen.add(k)
-            out.append(f)
-    return out
-
-
 def main(argv=None) -> int:
     args = _parser().parse_args(argv)
     if args.cmd == "track":
         from .mask_tracker_gui import track_main
         return track_main(args)
-    if args.cmd == "track-summary":
-        from .mtt_runs import folder_summary, print_summary, write_folder_summary
-        for f in summary_folders(args.videos):
-            path = write_folder_summary(f)
-            if path:
-                print(f"== {path}")
-                print_summary(folder_summary(f))
-        return 0
     if args.cmd == "extract-frames":
         res = extract_frames(args.project, read_frame_list(args.frames), args.workers)
         if args.focus_out:

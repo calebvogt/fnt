@@ -357,7 +357,8 @@ def run_batch(model_dir: str, videos: Sequence[str], step: int = 250, conf: floa
                     cap.release()
                     frames, tiers = np.arange(n), np.full(n, 2, np.int8)
             s = infer_video(model, v, name, step, conf, imgsz, device,
-                            on_frame=on_frame, should_stop=should_stop, roi=roi,
+                            on_frame=on_frame, should_stop=should_stop,
+                            roi=roi.for_source(v) if roi is not None else None,  # its trial's own
                             frames=frames, tiers=tiers, gate=gate)
             done += int(s["complete"])
             log(f"[batch] {k + 1}/{len(todo)} {os.path.basename(v)}: {s['samples']} frames, "

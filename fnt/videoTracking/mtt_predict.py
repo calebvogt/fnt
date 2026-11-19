@@ -175,7 +175,12 @@ def predict_frames(project: str, model_dir: str, frames: Optional[Iterable[str]]
     log(f"[predict] {os.path.basename(os.path.normpath(model_dir))}: {len(todo)} unreviewed frame(s), "
         f"confidence >= {confidence:.2f}")
     clear_predictions(coco, todo)
+    # Per-trial ROIs: each frame is prepared with its source video's trial's.
+    from .mtt_roi import frame_source, frame_sources
+    sources = frame_sources(pdir) if hasattr(engine, "use_source") else {}
     for i, name in enumerate(todo):
+        if sources:
+            engine.use_source(frame_source(name, sources) or "")
         if should_stop is not None and should_stop():
             break
         img = cv2.imread(os.path.join(frames_dir, name))

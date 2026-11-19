@@ -103,6 +103,21 @@ behaviour tools, MAD's Fusion QC) prepares frames the same way, maps the masks
 back to full-frame coordinates and drops detections centred outside the area.
 Models trained before the ROI keep seeing whole frames.
 
+**Margin** grows the area the model sees beyond the drawn outline by that many
+pixels (and shrinks excluded holes by as much); the editor shows it as a dashed
+line. An animal seen at an angle stands out past the floor it is on, as near the
+walls of an overhead camera's view, and an outline drawn on the floor alone cuts
+it off.
+
+**One outline per trial.** A camera bumped between trials frames the arena
+differently. With a frame from a trial on screen, **ROI** offers **Only for
+<trial folder>**: the outline is then kept for that trial's videos alone (the
+folder the video is in, or the one above a `cam5`/`Camera5`/`ch1_...` camera
+folder). Training frames, videos and predictions each use their own trial's
+outline, and the project's outline for trials without one; the preview shows the
+one of the frame on screen. Outlines placed by alignment rather than by hand are
+marked *proposed* until saved from the editor.
+
 !!! note
     This is not FNT's separate **ROI Tool** (zones for occupancy analysis of
     finished tracks).
@@ -228,38 +243,214 @@ only every Nth frame: 3 on 30 fps video gives 10 positions per second at about a
 third of the model time (every frame is still decoded). Frame numbers and
 `time_s` in `trajectories.csv` stay the video's, speeds use the real time between
 analysed frames, and the tracked video shows the analysed frames at fps / N, so it
-keeps the source's length. **Max disappear** then counts analysed frames. Videos that already have a `<video>_MaskTracker` folder are left
-out; `--redo` tracks them again after moving their old folders to
-`_TO_DELETE_tracking/` beside them. `--quit-when-done` closes the window at
+keeps the source's length. **Max disappear** then counts analysed frames.
+
+How detections join tracks: each frame, detections are matched to the tracks by
+centroid distance (Hungarian or greedy); a pair further apart than the match
+distance (15% of the frame diagonal) never matches and does not sway the
+others. A detection left over starts a new track; once there are **Max objects**
+tracks it is taken as one of those animals seen again and continues the nearest
+track that got no detection on that frame. A track that already has one is
+never taken over, and a detection beyond the limit with every track taken is
+left out (until 2026-11-18 it could take over a matched track, putting two
+animals under one ID).
+
+Videos that already have a track in their `<video>_MaskTracker` folder are
+left out; `--redo` tracks them again, first moving the files tracking wrote to
+`_TO_DELETE_tracking/<video>_MaskTracker/` beside them (nothing is deleted). The
+folder stays, with the files other tools keep in it, such as the ROI Tool's
+drawing (`*_roi*`). `--quit-when-done` closes the window at
 the end.
 
 Each `<video>_MaskTracker` folder records its run: `run_settings.json` (the
 model, every setting, the FNT version, when, frames per second, and how many
 frames had no detection) and `inference.log`. `--settings-from <that folder>`
-repeats the run exactly on other videos (flags given as well win). At the end of
-a run, each video folder gets `MaskTracker_summary.csv`: one row per tracked
-video with its frames, frames without a detection, tracks, speed and settings.
-`mask_tracker_cli track-summary --videos <folders>` rebuilds it for any folder;
-output from before these records is read from its trajectories and mask store.
+repeats the run exactly on other videos (flags given as well win). Nothing else is
+written beside the videos: each video's record is in its own folder.
 
 ### Exits
 
 Tracking that keeps a count of the animals needs to know where an animal can
-leave the view (the mouth of an entrance tube):
+leave the view: each opening in the wall (in a resource zone, the square
+cut-outs). Draw one outline per opening, over the gap and the strip just
+outside it. Don't outline the floor or cover inside the view (a water tower,
+a nest): an animal that vanishes there is hiding and stays in the count; one
+that vanishes within 60 px of an exit has left.
 
 ```bash
 python -m fnt.videoTracking.mask_tracker_cli exits --videos <folders or files> \
     [--focus <cameras.txt>]
 ```
 
+In the Mask Tracker window, **Exits...** on the Inference tab's Video Queue
+opens the same window for the queued videos' folders (or a folder you pick
+when the queue is empty).
+
 The window lists every folder and camera, unchecked ones first (a `--focus`
 file of `folder/camera` lines puts those at the top), and shows each camera's
 median frame. Click the corners round each exit and close the outline as in the
 ROI editor; corners can be dragged and **Delete** removes an exit. **Space**
 confirms the camera as it is and moves on; **PgUp** / **PgDn** step through the
-list. The exits are saved per camera in `exits.json` in each video folder. A
+list; **Done** (or **Esc**) saves and closes the window. The exits are saved per camera in `exits.json` in each video folder. A
 fixed outline cannot follow an exit that moves (a tube that slides in its hole
-over a trial), so check those cameras across the trial.
+over a trial), so check those cameras across the trial. Cameras are told apart
+by the start of the video name (`CAM13_...`); recorder names that put the camera
+second (`VoleCosm_Camera1_{...}_<time>.mp4`, several cameras in one folder) keep
+it (`VoleCosm_Camera1`).
+
+### Counting through huddles
+
+In a huddle the model cannot tell animals apart: they lie on and under each
+other, and the number of masks it draws there says little about how many
+animals there are. The count does not need it. Animals arrive and leave only
+through the exits, so a huddle holds the animals that went into it minus those
+that came out, even when it was there before the video started (the animals
+leaving it show how many it held). An animal lost from view anywhere other than
+an exit is hiding (under a feeder, beyond the frame's edge), not gone.
+
+```bash
+python -m fnt.videoTracking.mtt_counts <tracked videos or their _MaskTracker folders> \
+    [--animals N]
+```
+
+It reads each video's masks (`<video>_tracks.h5`; track with **Save masks**,
+`--save-masks`), or, without them, the boxes in `trajectories.csv`, and the
+camera's exits from `exits.json`. Masks that touch are one group; a group
+followed from frame to frame until animals join or leave it is a segment. One
+whole number of animals per segment is then solved for the whole video at once:
+animals are conserved where segments meet and split; they arrive and leave
+cheaply at the exits and at the video's start and end; a segment starting or
+ending anywhere else is animals coming out of or going into hiding, and the
+number hiding can never go below zero; a lone animal-sized mask is at least one
+animal, and a group at least as many as its area holds and as many as the whole
+animals it shows apart (masks of at least 0.6 of one animal, not lying over a
+bigger mask: animals side by side touch and curl up, so their group has little
+more area than one animal, but each keeps its own mask); `--animals` caps the
+total. Without exits drawn every start and end counts as an arrival or a
+departure and nothing hides. In the `_MaskTracker` folder:
+
+- `counts.csv`: per analysed frame, animals in view, hiding, and both (`in_space`),
+  with the groups and masks seen;
+- `segments.csv`: each segment's frames, place, masks, area (in animals), whole
+  masks, the least it can hold, and solved count;
+- `count_events.csv`: arrivals and departures at the exits, and animals going
+  into and coming out of hiding.
+
+### Midline keypoints
+
+Keypoints along the body come from the masks themselves, with no keypoint
+labelling: each frame's mask is thinned to its spine, the spine's ends are
+extended to the mask's edge, and five keypoints are placed along it (nose,
+neck, mid, hip, tail base, plus the tail tip when the tail is in the mask).
+
+```bash
+python -m fnt.videoTracking.mtt_midline <tracked videos, folders or .txt lists> \
+    [--head bright|motion|none] [--objects largest|all] [--scale auto|N] [--workers N] \
+    [--frame-workers N] [--skip-existing]
+```
+
+`--workers` runs that many videos at once; `--frame-workers N` splits each
+video's frames across N processes (a long or crowded video, such as a mesocosm
+overhead camera with several enlarged animals). Each frame's midline is worked
+out on its own and the head/tail orientation over time is done afterwards on
+the joined results, so the CSV is the same as with one process.
+
+`--objects largest` (default) does one animal, the track with the most frames
+(an open field). `--objects all` does every tracked animal (a mesocosm or any
+group video): each is oriented along its own frames, and the CSV has one row
+per animal per analysed frame with its `object_id` (with a frame step, only the
+analysed frames).
+
+Small animals are analysed enlarged. The size limits (smallest mask, smallest
+head marker, tail length) were set on open-field voles, whose masks are about
+7000 px. When a video's median mask is smaller, `--scale auto` (default)
+enlarges each crop to that size first: a mesocosm overhead vole of about
+560 px, with a hat 6–8 px across, is enlarged about 3.5×. Every value in the
+CSV is still in the video's pixels. `--scale N` sets the factor by hand.
+
+The video must have been tracked with **Save masks** (`--save-masks`). Which
+end is the head is decided from a head cue and kept consistent from frame to
+frame:
+
+- `bright` (default): a bright marker on the head (a tracking tag or headcap),
+  the largest patch in the mask brighter than the body by `--bright-delta`
+  grey levels (40);
+- `motion`: the end leading the direction of travel, for animals without a
+  marker. This is a weak cue: on VoleCosm open-field videos it agreed with the
+  head marker on only about 70% of moving frames (animals turn, back up and
+  move sideways), so check the orientation before relying on it;
+- `none`: frame-to-frame continuity only; the first frame's head end is
+  arbitrary.
+
+Written to `<video>_MaskTracker/<video>_midline.csv`, one row per frame, in
+pixels: the keypoints, body and tail length, head and body direction, the
+head-body angle, bend, total turning, the mask and marker area (frames without
+a marker hold their orientation from neighbouring frames), and `ok` (the frame
+had a usable mask). A 10-minute video takes about 5 minutes per worker.
+
+### Overhead camera to floor metres
+
+```bash
+python -m fnt.videoTracking.mtt_floor fit --outline <a run_settings.json or ROI json> \
+    --arena X0 X1 Y0 Y1 [--flip-x] [--no-flip-y] --out floor_map.json [--check-frame frame.png]
+```
+
+A wide overhead lens bends the arena's straight walls outward, so a plain
+perspective mapping is off near the walls. `mtt_floor` uses the floor outline
+drawn as the camera's ROI (it follows the walls): it fits the lens's radial
+distortion so the outline's points along each wall become straight (points off
+a wall's smooth curve, such as notches cut round boxes, are left out),
+intersects the four walls for the floor's corners and maps them onto the arena
+rectangle in floor-plan metres (`--arena`; by default the image's top is the
+plan's high y). `--check-frame` draws the floor grid on a frame to look at.
+In Python, `FloorMap.load(path).to_floor(pixels)` gives metres and
+`to_pixels(metres)` goes back; `FloorMap.align(pixels, targets)` fits a robust
+affine onto another tracking system's coordinates (for example UWB positions
+matched to the same animals), so the two can be compared directly. On the
+VoleCosm overhead camera the walls' bow went from about 3% to 0.7% of a wall's
+length.
+
+### Names across cameras (UWB)
+
+```bash
+python -m fnt.videoTracking.mtt_identity identity.json
+```
+
+For an arena filmed by several cameras whose animals also wear position tags
+(UWB): it names every track and hands names between cameras. Tracks from the
+cameras must share frame numbers (clock-synced clips, `fnt-grid --clips`).
+UWB is too coarse indoors to name animals moment by moment, but it is
+trustworthy when an animal is alone, so names are anchored there and carried
+along the tracks:
+
+- **Tracklets**: each camera's tracks, cut where they jump faster than an
+  animal moves or are lost for long; an overhead camera's positions go to floor
+  metres through its floor map (`mtt_floor`).
+- **Anchors**: a zone camera that sees one animal while UWB has exactly one
+  animal in that box and all others clear of it; an overhead animal whose
+  nearest UWB animal is close, the next one far, and no other animal near it.
+  A tracklet anchored to two animals holds a swap and is cut between them.
+- **Links**: handoffs (a zone tracklet ends in one of its camera's exits, from
+  the Exits window, and an overhead tracklet starts by that box within a few
+  seconds, or the reverse) and bridges (a tracklet ends and another starts close
+  by soon after in the same camera: mask flicker).
+- **Names**: one integer programme names all tracklets at once. Anchors decide,
+  the plain UWB distance breaks ties, and a link whose two ends get different
+  names costs its weight, so a name travels along a chain. No animal is on two
+  tracklets at once (except the two views of an animal in a doorway) or in two
+  places further apart than it could run in the time between. A tracklet nothing
+  anchors or links stays unnamed; a chain whose evidence barely favours its name
+  is marked unsure.
+
+`identity.json` gives the clock time of frame 0 (`start`), the frame count,
+the UWB CSV and its columns, the UWB clock offset (`uwb_offset_s`: UWB second =
+video clock second + offset), the zones CSV (box corners in metres) and, per
+camera, its Mask Tracker folder plus either its `zone` and `exits` or its
+`floor_map`. It writes `identities.csv` (one row per tracklet: camera,
+object_id, first and last frame, animal, unsure, anchors) and `links.csv`.
+On a VoleCosm minute it named 83% of tracked detections, 4% of them unsure; a
+box holding several animals at once is never anchored, so its tracks take their
+names from the doorway handoffs.
 
 ## Labelling on another machine
 

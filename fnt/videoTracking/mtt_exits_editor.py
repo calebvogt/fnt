@@ -1,7 +1,8 @@
 """Drawing each camera's exits (mtt_exits) on its median frame.
 
 ``ExitsWindow`` lists every folder x camera; unchecked ones first, then by the given focus
-order. Click the corners round an exit (the mouth of the entrance tube), and close it as in
+order. Click the corners round an exit (an opening in the wall, such as a resource zone's
+cut-outs), and close it as in
 the ROI editor (first corner again, double-click, right-click or Enter). Corners can be
 dragged. Space confirms the camera's exits as they are and moves on; any edit is saved as
 checked when you leave the camera.
@@ -110,12 +111,13 @@ class ExitsWindow(QWidget):
         self.list.currentRowChanged.connect(self._go)
         self.lbl = QLabel()
         self.lbl.setWordWrap(True)
-        hint = QLabel("Click the corners round each exit (the open end of the entrance tube, "
-                      "where mice come and go). Close it on the first corner, double-click, "
+        hint = QLabel("Click the corners round each exit (an opening in the wall where animals "
+                      "come and go; one outline per opening). Close it on the first corner, double-click, "
                       "right-click or Enter. Drag corners to adjust; Backspace drops the last "
                       "corner, Esc the outline. Delete removes the selected (or last) exit."
                       "\n\nSpace: these exits are right, next camera. "
-                      "PgDn / PgUp: next / previous. Edits are saved when you move on.")
+                      "PgDn / PgUp: next / previous. Edits are saved when you move on. "
+                      "Done or Esc: save and close.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #aaaaaa; font-size: 10px;")
         b_ok = QPushButton("Right, next (Space)")
@@ -126,10 +128,13 @@ class ExitsWindow(QWidget):
         b_prev.clicked.connect(lambda: self.step(-1))
         b_next = QPushButton("Next")
         b_next.clicked.connect(lambda: self.step(1))
+        b_done = QPushButton("Done (save and close)")
+        b_done.setToolTip("Save this camera's exits and close the window (Esc).")
+        b_done.clicked.connect(self.close)
         self.exit_list = QListWidget()
         self.exit_list.setMaximumHeight(90)
         self.exit_list.currentRowChanged.connect(self._highlight)
-        for b in (b_ok, b_del, b_prev, b_next):
+        for b in (b_ok, b_del, b_prev, b_next, b_done):
             b.setAutoDefault(False)
             b.setFocusPolicy(Qt.NoFocus)
 
@@ -146,15 +151,17 @@ class ExitsWindow(QWidget):
         row.addWidget(b_next)
         side.addLayout(row)
         side.addWidget(b_ok)
+        side.addWidget(b_done)
         side_w = QWidget()
         side_w.setLayout(side)
         side_w.setFixedWidth(280)
         banner = QLabel(
-            "Outline where mice enter and leave this camera's view (for a resource zone: the open "
-            "end of the white entrance tube). The tracker then keeps counting a mouse that "
+            "Outline each opening where animals enter and leave this camera's view (for a resource "
+            "zone: each cut-out in the wall, with the strip just outside it; not the floor, and not "
+            "a water tower or other cover inside). The tracker then keeps counting an animal that "
             "vanishes anywhere else: it is hiding, not gone.<br><b>Yellow = the current exit.</b> "
-            "On the open end? Press <b>Space</b>. Wrong? Press <b>Del</b>, click the corners "
-            "round the open end, press <b>Enter</b>, then <b>Space</b>.")
+            "Right? Press <b>Space</b>. Wrong? Press <b>Del</b>, click the corners round each "
+            "opening, press <b>Enter</b> after each, then <b>Space</b>.")
         banner.setWordWrap(True)
         banner.setStyleSheet("font-size: 13px; padding: 4px;")
         left = QVBoxLayout()
@@ -203,7 +210,10 @@ class ExitsWindow(QWidget):
 
         def work():
             fr = median_frame(self.cameras[key])
-            self._loaded.emit((key, fr))
+            try:
+                self._loaded.emit((key, fr))
+            except RuntimeError:                  # the window was closed while loading
+                pass
         threading.Thread(target=work, daemon=True).start()
 
     def _on_loaded(self, item) -> None:
@@ -304,6 +314,8 @@ class ExitsWindow(QWidget):
             self.step(-1)
         elif ev.key() in (Qt.Key_Return, Qt.Key_Enter):
             self.canvas.close_outline()
+        elif ev.key() == Qt.Key_Escape and not self.canvas._points:
+            self.close()                                  # Esc mid-outline drops the outline
         else:
             super().keyPressEvent(ev)
 

@@ -16,7 +16,7 @@ from PyQt5.QtCore import QPointF, QRectF, Qt, pyqtSignal
 from PyQt5.QtGui import (QBrush, QColor, QImage, QPainter, QPainterPath, QPen, QPixmap,
                          QPolygonF)
 from PyQt5.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QDialog, QHBoxLayout,
-                             QLabel, QListWidget, QPushButton, QRadioButton, QSizePolicy,
+                             QLabel, QListWidget, QPushButton, QRadioButton, QSizePolicy, QSpinBox,
                              QVBoxLayout, QWidget)
 
 from .mtt_roi import ROI
@@ -24,6 +24,7 @@ from .mtt_roi import ROI
 SHADE = QColor(0, 0, 0, 165)
 INCLUDE_COLOR = QColor("#4d8fe0")
 EXCLUDE_COLOR = QColor("#e05a4d")
+MARGIN_COLOR = QColor("#7fd0ff")
 SNAP_PX = 12          # a click this close to the first corner closes the outline
 
 
@@ -66,6 +67,15 @@ def paint_roi(painter: QPainter, roi: ROI, img_w: int, img_h: int,
             hot = highlight == (kind, i)
             painter.setPen(QPen(color, 3.0 if hot else 1.6, Qt.SolidLine))
             painter.drawPolygon(poly(p))
+    if r.margin_px > 0:
+        # Where the model really looks: the outlines grown by the margin.
+        import cv2
+        keep = r.keep_mask(img_h, img_w).astype(np.uint8)
+        cs, _ = cv2.findContours(keep, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        painter.setPen(QPen(MARGIN_COLOR, 1.6, Qt.DashLine))
+        for c in cs:
+            if len(c) >= 3:
+                painter.drawPolygon(poly([(float(q[0][0]), float(q[0][1])) for q in c]))
     painter.restore()
 
 
@@ -88,6 +98,7 @@ class _ROICanvas(QWidget):
         r = roi.for_size(self.img_w, self.img_h) if roi is not None else ROI()
         self.areas = {"include": [list(p) for p in r.include],
                       "exclude": [list(p) for p in r.exclude]}
+        self.margin_px = float(r.margin_px)
         self.mode = "include"
         self.highlight: Optional[Tuple[str, int]] = None
         self._points: List[Tuple[float, float]] = []      # the outline being drawn
@@ -133,7 +144,7 @@ class _ROICanvas(QWidget):
     def roi(self) -> Optional[ROI]:
         r = ROI(include=[list(p) for p in self.areas["include"]],
                 exclude=[list(p) for p in self.areas["exclude"]],
-                frame_size=(self.img_w, self.img_h))
+                frame_size=(self.img_w, self.img_h), margin_px=self.margin_px)
         return None if r.is_empty() else r
 
     # ------------------------------------------------------------ editing
@@ -255,9 +266,10 @@ class ROIEditorDialog(QDialog):
     """Draw the included and excluded areas on ``frame_rgb``; ``roi()``
     after Save is the result (None: whole frames)."""
 
-    def __init__(self, frame_rgb: np.ndarray, roi: Optional[ROI] = None, parent=None):
+    def __init__(self, frame_rgb: np.ndarray, roi: Optional[ROI] = None, parent=None,
+                 trial: Optional[str] = None, own: bool = False):
         super().__init__(parent)
-        self.setWindowTitle("Region of interest")
+        self.setWindowTitle("Region of interest" + (f" - {trial}" if trial else ""))
         screen = QApplication.primaryScreen()
         if screen is not None:
             g = screen.availableGeometry()
@@ -291,6 +303,25 @@ class ROIEditorDialog(QDialog):
                                        "the box around the included area, the rest grey.")
         self.chk_model_view.toggled.connect(self._model_view)
 
+        self.spin_margin = QSpinBox()
+        self.spin_margin.setRange(0, 300)
+        self.spin_margin.setSuffix(" px")
+        self.spin_margin.setValue(int(round(self.canvas.margin_px)))
+        self.spin_margin.setToolTip(
+            "Margin beyond the drawn outline where the model still looks (dashed line).\n"
+            "An animal seen at an angle stands out past the floor it is on (near the\n"
+            "walls of an overhead view); without a margin it is cut off. Excluded areas\n"
+            "shrink by as much.")
+        self.spin_margin.valueChanged.connect(self._margin_changed)
+        self.chk_trial = None
+        if trial:
+            self.chk_trial = QCheckBox(f"Only for {trial}")
+            self.chk_trial.setChecked(own)
+            self.chk_trial.setToolTip(
+                "Save this outline for this trial folder's videos only (the camera may\n"
+                "frame the arena differently in other trials). Unticked: the project's\n"
+                "outline, used for every trial without its own.")
+
         self.list_areas = QListWidget()
         self.list_areas.setMaximumWidth(240)
         self.list_areas.currentRowChanged.connect(self._select_area)
@@ -317,6 +348,12 @@ class ROIEditorDialog(QDialog):
         side.addWidget(hint)
         side.addSpacing(6)
         side.addWidget(self.chk_model_view)
+        mrow = QHBoxLayout()
+        mrow.addWidget(QLabel("Margin:"))
+        mrow.addWidget(self.spin_margin)
+        side.addLayout(mrow)
+        if self.chk_trial is not None:
+            side.addWidget(self.chk_trial)
         side.addSpacing(6)
         side.addWidget(QLabel("Outlines:"))
         side.addWidget(self.list_areas, 1)
@@ -340,6 +377,14 @@ class ROIEditorDialog(QDialog):
 
     def roi(self) -> Optional[ROI]:
         return self.canvas.roi()
+
+    def for_trial(self) -> bool:
+        """Whether the outline is saved for this trial folder only."""
+        return self.chk_trial is not None and self.chk_trial.isChecked()
+
+    def _margin_changed(self, v: int) -> None:
+        self.canvas.margin_px = float(v)
+        self.canvas._edited()
 
     def keyPressEvent(self, ev):
         if ev.key() in (Qt.Key_Return, Qt.Key_Enter):

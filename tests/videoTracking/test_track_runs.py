@@ -1,15 +1,13 @@
 """Whole-video tracking from the command line, and what a run leaves behind.
 
-Each <video>_MaskTracker folder gets run_settings.json and inference.log; a
-video folder's MaskTracker_summary.csv has a row per tracked video;
+Each <video>_MaskTracker folder gets run_settings.json and inference.log;
 ``mask_tracker_cli track`` takes every Inference setting as a flag (or an
 earlier run's, with --settings-from) and opens the window on them; --redo moves
-old output aside instead of deleting it.
+the old tracking files aside instead of deleting them, keeping the folder and its ROI drawing.
 
 Runs under pytest, or directly.
 """
 import argparse
-import csv
 import json
 import os
 import sys
@@ -91,22 +89,6 @@ def test_a_run_records_its_settings_and_log(tracked):
     assert rec["tracks"] >= 1 and rec["fnt_version"] and rec["finished"]
     log = open(os.path.join(res["output_dir"], R.LOG_FILE), encoding="utf-8").read()
     assert "[Fake] model loaded" in log and "[MTT Inference] Done" in log
-
-
-def test_the_folder_summary_has_a_row_per_tracked_video(tracked, tmp_path):
-    video, res = tracked
-    # An older run without run_settings.json: read from its trajectories.
-    old = tmp_path / "cam2_MaskTracker"
-    old.mkdir()
-    (tmp_path / "cam2.avi").write_bytes(b"")
-    (old / "trajectories.csv").write_text("frame,object_id\n0,1\n1,1\n")
-    path = R.write_folder_summary(str(tmp_path))
-    rows = list(csv.DictReader(open(path, encoding="utf-8")))
-    by = {r["video"]: r for r in rows}
-    assert by["cam1.avi"]["status"] == "done"
-    assert by["cam1.avi"]["frames_without_detection"] == "2"
-    assert by["cam1.avi"]["workers"] == "3"
-    assert by["cam2.avi"]["status"] == "no record" and by["cam2.avi"]["tracks"] == "1"
 
 
 def test_tracking_folders_never_count_as_videos(tracked, tmp_path):
@@ -208,18 +190,25 @@ def test_track_opens_the_models_project_on_the_videos(monkeypatch, tmp_path):
     assert "--parallel" in argv and "--conf" in argv
 
 
-def test_redo_moves_the_old_output_aside(monkeypatch, tmp_path):
+def test_redo_moves_the_old_tracking_aside_and_keeps_the_roi_drawing(monkeypatch, tmp_path):
     import fnt.videoTracking.mask_tracker_gui as G
     proj, run = _project(tmp_path)
     vids = tmp_path / "videos"
     vids.mkdir()
     make_video(str(vids / "a.avi"))
-    (vids / "a_MaskTracker").mkdir()
-    (vids / "a_MaskTracker" / "trajectories.csv").write_text("frame\n0\n")
+    out = vids / "a_MaskTracker"
+    out.mkdir()
+    (out / "a_trajectories.csv").write_text("frame\n0\n")
+    (out / "run_settings.json").write_text("{}")
+    (out / "a_roiConfig.json").write_text("{}")
+    assert R.has_tracking_output(str(vids / "a.avi"))
     monkeypatch.setattr(G, "main", lambda argv: 0)
     C.main(["track", "--videos", str(vids), "--model", run, "--redo"])
-    assert not (vids / "a_MaskTracker").exists()
-    assert (vids / "_TO_DELETE_tracking" / "a_MaskTracker" / "trajectories.csv").exists()
+    assert (out / "a_roiConfig.json").exists()                              # the drawing stays
+    assert not (out / "a_trajectories.csv").exists()
+    assert (vids / "_TO_DELETE_tracking" / "a_MaskTracker" / "a_trajectories.csv").exists()
+    assert (vids / "_TO_DELETE_tracking" / "a_MaskTracker" / "run_settings.json").exists()
+    assert not R.has_tracking_output(str(vids / "a.avi"))                   # so it is tracked again
 
 
 def test_track_needs_a_project_for_a_loose_model(tmp_path, capsys):

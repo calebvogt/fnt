@@ -2342,10 +2342,18 @@ class PostTrainInferenceWorker(QThread):
 
             total = len(self.frame_paths)
             inferred_count = 0
+            # Per-trial ROIs: each frame prepared with its source video's trial's
+            # (frames live in <project>/training_frames/).
+            from .mtt_roi import frame_source, frame_sources
+            sources = {}
+            if hasattr(engine, "use_source") and self.frame_paths:
+                sources = frame_sources(os.path.dirname(os.path.dirname(self.frame_paths[0])))
 
             for i, path in enumerate(self.frame_paths):
                 if self._stop_flag:
                     break
+                if sources:
+                    engine.use_source(frame_source(path, sources) or "")
 
                 img = cv2.imread(path)
                 if img is None:
@@ -6025,6 +6033,14 @@ class MaskTrackerWindow(QMainWindow):
         btn_clear_vids.setToolTip("Remove all videos from the queue.")
         btn_clear_vids.clicked.connect(self._clear_tracking_videos)
         vid_btn_row.addWidget(btn_clear_vids)
+        btn_exits = QPushButton("Exits...")
+        btn_exits.setToolTip(
+            "Draw each camera's exits (the openings in the wall where animals come\n"
+            "and go) for the queued videos' folders; saved as exits.json beside the\n"
+            "videos. Animal counts use them: an animal that vanishes at an exit has\n"
+            "left, one that vanishes anywhere else is hiding and stays counted.")
+        btn_exits.clicked.connect(self._open_exits)
+        vid_btn_row.addWidget(btn_exits)
         video_vbox.addLayout(vid_btn_row)
 
         self.list_track_videos = QListWidget()
@@ -6987,6 +7003,7 @@ class MaskTrackerWindow(QMainWindow):
         if hasattr(self, "btn_guide"):
             self.btn_guide.set_project(d)
         self._project_config = {}
+        self._project_config_saved = None
         self._refresh_roi()
         self._cls_data_loaded = False
         os.makedirs(os.path.join(d, "training_frames"), exist_ok=True)
@@ -7259,6 +7276,7 @@ class MaskTrackerWindow(QMainWindow):
         self._migrate_model_folder_names()
         self._cls_data_loaded = False
         self._project_config = cfg
+        self._project_config_saved = copy.deepcopy(cfg)     # what is on disk (see _save_project_config)
         self._refresh_roi()
 
         # Keep missing videos in the list (shown in red) instead of silently
@@ -7352,10 +7370,12 @@ class MaskTrackerWindow(QMainWindow):
         self.status_bar.showMessage(f"Project saved: {self._project_dir}")
 
     def _refresh_roi(self):
-        """Show the project's ROI on the preview and the ROI button."""
+        """Show the project's ROI on the preview (the current frame's trial's own,
+        when it has one) and the ROI button."""
         from .mtt_roi import ROI
         roi = ROI.from_dict(self._project_config.get("roi"))
-        self.preview.roi = roi
+        shown = roi.for_source(self._roi_source()) if roi is not None else None
+        self.preview.roi = shown
         self.preview.update()
         if hasattr(self, "btn_roi"):
             self.btn_roi.setText("ROI" if roi is not None else "ROI (none)")
@@ -7368,6 +7388,14 @@ class MaskTrackerWindow(QMainWindow):
                 "with it; models trained before it was drawn are unaffected.\n"
                 "Click to draw it on the frame on screen.")
 
+    def _roi_source(self) -> Optional[str]:
+        """The source video of the frame on screen, for per-trial ROIs."""
+        try:
+            src = self._scrubber_source()
+        except Exception:
+            src = None
+        return src[0] if src else None
+
     def _edit_roi(self):
         if self._project_dir is None:
             QMessageBox.information(self, "Region of interest", "Open a project first.")
@@ -7377,12 +7405,30 @@ class MaskTrackerWindow(QMainWindow):
             QMessageBox.information(self, "Region of interest",
                                     "Show a frame first: the ROI is drawn on it.")
             return
-        from .mtt_roi import ROI
+        from .mtt_roi import ROI, trial_key
         from .mtt_roi_editor import ROIEditorDialog
-        dlg = ROIEditorDialog(frame, ROI.from_dict(self._project_config.get("roi")), self)
+        whole = ROI.from_dict(self._project_config.get("roi"))
+        src = self._roi_source()
+        trial = trial_key(src) if src else None
+        own = bool(whole is not None and trial and trial in whole.by_folder)
+        start = whole.for_source(src) if whole is not None else None
+        dlg = ROIEditorDialog(frame, start, self, trial=trial, own=own)
         if dlg.exec_() != QDialog.Accepted:
             return
         roi = dlg.roi()
+        by = dict(whole.by_folder) if whole is not None else {}
+        if dlg.for_trial():
+            if roi is None:
+                by.pop(trial, None)
+            else:
+                by[trial] = roi
+            base = whole.base() if whole is not None and not whole.is_empty() else ROI()
+            base.by_folder = by
+            roi = None if base.is_empty() and not by else base
+        elif roi is not None:
+            roi.by_folder = by
+        elif by:
+            roi = ROI(by_folder=by)
         if roi is None:
             self._project_config.pop("roi", None)
         else:
@@ -7397,8 +7443,25 @@ class MaskTrackerWindow(QMainWindow):
         if self._project_dir is None:
             return
         path = os.path.join(self._project_dir, "project_config.json")
+        # Another window or a script may have changed the file since this one
+        # read it (an ROI drawn elsewhere, per-trial outlines): keep their
+        # value of every setting this window has not changed itself.
+        base = getattr(self, "_project_config_saved", None)
+        if base is not None and os.path.exists(path):
+            try:
+                with open(path) as f:
+                    disk = json.load(f)
+            except (OSError, ValueError):
+                disk = None
+            if isinstance(disk, dict):
+                missing = object()
+                for k, v in disk.items():
+                    if (base.get(k, missing) != v
+                            and self._project_config.get(k, missing) == base.get(k, missing)):
+                        self._project_config[k] = v
         with open(path, "w") as f:
             json.dump(self._project_config, f, indent=2)
+        self._project_config_saved = copy.deepcopy(self._project_config)
 
     def _autosave_project_config(self):
         """Persist video list + classes immediately, like annotations already do.
@@ -7895,6 +7958,8 @@ class MaskTrackerWindow(QMainWindow):
             self._lbl_scrub_video.setToolTip("")
             return
         vpath, pos = src
+        if getattr(self, "_project_config", None) and self._project_config.get("roi", {}).get("by_folder"):
+            self._refresh_roi()             # per-trial ROI: this frame's trial's
         # Keep the video playhead on the frame being labeled, so selecting
         # this video in the list opens here rather than at frame 0.
         self._video_frame_idx = pos
@@ -13276,6 +13341,29 @@ class MaskTrackerWindow(QMainWindow):
         self.list_track_videos.clear()
         self._update_tracking_button_state()
 
+    def _open_exits(self):
+        """The Exits window on the cameras of the queued videos (or of a folder chosen now)."""
+        from .mtt_exits import cameras_in
+        from .mtt_exits_editor import ExitsWindow
+        videos = [self.list_track_videos.item(i).data(Qt.UserRole)
+                  for i in range(self.list_track_videos.count())]
+        videos = [v for v in videos if v]
+        if not videos:
+            folder = QFileDialog.getExistingDirectory(self, "Video folder(s) to draw exits for")
+            if not folder:
+                return
+            videos = [folder]
+        cams = cameras_in(videos)
+        if not cams:
+            QMessageBox.information(self, "Exits", "No videos found.")
+            return
+        w = getattr(self, "_exits_window", None)
+        if w is not None and w.isVisible():
+            w.close()
+        self._exits_window = ExitsWindow(cams)
+        self._exits_window.show()
+        self._exits_window.raise_()
+
     def _update_tracking_button_state(self):
         idx = self.combo_track_model.currentIndex()
         dirs = getattr(self, "_track_model_dirs", [])
@@ -13298,13 +13386,9 @@ class MaskTrackerWindow(QMainWindow):
         for i in range(self.list_track_videos.count()):
             video_paths.append(self.list_track_videos.item(i).data(Qt.UserRole))
 
-        existing = []
-        for vp in video_paths:
-            out_dir = os.path.join(
-                str(Path(vp).parent), f"{Path(vp).stem}_MaskTracker"
-            )
-            if os.path.isdir(out_dir):
-                existing.append(os.path.basename(vp))
+        # A folder holding only the ROI Tool's drawing is not a track: it is kept and tracked into without asking.
+        from .mtt_runs import has_tracking_output, move_tracking_aside
+        existing = [os.path.basename(vp) for vp in video_paths if has_tracking_output(vp)]
 
         if existing:
             names = "\n".join(f"  • {n}" for n in existing)
@@ -13313,18 +13397,16 @@ class MaskTrackerWindow(QMainWindow):
                 "Existing Results Found",
                 f"The following video(s) already have MaskTracker output:\n\n"
                 f"{names}\n\n"
-                f"Overwriting will clear all contents in the MaskTracker "
-                f"output folder(s), including any ROI analysis saved there.\n\n"
-                f"Overwrite existing results?",
+                f"Re-tracking moves the old tracking files to _TO_DELETE_tracking/ "
+                f"beside each video; the MaskTracker folder and its ROI drawing stay.\n\n"
+                f"Re-track these videos?",
                 QMessageBox.Yes | QMessageBox.Cancel,
             )
             if reply != QMessageBox.Yes:
                 return
 
             for vp in video_paths:
-                out_dir = Path(vp).parent / f"{Path(vp).stem}_MaskTracker"
-                if out_dir.is_dir():
-                    shutil.rmtree(out_dir)
+                move_tracking_aside(vp)
 
             roi_existing = []
             for vp in video_paths:
@@ -13347,14 +13429,20 @@ class MaskTrackerWindow(QMainWindow):
                     f"(It will be invalid after re-tracking.)",
                     QMessageBox.Yes | QMessageBox.No,
                 )
-                if roi_reply == QMessageBox.Yes:
+                if roi_reply == QMessageBox.Yes:  # moved aside, not deleted
                     for vp in video_paths:
                         stem = Path(vp).stem
                         parent = Path(vp).parent
                         for suffix in (f"{stem}_roiAnalysis", f"{stem}_roiAnalysis_SLEAP"):
                             roi_dir = parent / suffix
                             if roi_dir.is_dir():
-                                shutil.rmtree(roi_dir)
+                                from datetime import datetime
+                                aside = parent / "_TO_DELETE_tracking" / suffix
+                                if aside.exists():
+                                    aside = aside.with_name(
+                                        f"{suffix}_{datetime.now():%Y%m%d_%H%M%S}")
+                                aside.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.move(str(roi_dir), str(aside))
 
         combo_text = self.combo_track_device.currentText()
         if combo_text.startswith("Auto"):
@@ -13482,9 +13570,8 @@ class MaskTrackerWindow(QMainWindow):
                 videos += find_track_videos([item])
             else:
                 print(f"[MTT] --infer: no such video or folder: {item}", flush=True)
-        todo = [v for v in videos
-                if not os.path.isdir(os.path.join(str(Path(v).parent),
-                                                  f"{Path(v).stem}_MaskTracker"))]
+        from .mtt_runs import has_tracking_output
+        todo = [v for v in videos if not has_tracking_output(v)]
         if len(todo) < len(videos):
             print(f"[MTT] --infer: {len(videos) - len(todo)} video(s) already have "
                   f"output, left out", flush=True)
@@ -13796,33 +13883,14 @@ class MaskTrackerWindow(QMainWindow):
             self.lbl_track_status.setText(line.replace("[MTT Parallel] ", ""))
             self._track_parallel = False
             self._show_infer_grid(False)
-        self._write_run_summaries()
-        if getattr(self, "_quit_when_done", False):
-            QTimer.singleShot(1500, self.close)
-
-    def _write_run_summaries(self):
-        """MaskTracker_summary.csv in each folder this run's videos are in."""
-        from .mtt_runs import write_folder_summary
-        seen = set()
-        for v in getattr(self, "_track_video_paths", []) or []:
-            folder = os.path.dirname(v)
-            if folder in seen:
-                continue
-            seen.add(folder)
-            try:
-                path = write_folder_summary(folder)
-            except Exception as e:
-                path = None
-                self._on_infer_log(f"[MTT] could not write the summary in {folder}: {e}")
-            if path:
-                self._on_infer_log(f"[MTT] summary: {path}")
-                print(f"[MTT] summary: {path}", flush=True)
         self.lbl_tracking_info.setText(
             f"Inference complete — {self._track_videos_done} video(s) processed"
         )
         self.status_bar.showMessage(
             f"Inference complete: {self._track_videos_done} video(s)"
         )
+        if getattr(self, "_quit_when_done", False):
+            QTimer.singleShot(1500, self.close)
 
     def _toggle_tracking_pause(self):
         if not hasattr(self, "_inference_worker") or not self._inference_worker.isRunning():
@@ -14416,7 +14484,7 @@ def track_main(args) -> int:
     """``mask_tracker_cli track``: open the project in the window and track the
     videos from the Inference tab (see ``main``'s ``--infer``)."""
     from .mask_tracker_cli import settings_argv
-    from .mtt_runs import find_track_videos, output_dir_for
+    from .mtt_runs import find_track_videos
     model = args.model
     if not model and args.settings_from:
         model = inference_settings(args).get("model_dir")
@@ -14433,18 +14501,12 @@ def track_main(args) -> int:
         print("track: no videos found", file=sys.stderr)
         return 1
     if args.redo:
-        import shutil
-        from datetime import datetime
+        from .mtt_runs import move_tracking_aside
         for v in videos:
-            out = output_dir_for(v)
-            if os.path.isdir(out):
-                bin_dir = os.path.join(os.path.dirname(v), "_TO_DELETE_tracking")
-                os.makedirs(bin_dir, exist_ok=True)
-                dest = os.path.join(bin_dir, os.path.basename(out))
-                if os.path.exists(dest):
-                    dest += datetime.now().strftime("_%Y%m%d_%H%M%S")
-                shutil.move(out, dest)
-                print(f"[MTT] moved the old output to {dest}", flush=True)
+            dest = move_tracking_aside(v)
+            if dest:
+                print(f"[MTT] moved the old tracking files to {dest} (the folder and its ROI files stay)",
+                      flush=True)
     argv = (["--project", project, "--infer", *videos, "--infer-model", model]
             + settings_argv(args))
     return main(argv)

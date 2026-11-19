@@ -67,6 +67,17 @@ def test_data_only_writes_no_video(tmp_path):
     assert not os.path.exists(os.path.join(mt, "T001_F1_PreOFT_roiTracked.mp4"))
 
 
+def test_a_retracked_video_uses_the_new_track(tmp_path):
+    """A re-track writes trajectories.csv and moves <video>_trajectories.csv aside; the drawing still names the old."""
+    video, csv = _video_with_track(str(tmp_path), "T001_F1_PreOFT")
+    cfg = _config(video, csv)
+    os.replace(csv, os.path.join(os.path.dirname(csv), "trajectories.csv"))
+    assert roi_cli.main([cfg, "--data-only", "--workers", "1"]) == 0
+    mt = os.path.dirname(cfg)
+    assert os.path.exists(os.path.join(mt, "T001_F1_PreOFT_roiSummary.csv"))
+    assert json.load(open(cfg))["csv_path"] == csv                  # the drawing is left as it was
+
+
 def test_queueing_saves_the_drawing(tmp_path):
     video, csv = _video_with_track(str(tmp_path), "T001_F1_PreOFT")
     c = VideoROIConfig(video, csv, "mtt")

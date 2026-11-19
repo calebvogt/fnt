@@ -40,10 +40,26 @@ def find_configs(paths):
     return [c for c in out if not (c in seen or seen.add(c))]
 
 
+def _track_csv(d, config_path):
+    """The configuration's tracking CSV; when it has gone (a Mask Tracker re-track writes ``trajectories.csv`` and
+    moves the old ``<video>_trajectories.csv`` aside), the track now beside the configuration."""
+    p = d["csv_path"]
+    if os.path.exists(p):
+        return p
+    here = os.path.dirname(os.path.abspath(config_path))
+    stem = os.path.splitext(os.path.basename(d["video_path"]))[0]
+    for name in (os.path.basename(p), f"{stem}_trajectories.csv", "trajectories.csv"):
+        q = os.path.join(here, name)
+        if os.path.exists(q):
+            return q
+    return p
+
+
 def _load(config_path):
     from fnt.sleapProcessing.sleap_roi_tool_pyqt import VideoROIConfig
     with open(config_path, encoding="utf-8") as f:
         d = json.load(f)
+    d["csv_path"] = _track_csv(d, config_path)
     c = VideoROIConfig(d["video_path"], d["csv_path"], d.get("data_source", "sleap"))
     c.from_config_dict(d)
     c.configured = True

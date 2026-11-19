@@ -40,6 +40,9 @@ def test_save_keeps_other_cameras(folder):
 
 
 def test_cameras_and_median(folder):
+    for sub in ("CAM13_2022-01-01_00_00_00_000_MaskTracker", "_TO_DELETE_tracking"):
+        os.makedirs(os.path.join(folder, sub))               # tracking output: not cameras
+        _clip(os.path.join(folder, sub, "CAM15_annotated.mp4"), 10)
     cams = cameras_in([os.path.dirname(folder)])
     key13 = (os.path.abspath(folder), "CAM13")
     assert set(cams) == {key13, (os.path.abspath(folder), "CAM14")}
@@ -73,3 +76,31 @@ def test_editor_saves_drawn_and_confirmed(folder):
     assert load_exits(folder)["CAM13"]["exits"] == [[[10, 10], [20, 10], [20, 20], [10, 20]]]
     assert w.cur[1] == "CAM14"
     w.close()
+
+
+def test_editor_done_and_esc_save_and_close(folder):
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtGui import QKeyEvent
+    from PyQt5.QtWidgets import QApplication, QPushButton
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    from fnt.videoTracking.mtt_exits_editor import ExitsWindow
+    cams = cameras_in([folder])
+    w = ExitsWindow(cams)
+    for k in w.keys:
+        w._on_loaded((k, median_frame(cams[k])))
+    w.show()
+    w.canvas._points = [(1, 1), (9, 1), (9, 9)]
+    w.canvas.close_outline()
+    done = [b for b in w.findChildren(QPushButton) if b.text().startswith("Done")]
+    assert len(done) == 1
+    done[0].click()                                               # saves the edit, closes
+    assert not w.isVisible()
+    assert load_exits(folder)[w.cur[1]]["exits"] == [[[1, 1], [9, 1], [9, 9]]]
+    w2 = ExitsWindow(cams)
+    w2.show()
+    w2.canvas._points = [(2, 2)]                                  # an outline in progress:
+    w2.keyPressEvent(QKeyEvent(QKeyEvent.KeyPress, Qt.Key_Escape, Qt.NoModifier))
+    assert w2.isVisible()                                         # Esc does not close
+    w2.canvas._points = []
+    w2.keyPressEvent(QKeyEvent(QKeyEvent.KeyPress, Qt.Key_Escape, Qt.NoModifier))
+    assert not w2.isVisible()

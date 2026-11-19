@@ -1,7 +1,7 @@
 """Where animals can leave a fixed camera's view: its exits.
 
 An enclosed space (a nest box, a resource zone) is entered and left only through a few
-places, such as the mouth of an entrance tube. A tracker that knows them can keep counting
+places, such as the cut-outs in a resource zone's walls. A tracker that knows them can keep counting
 a mouse it has lost sight of anywhere else: it is hiding, not gone.
 
 Exits are drawn per camera framing, so they live with the videos: ``exits.json`` in each
@@ -64,7 +64,9 @@ def cameras_in(items: Sequence[str]) -> Dict[Tuple[str, str], List[str]]:
     videos = []
     for it in items:
         if os.path.isdir(it):
-            for root, _, files in os.walk(it):
+            for root, dirs, files in os.walk(it):
+                # not Mask Tracker's own output (annotated videos) or folders set aside
+                dirs[:] = [d for d in dirs if not d.endswith("_MaskTracker") and not d.startswith("_TO_DELETE")]
                 videos += [os.path.join(root, f) for f in files if f.lower().endswith(VIDEO_EXTS)]
         elif it.lower().endswith(VIDEO_EXTS):
             videos.append(it)
