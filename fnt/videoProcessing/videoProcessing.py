@@ -268,7 +268,8 @@ class VideoProcessorWorker(QThread):
                  instance_id=1, skip_already_processed=False,
                  burn_subtitles=False, subtitle_style=None,
                  replace_whitespace=False, filename_prefix="", filename_suffix="",
-                 input_extensions=None, shard=None, recover_damaged=True):
+                 input_extensions=None, shard=None, recover_damaged=True,
+                 stream_copy=False):
         super().__init__()
         self.input_dirs = input_dirs
         self.input_videos = input_videos
@@ -295,6 +296,11 @@ class VideoProcessorWorker(QThread):
         # encoding with the lost frames left out (video then runs ahead of the
         # camera clock).
         self.recover_damaged = recover_damaged
+        # A source that already is what the encode would make (H.264/H.265 at the
+        # target size and frame rate, gray when gray is asked for, no lost frames) is
+        # copied into the output container instead of re-encoded (see
+        # _stream_copy_blocker); anything else is encoded as usual.
+        self.stream_copy = stream_copy
         self.should_stop = False
         # Retry transient failures (e.g. network drops reading from a mapped
         # network drive cause FFmpeg to crash mid-read). max_retries is the
@@ -461,6 +467,137 @@ class VideoProcessorWorker(QThread):
         except Exception as e:
             self.progress_update.emit(f"  🩹 {name}: rebuild error: {e}")
             return False
+
+    # ------------------------------------------------------------ stream copy
+    COPY_CODECS = ("h264", "hevc")
+    COPY_PIX_FMTS = ("yuv420p", "yuvj420p", "gray")
+    COPY_FORMATS = ("mp4", "mov", "mkv", "matroska")
+
+    @staticmethod
+    def _probe_stream(filepath):
+        """codec, width, height, pix_fmt and frame rates of the first video stream."""
+        try:
+            r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                                "stream=codec_name,width,height,pix_fmt,r_frame_rate,avg_frame_rate",
+                                "-of", "json", filepath], capture_output=True, text=True, timeout=60)
+            import json
+            return json.loads(r.stdout)["streams"][0] if r.returncode == 0 else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _rate(text):
+        try:
+            a, b = str(text).split("/")
+            return float(a) / float(b) if float(b) else None
+        except Exception:
+            return None
+
+    def _has_colour(self, filepath, duration):
+        """Whether any of three frames (10%, 50%, 90% in) has colour: chroma away from
+        neutral. None when the frames cannot be read."""
+        import numpy as np
+        w, h = self._target_resolution()
+        for frac in (0.1, 0.5, 0.9):
+            try:
+                # -ss before -i: jump to the keyframe near there (any frame will do)
+                r = subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-ss",
+                                    f"{(duration or 0) * frac:.2f}", "-i", filepath,
+                                    "-frames:v", "1", "-f", "rawvideo",
+                                    "-pix_fmt", "yuv420p", "-"], capture_output=True, timeout=120)
+            except Exception:
+                return None
+            b = np.frombuffer(r.stdout, np.uint8)
+            if len(b) != w * h * 3 // 2:
+                return None
+            uv = b[w * h:].astype(np.int16) - 128
+            if np.mean(np.abs(uv) > 3) > 0.001:
+                return True
+        return False
+
+    def _stream_copy_blocker(self, src, gaps, is_avi):
+        """Why ``src`` cannot simply be copied into the output, or None when it can:
+        it must already be H.264 or H.265, 8-bit 4:2:0, at the target size and frame
+        rate, gray when gray is asked for, with no lost frames (mp4/mkv: no jumps in its
+        timestamps; AVIs are checked after the copy)."""
+        if self.burn_subtitles:
+            return "burning subtitles needs a re-encode"
+        if self.output_format not in self.COPY_FORMATS:
+            return f"stream copy writes mp4/mov/mkv, not {self.output_format}"
+        st = self._probe_stream(src)
+        if not st:
+            return "its video stream cannot be read"
+        if st.get("codec_name") not in self.COPY_CODECS:
+            return f"it is {st.get('codec_name')}, not H.264/H.265"
+        if st.get("pix_fmt") not in self.COPY_PIX_FMTS:
+            return f"its pixel format is {st.get('pix_fmt')}"
+        if (st.get("width"), st.get("height")) != self._target_resolution():
+            return f"it is {st.get('width')}x{st.get('height')}, not {'x'.join(map(str, self._target_resolution()))}"
+        for key in ("r_frame_rate", "avg_frame_rate"):
+            fps = self._rate(st.get(key))
+            if fps is None or abs(fps - float(self.frame_rate)) > 0.01:
+                return f"its frame rate is {st.get(key)}, not {self.frame_rate}"
+        if not is_avi:
+            if gaps is None:
+                from fnt.videoProcessing import frame_gaps as G
+                gaps = G.probe(src)
+            if gaps is None:
+                return "its timestamps cannot be read"
+            if gaps.gaps:
+                return f"it has {len(gaps.gaps)} stretch(es) of lost frames"
+        if self.grayscale:
+            colour = self._has_colour(src, self._media_duration(src))
+            if colour is None:
+                return "its frames cannot be checked for colour"
+            if colour:
+                return "it has colour"
+        return None
+
+    def _stream_copy(self, src, original, partial_file, is_avi):
+        """Copy ``src``'s video into ``partial_file`` without re-encoding. Returns None
+        when the copy is good, else why it is not (the caller encodes instead)."""
+        st = self._probe_stream(src) or {}
+        cmd = ["ffmpeg", "-y", "-nostdin", "-v", "error", "-fflags", "+genpts", "-i", src,
+               "-map", "0:v:0", "-c:v", "copy"]
+        if st.get("codec_name") == "hevc" and self.output_format in ("mp4", "mov"):
+            cmd += ["-tag:v", "hvc1"]                    # HEVC in mp4 as players expect
+        if self.remove_audio:
+            cmd += ["-an"]
+        else:
+            cmd += ["-map", "0:a?", "-c:a", "aac", "-b:a", "128k"]
+        cmd += ["-movflags", "+faststart", "-avoid_negative_ts", "make_zero",
+                "-f", self.output_format, partial_file]
+        try:
+            r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                               timeout=3600)
+        except Exception as e:
+            return f"the copy failed: {e}"
+        if r.returncode != 0:
+            return f"the copy failed: {r.stderr.strip()[-300:]}"
+        if is_avi and not self._avi_header_intact(src):
+            return "its header is lost"
+        src_d, out_d = self._media_duration(src), self._media_duration(partial_file)
+        if not src_d or not out_d:
+            return "the copy's length cannot be read"
+        if abs(src_d - out_d) > max(1.0, 0.002 * src_d):
+            return (f"the copy is {src_d - out_d:,.1f} s off the recording's length "
+                    f"(frames lost in the source)")
+        return None
+
+    def _try_stream_copy(self, src, original, partial_file, output_file, gaps, is_avi):
+        """Stream-copy ``src`` when it qualifies; True when the output is done."""
+        name = os.path.basename(original)
+        why = self._stream_copy_blocker(src, gaps, is_avi)
+        if why is None:
+            why = self._stream_copy(src, original, partial_file, is_avi)
+            if why is None:
+                os.replace(partial_file, output_file)
+                self.progress_update.emit(f"✅ Completed (stream copy, not re-encoded): {name}")
+                return True
+            if os.path.exists(partial_file):
+                os.remove(partial_file)
+        self.progress_update.emit(f"  re-encoding {name}: {why}")
+        return False
 
     def _copy_to_failed(self, video_file, parent_dir):
         """Copy a failed video file to proc_failed_copies/ directory."""
@@ -771,6 +908,11 @@ class VideoProcessorWorker(QThread):
             gaps = None
             if self.recover_damaged and not is_avi:
                 gaps = self._probe_gaps(ffmpeg_input, video_filename)
+
+            # Already what the encode would make: copy it as it is
+            if self.stream_copy and self._try_stream_copy(
+                    ffmpeg_input, video_file, partial_file, output_file, gaps, is_avi):
+                return True
 
             # Build FFmpeg command based on settings
             cmd = self.build_ffmpeg_command(ffmpeg_input, partial_file, gaps=gaps)
@@ -1656,6 +1798,19 @@ class VideoProcessingGUI(QMainWindow):
         group_layout.addWidget(self.recover_check, row, 0, 1, 2)
         row += 1
 
+        # Stream copy: keep a source that already is what the encode would make
+        self.stream_copy_check = QCheckBox("Copy videos that need no re-encoding (much faster)")
+        self.stream_copy_check.setChecked(True)
+        self.stream_copy_check.setToolTip(
+            "A video that is already H.264/H.265 at the chosen size and frame rate, gray "
+            "(when Convert to Grayscale is on), with no lost frames, is copied into the "
+            "output as it is: no re-encoding, so it takes seconds instead of minutes and "
+            "loses no detail; audio is dropped as usual. Its file is larger than an x265 "
+            "encode (about the camera's own bitrate). Anything else (other codecs, sizes "
+            "or frame rates, colour, lost frames) is encoded with the settings below.")
+        group_layout.addWidget(self.stream_copy_check, row, 0, 1, 2)
+        row += 1
+
         # Remove whitespace from output filenames option
         self.replace_whitespace_check = QCheckBox("Remove whitespace from filenames")
         self.replace_whitespace_check.setChecked(False)
@@ -2177,7 +2332,7 @@ class VideoProcessingGUI(QMainWindow):
         self.log_message("Starting video preprocessing...")
         self.log_message(f"Settings: {frame_rate} fps, {resolution}, {codec}, Preset: {preset}, CRF: {crf_quality}, Format: {output_format}")
         self.log_message(f"Input types: {self.input_types_combo.currentText()}")
-        self.log_message(f"Options: Grayscale: {grayscale}, Remove Audio: {remove_audio}, Contrast: {apply_clahe}, Remove Whitespace: {replace_whitespace}, Keep damaged videos at real length: {self.recover_check.isChecked()}")
+        self.log_message(f"Options: Grayscale: {grayscale}, Remove Audio: {remove_audio}, Contrast: {apply_clahe}, Remove Whitespace: {replace_whitespace}, Keep damaged videos at real length: {self.recover_check.isChecked()}, Copy videos that need no re-encoding: {self.stream_copy_check.isChecked()}")
         if filename_prefix or filename_suffix:
             self.log_message(
                 f"Filename: prefix='{filename_prefix}', suffix='{filename_suffix}'")
@@ -2212,6 +2367,7 @@ class VideoProcessingGUI(QMainWindow):
             input_extensions=input_extensions,
             shard=getattr(self, '_shard', None),
             recover_damaged=self.recover_check.isChecked(),
+            stream_copy=self.stream_copy_check.isChecked(),
         )
         self.worker.progress_update.connect(self.log_message)
         self.worker.file_progress.connect(self.update_file_progress)
@@ -2434,6 +2590,8 @@ def _launch_parser():
                    help="Process only part K of N of the files (split by file name), "
                         "so N windows started with 1/N .. N/N encode one folder in "
                         "parallel without taking the same file.")
+    p.add_argument("--no-stream-copy", action="store_true",
+                   help="Re-encode every video, also those that could be copied as they are.")
     return p
 
 
@@ -2454,6 +2612,8 @@ def apply_launch_args(window, args) -> None:
                              + ", ".join(t.split()[0] for t in items))
         window.codec_combo.setCurrentText(match[0])
     window._auto_skip_existing = bool(getattr(args, 'skip_existing', False))
+    if getattr(args, 'no_stream_copy', False):
+        window.stream_copy_check.setChecked(False)
     for d in args.input_dir:
         d = os.path.abspath(d)
         if os.path.isdir(d) and d not in window.selected_dirs:

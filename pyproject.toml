@@ -94,6 +94,7 @@ all = [
 fnt = "fnt.gui_pyqt:main"
 mad = "fnt.usv.usv_detector.cli:main"
 fnt-fed = "fnt.fed3.cli:main"
+fnt-grid = "fnt.videoProcessing.camera_grid_cli:main"
 
 [project.urls]
 Homepage = "https://github.com/calebvogt/fnt"
