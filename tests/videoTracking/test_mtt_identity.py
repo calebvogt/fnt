@@ -62,3 +62,19 @@ def test_a_name_anchored_in_the_box_is_carried_out_through_the_doorway(tmp_path)
     assert get("cam5", 7, N - 1)[0] == "A"                      # and kept beside B at the end
     assert get("cam5", 3, N - 1)[0] == "B"
     assert idn.links_.kind.str.startswith("handoff").any()
+
+
+def test_an_animal_is_not_named_before_its_first_uwb_fix(tmp_path):
+    # C is released at 15 s at (2, 2); before that, UWB has no C, but interpolation alone would hold C at its first
+    # fix, and something seen there early (a hand at the release point) would be anchored as C
+    cfg = _setup(tmp_path)
+    u = pd.read_csv(cfg["uwb"])
+    late = [("C", 1000 + k / FPS, 2.0, 2.0) for k in range(450, N, 10)]
+    pd.concat([u, pd.DataFrame(late, columns=u.columns)]).to_csv(cfg["uwb"], index=False)
+    over = pd.read_csv(cfg["cameras"]["cam5"]["tracks"])
+    early = np.arange(0, 300)
+    hand = pd.DataFrame(dict(frame=early, object_id=9, x=200.0, y=100.0, confidence=0.9))
+    pd.concat([over, hand]).to_csv(cfg["cameras"]["cam5"]["tracks"], index=False)
+    get = lookup(Identity(cfg).run(log=lambda *_: None))
+    assert get("cam5", 9, 100)[0] != "C"
+    assert get("cam5", 7, N - 1)[0] == "A"

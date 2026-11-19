@@ -62,7 +62,7 @@ def worker(k, f0, f1, size, out_path, prev_dir, progress, cfg_path, hold):
     from fnt.videoProcessing.camera_grid_cli import MESOCOSM_LAYOUT, parse_layout
     from fnt.videoProcessing.camera_grid_encode import EncodeSettings
     from fnt.videoTracking.mtt_identity import lookup
-    from fnt.videoTracking.track_store import TrackMaskReader
+    from fnt.videoTracking.track_store import TrackMaskReader, long_path
     cfg, out_dir, cams = _plan(cfg_path)
     ids = pd.read_csv(os.path.join(out_dir, "identities.csv"), keep_default_na=False)
     who = lookup(ids)
@@ -80,7 +80,7 @@ def worker(k, f0, f1, size, out_path, prev_dir, progress, cfg_path, hold):
     kp = {}
     for c, v in cams.items():
         if v["midline"]:
-            m = pd.read_csv(v["midline"])
+            m = pd.read_csv(long_path(v["midline"]))
             m = m[(m.frame >= f0 - hold) & (m.frame < f1)]
             kp[c] = {n: g for n, g in m.groupby("frame")}
     caps = {c: cv2.VideoCapture(v["clip"]) for c, v in cams.items() if c in cells}
@@ -96,9 +96,10 @@ def worker(k, f0, f1, size, out_path, prev_dir, progress, cfg_path, hold):
 
     def label(img, text, x, y, colour, scale):
         scale *= s
-        (tw, tht), _ = cv2.getTextSize(text, font, scale, th)
-        x = int(np.clip(x - tw / 2, 2, W - tw - 2)); y = int(max(tht + 4, y))
-        cv2.putText(img, text, (x, y), font, scale, (0, 0, 0), max(2, round(6 * s)), cv2.LINE_AA)
+        (tw, tht), bl = cv2.getTextSize(text, font, scale, th)
+        pad = max(3, round(8 * s))                     # names on a black box: readable on any background
+        x = int(np.clip(x - tw / 2, pad, W - tw - pad)); y = int(max(tht + pad, y))
+        cv2.rectangle(img, (x - pad, y - tht - pad), (x + tw + pad, y + bl + pad), (0, 0, 0), -1)
         cv2.putText(img, text, (x, y), font, scale, colour, th, cv2.LINE_AA)
 
     for n in range(f0, f1):
@@ -167,7 +168,10 @@ def worker(k, f0, f1, size, out_path, prev_dir, progress, cfg_path, hold):
         if (n - f0) % 15 == 0:
             tmp = os.path.join(prev_dir, f"w{k}.tmp.jpg")
             cv2.imwrite(tmp, cv2.resize(img, (640, 360), interpolation=cv2.INTER_AREA))
-            os.replace(tmp, os.path.join(prev_dir, f"w{k}.jpg"))
+            try:                   # the window may be reading the last preview (Windows locks it): skip it
+                os.replace(tmp, os.path.join(prev_dir, f"w{k}.jpg"))
+            except OSError:
+                pass
     ff.stdin.close()
     ff.wait()
 
@@ -220,6 +224,9 @@ def render(cfg_path, size="4k", workers=8, frames=None, hold=1, out=None, window
             time.sleep(1)
     if window:
         cv2.destroyAllWindows()
+    bad = [k + 1 for k, p in enumerate(procs) if p.exitcode or progress[k] != edges[k + 1] - edges[k]]
+    if bad:                                    # never join a video with a part missing frames
+        raise RuntimeError(f"tracked grid: part(s) {bad} stopped early; nothing written (parts in {work})")
     lst = os.path.join(work, "parts.txt")
     with open(lst, "w") as fh:
         fh.writelines(f"file '{p}'\n" for p in parts)

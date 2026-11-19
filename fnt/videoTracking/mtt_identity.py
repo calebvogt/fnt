@@ -50,6 +50,8 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+FAR = 1e3    # m: where an animal not in the arena is placed (never near anything)
+
 
 @dataclass
 class Params:
@@ -70,6 +72,7 @@ class Params:
     w_bridge: float = 300.0
     anchor_w: float = 2.0            # per anchor frame
     weak: float = 0.2                # weight of the plain UWB distance (m per frame)
+    present_pad_s: float = 2.0       # s: an animal counts as in the arena this long before its first UWB fix
     unknown_m: float = 1.0           # an unnamed tracklet costs as much as the worst UWB match
     vmax: float = 1.0                # m/s between two places
     pair_s: float = 5.0              # tracklets further apart in time are not compared
@@ -104,8 +107,15 @@ class Identity:
         t = start + float(cfg.get("uwb_offset_s", 0)) + np.arange(self.n) / self.fps
         u = u[u[cols["time"]].between(t[0] - 30, t[-1] + 30)]
         self.animals = sorted(u[cols["animal"]].unique())
-        self.uxy = {a: np.stack([np.interp(t, g[cols["time"]], g[cols["x"]]), np.interp(t, g[cols["time"]], g[cols["y"]])], 1)
-                    for a, g in u.sort_values(cols["time"]).groupby(cols["animal"])}
+        self.uxy, self.present = {}, {}
+        for a, g in u.sort_values(cols["time"]).groupby(cols["animal"]):
+            ts = g[cols["time"]].to_numpy(float)
+            xy = np.stack([np.interp(t, ts, g[cols["x"]]), np.interp(t, ts, g[cols["y"]])], 1)
+            # before an animal's first fix (not yet released) and after its last it is not in the arena: placed far
+            # away, so it is never an anchor nor near a vole, and a tracklet mostly outside that span can't take it
+            on = (t >= ts[0] - self.p.present_pad_s) & (t <= ts[-1] + self.p.present_pad_s)
+            xy[~on] = FAR
+            self.uxy[a], self.present[a] = xy, on
         self.cams = cfg["cameras"]
         self.floor = {c: FloorMap.load(v["floor_map"]) for c, v in self.cams.items() if v.get("floor_map")}
         self.exits = {}
@@ -286,6 +296,11 @@ class Identity:
         ev = p.weak * Cm * nfr[:, None]
         ev[:, :-1] -= p.anchor_w * anchor
         c = np.concatenate([ev.ravel(), np.repeat([lk["w"] / 2 for lk in links], nA)])
+        ub = np.ones(nx + ny)
+        for i, t in enumerate(tl):                       # an animal not yet in the arena (or gone) can't be named
+            for a, an in enumerate(self.animals):
+                if self.present[an][t["frames"]].mean() < 0.5:
+                    ub[i * nA + a] = 0
         R_, C_, V_, lo, hi = [], [], [], [], []
 
         def row(entries, l, h):
@@ -318,7 +333,7 @@ class Identity:
                         row([(i * nA + a, 1), (j * nA + a, 1)], 0, 1)
         A_ = coo_matrix((V_, (R_, C_)), shape=(len(lo), nx + ny)).tocsr()
         res = milp(c, constraints=LinearConstraint(A_, lo, hi), integrality=np.r_[np.ones(nx), np.zeros(ny)],
-                   bounds=Bounds(0, 1), options={"time_limit": p.time_limit_s})
+                   bounds=Bounds(0, ub), options={"time_limit": p.time_limit_s})
         if res.x is None:
             raise RuntimeError(f"naming failed: {res.message}")
         lab = res.x[:nx].reshape(nT, nA).argmax(1)
