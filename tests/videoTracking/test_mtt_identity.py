@@ -1,4 +1,4 @@
-﻿"""Names across cameras: a vole anchored alone in its box keeps its name after walking out of the doorway onto
+"""Names across cameras: a vole anchored alone in its box keeps its name after walking out of the doorway onto
 the overhead camera's floor, where UWB alone could not tell it from another vole close by."""
 import json
 
@@ -78,3 +78,29 @@ def test_an_animal_is_not_named_before_its_first_uwb_fix(tmp_path):
     get = lookup(Identity(cfg).run(log=lambda *_: None))
     assert get("cam5", 9, 100)[0] != "C"
     assert get("cam5", 7, N - 1)[0] == "A"
+
+
+def _corrected(tmp_path, rows):
+    from fnt.videoTracking.mtt_identity import read_corrections
+    cfg = _setup(tmp_path)
+    pd.DataFrame(rows, columns=["camera", "object_id", "frame_first", "frame_last", "animal"]).to_csv(
+        tmp_path / "corrections.csv", index=False)
+    idn = Identity(cfg, read_corrections(str(tmp_path / "corrections.csv")))
+    res = idn.run(log=lambda *_: None)
+    return idn, res, lookup(res)
+
+
+def test_a_correction_overrides_the_evidence_and_moves_the_rest(tmp_path):
+    # the reviewer says overhead track 3 is A for the last 5 s: A can't be on two tracks at once, so track 7 (which
+    # the UWB and the handoff call A) gives up the name, and the rest of track 3 stays B
+    idn, res, get = _corrected(tmp_path, [("cam5", 3, 450, N - 1, "A")])
+    assert get("cam5", 3, N - 1)[0] == "A"
+    assert get("cam5", 3, 100)[0] == "B"
+    assert get("cam5", 7, N - 1)[0] != "A"
+    assert res.fixed.sum() == 1 and not idn.broken_
+
+
+def test_a_stretch_marked_not_an_animal_is_left_unnamed(tmp_path):
+    idn, res, get = _corrected(tmp_path, [("cam1", 1, 0, 50, "none")])
+    assert get("cam1", 1, 20)[0] == ""
+    assert get("cam1", 1, 100)[0] == "A"                       # the rest of the track keeps its anchors

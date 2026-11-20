@@ -452,6 +452,61 @@ On a VoleCosm minute it named 83% of tracked detections, 4% of them unsure; a
 box holding several animals at once is never anchored, so its tracks take their
 names from the doorway handoffs.
 
+An animal counts as in the arena only from its first UWB fix to its last, so
+nothing seen before its release (hands at the release point) takes its name.
+On the 35-minute VoleCosm VC-T005 drop test each vole was first named within a
+minute of its UWB release.
+
+**Corrections**: `corrections.csv` in the `out` folder (camera, object_id,
+frame_first, frame_last, animal; `none` = not an animal), written by the
+Fusion View window. Tracklets are cut at each correction's ends and the
+stretch inside keeps the name given, every other rule still applying, so a
+correction renames whatever its chain carries. A correction the rules can't
+meet (the same animal twice at once) is reported, not forced. `identities.csv`
+marks corrected tracklets (`fixed`).
+
+### Fusion View
+
+```bash
+python -m fnt.videoTracking.fusion_view identity.json
+```
+
+A window for checking and correcting the names, without rendering a video:
+the camera grid drawn live with each animal's mask, keypoints and name.
+
+- **Play and scroll**: slider, play/pause at 0.25-8x, step by an analysed
+  frame, a second or ten seconds (arrow keys, Shift, Ctrl; Space plays). A
+  timeline has a row per animal, coloured by the camera that names it (faint
+  where unsure); click it to go there. Tracks made at a frame step play their
+  analysed frames only (option).
+- **Zoom**: pinch on a trackpad or touch screen, Ctrl+scroll or the mouse
+  wheel zoom about the pointer (up to 12x); drag, or scroll with two fingers,
+  to move about; `+` / `-` / `0` (or the -, Fit, + buttons) zoom in, out and
+  back to the whole grid. Zoomed in, the grid is drawn at 4K so the cameras and
+  labels stay sharp; whole, at 1080 for speed. A click that doesn't drag still
+  picks an animal.
+- **Show** (toggles): masks, keypoints, names, video tails, UWB positions
+  (a filled dot and the animal's name on the overhead camera; who UWB puts in
+  or near each box on the zone cameras), UWB tails, a floor map in metres with
+  the video positions (squares) and UWB positions (dots and names) side by
+  side, and the legend, which gives each animal's distance between its video
+  and UWB positions. Tail length is set in seconds. The UWB positions are the
+  file named by `uwb` in identity.json as they are: with FNT's smoothed export,
+  its smoothing (e.g. a 10-s forward-backward EWMA) shows as UWB cutting
+  corners and falling short of fast runs.
+- **Go to** (N / P): the next or previous unsure name, name change on a track
+  (a possible swap), handoff between cameras, long unnamed track, or
+  correction.
+- **Correct**: click an animal to see its track, frames, name, margin, anchors
+  and its mean UWB distance to every animal over the stretch, then name the
+  stretch (or from here on, or up to here) as an animal or as not an animal.
+  Corrections are saved at once; **Re-solve names** runs the naming again with
+  them held (about half a minute for a 35-minute test) and redraws. Corrected
+  names are drawn in a white frame.
+
+Jumping far takes up to a second (the clips have a keyframe every ~8 s);
+playing on and stepping are quick.
+
 ## Labelling on another machine
 
 A focus list can be labelled anywhere FNT is installed, e.g. on a laptop through

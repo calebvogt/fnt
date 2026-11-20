@@ -16,10 +16,14 @@ where the match is unambiguous and **carried** along the video tracks from there
    ``exits.json``) and an overhead tracklet starts by that box within a few seconds, or the other way round;
    *bridges* - in one camera a tracklet ends and another starts close by soon after (mask flicker, a tracker cut).
 4. **Names**: one integer programme labels every tracklet at once: anchors decide, the plain UWB distance breaks
-   ties, and each link whose ends get different names costs its weight, so a name travels forward and backward
-   along a chain. No animal is on two tracklets at once (except the two views of a vole in a doorway), nor in two
+   ties, and each link whose ends get different names costs its weight (an unnamed end costs nothing), so a name
+   travels forward and backward along a chain. No animal is on two tracklets at once (except the two views of a vole in a doorway), nor in two
    places further apart than it could run in the time between. A tracklet nothing anchors or links is left
    unnamed rather than guessed. A chain whose evidence barely favours its name over the next is marked unsure.
+5. **Corrections** (``corrections.csv`` in the ``out`` folder, written by the Fusion View window): rows of
+   camera, object_id, frame_first, frame_last, animal (``none``: not an animal). Tracklets are cut at each
+   correction's ends and the stretch inside is held to the name given; every other rule still applies, so one
+   correction renames whatever its chain carries. A correction the rules can't meet is reported, not forced.
 
     python -m fnt.videoTracking.mtt_identity <identity.json>
 
@@ -78,6 +82,7 @@ class Params:
     pair_s: float = 5.0              # tracklets further apart in time are not compared
     sure: float = 40.0               # a chain is unsure below this margin
     time_limit_s: float = 900.0
+    w_fixed: float = 1e6             # cost of breaking a correction (only when the hard rules leave no choice)
 
 
 def box_dist(x, y, box):
@@ -91,10 +96,27 @@ def _tracks_csv(path: str) -> str:
     return os.path.join(path, "trajectories.csv")
 
 
+NOT_ANIMAL = "none"
+
+
+def corrections_path(cfg: Dict, cfg_path: Optional[str] = None) -> str:
+    out = cfg.get("out") or (os.path.dirname(os.path.abspath(cfg_path)) if cfg_path else "")
+    return cfg.get("corrections") or (os.path.join(out, "corrections.csv") if out else "")
+
+
+def read_corrections(path: str) -> pd.DataFrame:
+    cols = ["camera", "object_id", "frame_first", "frame_last", "animal"]
+    if not path or not os.path.exists(path):
+        return pd.DataFrame(columns=cols)
+    return pd.read_csv(path, keep_default_na=False)[cols]
+
+
 class Identity:
-    def __init__(self, cfg: Dict):
+    def __init__(self, cfg: Dict, corrections: Optional[pd.DataFrame] = None):
         from .mtt_floor import FloorMap
         self.cfg = cfg
+        self.corrections = (corrections if corrections is not None
+                            else read_corrections(corrections_path(cfg))).reset_index(drop=True)
         self.p = Params(**cfg.get("params", {}))
         self.fps = float(cfg.get("fps", 30))
         self.n = int(cfg["frames"])
@@ -222,6 +244,30 @@ class Identity:
             n_cuts += len(cuts)
         return out, n_cuts
 
+    def apply_corrections(self, tl):
+        """Cut tracklets at each correction's ends; return them and {tracklet index: animal index or None}."""
+        cuts: Dict[tuple, set] = {}
+        for r in self.corrections.itertuples():
+            cuts.setdefault((r.camera, int(r.object_id)), set()).update((int(r.frame_first), int(r.frame_last) + 1))
+        out = []
+        for t in tl:
+            c = sorted(f for f in cuts.get((t["cam"], t["obj"]), ()) if t["f0"] < f <= t["f1"])
+            if not c:
+                out.append(t)
+                continue
+            for piece in np.split(np.arange(len(t["frames"])), np.searchsorted(t["frames"], c)):
+                if len(piece):
+                    out.append(self._make(t["cam"], t["obj"], t["frames"][piece], t["xy"][piece]))
+        fixed = {}
+        for i, t in enumerate(out):
+            for r in self.corrections.itertuples():
+                if (r.camera, int(r.object_id)) == (t["cam"], t["obj"]) and int(r.frame_first) <= t["f0"]                         and t["f1"] <= int(r.frame_last):
+                    a = str(r.animal)
+                    if a != NOT_ANIMAL and a not in self.animals:
+                        raise ValueError(f"correction names {a}, not one of {', '.join(self.animals)}")
+                    fixed[i] = None if a == NOT_ANIMAL else self.animals.index(a)
+        return out, fixed
+
     # ---------------------------------------------------------------- links
     def _near_exit(self, cam, x, y):
         import cv2
@@ -284,7 +330,7 @@ class Identity:
         box = self.boxes[self.cams[z["cam"]]["zone"]]
         return len(fo) > 0 and np.median(box_dist(fo[:, 0], fo[:, 1], box)) <= self.p.link_m
 
-    def name(self, tl, anchor, links):
+    def name(self, tl, anchor, links, fixed=None):
         from scipy.optimize import Bounds, LinearConstraint, milp
         from scipy.sparse import coo_matrix
         p = self.p
@@ -292,15 +338,20 @@ class Identity:
         Cm = np.array([list(t["cost"]) + [p.unknown_m] for t in tl])
         nfr = np.array([len(t["frames"]) for t in tl], float)
         nL = len(links)
-        nx, ny = nT * nA, nL * nA
+        nx, ny = nT * nA, nL
         ev = p.weak * Cm * nfr[:, None]
         ev[:, :-1] -= p.anchor_w * anchor
-        c = np.concatenate([ev.ravel(), np.repeat([lk["w"] / 2 for lk in links], nA)])
+        c = np.concatenate([ev.ravel(), [lk["w"] for lk in links]])
         ub = np.ones(nx + ny)
         for i, t in enumerate(tl):                       # an animal not yet in the arena (or gone) can't be named
             for a, an in enumerate(self.animals):
                 if self.present[an][t["frames"]].mean() < 0.5:
                     ub[i * nA + a] = 0
+        for i, a in (fixed or {}).items():               # a correction: every other choice costs w_fixed
+            k = nA - 1 if a is None else a
+            c[i * nA:(i + 1) * nA] += p.w_fixed
+            c[i * nA + k] -= p.w_fixed
+            ub[i * nA + k] = 1                           # the person reviewing knows better than the UWB span
         R_, C_, V_, lo, hi = [], [], [], [], []
 
         def row(entries, l, h):
@@ -311,10 +362,14 @@ class Identity:
 
         for t in range(nT):
             row([(t * nA + a, 1) for a in range(nA)], 1, 1)
+        # a link costs its weight when its two ends carry different names; a named end beside an unnamed one is
+        # free, so an unnamed (often spurious) tracklet doesn't pull its anchored neighbours unnamed
+        U = nA - 1
         for li, lk in enumerate(links):
-            for a in range(nA):
-                row([(nx + li * nA + a, 1), (lk["a"] * nA + a, -1), (lk["b"] * nA + a, 1)], 0, np.inf)
-                row([(nx + li * nA + a, 1), (lk["a"] * nA + a, 1), (lk["b"] * nA + a, -1)], 0, np.inf)
+            i, j = lk["a"], lk["b"]
+            for a in range(U):
+                row([(nx + li, 1), (i * nA + a, -1), (j * nA + a, 1), (j * nA + U, 1)], 0, np.inf)
+                row([(nx + li, 1), (j * nA + a, -1), (i * nA + a, 1), (i * nA + U, 1)], 0, np.inf)
         handoffs = {frozenset((lk["a"], lk["b"])) for lk in links if lk["kind"].startswith("handoff")}
         fsets = [set(t["frames"].tolist()) for t in tl]
         order = sorted(range(nT), key=lambda i: tl[i]["f0"])
@@ -365,6 +420,7 @@ class Identity:
         for i, t in enumerate(tl):
             t["id"] = i
         tl, n_cuts = self.split_swaps(tl, self.anchors(tl))
+        tl, fixed = self.apply_corrections(tl)
         anchor = np.zeros((len(tl), len(self.animals)))
         for i, t in enumerate(tl):
             t["id"] = i
@@ -374,14 +430,22 @@ class Identity:
         log(f"{len(tl)} tracklets ({n_cuts} cut where their anchors changed animal); anchors on "
             f"{int((anchor.sum(1) > 0).sum())}")
         links = self.links(tl)
-        lab, margin, Cm = self.name(tl, anchor, links)
+        lab, margin, Cm = self.name(tl, anchor, links, fixed)
+        self.broken_ = []                                # corrections the hard rules could not meet
+        for i, a in fixed.items():
+            if int(lab[i]) != (len(self.animals) if a is None else a):
+                self.broken_.append((tl[i]["cam"], tl[i]["obj"], tl[i]["f0"], tl[i]["f1"]))
+        if self.broken_:
+            log(f"{len(self.broken_)} correction stretch(es) could not be met (e.g. the same animal twice at once): "
+                + "; ".join(f"{c} #{o} {f0}-{f1}" for c, o, f0, f1 in self.broken_[:5]))
         rows = []
         for t in tl:
             a = int(lab[t["id"]])
             name = self.animals[a] if a < len(self.animals) else ""
+            is_fixed = t["id"] in fixed
             rows.append(dict(camera=t["cam"], object_id=t["obj"], frame_first=t["f0"], frame_last=t["f1"],
-                             detections=len(t["frames"]), animal=name,
-                             unsure=bool(name and margin[t["id"]] < self.p.sure),
+                             detections=len(t["frames"]), animal=name, fixed=is_fixed,
+                             unsure=bool(name and not is_fixed and margin[t["id"]] < self.p.sure),
                              margin=round(float(margin[t["id"]]), 1) if name else "",
                              anchors=" ".join(f"{self.animals[j]}:{int(v)}" for j, v in enumerate(anchor[t["id"]]) if v),
                              uwb_m=round(float(Cm[t["id"], a]), 3) if name else ""))
@@ -419,7 +483,7 @@ def main(argv=None) -> int:
         cfg = json.load(fh)
     out = cfg.get("out") or os.path.dirname(os.path.abspath(a.config))
     os.makedirs(out, exist_ok=True)
-    idn = Identity(cfg)
+    idn = Identity(cfg, read_corrections(corrections_path(cfg, a.config)))
     res = idn.run()
     res.to_csv(os.path.join(out, "identities.csv"), index=False)
     idn.links_.to_csv(os.path.join(out, "links.csv"), index=False)
