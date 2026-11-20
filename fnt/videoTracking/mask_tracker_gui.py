@@ -975,6 +975,32 @@ class AnnotationPreviewWidget(QWidget):
         self._pan_x = 0.0
         self._pan_y = 0.0
 
+    def zoom_by(self, factor: float, at: Optional[Tuple[float, float]] = None) -> None:
+        """Zoom by ``factor`` (0.5x-20x of the fitted frame), keeping the
+        point ``at`` (widget pixels; default the middle of the view) still."""
+        if self._pixmap is None:
+            return
+        old = self._zoom
+        self._zoom = max(0.5, min(20.0, old * factor))
+        if self._zoom == old:
+            return
+        mx, my = at if at is not None else (self.width() / 2, self.height() / 2)
+        base = self._base_scale()
+        # where the fitted frame's corner sits before panning (see _img_to_widget)
+        cx = (self.width() - self._img_w * base) / 2
+        cy = (self.height() - self._img_h * base) / 2
+        r = self._zoom / old
+        self._pan_x = (mx - cx) - (mx - cx - self._pan_x) * r
+        self._pan_y = (my - cy) - (my - cy - self._pan_y) * r
+        self.zoom_changed.emit(self._zoom)
+        self.update()
+
+    def fit_view(self) -> None:
+        """The whole frame fitted to the view again (100%)."""
+        self._reset_view()
+        self.zoom_changed.emit(self._zoom)
+        self.update()
+
     def _base_scale(self) -> float:
         if self._pixmap is None:
             return 1.0
@@ -1095,16 +1121,9 @@ class AnnotationPreviewWidget(QWidget):
             self.update()
             return
         delta = event.angleDelta().y()
-        factor = 1.15 if delta > 0 else 1.0 / 1.15
-        old_zoom = self._zoom
-        self._zoom = max(0.5, min(20.0, self._zoom * factor))
-        if self._zoom == old_zoom:
+        if delta == 0:              # a sideways trackpad swipe: not a zoom out
             return
-        mx, my = event.x(), event.y()
-        self._pan_x = mx - (mx - self._pan_x) * (self._zoom / old_zoom)
-        self._pan_y = my - (my - self._pan_y) * (self._zoom / old_zoom)
-        self.zoom_changed.emit(self._zoom)
-        self.update()
+        self.zoom_by(1.15 if delta > 0 else 1.0 / 1.15, (event.x(), event.y()))
 
     def mousePressEvent(self, event: QMouseEvent):
         if self._pixmap is None or self.busy_text:
@@ -1453,17 +1472,9 @@ class AnnotationPreviewWidget(QWidget):
         elif event.key() == Qt.Key_0:
             self.category_hotkey.emit(9)
         elif event.key() in (Qt.Key_Plus, Qt.Key_Equal):
-            self._zoom = min(20.0, self._zoom * 1.2)
-            self.zoom_changed.emit(self._zoom)
-            self.update()
+            self.zoom_by(1.2)
         elif event.key() == Qt.Key_Minus:
-            self._zoom = max(0.5, self._zoom / 1.2)
-            self.zoom_changed.emit(self._zoom)
-            self.update()
-        elif event.key() == Qt.Key_0:
-            self._reset_view()
-            self.zoom_changed.emit(self._zoom)
-            self.update()
+            self.zoom_by(1 / 1.2)
         else:
             super().keyPressEvent(event)
 
@@ -4499,15 +4510,39 @@ class MaskTrackerWindow(QMainWindow):
         self.btn_edit_classes.clicked.connect(self._edit_classes)
         self._tools_class_row.addWidget(self.btn_edit_classes)
 
+        # Zoom by click: - 100% + Fit (a trackpad pinch or the wheel is fiddly).
+        self.btn_zoom_out = QPushButton("−")
+        self.btn_zoom_in = QPushButton("+")
+        self.btn_zoom_fit = QPushButton("Fit")
+        for b, tip, slot, width in (
+                (self.btn_zoom_out, "Zoom out (also - key, scroll)",
+                 lambda _=False: self.preview.zoom_by(1 / 1.25), 26),
+                (self.btn_zoom_in, "Zoom in on the middle of the view (also + key, scroll)",
+                 lambda _=False: self.preview.zoom_by(1.25), 26),
+                (self.btn_zoom_fit, "Fit the whole frame to the view (100%)",
+                 lambda _=False: self.preview.fit_view(), 40)):
+            b.setFocusPolicy(Qt.NoFocus)        # the preview keeps the keys
+            b.setFixedSize(width, 22)
+            if b is not self.btn_zoom_fit:      # the app's button font makes +/- specks
+                b.setStyleSheet("QPushButton { font-size: 16px; font-weight: bold; padding: 0px; }")
+            b.setToolTip(tip)
+            b.clicked.connect(slot)
         self.lbl_zoom_info = QLabel("100%")
         self.lbl_zoom_info.setStyleSheet("color: #999999;")
-        self.lbl_zoom_info.setToolTip("Current zoom. Scroll to zoom, 0 resets, +/- step.")
+        self.lbl_zoom_info.setMinimumWidth(38)
+        self.lbl_zoom_info.setAlignment(Qt.AlignCenter)
+        self.lbl_zoom_info.setToolTip("Current zoom (100% = the whole frame fitted). "
+                                      "Scroll, +/- or the buttons zoom; Fit returns to 100%.")
+        info_layout.addWidget(self.btn_zoom_out)
         info_layout.addWidget(self.lbl_zoom_info)
+        info_layout.addWidget(self.btn_zoom_in)
+        info_layout.addWidget(self.btn_zoom_fit)
         right_layout.addWidget(info_row)
 
         # Store annotation-specific widgets for show/hide on tab switch
         self._annotation_bar_widgets = [
             self.lbl_mode, self.lbl_frame_info, self.lbl_ann_stats, self.lbl_zoom_info,
+            self.btn_zoom_out, self.btn_zoom_in, self.btn_zoom_fit,
         ]
         # Classifier info label (hidden by default, shown on Classifier tab)
         self.lbl_classifier_info = QLabel("")
@@ -4792,7 +4827,8 @@ class MaskTrackerWindow(QMainWindow):
             "  U undoes a click or stroke; Shift+right-click drops an object.\n"
             "Edit Mask (right-click a saved mask), or Paint / Eraser on it, brings\n"
             "  it back (dashed) to reshape; Enter saves and turns the tool off.\n"
-            "Left-click + drag to pan. Scroll to zoom. Enter = next unlabeled frame.\n"
+            "Left-click + drag to pan. Scroll (or − / + / Fit, bottom right) to zoom. "
+            "Enter = next unlabeled frame.\n"
             "Space = next frame in the queue, via this video's timeline (Shift+Space = back).\n"
             "N / B = next / back in the queue. E = mark the frame empty (trains as a background).\n"
             "Review: A accepts the bold prediction (click one to pick it), R rejects\n"

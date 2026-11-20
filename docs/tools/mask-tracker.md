@@ -63,11 +63,12 @@ the queue) or from a script (`mask_tracker_cli extract-frames`, below).
 | ← → (Shift ±10, Ctrl ±100) | Scrub the source video; landing on a queue frame opens it with its masks |
 | **V** | Show / hide the masks (and the ROI shading) |
 | **1**–**9**, **0** | Class: save the pending mask as that class, or switch the active class |
+| **+** / **−**, scroll | Zoom in / out; or the **−** **+** **Fit** buttons beside the zoom % (bottom right). **Fit** shows the whole frame again (100%) |
 
 The timeline under the frame marks the queue's frames from this video: green
 labelled, yellow predicted, white still to do.
 
-**Small animals.** Zoom in (scroll) before you click: SAM sees what you see.
+**Small animals.** Zoom in (scroll or **+**) before you click: SAM sees what you see.
 Label every animal in a frame, or the model learns the ones you left as
 background.
 
