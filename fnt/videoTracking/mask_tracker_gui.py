@@ -6156,12 +6156,12 @@ class MaskTrackerWindow(QMainWindow):
         row2 = QHBoxLayout()
         row2.addWidget(QLabel("Max disappear:"))
         self.combo_track_disappear = QComboBox()
-        self.combo_track_disappear.addItems(["Never", "30", "60", "90", "150", "300"])
+        self.combo_track_disappear.addItems(["Auto", "Never", "6", "30", "60", "90", "150", "300"])
         self.combo_track_disappear.setToolTip(
-            "Max frames an object can vanish before its track is dropped.\n"
-            "Never: tracks persist for the entire video (recommended).\n"
-            "30: ~1 second at 30fps. Use if objects leave and re-enter\n"
-            "and you want separate track IDs for each appearance."
+            "Max analysed frames an object can vanish before its track ends.\n"
+            "Auto (recommended): ByteTrack linker 6 (a short gap; the names step\n"
+            "joins the pieces), never with Max objects 1; Centroid linker never.\n"
+            "Never: tracks persist for the entire video."
         )
         row2.addWidget(self.combo_track_disappear)
         row2.addWidget(QLabel("frames"))
@@ -6213,6 +6213,25 @@ class MaskTrackerWindow(QMainWindow):
         )
         row_match.addWidget(self.combo_track_matching)
         settings_vbox.addLayout(row_match)
+
+        row_link = QHBoxLayout()
+        row_link.addWidget(QLabel("Linker:"))
+        self.combo_track_linker = QComboBox()
+        self.combo_track_linker.addItems(["ByteTrack (overlap + motion)", "Centroid (before Nov 2026)"])
+        self.combo_track_linker.setToolTip(
+            "How each frame's detections join tracks.\n"
+            "ByteTrack (default): centroid distance plus mask overlap, confident\n"
+            "  detections first (low-confidence ones only continue a track),\n"
+            "  and a motion prediction. Far fewer swaps and broken tracks where\n"
+            "  animals crowd together.\n"
+            "Centroid: the linker before November 2026 (nearest centroid; with\n"
+            "  Matching above). Use it to repeat an older run."
+        )
+        row_link.addWidget(self.combo_track_linker)
+        settings_vbox.addLayout(row_link)
+        # linker settings without a widget (gate, two-pass split, ...), from the
+        # command line or --settings-from; passed on to the run as given
+        self._track_linker_extra: Dict = {}
 
         row_res = QHBoxLayout()
         row_res.addWidget(QLabel("Resolution:"))
@@ -8600,7 +8619,7 @@ class MaskTrackerWindow(QMainWindow):
         queue, so it covers only the focused frames too. Returns
         (frames shown, names not found in training_frames/).
         """
-        names = expand_focus_items(items)
+        names = expand_focus_items(items, self._project_dir)
         self._focus_names = set(names)
         self._focus_rank = {n: i for i, n in enumerate(names)}
         # The session's name in the title: the list file's (focus_zone_round6), so
@@ -10398,9 +10417,12 @@ class MaskTrackerWindow(QMainWindow):
             w.request_stop()
         return False            # stays open until the run has stopped, then quits
 
-    def _quit_if_asked(self) -> bool:
-        """After a run: quit if the user stopped it to close the window."""
-        if getattr(self, "_quit_when_idle", False):
+    def _quit_if_asked(self, run_over: bool = True) -> bool:
+        """After a run: quit if the user stopped it to close the window, or, with
+        --training-window-only, once the whole run (training and any post-training
+        inference) is over: the model, training_log.csv and training_summary.json
+        are already in the run folder. An error keeps the window up (not called)."""
+        if getattr(self, "_quit_when_idle", False) or (run_over and getattr(self, "_window_only", False)):
             QTimer.singleShot(0, QApplication.instance().quit)
             return True
         return False
@@ -10474,10 +10496,11 @@ class MaskTrackerWindow(QMainWindow):
             "best_str": best_str,
         }
 
-        if self._quit_if_asked():
+        post_infer = bool(self.chk_post_infer.isChecked() and run_dir)
+        if self._quit_if_asked(run_over=not post_infer):
             return
         # Trigger post-training inference if enabled, otherwise show dialog now
-        if self.chk_post_infer.isChecked() and run_dir:
+        if post_infer:
             self.lbl_train_status.setText("Training done — running inference on unlabeled frames...")
             self._seg_log_text.append("")
             self._run_post_train_inference(run_dir)
@@ -13493,7 +13516,8 @@ class MaskTrackerWindow(QMainWindow):
             device = "auto"
 
         disappear_text = self.combo_track_disappear.currentText()
-        max_disappear = 0 if disappear_text == "Never" else int(disappear_text)
+        max_disappear = (0 if disappear_text == "Never" else
+                         -1 if disappear_text == "Auto" else int(disappear_text))
 
         match_text = self.combo_track_matching.currentText()
         matching_algo = "greedy" if match_text.startswith("Greedy") else "hungarian"
@@ -13512,7 +13536,10 @@ class MaskTrackerWindow(QMainWindow):
             "device": device,
             "save_masks": self.chk_save_masks.isChecked(),
             "frame_step": self.spin_track_step.value(),
+            "linker": ("centroid" if self.combo_track_linker.currentText().startswith("Centroid")
+                       else "bytetrack"),
         }
+        config_dict.update(getattr(self, "_track_linker_extra", {}) or {})
 
         if self.chk_behavior_cls.isChecked():
             config_dict["use_masks"] = True
@@ -13659,7 +13686,8 @@ class MaskTrackerWindow(QMainWindow):
             self.spin_track_confidence.setValue(float(d["confidence_threshold"]))
             note("confidence_threshold")
         if "max_disappeared_frames" in d:
-            text = "Never" if int(d["max_disappeared_frames"]) == 0 else str(int(d["max_disappeared_frames"]))
+            md = int(d["max_disappeared_frames"])
+            text = "Never" if md == 0 else ("Auto" if md < 0 else str(md))
             if self.combo_track_disappear.findText(text) < 0:
                 self.combo_track_disappear.addItem(text)
             self.combo_track_disappear.setCurrentText(text)
@@ -13675,6 +13703,13 @@ class MaskTrackerWindow(QMainWindow):
                 if self.combo_track_matching.itemText(i).lower().startswith(d["matching_algorithm"]):
                     self.combo_track_matching.setCurrentIndex(i)
             note("matching_algorithm")
+        if "linker" in d:
+            self.combo_track_linker.setCurrentIndex(1 if str(d["linker"]).lower() == "centroid" else 0)
+            note("linker")
+        for key in ("gate_px", "two_pass_conf", "iou_weight", "motion", "takeover"):
+            if key in d:
+                self._track_linker_extra[key] = d[key]
+                note(key)
         if "inference_size" in d:
             size = int(d["inference_size"] or 0)
             text = None
@@ -14336,12 +14371,16 @@ DEVICE_CHOICES = {
 }
 
 
-def expand_focus_items(items) -> List[str]:
+def expand_focus_items(items, project_dir: Optional[str] = None) -> List[str]:
     """Frame filenames from --focus items, in order, without duplicates.
 
     An item is a frame filename or path, or a .txt file listing them one per
     line (blank lines and lines starting with # are skipped). Names without an
-    image extension are taken as .png, the extension extraction writes.
+    image extension are taken as .png, the extension extraction writes. A list
+    given by name only (focus_round6.txt) is looked up in the project's focus/
+    folder when it is not a file from the current folder; a .txt that is found
+    nowhere raises FileNotFoundError instead of becoming a frame name that
+    matches nothing (a silent 0-frame session).
     """
     names: List[str] = []
     seen = set()
@@ -14359,8 +14398,14 @@ def expand_focus_items(items) -> List[str]:
 
     for item in items or ():
         item = str(item)
-        if item.lower().endswith(".txt") and os.path.isfile(item):
-            with open(item, encoding="utf-8") as fh:
+        if item.lower().endswith(".txt"):
+            if not os.path.isfile(item) and project_dir:
+                cand = os.path.join(project_dir, "focus", item)
+                if os.path.isfile(cand):
+                    item = cand
+            if not os.path.isfile(item):
+                raise FileNotFoundError(f"focus list not found: {item}")
+            with open(item, encoding="utf-8-sig") as fh:
                 for line in fh:
                     _add(line)
         else:
@@ -14610,7 +14655,12 @@ def main(argv=None) -> int:
     if config:
         win._load_project(config)
         if args.focus:
-            shown, missing = win.focus_frames(args.focus)
+            try:
+                shown, missing = win.focus_frames(args.focus)
+            except FileNotFoundError as e:       # shown, not lost to a pythonw launch
+                print(f"[MTT] {e}", flush=True)
+                QMessageBox.warning(None if win._window_only else win, "Focus list", str(e))
+                shown, missing = 0, []
             note = ""
             if missing:
                 note = f"; not in training_frames/: {', '.join(missing[:5])}"

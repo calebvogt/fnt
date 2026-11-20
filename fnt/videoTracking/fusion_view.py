@@ -47,41 +47,150 @@ CAM_COLOURS = [(90, 160, 255), (255, 170, 60), (120, 210, 120), (230, 110, 200),
 JUMPS = ["unsure name", "name change on a track", "handoff between cameras", "long unnamed track", "correction"]
 
 
-def _qimage(bgr: np.ndarray) -> QImage:
-    h, w = bgr.shape[:2]
-    rgb = np.ascontiguousarray(bgr[:, :, ::-1])
-    return QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()
+def _bgra(bgr: np.ndarray):
+    """(QImage, buffer): the picture as Qt's native 32-bit format, on the buffer (keep it while the QImage is
+    used); converting once here is far cheaper than an RGB888 copy and lets Qt paint it without converting."""
+    import cv2
+    buf = cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA)
+    h, w = buf.shape[:2]
+    return QImage(buf.data, w, h, 4 * w, QImage.Format_RGB32), buf
+
+
+class _Kept:
+    """Pictures kept by key up to a size in MB, the least recently used dropped first (thread-safe)."""
+
+    def __init__(self, mb: float):
+        import threading
+        from collections import OrderedDict
+        self.max, self.bytes = mb * 2 ** 20, 0
+        self.items: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
+        self.lock = threading.Lock()
+
+    def get(self, key):
+        with self.lock:
+            img = self.items.get(key)
+            if img is not None:
+                self.items.move_to_end(key)
+            return img
+
+    def put(self, key, img):
+        with self.lock:
+            if key in self.items:
+                return
+            self.items[key] = img
+            self.bytes += img.nbytes
+            while self.bytes > self.max and len(self.items) > 1:
+                _, old = self.items.popitem(last=False)
+                self.bytes -= old.nbytes
+
+    def clear(self):
+        with self.lock:
+            self.items.clear()
+            self.bytes = 0
 
 
 class Player:
-    """Frame n of every camera's clip; reads on in order while playing, seeks otherwise (cameras in parallel)."""
+    """Frame n of every camera's clip, each scaled to its cell.
 
-    def __init__(self, clips: Dict[str, str]):
+    One reader thread per camera, so the cameras decode side by side. Decoded frames are kept whole (``WHOLE_MB``)
+    and scaled to their cells (``CELL_MB``): redrawing a frame (an overlay toggled) decodes nothing and zooming (a
+    new cell size) is only a resize. Reads on in order going forward; a short step back decodes the analysed
+    frames before it in the same pass (the decoder has to start from an earlier key frame anyway), so the next
+    steps back are instant; ``prefetch`` decodes the next frame while this one is drawn."""
+    WHOLE_MB = 1200
+    CELL_MB = 600
+    AHEAD = 45              # frames: read on instead of seeking
+    FILL = 24               # analysed frames decoded before a step back
+    BACK = 301              # a step back of up to this many frames fills; a longer jump only seeks
+
+    def __init__(self, clips: Dict[str, str], hold: int = 1):
         import cv2
         self.cv2 = cv2
         self.caps = {c: cv2.VideoCapture(p) for c, p in clips.items()}
         self.pos = {c: 0 for c in clips}
-        self.pool = ThreadPoolExecutor(max_workers=max(1, len(clips)))
+        self.hold = max(1, int(hold))
+        self.pools = {c: ThreadPoolExecutor(max_workers=1) for c in clips}     # one decoder per camera
+        self.whole = _Kept(self.WHOLE_MB)                                        # (cam, n) -> frame
+        self.cells = _Kept(self.CELL_MB)                                         # (cam, n, w, h) -> cell
+        self.pending: Dict[tuple, object] = {}
 
-    def _one(self, cam, n):
-        cap = self.caps[cam]
-        if not (self.pos[cam] <= n <= self.pos[cam] + 45):
-            cap.set(self.cv2.CAP_PROP_POS_FRAMES, n)
-            self.pos[cam] = n
-        while self.pos[cam] < n:
-            cap.grab()
-            self.pos[cam] += 1
-        ok, fr = cap.read()
-        self.pos[cam] = n + 1 if ok else -10 ** 9
-        return cam, fr if ok else None
+    def _fit(self, fr, size):
+        w, h = size
+        if fr.shape[1] == w and fr.shape[0] == h:
+            return fr
+        return self.cv2.resize(fr, (w, h), interpolation=self.cv2.INTER_AREA)
 
-    def read(self, n) -> Dict[str, np.ndarray]:
-        return dict(self.pool.map(lambda c: self._one(c, n), list(self.caps)))
+    # decoding (on the camera's own thread)
+    def _decode(self, cam, n, size):
+        key = (cam, n) + tuple(size)
+        img = self.cells.get(key)
+        if img is not None:
+            return img
+        fr = self.whole.get((cam, n))
+        if fr is None:
+            cap, pos, fill = self.caps[cam], self.pos[cam], ()
+            if not (pos <= n <= pos + self.AHEAD):
+                start = n
+                if 0 < pos - n <= self.BACK:                    # a step back: the frames before it too
+                    start = max(0, n - self.FILL * self.hold)
+                    fill = set(range(n - self.hold, start - 1, -self.hold))
+                cap.set(self.cv2.CAP_PROP_POS_FRAMES, start)
+                self.pos[cam] = start
+            while self.pos[cam] < n:
+                p = self.pos[cam]
+                if p in fill:
+                    ok, f = cap.read()
+                    if ok:
+                        self.whole.put((cam, p), f)
+                else:
+                    cap.grab()
+                self.pos[cam] = p + 1
+            ok, fr = cap.read()
+            self.pos[cam] = n + 1 if ok else -10 ** 9
+            if not ok:
+                return None
+            self.whole.put((cam, n), fr)
+        img = self._fit(fr, size)
+        self.cells.put(key, img)
+        return img
+
+    def _submit(self, cam, n, size):
+        key = (cam, n) + tuple(size)
+        fut = self.pending.get(key)
+        if fut is None:
+            fut = self.pools[cam].submit(self._decode, cam, n, size)
+            self.pending[key] = fut
+            fut.add_done_callback(lambda _f, k=key: self.pending.pop(k, None))
+        return fut
+
+    def read(self, n, sizes: Dict[str, tuple]) -> Dict[str, np.ndarray]:
+        """{camera: frame n scaled to sizes[camera] (w, h)} for the cameras in sizes."""
+        out, futs = {}, {}
+        for cam, size in sizes.items():
+            if cam not in self.caps:
+                continue
+            img = self.cells.get((cam, n) + tuple(size))
+            if img is not None:
+                out[cam] = img
+            else:
+                futs[cam] = self._submit(cam, n, size)
+        for cam, fut in futs.items():
+            out[cam] = fut.result()
+        return out
+
+    def prefetch(self, n, sizes: Dict[str, tuple]):
+        """Start decoding frame n (playing: the next frame while this one is drawn)."""
+        for cam, size in sizes.items():
+            if cam in self.caps and self.cells.get((cam, n) + tuple(size)) is None:
+                self._submit(cam, n, size)
 
     def close(self):
-        self.pool.shutdown(wait=False)
+        for p in self.pools.values():
+            p.shutdown(wait=True, cancel_futures=True)
         for c in self.caps.values():
             c.release()
+        self.whole.clear()
+        self.cells.clear()
 
 
 class GridView(QWidget):
@@ -105,6 +214,11 @@ class GridView(QWidget):
 
     def set_image(self, img: QImage):
         self.img = img
+        self.update()
+
+    def set_frame(self, bgr: np.ndarray):
+        """Show a BGR picture (kept as Qt's native format; the buffer lives as long as the image shown)."""
+        self.img, self._buf = _bgra(bgr)
         self.update()
 
     # geometry: the fitted rectangle on screen, and the part of the canvas shown in it
@@ -164,7 +278,7 @@ class GridView(QWidget):
         p = QPainter(self)
         p.fillRect(self.rect(), Qt.black)
         if self.img is not None:
-            p.setRenderHint(QPainter.SmoothPixmapTransform)
+            p.setRenderHint(QPainter.SmoothPixmapTransform, not self._dragged)     # smooth once the drag stops
             p.drawImage(self._target(), self.img, self._source())
 
     # input
@@ -207,6 +321,8 @@ class GridView(QWidget):
         press, dragged = self._press, self._dragged
         self._press, self._dragged = None, False
         self.unsetCursor()
+        if dragged:
+            self.update()
         if press is None or dragged or e.button() != Qt.LeftButton:
             return
         r = self._target()
@@ -314,12 +430,15 @@ class ReviewWindow(QMainWindow):
         super().__init__()
         self.cfg_path = cfg_path
         self.scene = Scene(cfg_path, "1080")
-        self.player = Player({c: v["clip"] for c, v in self.scene.cams.items() if c in self.scene.cells})
+        self.player = Player({c: v["clip"] for c, v in self.scene.cams.items() if c in self.scene.cells},
+                             hold=self.scene.hold)
         self.corr_path = corrections_path(self.scene.cfg, cfg_path)
         self.corrections = read_corrections(self.corr_path)
         lp = os.path.join(self.scene.out_dir, "links.csv")
         self.links = pd.read_csv(lp) if os.path.exists(lp) else pd.DataFrame()
         self.n = 0
+        self._want: Optional[int] = None
+        self._shown: set = set()
         self.playing = False
         self.dirty = False
         self.solver: Optional[Solver] = None
@@ -335,7 +454,7 @@ class ReviewWindow(QMainWindow):
         self.view = GridView()
         self.view.clicked.connect(self._clicked)
         self.timeline = Timeline()
-        self.timeline.seek.connect(self.show_frame)
+        self.timeline.seek.connect(self.request_frame)
         self.slider = QSlider(Qt.Horizontal)
         self.slider.setRange(0, self.scene.n_frames - 1)
         self.slider.sliderReleased.connect(lambda: self.show_frame(self.slider.value()))
@@ -465,11 +584,37 @@ class ReviewWindow(QMainWindow):
     def overlays(self) -> Overlays:
         return Overlays(**{k: cb.isChecked() for k, cb in self.checks.items()}, tail_s=self.tail.value())
 
+    def _cell_sizes(self) -> Dict[str, tuple]:
+        """{camera: cell (w, h)} for the cameras in view: zoomed in, the others are not decoded."""
+        v, sc = self.view, self.scene
+        cells = sc.cells
+        if v.zoom > 1.0:
+            hw = hh = 0.5 / v.zoom
+            x0, x1 = (v.centre[0] - hw) * sc.W, (v.centre[0] + hw) * sc.W
+            y0, y1 = (v.centre[1] - hh) * sc.H, (v.centre[1] + hh) * sc.H
+            cells = {c: r for c, r in cells.items() if r[0] < x1 and r[0] + r[2] > x0 and r[1] < y1 and r[1] + r[3] > y0}
+        return {c: (w, h) for c, (_, _, w, h) in cells.items()}
+
+    def request_frame(self, n):
+        """Show frame n once the events waiting now are handled: dragging along the timeline draws the latest
+        position only, not every position passed."""
+        first = self._want is None
+        self._want = int(n)
+        if first:
+            QTimer.singleShot(0, self._show_wanted)
+
+    def _show_wanted(self):
+        n, self._want = self._want, None
+        if n is not None:
+            self.show_frame(n)
+
     def show_frame(self, n):
         n = int(np.clip(n, 0, self.scene.n_frames - 1))
         self.n = n
-        img = self.scene.draw(self.scene.compose(self.player.read(n)), n, self.overlays())
-        self.view.set_image(_qimage(img))
+        sizes = self._cell_sizes()
+        self._shown = set(sizes)
+        img = self.scene.draw(self.scene.compose(self.player.read(n, sizes)), n, self.overlays())
+        self.view.set_frame(img)
         self.timeline.set_playhead(n)
         self.slider.blockSignals(True)
         self.slider.setValue(n)
@@ -482,6 +627,8 @@ class ReviewWindow(QMainWindow):
         size = "4k" if z > 1.4 else "1080"
         if size != self.scene.size:
             self.scene.set_size(size)
+            self.show_frame(self.n)
+        elif not set(self._cell_sizes()) <= self._shown:          # moved onto a camera not drawn yet
             self.show_frame(self.n)
 
     def _slider_moved(self, v):
@@ -517,6 +664,11 @@ class ReviewWindow(QMainWindow):
             return
         if target > self.n:
             self.show_frame(target)
+            # the nearest frame that can come next, decoded while this one is on screen (never one beyond it: a
+            # later frame than the one asked for would mean going back)
+            nxt = target + (self.scene.hold if self.analysed_only.isChecked() else 1)
+            if nxt < self.scene.n_frames:
+                self.player.prefetch(nxt, self._cell_sizes())
 
     # ---------------------------------------------------------------- names and moments
     def _refresh_names(self):

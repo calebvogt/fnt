@@ -137,16 +137,29 @@ def footage_window(probes, start, end, margin=60.0):
     return max(start, first), min(end, last)
 
 
-def prepare_day(trial_name, tracks, reader, day, out_dir, args, day_no=1):
+def hm(t, midnight):
+    """HH:MM of `t`; past the next midnight (the 25-hour day daylight saving ends) as hours since `midnight`
+    (25:00), so the progress window reads the span right."""
+    s = (t - midnight).total_seconds()
+    if s <= 86400:
+        return f"{t:%H:%M}"
+    return f"{int(s // 3600):02d}:{int(s // 60 % 60):02d}"
+
+
+def prepare_day(trial_name, tracks, reader, day, out_dir, args, day_no=1, hours=24):
     """Read the day's clocks (or reuse the readings) and fit each camera's
-    error. Returns the day's job: copies of the tracks carrying the fit."""
+    error. Returns the day's job: copies of the tracks carrying the fit.
+
+    `hours` is 25 on the day daylight saving ends: `tracks` are then on that
+    day's continuous axis (camera_clock.continuous_track) and the day runs
+    00:00 to 25:00, both 01:xx hours in order."""
     clock_dir = os.path.join(out_dir, "clock")
     os.makedirs(clock_dir, exist_ok=True)
     tag = f"{trial_name}_{day:%Y-%m-%d}"
     from_time = getattr(args, "from_time", None)
     final = os.path.join(out_dir, grid_name(trial_name, day, day_no, from_time))
-    start = datetime.datetime.combine(day, datetime.time.min)
-    end = start + datetime.timedelta(days=1)
+    midnight = start = datetime.datetime.combine(day, datetime.time.min)
+    end = start + datetime.timedelta(hours=hours)
 
     # 1. read every camera's clock every minute
     readings = os.path.join(clock_dir, f"{tag}_clock_readings.csv")
@@ -164,7 +177,11 @@ def prepare_day(trial_name, tracks, reader, day, out_dir, args, day_no=1):
                             step=args.step, workers=args.workers, progress=prog)
         _write_csv(readings, probes, PROBE_KEYS)
 
-    # 2. fit each camera's clock error, segment by segment
+    # 2. fit each camera's clock error, segment by segment; on the day daylight
+    # saving ends, readings after a camera's fallback go onto the day's axis
+    probes, shifted = cc.unwrap_fallback(probes)
+    for name, n in shifted.items():
+        log(f"  {tag} {name}: clock fell back an hour; {n} readings after it moved 1 h on")
     model_rows, summary, day_tracks = [], [], {}
     for name, tr in tracks.items():
         mine = [p for p in probes if p["camera"] == name]
@@ -189,12 +206,12 @@ def prepare_day(trial_name, tracks, reader, day, out_dir, args, day_no=1):
     elif not getattr(args, "keep_black", False):
         s0, e0 = footage_window(probes, start, end)
         if (s0, e0) != (start, end):
-            log(f"  {tag}: footage {s0:%H:%M} to {e0:%H:%M}; black before and after left out")
+            log(f"  {tag}: footage {hm(s0, midnight)} to {hm(e0, midnight)}; black before and after left out")
         start, end = s0, e0
     if getattr(args, "minutes", None):
         end = min(end, start + datetime.timedelta(minutes=args.minutes))
-    return {"tag": tag, "final": final, "start": start, "end": end,
-            "tracks": day_tracks, "clock_dir": clock_dir}
+    return {"tag": tag, "final": final, "start": start, "end": end, "midnight": midnight,
+            "fallback": hours > 24, "tracks": day_tracks, "clock_dir": clock_dir}
 
 
 def encode_day(job, layout, reader, args):
@@ -213,7 +230,8 @@ def encode_day(job, layout, reader, args):
         tmp_out = os.path.join(work, os.path.basename(final))
         cmd, n = build_chunk_command(tracks, layout, settings, start, end, tmp_out,
                                      work_dir=work)
-        log(f"{tag}: encoding {start:%H:%M} to {end:%H:%M} ({n} footage runs) -> {final}")
+        midnight = job.get("midnight", datetime.datetime.combine(start.date(), datetime.time.min))
+        log(f"{tag}: encoding {hm(start, midnight)} to {hm(end, midnight)} ({n} footage runs) -> {final}")
         t0 = time.time()
         with open(os.path.join(clock_dir, f"{tag}_ffmpeg.log"), "w", encoding="utf-8") as lf:
             r = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
@@ -228,11 +246,11 @@ def encode_day(job, layout, reader, args):
     ctag = re.sub(r"(_grid)?\.mp4$", "", os.path.basename(final))
     done = os.path.exists(os.path.join(clock_dir, f"{ctag}_grid_check.csv"))
     if not args.no_check and not (done and not args.overwrite):
-        check(ctag, final, tracks, layout, reader, clock_dir, args, start)
+        check(ctag, final, tracks, layout, reader, clock_dir, args, start, fallback=job.get("fallback", False))
     return True
 
 
-def check(tag, video, tracks, layout, reader, clock_dir, args, start):
+def check(tag, video, tracks, layout, reader, clock_dir, args, start, fallback=False):
     geo = EncodeSettings(width=args.width, height=args.height)
     cells = {cam: geo.cell_rect(layout, r, c) for (r, c), cam in layout.assignments.items()
              if cam in tracks}
@@ -249,9 +267,10 @@ def check(tag, video, tracks, layout, reader, clock_dir, args, start):
                 if hit is None:
                     continue
                 clock, grid_t = hit
-                # clock second minus grid time, both from the chunk's start
-                err = (clock - start).total_seconds() - grid_t
-                if abs(err) < 10:       # a further-out reading is a misread
+                # clock second minus grid time, both from the chunk's start; a
+                # further-out reading is a misread
+                err = cc.grid_error(clock, start, grid_t, fallback=fallback)
+                if err is not None:
                     errs[cam] = err
             row = {"grid_s": t, **{c: (round(e, 3) if c in errs else "") for c, e in
                                     ((c, errs.get(c)) for c in cells)}}
@@ -275,6 +294,25 @@ def check(tag, video, tracks, layout, reader, clock_dir, args, start):
     else:
         log(f"{tag}: no clock could be read back from the grid")
 
+
+
+def _on_console() -> bool:
+    """stdout is a real console. On Windows NUL also says isatty(), so a queue that
+    starts this with its output discarded got a progress window per day (on top of
+    its own); there only a handle with a console mode counts."""
+    out = sys.stdout
+    if not (out and out.isatty()):
+        return False
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        import msvcrt
+        mode = ctypes.c_uint32()
+        h = msvcrt.get_osfhandle(out.fileno())
+        return bool(ctypes.windll.kernel32.GetConsoleMode(h, ctypes.byref(mode)))
+    except Exception:
+        return False
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
@@ -352,7 +390,18 @@ def main(argv=None):
         log("learning the clock font")
         reader = cc.learn_from_tracks(list(tracks.values()))
         reader.save(font)
-    # a 25-hour day (daylight saving ends) runs into the next: place its files by their clocks
+    # The day daylight saving ends holds 25 h: that day is encoded on its own
+    # continuous axis (both 01:xx hours in order, 00:00 to 25:00), built from
+    # the file timeline before anything is anchored ...
+    dst_days = set()
+    for t in tracks.values():
+        dst_days |= cc.fallback_days(t)
+    dst_tracks = {d: {cam: cc.continuous_track(t, d) for cam, t in tracks.items()} for d in dst_days}
+    for d in sorted(dst_days):
+        log(f"  {d:%Y-%m-%d}: daylight saving ends; its grid runs 00:00 to 25:00 with both 01:00 hours in order "
+            f"(after the fallback the cameras' clocks read an hour behind the grid's time)")
+    # ... while the days after it take the 25-hour day's files placed by their
+    # clocks, so their first hour is not covered by its last one
     for cam, t in tracks.items():
         for path, old, new in cc.anchor_overfull_days(reader, t):
             log(f"  {cam}: {os.path.basename(path)} placed by its clock at {new:%Y-%m-%d %H:%M:%S} "
@@ -371,16 +420,17 @@ def main(argv=None):
         days = all_days
     if not days:
         ap.error("give --day or --all-days")
-    show = args.window if args.window is not None else bool(sys.stdout and sys.stdout.isatty())
+    show = args.window if args.window is not None else _on_console()
     if show:
         from fnt.videoProcessing import camera_grid_progress
         camera_grid_progress.launch(trial, days, watch_pid=os.getpid(),
-                                    title=f"Camera grids â€” {trial_name}")
+                                    title=f"Camera grids — {trial_name}")
     # --parallel days at a time, each reading its clocks and then encoding,
     # so one day's encode runs while the next day's clocks are read
     def one(day):
         try:
-            job = prepare_day(trial_name, tracks, reader, day, out_dir, args, day_no=(day - first).days + 1)
+            job = prepare_day(trial_name, dst_tracks.get(day, tracks), reader, day, out_dir, args,
+                              day_no=(day - first).days + 1, hours=25 if day in dst_days else 24)
             ok = True if args.no_grid and args.clips else encode_day(job, layout, reader, args)
             if args.clips:
                 cw, ch = (int(v) for v in args.clip_size.lower().split("x"))

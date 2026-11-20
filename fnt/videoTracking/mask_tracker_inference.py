@@ -35,9 +35,38 @@ class MaskInferenceConfig:
     nms_threshold: float = 0.5
     device: str = "auto"
     max_detections: int = 1
-    max_disappeared_frames: int = 0
+    # Analysed frames a track may go undetected before it ends. 0 = never;
+    # -1 = auto: "bytetrack" 5 (it ends at the 6th; never with max_detections 1),
+    # "centroid" never ends them.
+    max_disappeared_frames: int = -1
     iou_match_threshold: float = 0.3
     matching_algorithm: str = "hungarian"
+    # Frame-to-frame linker (how each frame's detections join tracks):
+    #   "bytetrack" (default since 2026-11-20): cost = centroid distance + mask
+    #     overlap, two passes by confidence (low-confidence detections only
+    #     continue tracks, never start one), constant-velocity Kalman motion.
+    #   "centroid": FNT's linker before 2026-11-20 (centroid distance within 15%
+    #     of the frame diagonal, tracks never end by default, at the object
+    #     limit a detection takes over the nearest free track). Runs recorded
+    #     without a linker were made with it.
+    linker: str = "bytetrack"
+    # bytetrack: farthest a centroid may move per video frame, in px (x frame
+    # step per analysed frame). 0 = auto: half the median animal size
+    # (sqrt mask area), at least 1.2% of the frame diagonal.
+    gate_px: float = 0.0
+    # bytetrack: weight of (1 - mask IoU) beside distance / gate in the cost.
+    iou_weight: float = 1.0
+    # bytetrack: detections at or above this confidence are matched first and
+    # may start tracks; below it they only continue one (else they keep an id
+    # of their own, from 1000001 up). 0 = auto: min(0.5, 0.8 x median
+    # confidence); < 0 = one pass.
+    two_pass_conf: float = 0.0
+    # bytetrack: "kalman" (constant velocity) or "none".
+    motion: str = "kalman"
+    # At max_detections tracks, an unmatched detection continues the nearest
+    # free track (one with no detection on that frame). None = auto: on for
+    # "centroid" and for max_detections 1 (one animal: every detection is it).
+    takeover: Optional[bool] = None
     inference_size: int = 0
     use_masks: bool = False
     # Persist per-frame silhouettes to <video>_MaskTracker/<video>_tracks.h5.
@@ -487,8 +516,85 @@ class MaskRCNNInference:
         }
 
 
+#: Ids from here on: low-confidence detections that continued no track (bytetrack
+#: linker), each its own one-detection track, so no detection is lost.
+SINGLETON_ID0 = 1_000_001
+
+
+def mask_crop(mask: np.ndarray, ys: Optional[np.ndarray] = None,
+              xs: Optional[np.ndarray] = None) -> Optional[Tuple[int, int, np.ndarray]]:
+    """(x0, y0, the mask cropped to its own box), or None for an empty mask."""
+    if ys is None or xs is None:
+        ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return None
+    x0, y0 = int(xs.min()), int(ys.min())
+    return x0, y0, np.asarray(mask[y0:int(ys.max()) + 1, x0:int(xs.max()) + 1], dtype=bool)
+
+
+def crop_iou(a, b, dx: float = 0.0, dy: float = 0.0) -> float:
+    """IoU of two cropped masks (mask_crop), ``a`` shifted by (dx, dy)."""
+    if a is None or b is None:
+        return 0.0
+    ax, ay, am = a[0] + int(round(dx)), a[1] + int(round(dy)), a[2]
+    bx, by, bm = b
+    x0, y0 = max(ax, bx), max(ay, by)
+    x1, y1 = min(ax + am.shape[1], bx + bm.shape[1]), min(ay + am.shape[0], by + bm.shape[0])
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    inter = int(np.logical_and(am[y0 - ay:y1 - ay, x0 - ax:x1 - ax],
+                               bm[y0 - by:y1 - by, x0 - bx:x1 - bx]).sum())
+    return inter / (int(am.sum()) + int(bm.sum()) - inter) if inter else 0.0
+
+
+def box_iou(a, b, dx: float = 0.0, dy: float = 0.0) -> float:
+    """IoU of two boxes (x1, y1, x2, y2), ``a`` shifted by (dx, dy)."""
+    if a is None or b is None:
+        return 0.0
+    ax1, ay1, ax2, ay2 = float(a[0]) + dx, float(a[1]) + dy, float(a[2]) + dx, float(a[3]) + dy
+    iw = min(ax2, float(b[2])) - max(ax1, float(b[0]))
+    ih = min(ay2, float(b[3])) - max(ay1, float(b[1]))
+    if iw <= 0 or ih <= 0:
+        return 0.0
+    inter = iw * ih
+    union = (ax2 - ax1) * (ay2 - ay1) + (float(b[2]) - float(b[0])) * (float(b[3]) - float(b[1])) - inter
+    return inter / union if union > 0 else 0.0
+
+
+class _ConstantVelocityKF:
+    """Constant-velocity Kalman filter on a centroid; one predict per analysed frame."""
+    F = np.array([[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]], float)
+    H = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], float)
+
+    def __init__(self, xy, q: float = 40.0, r: float = 6.0):
+        self.x = np.array([xy[0], xy[1], 0.0, 0.0], float)
+        self.P = np.diag([r * r, r * r, 100.0 ** 2, 100.0 ** 2])
+        g = np.array([[0.5, 0], [0, 0.5], [1, 0], [0, 1]])
+        self.Q = g @ g.T * q * q
+        self.R = np.eye(2) * r * r
+
+    def predict(self):
+        self.x = self.F @ self.x
+        self.P = self.F @ self.P @ self.F.T + self.Q
+
+    def update(self, xy):
+        y = np.asarray(xy, float) - self.H @ self.x
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        self.x = self.x + K @ y
+        self.P = (np.eye(4) - K @ self.H) @ self.P
+
+
 class MultiObjectTracker:
-    """Frame-to-frame multi-object tracker using centroid distance matching."""
+    """Frame-to-frame multi-object tracker: joins each analysed frame's
+    detections to tracks. ``config.linker`` picks how (see MaskInferenceConfig):
+    "bytetrack" (distance + mask overlap, two passes by confidence, Kalman
+    motion) or "centroid" (the earlier centroid-distance linker, unchanged)."""
+
+    #: bytetrack's auto track end: a track survives this many missed analysed
+    #: frames and ends at the next (0.5 s at 10 analysed frames per second)
+    AUTO_MAX_AGE = 5
+    _STATS_MAX = 1000          # detections the auto gate / two-pass split are measured on
 
     def __init__(self, config: MaskInferenceConfig):
         self.config = config
@@ -497,6 +603,75 @@ class MultiObjectTracker:
         self.disappeared: Dict[int, int] = {}
         self.records: List[Dict] = []
         self._max_match_dist: float = 0.0
+        # bytetrack state
+        self._kf: Dict[int, _ConstantVelocityKF] = {}
+        self._last_k: Dict[int, int] = {}
+        self._at_k: Dict[int, int] = {}
+        self._next_single = SINGLETON_ID0
+        self._sizes: List[float] = []
+        self._confs: List[float] = []
+        self._body: Optional[float] = None
+        self._conf_med: Optional[float] = None
+        self._diag: float = 0.0
+        self.n_singletons = 0
+
+    # -- settings, resolved -------------------------------------------------
+    @property
+    def linker(self) -> str:
+        return "centroid" if str(getattr(self.config, "linker", "bytetrack")).lower() == "centroid" \
+            else "bytetrack"
+
+    def _single_animal(self) -> bool:
+        return int(self.config.max_detections or 0) == 1
+
+    def _takeover(self) -> bool:
+        t = getattr(self.config, "takeover", None)
+        if t is None:
+            return self.linker == "centroid" or self._single_animal()
+        return bool(t)
+
+    def _max_age(self) -> int:
+        """Analysed frames a track may go undetected (0 = never)."""
+        md = int(self.config.max_disappeared_frames)
+        if md >= 0:
+            return md
+        if self.linker == "centroid" or self._single_animal():
+            return 0
+        return self.AUTO_MAX_AGE
+
+    def _step(self) -> int:
+        return max(1, int(getattr(self.config, "frame_step", 1) or 1))
+
+    def _gate(self) -> float:
+        """bytetrack: farthest a centroid may move between analysed frames, px."""
+        g = float(getattr(self.config, "gate_px", 0) or 0)
+        if g <= 0:
+            g = max(0.5 * self._body if self._body else 0.0, 0.012 * self._diag if self._diag else 0.0)
+            if g <= 0:
+                g = 25.0
+        return g * self._step()
+
+    def _two_pass(self) -> float:
+        """The two-pass confidence split (0 = one pass)."""
+        t = float(getattr(self.config, "two_pass_conf", 0.0) or 0.0)
+        if t < 0:
+            return 0.0
+        if t > 0:
+            return t
+        return min(0.5, 0.8 * self._conf_med) if self._conf_med is not None else 0.5
+
+    def resolved_settings(self) -> Dict:
+        """The linker settings as used (autos resolved), for the run record."""
+        out = {"linker": self.linker, "max_disappeared_frames": self._max_age(),
+               "takeover": self._takeover()}
+        if self.linker == "bytetrack":
+            out.update(gate_px_per_analysed_frame=round(self._gate(), 1),
+                       two_pass_conf=round(self._two_pass(), 3),
+                       iou_weight=float(getattr(self.config, "iou_weight", 1.0)),
+                       motion=str(getattr(self.config, "motion", "kalman")),
+                       median_animal_px=round(self._body, 1) if self._body else None,
+                       low_confidence_singletons=self.n_singletons)
+        return out
 
     def _get_max_match_dist(self, frame_h: int, frame_w: int) -> float:
         """Auto-compute max matching distance as 15% of frame diagonal."""
@@ -505,6 +680,7 @@ class MultiObjectTracker:
         self._max_match_dist = 0.15 * np.sqrt(frame_h**2 + frame_w**2)
         return self._max_match_dist
 
+    # -- one frame --------------------------------------------------------
     def update(self, detections: Dict, frame_idx: int, fps: float = 30.0,
                frame_hw: Optional[Tuple[int, int]] = None) -> Dict[int, Dict]:
         """Process detections for one frame and return matched track assignments."""
@@ -512,10 +688,12 @@ class MultiObjectTracker:
 
         masks = detections["masks"]
         has_masks = masks is not None
+        want_crop = self.linker == "bytetrack"
 
         current_dets = []
         for i in range(n_det):
             box = detections["boxes"][i]
+            crop = None
             if has_masks:
                 mask = masks[i]
                 ys, xs = np.where(mask)
@@ -524,6 +702,8 @@ class MultiObjectTracker:
                     cy = float((box[1] + box[3]) / 2)
                 else:
                     cx, cy = float(xs.mean()), float(ys.mean())
+                    if want_crop:
+                        crop = mask_crop(mask, ys, xs)
                 area = int(mask.sum())
                 # Reuses the nonzero indices already computed above, so the
                 # shape descriptors cost one small crop rather than a second
@@ -535,7 +715,7 @@ class MultiObjectTracker:
                 cy = float((box[1] + box[3]) / 2)
                 area = int((box[2] - box[0]) * (box[3] - box[1]))
                 shape = dict(_EMPTY_SHAPE)
-            current_dets.append({
+            det = {
                 "centroid": (cx, cy),
                 "bbox": box,
                 "mask": mask,
@@ -543,8 +723,157 @@ class MultiObjectTracker:
                 "label": int(detections["labels"][i]),
                 "area": area,
                 "shape": shape,
-            })
+            }
+            if want_crop:
+                det["crop"] = crop
+            current_dets.append(det)
 
+        if frame_hw is None and has_masks and len(masks) > 0:
+            frame_hw = tuple(masks[0].shape[:2])
+        return self.update_dets(current_dets, frame_idx, fps, frame_hw)
+
+    def update_dets(self, current_dets: List[Dict], frame_idx: int, fps: float = 30.0,
+                    frame_hw: Optional[Tuple[int, int]] = None) -> Dict[int, Dict]:
+        """``update`` on detections already prepared: dicts with centroid, bbox,
+        mask (or None), score, label, area, shape and, for bytetrack, crop
+        (mask_crop, or None: boxes overlap instead). Used to link again from a
+        saved track store without re-detecting."""
+        if self.linker == "centroid":
+            return self._update_centroid(current_dets, frame_idx, fps, frame_hw)
+        return self._update_bytetrack(current_dets, frame_idx, fps, frame_hw)
+
+    # -- bytetrack --------------------------------------------------------
+    def _note_stats(self, dets: List[Dict]):
+        if len(self._sizes) >= self._STATS_MAX:
+            return
+        n0 = len(self._sizes)
+        for d in dets:
+            if len(self._sizes) >= self._STATS_MAX:
+                break
+            if d.get("area"):
+                self._sizes.append(math.sqrt(float(d["area"])))
+                self._confs.append(float(d["score"]))
+        n = len(self._sizes)
+        if n >= 30 and (self._body is None or n // 50 != n0 // 50 or n == self._STATS_MAX):
+            self._body = float(np.median(self._sizes))
+            self._conf_med = float(np.median(self._confs))
+
+    def _new_track(self, det: Dict, k: int) -> int:
+        tid = self.next_object_id
+        self.next_object_id += 1
+        self.active_tracks[tid] = det
+        self.disappeared[tid] = 0
+        self._last_k[tid] = k
+        self._at_k[tid] = k
+        if str(getattr(self.config, "motion", "kalman")).lower() == "kalman":
+            self._kf[tid] = _ConstantVelocityKF(det["centroid"])
+        return tid
+
+    def _end_track(self, tid: int):
+        for d in (self.active_tracks, self.disappeared, self._kf, self._last_k, self._at_k):
+            d.pop(tid, None)
+
+    def _continue_track(self, tid: int, det: Dict, k: int):
+        kf = self._kf.get(tid)
+        if kf is not None:
+            kf.update(det["centroid"])
+        self.active_tracks[tid] = det
+        self.disappeared[tid] = 0
+        self._last_k[tid] = k
+
+    def _assign(self, tids: List[int], dets: List[Dict], pred: Dict[int, np.ndarray], gate: float):
+        """Gated Hungarian on distance / gate + iou_weight x (1 - overlap):
+        [(track id, det index)]."""
+        if not tids or not dets:
+            return []
+        from scipy.optimize import linear_sum_assignment
+        w_iou = float(getattr(self.config, "iou_weight", 1.0))
+        C = np.full((len(tids), len(dets)), np.inf)
+        for a, t in enumerate(tids):
+            tr, p = self.active_tracks[t], pred[t]
+            shift = p - np.asarray(tr["centroid"], float)
+            for b, d in enumerate(dets):
+                dist = float(np.hypot(d["centroid"][0] - p[0], d["centroid"][1] - p[1]))
+                if dist > gate:
+                    continue
+                c = dist / gate
+                if w_iou:
+                    if tr.get("crop") is not None and d.get("crop") is not None:
+                        ov = crop_iou(tr["crop"], d["crop"], *shift)
+                    else:
+                        ov = box_iou(tr.get("bbox"), d.get("bbox"), *shift)
+                    c += w_iou * (1.0 - ov)
+                C[a, b] = c
+        ri, ci = linear_sum_assignment(np.where(np.isfinite(C), C, 1e9))
+        return [(tids[a], int(b)) for a, b in zip(ri, ci) if np.isfinite(C[a, b])]
+
+    def _update_bytetrack(self, dets: List[Dict], frame_idx: int, fps: float,
+                          frame_hw: Optional[Tuple[int, int]]) -> Dict[int, Dict]:
+        if frame_hw is not None and not self._diag:
+            self._diag = float(np.hypot(*frame_hw))
+        self._note_stats(dets)
+        k = int(frame_idx) // self._step()
+        max_age = self._max_age()
+        if max_age > 0:
+            # missed analysed frames since the track's last detection, as the centroid linker counts them
+            for tid in [t for t in self.active_tracks if k - self._last_k.get(t, k) - 1 > max_age]:
+                self._end_track(tid)
+        pred: Dict[int, np.ndarray] = {}
+        for tid in self.active_tracks:
+            kf = self._kf.get(tid)
+            if kf is not None:
+                for _ in range(max(0, k - self._at_k.get(tid, k))):
+                    kf.predict()
+                self._at_k[tid] = k
+                pred[tid] = kf.x[:2].copy()
+            else:
+                pred[tid] = np.asarray(self.active_tracks[tid]["centroid"], float)
+            self.disappeared[tid] = k - self._last_k.get(tid, k)
+
+        gate = self._gate()
+        split = self._two_pass()
+        hi = [i for i, d in enumerate(dets) if d["score"] >= split]
+        lo = [i for i, d in enumerate(dets) if d["score"] < split]
+        tids = list(self.active_tracks)
+        got: Dict[int, int] = {}                          # det index -> track id
+        for t, b in self._assign(tids, [dets[i] for i in hi], pred, gate):
+            got[hi[b]] = t
+        taken = set(got.values())
+        rest = [t for t in tids if t not in taken]
+        for t, b in self._assign(rest, [dets[i] for i in lo], pred, gate):
+            got[lo[b]] = t
+        for i, t in got.items():
+            self._continue_track(t, dets[i], k)
+
+        matched: Dict[int, Dict] = {}
+        for i in sorted(got, key=lambda i: got[i]):
+            matched[got[i]] = dets[i]
+            self._record(got[i], dets[i], frame_idx, fps)
+        takeover = self._takeover()
+        limit = int(self.config.max_detections or 0)
+        for i, d in enumerate(dets):
+            if i in got:
+                continue
+            if takeover and limit > 0 and len(self.active_tracks) >= limit:
+                free = [t for t in self.active_tracks if t not in matched]
+                if not free:
+                    continue                                 # an extra: left out, as before
+                t = min(free, key=lambda t: float(np.hypot(*(np.asarray(d["centroid"]) - pred.get(
+                    t, np.asarray(self.active_tracks[t]["centroid"], float))))))
+                self._continue_track(t, d, k)
+            elif d["score"] >= split:
+                t = self._new_track(d, k)
+            else:
+                t = self._next_single                        # low confidence: never starts a track
+                self._next_single += 1
+                self.n_singletons += 1
+            matched[t] = d
+            self._record(t, d, frame_idx, fps)
+        return matched
+
+    # -- centroid (the linker before 2026-11-20; unchanged) ----------------
+    def _update_centroid(self, current_dets: List[Dict], frame_idx: int, fps: float,
+                         frame_hw: Optional[Tuple[int, int]]) -> Dict[int, Dict]:
         if not self.active_tracks:
             matched = {}
             for det in current_dets:
@@ -556,10 +885,11 @@ class MultiObjectTracker:
                 self._record(obj_id, det, frame_idx, fps)
             return matched
 
+        max_age = self._max_age()
         if not current_dets:
             for obj_id in list(self.active_tracks.keys()):
                 self.disappeared[obj_id] = self.disappeared.get(obj_id, 0) + 1
-                if self.config.max_disappeared_frames > 0 and self.disappeared[obj_id] > self.config.max_disappeared_frames:
+                if max_age > 0 and self.disappeared[obj_id] > max_age:
                     del self.active_tracks[obj_id]
                     del self.disappeared[obj_id]
             return {}
@@ -570,9 +900,6 @@ class MultiObjectTracker:
 
         if frame_hw is not None:
             max_dist = self._get_max_match_dist(frame_hw[0], frame_hw[1])
-        elif detections["masks"] is not None and len(detections["masks"]) > 0:
-            h, w = detections["masks"][0].shape[:2]
-            max_dist = self._get_max_match_dist(h, w)
         else:
             max_dist = 200.0
 
@@ -601,14 +928,15 @@ class MultiObjectTracker:
             if row_idx not in matched_rows:
                 obj_id = track_ids[row_idx]
                 self.disappeared[obj_id] = self.disappeared.get(obj_id, 0) + 1
-                if self.config.max_disappeared_frames > 0 and self.disappeared[obj_id] > self.config.max_disappeared_frames:
+                if max_age > 0 and self.disappeared[obj_id] > max_age:
                     del self.active_tracks[obj_id]
                     del self.disappeared[obj_id]
 
+        takeover = self._takeover()
         for col_idx in range(n_dets):
             if col_idx not in used_cols:
                 det = current_dets[col_idx]
-                at_limit = (self.config.max_detections > 0
+                at_limit = (takeover and self.config.max_detections > 0
                             and len(self.active_tracks) >= self.config.max_detections)
                 if at_limit:
                     # As many tracks as animals: the detection is one of them seen again elsewhere, so it
@@ -711,26 +1039,7 @@ class MultiObjectTracker:
         df = pd.DataFrame(self.records)
         df = df.sort_values(["object_id", "frame"]).reset_index(drop=True)
 
-        if categories is not None:
-            cat_map = {int(k): v for k, v in categories.items()}
-            class_counters: Dict[str, int] = defaultdict(int)
-            obj_names: Dict[int, str] = {}
-            for oid in sorted(df["object_id"].unique()):
-                label = int(df.loc[df["object_id"] == oid, "label"].iloc[0])
-                class_name = cat_map.get(label, f"class{label}")
-                class_counters[class_name] += 1
-                obj_names[oid] = f"{class_name}_{class_counters[class_name]}"
-            df["object_name"] = df["object_id"].map(obj_names)
-
-        for oid in df["object_id"].unique():
-            mask = df["object_id"] == oid
-            dx = df.loc[mask, "x"].diff()
-            dy = df.loc[mask, "y"].diff()
-            dt = df.loc[mask, "time_s"].diff()
-            dt = dt.replace(0, np.nan)
-            df.loc[mask, "vx"] = (dx / dt).round(2)
-            df.loc[mask, "vy"] = (dy / dt).round(2)
-            df.loc[mask, "speed"] = (np.sqrt(dx**2 + dy**2) / dt).round(2)
+        add_names_and_velocities(df, categories)
 
         col_order = ["frame", "time_s", "object_id", "object_name", "label",
                      "x", "y", "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2",
@@ -738,6 +1047,31 @@ class MultiObjectTracker:
                      "confidence", "vx", "vy", "speed"]
         col_order = [c for c in col_order if c in df.columns]
         return df[col_order]
+
+
+
+def add_names_and_velocities(df: pd.DataFrame, categories: Optional[Dict] = None) -> None:
+    """object_name (class_N, numbered per class in id order) and vx, vy, speed
+    (per track, from consecutive rows) on a trajectories table sorted by
+    object_id then frame. Grouped rather than one pass per track: a linker
+    leaving thousands of one-detection tracks made the per-track loop crawl."""
+    if categories is not None:
+        cat_map = {int(k): v for k, v in categories.items()}
+        first_label = df.groupby("object_id", sort=True)["label"].first()
+        class_counters: Dict[str, int] = defaultdict(int)
+        obj_names: Dict[int, str] = {}
+        for oid, label in first_label.items():
+            class_name = cat_map.get(int(label), f"class{int(label)}")
+            class_counters[class_name] += 1
+            obj_names[oid] = f"{class_name}_{class_counters[class_name]}"
+        df["object_name"] = df["object_id"].map(obj_names)
+    g = df.groupby("object_id", sort=False)
+    dx = g["x"].diff()
+    dy = g["y"].diff()
+    dt = g["time_s"].diff().replace(0, np.nan)
+    df["vx"] = (dx / dt).round(2)
+    df["vy"] = (dy / dt).round(2)
+    df["speed"] = (np.sqrt(dx**2 + dy**2) / dt).round(2)
 
 
 def _draw_annotations(
@@ -895,10 +1229,13 @@ def run_inference_on_video(
         print(f"[MTT Inference] Video: {os.path.basename(video_path)}")
         print(f"[MTT Inference]   {total_frames} frames, {fps:.1f} fps, {w}x{h}"
               + (f", every {step}th frame analysed ({fps / step:.2f} per s)" if step > 1 else ""))
+        _md = config.max_disappeared_frames
         print(f"[MTT Inference]   confidence={config.confidence_threshold}, "
               f"max_detections={config.max_detections}, "
-              f"max_disappear={'never' if config.max_disappeared_frames == 0 else config.max_disappeared_frames}, "
-              f"matching={config.matching_algorithm}")
+              f"max_disappear={'never' if _md == 0 else ('auto' if _md < 0 else _md)}, "
+              f"linker={getattr(config, 'linker', 'bytetrack')}"
+              + (f", matching={config.matching_algorithm}"
+                 if str(getattr(config, 'linker', '')).lower() == 'centroid' else ""))
 
         video_stem = Path(video_path).stem
         video_dir = str(Path(video_path).parent)
@@ -1037,6 +1374,8 @@ def run_inference_on_video(
         fps_actual = frame_idx / elapsed if elapsed > 0 else 0
         print(f"[MTT Inference] Done: {frame_idx} frames in {elapsed:.1f}s ({fps_actual:.1f} fps)")
 
+        rec["linker_resolved"] = tracker.resolved_settings()
+        print(f"[MTT Inference] Linker: {rec['linker_resolved']}")
         df_raw = tracker.get_trajectories(categories=inference.categories)
 
         csv_path = os.path.join(output_dir, "trajectories.csv")

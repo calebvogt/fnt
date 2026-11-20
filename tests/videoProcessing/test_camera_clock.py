@@ -234,3 +234,99 @@ def test_a_run_starting_late_in_a_file_gives_that_file_its_own_input():
     assert tail["corr"][0] == pytest.approx((0.0, 7200.0, 2.0, 1e-4))
     # a run starting near its first file's beginning stays one input
     assert len(_split_late_start(dict(run, seek=10.0), {"a.mp4": 4000.0})) == 1
+
+
+# -- the day daylight saving ends (VoleCosm VC-T014, 2026-11-01) ---------------------------------------------------
+
+def _dst_track():
+    """Files as the names place them: 10/31 and 11/2 hold 24 h, 11/1 25 h (the repeated hour), 11/3 is the last."""
+    from fnt.videoProcessing.camera_timeline import build_timeline
+    segs = []
+    for day, n, dur in (("20261031000000", 4, 6 * 3600.0), ("20261101000000", 5, 5 * 3600.0),
+                        ("20261102000000", 4, 6 * 3600.0), ("20261103000000", 1, 6 * 3600.0)):
+        segs += [Segment(f"{day}_{i}.mp4", day, i, dur) for i in range(n)]
+    placed, gaps = build_timeline(segs)
+    return CameraTrack("cam1", "x", placed, gaps)
+
+
+def test_the_fallback_day_is_found_and_put_on_one_continuous_axis():
+    t = _dst_track()
+    assert cc.fallback_days(t) == {datetime.date(2026, 11, 1)}
+    c = cc.continuous_track(t, datetime.date(2026, 11, 1))
+    by = {s.path: s for s in c.segments}
+    # 11/1 runs 25 h in recorded order, 11/2 follows on an hour later, earlier days stay put
+    assert by["20261101000000_4.mp4"].end == datetime.datetime(2026, 11, 2, 1)
+    assert by["20261102000000_0.mp4"].start == datetime.datetime(2026, 11, 2, 1)
+    assert by["20261031000000_0.mp4"].start == datetime.datetime(2026, 10, 31)
+    assert all(a.end == b.start for a, b in zip(c.segments, c.segments[1:]))      # no overlap, no hole
+    # its own segments: anchoring the original track afterwards does not move them
+    t.segments[5].start = datetime.datetime(2000, 1, 1)
+    assert by["20261101000000_1.mp4"].start == datetime.datetime(2026, 11, 1, 5)
+
+
+def _dst_probes(cam, path_of, delta_of, start=datetime.datetime(2026, 11, 1), hours=25):
+    out = []
+    for k in range(0, hours * 3600, 60):
+        t = start + datetime.timedelta(seconds=k)
+        d = delta_of(k)
+        out.append({"camera": cam, "when": t, "path": path_of(t), "file_time": 0.0, "timeline": t,
+                    "clock": t + datetime.timedelta(seconds=d), "delta": d, "score": 0.9})
+    return out
+
+
+def test_readings_after_a_fallback_move_an_hour_on_and_nothing_else_does():
+    fall = 7198                                       # the clock goes 01:59:58 -> 01:00 at 02:00 on the axis
+    cam1 = _dst_probes("cam1", lambda t: "a.mp4", lambda k: 0.4 if k < fall else 0.4 - 3600)
+    cam1[700]["delta"] += 1.0                          # a misread second: left to the fit
+    # cam2's clock runs two minutes behind (VC-T010 cam1-2) and one reading misreads its hour: no fallback
+    cam2 = _dst_probes("cam2", lambda t: "b.mp4", lambda k: -3720.0 if k == 600 else -120.0)
+    # cam3: a lone reading an hour ahead
+    cam3 = _dst_probes("cam3", lambda t: "c.mp4", lambda k: 3600.2 if k == 6000 else 0.2)
+    out, shifted = cc.unwrap_fallback(cam1 + cam2 + cam3)
+    assert shifted == {"cam1": 25 * 60 - 120}
+    after = [p for p in out[:len(cam1)] if p["timeline"] >= datetime.datetime(2026, 11, 1, 2)]
+    assert all(abs(p["delta"] - 0.4) < 1.5 for p in after)
+    p = out[300]                                       # 05:00 on the axis: the clock showed 04:00 (standard time)
+    assert p["clock"] == datetime.datetime(2026, 11, 1, 5, 0, 0, 400000)
+    assert cam1[300]["delta"] == pytest.approx(0.4 - 3600)                       # the input is not changed
+    assert out[len(cam1):] == cam2 + cam3
+
+
+def test_a_normal_day_is_left_alone():
+    probes = _dst_probes("cam1", lambda t: "a.mp4", lambda k: 1.2, hours=24)
+    out, shifted = cc.unwrap_fallback(probes)
+    assert shifted == {} and out == probes
+
+
+def test_the_fallback_days_grid_check_reads_the_second_hour_on_the_axis():
+    start = datetime.datetime(2026, 11, 1)
+    # 03:00 on the axis shows 02:00 standard time
+    clock = datetime.datetime(2026, 11, 1, 2, 0, 0)
+    assert cc.grid_error(clock, start, 3 * 3600 + 0.033, fallback=True) == pytest.approx(-0.033)
+    assert cc.grid_error(clock, start, 3 * 3600 + 0.033) is None                 # another day: a misread
+    assert cc.grid_error(clock, start, 2 * 3600 + 0.5) == pytest.approx(-0.5)
+
+
+def test_the_fallback_day_runs_25_hours_and_fits_on_its_axis(tmp_path):
+    """prepare_day on the continuous track: the day is 00:00-25:00 and the readings after the fallback, an hour
+    behind the axis, fit to the camera's real error."""
+    import argparse
+    from fnt.videoProcessing import camera_grid_cli as cli
+    c = cc.continuous_track(_dst_track(), datetime.date(2026, 11, 1))
+    probes = _dst_probes("cam1", lambda t: cc.segment_at(c, t).path, lambda k: 0.4 if k < 7198 else 0.4 - 3600)
+    clock = tmp_path / "clock"
+    clock.mkdir()
+    cli._write_csv(str(clock / "VC-T014_2026-11-01_clock_readings.csv"), probes, cli.PROBE_KEYS)
+    args = argparse.Namespace(step=60.0, workers=1, keep_black=True, from_time=None, minutes=None)
+    job = cli.prepare_day("VC-T014", {"cam1": c}, None, datetime.date(2026, 11, 1), str(tmp_path), args,
+                          day_no=4, hours=25)
+    assert job["end"] - job["start"] == datetime.timedelta(hours=25) and job["fallback"]
+    sync = job["tracks"]["cam1"].clock_sync
+    for h in (1.5, 3, 12, 24.5):
+        assert sync.delta(datetime.datetime(2026, 11, 1) + datetime.timedelta(hours=h)) == pytest.approx(0.4)
+    assert job["final"].endswith("VC-T014_2026-11-01_day4_grid.mp4")
+    # the log writes the 25-hour span so the progress window reads it right
+    from fnt.videoProcessing.camera_grid_progress import _span_s
+    assert cli.hm(job["end"], job["midnight"]) == "25:00"
+    assert _span_s("00:00", cli.hm(job["end"], job["midnight"])) == 25 * 3600
+    assert cli.hm(datetime.datetime(2026, 11, 3), datetime.datetime(2026, 11, 2)) == "00:00"   # a normal day

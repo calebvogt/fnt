@@ -1,4 +1,5 @@
-"""Mask Tracker's frame-to-frame tracker at its object limit (no model or video needed)."""
+"""Mask Tracker's centroid linker (the one before 2026-11-20) at its object limit (no model or video
+needed). The default linker is tested in test_mtt_linker.py."""
 import numpy as np
 
 from fnt.videoTracking.mask_tracker_inference import MaskInferenceConfig, MultiObjectTracker
@@ -16,7 +17,7 @@ def _ids_at(tr, frame):
 
 def test_an_extra_detection_never_takes_an_id_already_used_on_that_frame():
     for matching in ("hungarian", "greedy"):
-        tr = MultiObjectTracker(MaskInferenceConfig(max_detections=2, matching_algorithm=matching))
+        tr = MultiObjectTracker(MaskInferenceConfig(max_detections=2, matching_algorithm=matching, linker="centroid"))
         tr.update(_dets((10, 10), (100, 100)), 0)
         out = tr.update(_dets((12, 10), (102, 100), (600, 600)), 1)     # a third, far away: the limit is 2
         ids = _ids_at(tr, 1)
@@ -25,7 +26,7 @@ def test_an_extra_detection_never_takes_an_id_already_used_on_that_frame():
 
 
 def test_at_the_limit_a_lost_animal_is_picked_up_where_it_reappears():
-    tr = MultiObjectTracker(MaskInferenceConfig(max_detections=2))
+    tr = MultiObjectTracker(MaskInferenceConfig(max_detections=2, linker="centroid"))
     tr.update(_dets((10, 10), (100, 100)), 0)
     tr.update(_dets((102, 100), (700, 650)), 1)          # animal 1 is now far off (beyond the match distance)
     by_id = {r["object_id"]: (r["x"], r["y"]) for r in tr.records if r["frame"] == 1}

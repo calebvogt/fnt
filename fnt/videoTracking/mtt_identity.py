@@ -7,14 +7,20 @@ indoors (slow tags, smoothing, radio bounce), but it is trustworthy when a vole 
 where the match is unambiguous and **carried** along the video tracks from there:
 
 1. **Tracklets**: each camera's tracks, cut where they jump faster than an animal moves (a tracker swap) or are lost
-   for long. Overhead positions go to floor metres through a floor map (``mtt_floor``).
+   for long. Overhead positions go to floor metres through a floor map (``mtt_floor``). On the overhead camera a
+   second mask on an animal already detected in that frame (masks overlapping, typically the whole body plus the
+   head alone) is left out first, keeping the larger mask (a camera's ``"dedupe"``: true/false overrides).
 2. **Anchors** (a frame where a tracklet's animal is plain): a zone camera that sees one vole while UWB has exactly
    one animal in that box and every other animal clear of it; an overhead vole whose nearest UWB animal is close,
    the next nearest far, and no other vole near it. A tracklet whose anchors name two animals holds a swap and is
    cut between them.
 3. **Links** (probably the same animal): *handoffs* - a zone tracklet ends in one of its camera's exits (an
    ``exits.json``) and an overhead tracklet starts by that box within a few seconds, or the other way round;
-   *bridges* - in one camera a tracklet ends and another starts close by soon after (mask flicker, a tracker cut).
+   *bridges* - in one camera a tracklet ends and another starts close by soon after (mask flicker, a tracker cut);
+   *doorway links* - one vole seen at once by a zone camera (touching an exit) and by the overhead camera (at that
+   exit's door on the floor): a strong link. Door positions come from the data (the overhead position of the one
+   vole by the box while one zone detection touches the exit) and are kept in ``doors.json`` in the ``out``
+   folder (edit it by hand, or ``--derive-doors`` to place them again).
 4. **Names**: one integer programme labels every tracklet at once: anchors decide, the plain UWB distance breaks
    ties, and each link whose ends get different names costs its weight (an unnamed end costs nothing), so a name
    travels forward and backward along a chain. No animal is on two tracklets at once (except the two views of a vole in a doorway), nor in two
@@ -38,7 +44,8 @@ where the match is unambiguous and **carried** along the video tracks from there
 
 ``start`` is the clock time of frame 0 (every camera's tracks share frame numbers: clock-synced clips, e.g.
 ``fnt-grid --clips``); UWB second = clock second + ``uwb_offset_s``. Writes ``identities.csv`` (one row per
-tracklet: camera, object_id, first and last frame, animal, unsure, margin, anchors) and ``links.csv``.
+tracklet: camera, object_id, first and last frame, animal, unsure, margin, anchors) and ``links.csv``, plus
+``doors.json``, ``duplicates.csv`` (detections left out) and ``door_links.csv`` when there are any.
 """
 from __future__ import annotations
 
@@ -83,6 +90,19 @@ class Params:
     sure: float = 40.0               # a chain is unsure below this margin
     time_limit_s: float = 900.0
     w_fixed: float = 1e6             # cost of breaking a correction (only when the hard rules leave no choice)
+    dedupe_iou: float = 0.3          # two masks in one frame overlapping this much (IoU) ...
+    dedupe_contain: float = 0.6      # ... or one this much inside the other (of the smaller's area) are one animal
+    door_touch_px: float = 15        # a zone detection's box this close to an exit polygon touches the exit
+    door_box_m: float = 0.3          # deriving a door: the one overhead vole within this of the box (m)
+    door_min_n: int = 5              # frames needed to place a door
+    door_m: float = 0.15             # an overhead detection this close to a door (m) is the vole in that doorway
+    door_min_frames: int = 2         # frames a zone/overhead pair must share a doorway to be linked
+    w_door: float = 2000.0           # weight of a doorway link (much stronger than a handoff)
+    doorway_q: float = 0.9           # a zone and an overhead tracklet seen at once are one vole in a doorway when this
+                                     # share of the overhead one's shared frames is within link_m of the box (was
+                                     # the median: a tracklet half by the box and half out on the floor passed)
+    conflict_rounds: int = 3        # re-solves after cutting tracklets left unnamed by a hard conflict (0: off)
+    conflict_margin_s: float = 0.5   # s added to the travel time (at vmax) kept clear on each side of a conflict
 
 
 def box_dist(x, y, box):
@@ -94,6 +114,96 @@ def _tracks_csv(path: str) -> str:
     if path.endswith(".csv"):
         return path
     return os.path.join(path, "trajectories.csv")
+
+
+def _mask_store(path: str) -> Optional[str]:
+    """The ``*_tracks.h5`` (masks) beside a camera's tracks, or None."""
+    d = os.path.dirname(path) if path.endswith(".csv") else path
+    found = sorted(glob.glob(os.path.join(glob.escape(d), "*_tracks.h5")))
+    return found[0] if found else None
+
+
+def find_duplicates(tj: pd.DataFrame, store: str, iou: float = 0.3, contain: float = 0.6) -> pd.DataFrame:
+    """Detections that are a second mask on an animal already detected in the same frame.
+
+    The overhead model sometimes puts two masks on one vole (typically the whole body and the head/cap alone). Two
+    masks of one frame are one animal when their IoU exceeds ``iou`` or the intersection covers ``contain`` of the
+    smaller; the larger (containing) mask is kept, since the higher-confidence one is often the head alone. Mask
+    overlap only: two real animals side by side don't overlap. Returns one row per dropped detection (frame, drop,
+    keep, iou, contained)."""
+    from .track_store import TrackMaskReader
+    rows = []
+    multi = tj[tj.duplicated("frame", keep=False)]
+    if multi.empty:
+        return pd.DataFrame(columns=["frame", "drop", "keep", "iou", "contained"])
+    has_box = all(c in tj for c in ("bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2"))
+    rd = TrackMaskReader(store)
+    try:
+        for f, g in multi.groupby("frame"):
+            objs = g.object_id.astype(int).tolist()
+            if has_box:                                   # pairs whose boxes meet; nothing else can overlap
+                b = g[["bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2"]].to_numpy(float)
+                pairs = [(i, j) for i in range(len(b)) for j in range(i + 1, len(b))
+                         if b[i, 0] <= b[j, 2] and b[j, 0] <= b[i, 2] and b[i, 1] <= b[j, 3] and b[j, 1] <= b[i, 3]]
+                if not pairs:
+                    continue
+            else:
+                pairs = [(i, j) for i in range(len(objs)) for j in range(i + 1, len(objs))]
+            row_of = {int(rd.object_id[r]): r for r in rd.rows_for_frame(int(f))}
+            masks: Dict[int, Optional[np.ndarray]] = {}
+
+            def mask(o):
+                if o not in masks:
+                    masks[o] = rd.mask_for_row(row_of[o]) if o in row_of else None
+                return masks[o]
+            gone = set()
+            for i, j in pairs:
+                a, b_ = objs[i], objs[j]
+                if a in gone or b_ in gone:
+                    continue
+                ma, mb = mask(a), mask(b_)
+                if ma is None or mb is None:
+                    continue
+                inter = int(np.logical_and(ma, mb).sum())
+                if not inter:
+                    continue
+                sa, sb = int(ma.sum()), int(mb.sum())
+                v_iou, v_cont = inter / (sa + sb - inter), inter / max(min(sa, sb), 1)
+                if v_iou > iou or v_cont > contain:
+                    keep, drop = (a, b_) if sa >= sb else (b_, a)
+                    gone.add(drop)
+                    rows.append(dict(frame=int(f), drop=drop, keep=keep, iou=round(v_iou, 3),
+                                     contained=round(v_cont, 3)))
+    finally:
+        rd.close()
+    return pd.DataFrame(rows, columns=["frame", "drop", "keep", "iou", "contained"])
+
+
+def _touches(poly: np.ndarray, tj: pd.DataFrame, px: float) -> np.ndarray:
+    """Which detections' boxes touch (or lie within ``px`` of) an exit polygon; the centre point without boxes."""
+    import cv2
+    x0, y0 = poly.min(0) - px
+    x1, y1 = poly.max(0) + px
+    if all(c in tj for c in ("bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2")):
+        b = tj[["bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2"]].to_numpy(float)
+    else:
+        xy = tj[["x", "y"]].to_numpy(float)
+        b = np.c_[xy, xy]
+    out = np.zeros(len(b), bool)
+    near = np.flatnonzero((b[:, 0] <= x1) & (b[:, 2] >= x0) & (b[:, 1] <= y1) & (b[:, 3] >= y0))
+    for k in near:
+        bx1, by1, bx2, by2 = b[k]
+        if cv2.pointPolygonTest(poly, ((bx1 + bx2) / 2, (by1 + by2) / 2), True) > -px:
+            out[k] = True
+        elif bx2 > bx1 and by2 > by1:
+            box = np.array([[bx1, by1], [bx2, by1], [bx2, by2], [bx1, by2]], np.float32)
+            out[k] = cv2.intersectConvexConvex(poly, box)[0] > 1
+    return out
+
+
+def doors_path(cfg: Dict, cfg_path: Optional[str] = None) -> str:
+    out = cfg.get("out") or (os.path.dirname(os.path.abspath(cfg_path)) if cfg_path else "")
+    return cfg.get("doors") or (os.path.join(out, "doors.json") if out else "")
 
 
 NOT_ANIMAL = "none"
@@ -146,10 +256,112 @@ class Identity:
                 with open(v["exits"], encoding="utf-8") as fh:
                     d = json.load(fh)
                 self.exits[c] = [np.array(p, np.float32) for e in d.values() for p in e.get("exits", [])]
+        self.doors: Dict[tuple, Dict] = {}               # (zone camera, exit index) -> {"xy", "n", "spread_m"}
+        self.duplicates_ = pd.DataFrame()
+        self.door_links_ = pd.DataFrame(columns=["zone", "over", "frames", "f0", "f1"])
+        self._tj: Dict[str, pd.DataFrame] = {}
+        self._touch: Dict[tuple, np.ndarray] = {}
 
     # ---------------------------------------------------------------- tracklets
     def kind(self, cam):
         return "overhead" if cam in self.floor else "zone"
+
+    def dedupe_on(self, cam) -> bool:
+        """Duplicate masks are merged on overhead cameras unless a camera's ``"dedupe"`` says otherwise."""
+        return bool(self.cams[cam].get("dedupe", self.kind(cam) == "overhead"))
+
+    def detections(self, cam) -> pd.DataFrame:
+        """A camera's detections as named: confident enough, in range, a second mask on one animal left out."""
+        if cam in self._tj:
+            return self._tj[cam]
+        p, v = self.p, self.cams[cam]
+        tj = pd.read_csv(_tracks_csv(v["tracks"]))
+        tj = tj[(tj.confidence >= p.min_conf) & (tj.frame < self.n)].reset_index(drop=True)
+        store = _mask_store(v["tracks"]) if self.dedupe_on(cam) else None
+        if store:
+            dup = find_duplicates(tj, store, p.dedupe_iou, p.dedupe_contain)
+            if len(dup):
+                key = pd.MultiIndex.from_frame(tj[["frame", "object_id"]].astype(int))
+                drop = key.isin(pd.MultiIndex.from_frame(dup[["frame", "drop"]].astype(int)))
+                # the kept mask stands for both: it takes the higher confidence of the pair
+                best = dup.merge(tj[["frame", "object_id", "confidence"]], left_on=["frame", "drop"],
+                                 right_on=["frame", "object_id"]).groupby(["frame", "keep"]).confidence.max()
+                ki = pd.MultiIndex.from_arrays([tj.frame.astype(int), tj.object_id.astype(int)])
+                up = best.reindex(ki).to_numpy()
+                tj["confidence"] = np.fmax(tj.confidence.to_numpy(float), up)
+                tj = tj[~drop].reset_index(drop=True)
+                self.duplicates_ = pd.concat([self.duplicates_, dup.assign(camera=cam)], ignore_index=True)
+        self._tj[cam] = tj
+        return tj
+
+    def touching(self, cam, k) -> np.ndarray:
+        """Which of a zone camera's detections touch its exit ``k``."""
+        if (cam, k) not in self._touch:
+            self._touch[(cam, k)] = _touches(self.exits[cam][k], self.detections(cam), self.p.door_touch_px)
+        return self._touch[(cam, k)]
+
+    def derive_doors(self) -> Dict[tuple, Dict]:
+        """The floor position of each zone-camera exit, from the data: the median overhead position of the one vole
+        by that box while exactly one zone detection touches the exit. An exit seen fewer than ``door_min_n`` times
+        gets no door (and no doorway links)."""
+        p, doors = self.p, {}
+        if not self.floor:
+            return doors
+        ocam = next(iter(self.floor))
+        o = self.detections(ocam)
+        fl = self.floor[ocam].to_floor(o[["x", "y"]].to_numpy(float))
+        by_f = {int(f): idx for f, idx in o.groupby("frame").indices.items()}
+        for cam, polys in self.exits.items():
+            if cam in self.floor or "zone" not in self.cams[cam]:
+                continue
+            box = self.boxes[self.cams[cam]["zone"]]
+            z = self.detections(cam)
+            for k in range(len(polys)):
+                hit = z[self.touching(cam, k)]
+                n_by = hit.groupby("frame").size()
+                pts = []
+                for f in n_by.index[n_by == 1]:
+                    idx = by_f.get(int(f))
+                    if idx is None:
+                        continue
+                    d = box_dist(fl[idx, 0], fl[idx, 1], box)
+                    if (d <= p.door_box_m).sum() == 1:
+                        pts.append(fl[idx][d <= p.door_box_m][0])
+                if len(pts) >= p.door_min_n:
+                    pts = np.array(pts)
+                    med = np.median(pts, 0)
+                    doors[(cam, k)] = dict(xy=med, n=len(pts),
+                                           spread_m=float(np.median(np.linalg.norm(pts - med, axis=1))))
+        return doors
+
+    @staticmethod
+    def save_doors(doors: Dict[tuple, Dict], path: str):
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({f"{c}:{k}": dict(x=round(float(v["xy"][0]), 4), y=round(float(v["xy"][1]), 4), n=int(v["n"]),
+                                        spread_m=round(float(v["spread_m"]), 4)) for (c, k), v in doors.items()},
+                      fh, indent=1)
+
+    @staticmethod
+    def load_doors(path: str) -> Dict[tuple, Dict]:
+        with open(path, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return {(k.rsplit(":", 1)[0], int(k.rsplit(":", 1)[1])): dict(xy=np.array([v["x"], v["y"]], float),
+                                                                       n=v.get("n", 0), spread_m=v.get("spread_m", 0))
+                for k, v in d.items()}
+
+    def use_doors(self, path: Optional[str] = None, rederive: bool = False, log=print):
+        """Door positions from ``path`` when it exists (so a hand-edited file is kept), else derived and saved
+        there."""
+        path = path if path is not None else doors_path(self.cfg)
+        if path and os.path.exists(path) and not rederive:
+            self.doors = self.load_doors(path)
+            log(f"doors: {len(self.doors)} from {path}")
+            return
+        self.doors = self.derive_doors()
+        if path:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            self.save_doors(self.doors, path)
+        log(f"doors: {len(self.doors)} derived from the data" + (f" -> {path}" if path else ""))
 
     def _make(self, cam, obj, fr, xy):
         t = dict(id=-1, cam=cam, obj=int(obj), f0=int(fr[0]), f1=int(fr[-1]), frames=np.asarray(fr, int),
@@ -159,9 +371,8 @@ class Identity:
 
     def tracklets(self) -> List[Dict]:
         p, out = self.p, []
-        for cam, v in self.cams.items():
-            tj = pd.read_csv(_tracks_csv(v["tracks"]))
-            tj = tj[(tj.confidence >= p.min_conf) & (tj.frame < self.n)]
+        for cam in self.cams:
+            tj = self.detections(cam)
             jump = p.jump_px[self.kind(cam)]
             for obj, g in tj.sort_values("frame").groupby("object_id"):
                 fr, xy = g.frame.to_numpy(), g[["x", "y"]].to_numpy()
@@ -305,6 +516,55 @@ class Identity:
                     reach = base + speed * gap
                     if d <= reach:
                         add(a["id"], b["id"], f"bridge {cam}", p.w_bridge * np.exp(-gap / 30) * (1 - 0.5 * d / reach))
+        out += self.door_links(tl, out)
+        return out
+
+    def door_links(self, tl, links) -> List[Dict]:
+        """Doorway links: a frame where exactly one zone detection touches an exit and exactly one overhead detection
+        lies within ``door_m`` of that exit's door shows one vole in two views, so their tracklets get a strong link
+        (``w_door``). A pair that is already a handoff has that link raised to ``w_door`` instead. Not a handoff:
+        the two views may overlap in time only while the overhead one stays by the box (the doorway rule)."""
+        p = self.p
+        self.door_links_ = pd.DataFrame(columns=["zone", "over", "frames", "f0", "f1"])
+        if not self.doors:
+            return []
+        owner = {}                                       # (camera, object, frame) -> tracklet
+        over: Dict[int, list] = {}                       # frame -> [(tracklet, floor xy)] overhead
+        for t in tl:
+            for k, f in enumerate(t["frames"]):
+                owner[(t["cam"], t["obj"], int(f))] = t["id"]
+                if t["floor"] is not None:
+                    over.setdefault(int(f), []).append((t["id"], t["floor"][k]))
+        pairs: Dict[tuple, list] = {}
+        for (cam, k), door in self.doors.items():
+            if cam not in self.exits or k >= len(self.exits[cam]):
+                continue
+            z = self.detections(cam)
+            hit = z[self.touching(cam, k)]
+            one = hit[hit.groupby("frame").frame.transform("size") == 1]
+            for f, obj in zip(one.frame.astype(int), one.object_id.astype(int)):
+                zi = owner.get((cam, obj, f))
+                near = [i for i, q in over.get(f, ()) if np.hypot(*(q - door["xy"])) <= p.door_m]
+                if zi is not None and len(near) == 1:
+                    pairs.setdefault((zi, near[0]), []).append(f)
+        out, rows = [], []
+        by_pair = {frozenset((lk["a"], lk["b"])): lk for lk in links}
+        for (zi, oi), frs in pairs.items():
+            if len(frs) < p.door_min_frames:
+                continue
+            rows.append(dict(zone=zi, over=oi, frames=len(frs), f0=min(frs), f1=max(frs)))
+            lk = by_pair.get(frozenset((zi, oi)))
+            if lk is not None:
+                lk["w"] = max(lk["w"], p.w_door)
+                if "+door" not in lk["kind"]:
+                    lk["kind"] += "+door"
+                continue
+            a, b = (zi, oi) if tl[zi]["f0"] <= tl[oi]["f0"] else (oi, zi)
+            lk = dict(a=a, b=b, kind=f"door {tl[zi]['cam']}", w=float(p.w_door), cam_a=tl[a]["cam"],
+                      cam_b=tl[b]["cam"], frame_a=tl[a]["f1"], frame_b=tl[b]["f0"])
+            by_pair[frozenset((zi, oi))] = lk
+            out.append(lk)
+        self.door_links_ = pd.DataFrame(rows, columns=["zone", "over", "frames", "f0", "f1"])
         return out
 
     # ---------------------------------------------------------------- names
@@ -328,7 +588,80 @@ class Identity:
             return False
         fo = o["floor"][np.isin(o["frames"], list(both))]
         box = self.boxes[self.cams[z["cam"]]["zone"]]
-        return len(fo) > 0 and np.median(box_dist(fo[:, 0], fo[:, 1], box)) <= self.p.link_m
+        return len(fo) > 0 and np.quantile(box_dist(fo[:, 0], fo[:, 1], box), self.p.doorway_q) <= self.p.link_m
+
+    def clashes(self, tl, links) -> List[tuple]:
+        """Pairs of tracklets that can never be the same animal (the hard rules): seen at the same time in two
+        places (a handoff or a doorway pair excepted), or too far apart for the time between them."""
+        p = self.p
+        handoffs = {frozenset((lk["a"], lk["b"])) for lk in links if lk["kind"].startswith("handoff")}
+        fsets = [set(t["frames"].tolist()) for t in tl]
+        order = sorted(range(len(tl)), key=lambda i: tl[i]["f0"])
+        out = []
+        for k, i in enumerate(order):
+            for j in order[k + 1:]:
+                if tl[j]["f0"] > tl[i]["f1"] + p.pair_s * self.fps:
+                    break
+                if tl[j]["f0"] <= tl[i]["f1"]:
+                    both = fsets[i] & fsets[j]
+                    clash = (frozenset((i, j)) not in handoffs and not self._doorway_pair(tl[i], tl[j], both)) \
+                        if len(both) > 3 else self._too_far(tl[i], tl[j])
+                else:
+                    clash = self._too_far(tl[i], tl[j])
+                if clash:
+                    out.append((i, j))
+        return out
+
+    def conflict_cuts(self, tl, lab, anchor, Cm, links) -> Dict[int, List[int]]:
+        """Where to cut tracklets the hard rules left unnamed. A tracklet whose evidence (anchors, UWB) names an
+        animal that a clashing tracklet holds lost all of its frames to that clash, often a long one to a short
+        overlap. Cut it around the other tracklet's span, widened on each side by the time an animal needs (at
+        ``vmax``, plus ``conflict_margin_s``) to get between the two places, so only that stretch is in doubt and
+        the rest can take the name. Returns {tracklet: frames to cut before}."""
+        p = self.p
+        U = len(self.animals)
+        nfr = np.array([len(t["frames"]) for t in tl], float)
+        ev = p.weak * Cm * nfr[:, None]
+        ev[:, :-1] -= p.anchor_w * anchor
+        want = {}
+        for i in np.flatnonzero(np.asarray(lab) == U):
+            a = int(np.argmin(ev[i, :-1]))
+            if ev[i, a] < ev[i, U] and nfr[i] >= 2 * p.min_frames:
+                want[int(i)] = a
+        def pos(t, f):                                   # where tracklet t is at (or nearest to) frame f
+            if t["floor"] is None:
+                return self.box_c[self.cams[t["cam"]]["zone"]]
+            return t["floor"][min(np.searchsorted(t["frames"], f), len(t["frames"]) - 1)]
+
+        def pad(t, o, f, end):                           # frames t needs to get to (from) o's start (end)
+            slack = 0.35 * ((t["floor"] is None) + (o["floor"] is None)) + 0.15
+            d = np.linalg.norm(pos(t, f) - self._place(o, end))
+            return int(np.ceil((max(d - slack, 0) / p.vmax + p.conflict_margin_s) * self.fps))
+
+        cuts: Dict[int, set] = {}
+        for i, j in self.clashes(tl, links):
+            for u, v in ((i, j), (j, i)):
+                if u not in want or int(lab[v]) != want[u]:
+                    continue
+                t, o = tl[u], tl[v]
+                w0 = o["f0"] - pad(t, o, o["f0"], False)
+                w1 = o["f1"] + pad(t, o, o["f1"], True)
+                c = {f for f in (w0, w1 + 1) if t["f0"] < f <= t["f1"]}
+                if c:
+                    cuts.setdefault(u, set()).update(c)
+        return {i: sorted(c) for i, c in cuts.items()}
+
+    def cut(self, tl, cuts: Dict[int, List[int]]) -> List[Dict]:
+        """The tracklets with each one in ``cuts`` cut before those frames (every piece kept)."""
+        out = []
+        for i, t in enumerate(tl):
+            if i not in cuts:
+                out.append(t)
+                continue
+            for piece in np.split(np.arange(len(t["frames"])), np.searchsorted(t["frames"], cuts[i])):
+                if len(piece):
+                    out.append(self._make(t["cam"], t["obj"], t["frames"][piece], t["xy"][piece]))
+        return out
 
     def name(self, tl, anchor, links, fixed=None):
         from scipy.optimize import Bounds, LinearConstraint, milp
@@ -370,22 +703,9 @@ class Identity:
             for a in range(U):
                 row([(nx + li, 1), (i * nA + a, -1), (j * nA + a, 1), (j * nA + U, 1)], 0, np.inf)
                 row([(nx + li, 1), (j * nA + a, -1), (i * nA + a, 1), (i * nA + U, 1)], 0, np.inf)
-        handoffs = {frozenset((lk["a"], lk["b"])) for lk in links if lk["kind"].startswith("handoff")}
-        fsets = [set(t["frames"].tolist()) for t in tl]
-        order = sorted(range(nT), key=lambda i: tl[i]["f0"])
-        for k, i in enumerate(order):
-            for j in order[k + 1:]:
-                if tl[j]["f0"] > tl[i]["f1"] + p.pair_s * self.fps:
-                    break
-                if tl[j]["f0"] <= tl[i]["f1"]:
-                    both = fsets[i] & fsets[j]
-                    clash = (frozenset((i, j)) not in handoffs and not self._doorway_pair(tl[i], tl[j], both)) \
-                        if len(both) > 3 else self._too_far(tl[i], tl[j])
-                else:
-                    clash = self._too_far(tl[i], tl[j])
-                if clash:
-                    for a in range(nA - 1):
-                        row([(i * nA + a, 1), (j * nA + a, 1)], 0, 1)
+        for i, j in self.clashes(tl, links):
+            for a in range(nA - 1):
+                row([(i * nA + a, 1), (j * nA + a, 1)], 0, 1)
         A_ = coo_matrix((V_, (R_, C_)), shape=(len(lo), nx + ny)).tocsr()
         res = milp(c, constraints=LinearConstraint(A_, lo, hi), integrality=np.r_[np.ones(nx), np.zeros(ny)],
                    bounds=Bounds(0, ub), options={"time_limit": p.time_limit_s})
@@ -415,22 +735,49 @@ class Identity:
         return lab, margin, Cm
 
     # ---------------------------------------------------------------- all
-    def run(self, log=print) -> pd.DataFrame:
+    def run(self, log=print, doors: Optional[str] = None, rederive_doors: bool = False) -> pd.DataFrame:
+        """Name every tracklet. ``doors``: the door-position file (default ``doors_path``: ``doors.json`` in the
+        ``out`` folder), read when it exists, else derived from the data and written there."""
         tl = self.tracklets()
+        if len(self.duplicates_):
+            log(f"{len(self.duplicates_)} duplicate mask(s) left out (a second mask on an animal already detected): "
+                + ", ".join(f"{c} {n}" for c, n in self.duplicates_.camera.value_counts().items()))
+        if self.exits and self.floor:
+            self.use_doors(doors, rederive_doors, log)
         for i, t in enumerate(tl):
             t["id"] = i
         tl, n_cuts = self.split_swaps(tl, self.anchors(tl))
-        tl, fixed = self.apply_corrections(tl)
-        anchor = np.zeros((len(tl), len(self.animals)))
-        for i, t in enumerate(tl):
-            t["id"] = i
-            t["cost"] = self.uwb_cost(t)
-        for i, f, a in self.anchors(tl):
-            anchor[i, a] += self.p.anchor_every
+
+        def prepare(tl):
+            tl, fixed = self.apply_corrections(tl)
+            anchor = np.zeros((len(tl), len(self.animals)))
+            for i, t in enumerate(tl):
+                t["id"] = i
+                if "cost" not in t:
+                    t["cost"] = self.uwb_cost(t)
+            for i, f, a in self.anchors(tl):
+                anchor[i, a] += self.p.anchor_every
+            return tl, fixed, anchor
+
+        tl, fixed, anchor = prepare(tl)
         log(f"{len(tl)} tracklets ({n_cuts} cut where their anchors changed animal); anchors on "
             f"{int((anchor.sum(1) > 0).sum())}")
         links = self.links(tl)
         lab, margin, Cm = self.name(tl, anchor, links, fixed)
+        # A tracklet a hard rule left unnamed loses all its frames to the clash, often a long one to a short
+        # overlap: cut it where the clash starts and ends and solve again, so only that stretch stays in doubt.
+        self.conflict_cuts_ = 0
+        for _ in range(self.p.conflict_rounds):
+            cuts = self.conflict_cuts(tl, lab, anchor, Cm, links)
+            if not cuts:
+                break
+            self.conflict_cuts_ += sum(len(c) for c in cuts.values())
+            tl, fixed, anchor = prepare(self.cut(tl, cuts))
+            links = self.links(tl)
+            lab, margin, Cm = self.name(tl, anchor, links, fixed)
+        if self.conflict_cuts_:
+            log(f"{self.conflict_cuts_} cut(s) where a hard conflict had left a tracklet unnamed; "
+                f"{len(tl)} tracklets")
         self.broken_ = []                                # corrections the hard rules could not meet
         for i, a in fixed.items():
             if int(lab[i]) != (len(self.animals) if a is None else a):
@@ -449,13 +796,13 @@ class Identity:
                              margin=round(float(margin[t["id"]]), 1) if name else "",
                              anchors=" ".join(f"{self.animals[j]}:{int(v)}" for j, v in enumerate(anchor[t["id"]]) if v),
                              uwb_m=round(float(Cm[t["id"], a]), 3) if name else ""))
-        self.links_ = pd.DataFrame(links)
-        if len(self.links_):
-            self.links_["kept"] = [lab[lk["a"]] == lab[lk["b"]] for lk in links]
+        self.links_ = pd.DataFrame(links, columns=["a", "b", "kind", "w", "cam_a", "cam_b", "frame_a", "frame_b"])
+        self.links_["kept"] = [lab[lk["a"]] == lab[lk["b"]] for lk in links]
         out = pd.DataFrame(rows).sort_values(["camera", "frame_first"])
         named = out[out.animal != ""].detections.sum() / max(out.detections.sum(), 1)
-        log(f"{len(links)} candidate links, {int(self.links_.kept.sum()) if len(links) else 0} kept; named "
-            f"{named:.0%} of tracked detections")
+        n_door = int(self.links_.kind.str.contains("door").sum()) if len(links) else 0
+        log(f"{len(links)} candidate links ({n_door} doorway), {int(self.links_.kept.sum()) if len(links) else 0} "
+            f"kept; named {named:.0%} of tracked detections")
         return out
 
 
@@ -478,15 +825,21 @@ def lookup(identities: pd.DataFrame):
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("config", help="identity.json (see the module's description)")
+    ap.add_argument("--derive-doors", action="store_true",
+                    help="place the doors from the data again, replacing doors.json")
     a = ap.parse_args(argv)
     with open(a.config, encoding="utf-8") as fh:
         cfg = json.load(fh)
     out = cfg.get("out") or os.path.dirname(os.path.abspath(a.config))
     os.makedirs(out, exist_ok=True)
     idn = Identity(cfg, read_corrections(corrections_path(cfg, a.config)))
-    res = idn.run()
+    res = idn.run(doors=doors_path(cfg, a.config), rederive_doors=a.derive_doors)
     res.to_csv(os.path.join(out, "identities.csv"), index=False)
     idn.links_.to_csv(os.path.join(out, "links.csv"), index=False)
+    if len(idn.duplicates_):
+        idn.duplicates_.to_csv(os.path.join(out, "duplicates.csv"), index=False)
+    if len(getattr(idn, "door_links_", ())):
+        idn.door_links_.to_csv(os.path.join(out, "door_links.csv"), index=False)
     print("wrote", os.path.join(out, "identities.csv"))
     return 0
 

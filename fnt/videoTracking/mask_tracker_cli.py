@@ -16,6 +16,10 @@ Mask Tracker window (the Inference tab, several videos at once with
 ``--parallel auto``), with every Inference setting as a flag;
 ``--settings-from`` repeats an earlier run's settings from its output folder.
 
+``relink <output folders...>`` links finished runs again with the current
+frame-to-frame linker from their saved detections, without re-detecting (see
+:mod:`fnt.videoTracking.mtt_relink`).
+
 ``pack-session --project P --focus LIST --out DIR`` copies a focus list's frames
 and labels into a portable session folder that opens as a project on any
 machine with FNT; ``unpack-session --session S`` merges the labels made there
@@ -72,12 +76,15 @@ def add_inference_settings(g) -> None:
                    help="Max objects per frame (0 = unlimited).")
     g.add_argument("--conf", type=float, default=None, help="Confidence threshold.")
     g.add_argument("--max-disappear", dest="max_disappear", default=None, metavar="N",
-                   help="Frames a track may go undetected before it ends: 'never' or N.")
+                   help="Analysed frames a track may go undetected before it ends: 'auto' (bytetrack: 6, "
+                        "never with --max-objects 1; centroid: never), 'never' or N.")
     g.add_argument("--frame-step", dest="frame_step", type=int, default=None, metavar="N",
                    help="Detect and track every Nth frame (1 = every frame). Frame numbers "
                         "and times stay the video's; e.g. 3 on 30 fps video = 10 per second.")
     g.add_argument("--iou", type=float, default=None, help="IoU threshold for matching.")
-    g.add_argument("--matching", choices=["hungarian", "greedy"], default=None)
+    g.add_argument("--matching", choices=["hungarian", "greedy"], default=None,
+                   help="Assignment for the centroid linker.")
+    add_linker_settings(g)
     g.add_argument("--resolution", default=None, metavar="PX",
                    help="Inference size: 'trained' or 256/384/512/640/800.")
     g.add_argument("--infer-device", dest="infer_device", default=None,
@@ -96,6 +103,25 @@ def add_inference_settings(g) -> None:
                    help="Close the window when the run ends.")
 
 
+def add_linker_settings(g) -> None:
+    """How each frame's detections join tracks (shared by ``track`` and ``relink``)."""
+    g.add_argument("--linker", choices=["bytetrack", "centroid"], default=None,
+                   help="bytetrack (default): centroid distance + mask overlap, two passes by "
+                        "confidence, Kalman motion. centroid: the linker before 2026-11-20.")
+    g.add_argument("--gate-px", dest="gate_px", type=float, default=None, metavar="PX",
+                   help="bytetrack: farthest an animal moves per video frame, px (x frame step); "
+                        "0 = auto (half the animal size, at least 1.2%% of the frame diagonal).")
+    g.add_argument("--two-pass-conf", dest="two_pass_conf", type=float, default=None, metavar="C",
+                   help="bytetrack: detections below C only continue tracks; 0 = auto, -1 = one pass.")
+    g.add_argument("--iou-weight", dest="iou_weight", type=float, default=None, metavar="W",
+                   help="bytetrack: weight of mask overlap in the cost (0 = distance only).")
+    g.add_argument("--motion", choices=["kalman", "none"], default=None,
+                   help="bytetrack: predict where each animal is next (kalman) or not.")
+    _on_off(g, "takeover", "At the object limit an unmatched detection continues the nearest free "
+                           "track (default for centroid and --max-objects 1).",
+            "Never: an unmatched detection starts a track.")
+
+
 #: (flag, dest) of add_inference_settings's value flags, for settings_argv.
 _VALUE_FLAGS = [("--settings-from", "settings_from"), ("--parallel", "parallel"),
                 ("--max-objects", "max_objects"), ("--conf", "conf"),
@@ -104,9 +130,11 @@ _VALUE_FLAGS = [("--settings-from", "settings_from"), ("--parallel", "parallel")
                 ("--matching", "matching"), ("--resolution", "resolution"),
                 ("--infer-device", "infer_device"), ("--classifier", "classifier"),
                 ("--nc-threshold", "nc_threshold"), ("--cls-window", "cls_window"),
-                ("--min-bout", "min_bout"), ("--uncertain-gap", "uncertain_gap")]
+                ("--min-bout", "min_bout"), ("--uncertain-gap", "uncertain_gap"),
+                ("--linker", "linker"), ("--gate-px", "gate_px"), ("--two-pass-conf", "two_pass_conf"),
+                ("--iou-weight", "iou_weight"), ("--motion", "motion")]
 _ON_OFF_FLAGS = [("masks", "masks"), ("tracked-video", "tracked_video"),
-                 ("save-masks", "save_masks"), ("preview", "preview")]
+                 ("save-masks", "save_masks"), ("preview", "preview"), ("takeover", "takeover")]
 
 
 def settings_argv(args) -> List[str]:
@@ -138,6 +166,8 @@ def inference_settings(args) -> Dict:
         rec = read_run_settings(args.settings_from)
         out.update(rec.get("settings", {}))
         out.pop("model_path", None)
+        # Runs recorded before the linker setting existed used the centroid linker.
+        out.setdefault("linker", "centroid")
         out["create_tracked_video"] = rec.get("create_tracked_video", True)
         out["classifier_dir"] = rec.get("classifier")
         out.update(rec.get("classifier_settings") or {})
@@ -148,7 +178,9 @@ def inference_settings(args) -> Dict:
         "infer_device": "device", "masks": "use_masks", "tracked_video": "create_tracked_video",
         "save_masks": "save_masks", "preview": "show_preview", "nc_threshold": "nc_threshold",
         "cls_window": "cls_window", "min_bout": "min_bout", "uncertain_gap": "uncertain_gap",
-        "frame_step": "frame_step",
+        "frame_step": "frame_step", "linker": "linker", "gate_px": "gate_px",
+        "two_pass_conf": "two_pass_conf", "iou_weight": "iou_weight", "motion": "motion",
+        "takeover": "takeover",
     }
     for a, k in flags.items():
         v = getattr(args, a, None)
@@ -156,7 +188,8 @@ def inference_settings(args) -> Dict:
             out[k] = v
     md = getattr(args, "max_disappear", None)
     if md is not None:
-        out["max_disappeared_frames"] = 0 if str(md).lower() == "never" else int(md)
+        m = str(md).lower()
+        out["max_disappeared_frames"] = 0 if m == "never" else (-1 if m == "auto" else int(md))
     res = getattr(args, "resolution", None)
     if res is not None:
         out["inference_size"] = 0 if str(res).lower() == "trained" else int(str(res).rstrip("px"))
@@ -169,6 +202,41 @@ def inference_settings(args) -> Dict:
             raise ValueError("--parallel takes a number or 'auto'")
         out["parallel"] = par
     return out
+
+
+def relink_folders(items: List[str]) -> List[str]:
+    """``<video>_MaskTracker`` folders with a track, from folders (themselves or
+    searched recursively, leaving out _TO_DELETE_tracking) and .txt lists."""
+    out: List[str] = []
+
+    def is_run(d):
+        return os.path.isdir(d) and any(
+            n.endswith("_tracks.h5") or n == "trajectories.csv" for n in os.listdir(d))
+
+    def add(p):
+        p = p.strip().strip('"')
+        if not p:
+            return
+        p = os.path.normpath(p)
+        if p.lower().endswith(".txt") and os.path.isfile(p):
+            with open(p, encoding="utf-8-sig") as fh:
+                for ln in fh:
+                    if ln.strip() and not ln.strip().startswith("#"):
+                        add(ln)
+            return
+        if p.endswith("_MaskTracker") and is_run(p):
+            out.append(p)
+            return
+        if os.path.isdir(p):
+            for root, dirs, _ in os.walk(p):
+                dirs[:] = sorted(d for d in dirs if d != "_TO_DELETE_tracking")
+                for d in list(dirs):
+                    if d.endswith("_MaskTracker") and is_run(os.path.join(root, d)):
+                        out.append(os.path.join(root, d))
+                        dirs.remove(d)
+    for it in items:
+        add(it)
+    return list(dict.fromkeys(out))
 
 
 def frame_name(video: str, index: int) -> str:
@@ -374,6 +442,21 @@ def _parser():
                          "<video>_MaskTracker folder are moved to _TO_DELETE_tracking/ first (not deleted); the "
                          "folder and other tools' files in it (the ROI Tool's drawing) stay.")
     add_inference_settings(t_.add_argument_group("settings"))
+    l_ = sub.add_parser("relink",
+                        help="Link finished runs again with the current linker, without re-detecting: "
+                             "reads each <video>_MaskTracker folder's saved detections and writes its "
+                             "trajectories and mask store anew (old outputs to _TO_DELETE_tracking/).")
+    l_.add_argument("folders", nargs="+",
+                    help="<video>_MaskTracker folders, folders holding them (searched recursively) "
+                         "and/or .txt lists of them.")
+    l_.add_argument("--tracked-video", dest="tracked_video", action="store_true",
+                    help="Draw the tracked video again from the source video (slow); otherwise the old "
+                         "one, showing the old ids, moves aside with the other outputs.")
+    l_.add_argument("--no-window", dest="no_window", action="store_true",
+                    help="Print progress here instead of showing the progress window.")
+    l_.add_argument("--max-disappear", dest="max_disappear", default=None, metavar="N",
+                    help="'auto' (default), 'never' or N analysed frames.")
+    add_linker_settings(l_.add_argument_group("linker"))
     x_ = sub.add_parser("exits",
                         help="Draw each camera's exits (the openings in the wall where animals come and go) on its "
                              "median frame; saved as exits.json in each video folder.")
@@ -390,6 +473,16 @@ def main(argv=None) -> int:
     if args.cmd == "track":
         from .mask_tracker_gui import track_main
         return track_main(args)
+    if args.cmd == "relink":
+        from .mtt_relink import run_relink
+        folders = relink_folders(args.folders)
+        if not folders:
+            print("no Mask Tracker output folders found", file=sys.stderr)
+            return 1
+        overrides = {k: v for k, v in inference_settings(args).items()
+                     if k in ("linker", "gate_px", "two_pass_conf", "iou_weight", "motion", "takeover",
+                              "max_disappeared_frames")}
+        return run_relink(folders, overrides, args.tracked_video, window=not args.no_window)
     if args.cmd == "extract-frames":
         res = extract_frames(args.project, read_frame_list(args.frames), args.workers)
         if args.focus_out:

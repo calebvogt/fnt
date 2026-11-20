@@ -324,6 +324,10 @@ def anchor_overfull_days(reader, track, slack=60.0, fps=30.0):
     hour lies on top of the next day's first (VoleCosm VC-T014, 2026-11-01).
     Each file of such a bucket is moved to where its clock says it starts.
     Returns ``[(path, old_start, new_start)]`` for the files moved.
+
+    That places the next day right, but the over-full day itself would have its
+    repeated hour's files on top of each other; the grid CLI encodes that day
+    on the continuous axis of `continuous_track` instead.
     """
     from .camera_timeline import _expected_bucket_seconds
     by_day = {}
@@ -354,6 +358,112 @@ def anchor_overfull_days(reader, track, slack=60.0, fps=30.0):
     if moved:
         track.segments.sort(key=lambda s: s.start)
     return moved
+
+
+#: How far an NVR's clock falls back when daylight saving ends.
+FALLBACK_S = 3600.0
+
+
+def fallback_days(track, slack=600.0):
+    """The dates whose day bucket holds about 25 h of footage: daylight saving ended that night and the NVR recorded
+    the repeated hour into the same day (VoleCosm VC-T014, 2026-11-01). Judged from the file durations, on the
+    timeline as the file names built it (before `anchor_overfull_days`). A trial's last bucket is never one: it ends
+    whenever recording stopped."""
+    from .camera_timeline import _expected_bucket_seconds
+    by_day = {}
+    for s in track.segments:
+        by_day.setdefault(s.day, []).append(s)
+    days = sorted(by_day)
+    out = set()
+    for i, day in enumerate(days[:-1]):
+        over = sum(s.duration for s in by_day[day]) - _expected_bucket_seconds(day, days[i + 1])
+        if abs(over - FALLBACK_S) <= slack:
+            out.add(datetime.datetime.strptime(day, "%Y%m%d%H%M%S").date())
+    return out
+
+
+def continuous_track(track, day):
+    """A copy of `track` on one continuous time axis through `day`, the day daylight saving ends.
+
+    `track` must be as the file names built it (not yet anchored by clocks): `day`'s files are then chained from its
+    stamp in the order recorded, so they run 25 h, to 01:00 the next day, with both 01:xx hours in order. Every later
+    day's files (and gaps) move an hour later to follow on. On this axis the day is [00:00, 25:00) and, from its
+    fallback on, a camera's burnt-in clock reads an hour behind the axis (see `unwrap_fallback`). The segments are
+    new objects, so anchoring the original track later does not move them.
+    """
+    from .camera_timeline import CameraTrack, Gap, Segment
+    stamp = f"{day:%Y%m%d}"
+    hour = datetime.timedelta(seconds=FALLBACK_S)
+    segs = []
+    for s in track.segments:
+        c = Segment(s.path, s.day, s.seq, s.duration)
+        later = s.day[:8] > stamp
+        c.start = s.start + hour if later else s.start
+        c.end = s.end + hour if later else s.end
+        segs.append(c)
+    later = [s.start for s in track.segments if s.day[:8] > stamp]
+    first_later = min(later) if later else None
+    gaps = [Gap(g.start + (hour if first_later is not None and g.start >= first_later else datetime.timedelta(0)),
+                g.duration, seq=g.seq, unlocated=g.unlocated) for g in track.gaps]
+    clone = CameraTrack(track.name, track.folder, sorted(segs, key=lambda s: s.start), gaps)
+    clone.clock_offset = getattr(track, "clock_offset", 0.0)
+    return clone
+
+
+def unwrap_fallback(probes, tol=60.0, min_readings=3):
+    """Clock readings put on the continuous axis of the day daylight saving ends (see `continuous_track`).
+
+    There a camera's clock reads about 3600 s behind the axis from its fallback on (inside a file or at a file
+    change). Per camera: when its readings sit on two levels 3600 +- `tol` s apart, the higher one first, every
+    reading on the lower level from the first one on gets 3600 s added to its clock and its error. A lone reading an
+    hour off (a misread hour digit) is not a fallback: each level needs `min_readings`.
+
+    Returns ``(readings, {camera: number shifted})``; readings of other days come back as they were.
+    """
+    hour = datetime.timedelta(seconds=FALLBACK_S)
+    out = list(probes)
+    by_cam = {}
+    for i, p in enumerate(probes):
+        if p and p.get("delta") is not None:
+            by_cam.setdefault(p.get("camera"), []).append(i)
+    shifted = {}
+    for cam, idx in by_cam.items():
+        idx = sorted(idx, key=lambda i: probes[i]["timeline"])
+        d = np.array([probes[i]["delta"] for i in idx])
+        if d.max() - d.min() < FALLBACK_S - tol:
+            continue
+        mid = (d.max() + d.min()) / 2
+        hi, lo = d > mid, d <= mid
+        if hi.sum() < min_readings or lo.sum() < min_readings:
+            continue
+        if abs(np.median(d[hi]) - np.median(d[lo]) - FALLBACK_S) > tol:
+            continue
+        first = int(np.argmax(lo))
+        if hi[first:].sum() > 0.1 * hi.sum():      # not a step down: the levels are mixed in time
+            continue
+        n = 0
+        for k in range(first, len(idx)):
+            if lo[k] and abs(d[k] + FALLBACK_S - np.median(d[hi])) <= tol:
+                p = dict(probes[idx[k]])
+                p["delta"] = p["delta"] + FALLBACK_S
+                if p.get("clock") is not None:
+                    p["clock"] = p["clock"] + hour
+                out[idx[k]] = p
+                n += 1
+        if n:
+            shifted[cam] = n
+    return out, shifted
+
+
+def grid_error(clock, start, grid_t, fallback=False, misread=10.0):
+    """A cell's clock error in a finished grid: the second its clock ticks to, from the chunk's `start`, minus the
+    grid time of the frame it ticks on; None for a misread (`misread` s or more off). On the day daylight saving ends
+    (`fallback`) the grid runs on the continuous axis, so a clock reading an hour behind it is that day's second
+    01:xx hour and is moved back onto the axis."""
+    err = (clock - start).total_seconds() - grid_t
+    if fallback and abs(err + FALLBACK_S) < misread:
+        err += FALLBACK_S
+    return err if abs(err) < misread else None
 
 
 def segment_at(track, when):
