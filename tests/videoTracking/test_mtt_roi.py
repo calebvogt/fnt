@@ -77,6 +77,28 @@ def test_to_frame_maps_back_and_drops_detections_under_the_lid():
     assert full[2][51:55, 140:150].all()             # the part below it kept (the edge row is the lid's)
 
 
+def test_margin_grows_the_area_but_not_the_holes():
+    r = ROI(include=[ARENA], exclude=[LID], frame_size=(200, 100), margin=5)
+    assert ROI.from_dict(json.loads(json.dumps(r.to_dict()))).margin == 5
+    assert "margin" not in _roi().to_dict() and ROI.from_dict(_roi().to_dict()).margin == 0
+    assert r.for_size(400, 200).margin == 10                 # scaled with the frame
+    assert r.box(200, 100) == (15, 5, 185, 95)
+    keep = r.keep_mask(100, 200)
+    assert keep[92, 100] and not keep[96, 100]              # 3 px past the floor line: seen; 7 px: not
+    assert not keep[30, 150]                                # under the lid: still excluded
+    out, _ = r.apply(np.full((100, 200, 3), 255, np.uint8))
+    assert (out[87, 85] == 255).all()                       # frame row 92, in the margin: not filled
+    # a vole on the bottom wall whose back reaches 4 px past the floor line
+    back = _box_mask(100, 200, 60, 80, 80, 94)
+    assert _roi().clip(back).sum() == 20 * 10               # no margin: cut at row 89
+    assert (r.clip(back) == back).all()                     # margin: whole
+    # one centred just past the floor line: dropped without a margin, kept with one
+    edge = _box_mask(100, 200, 60, 86, 80, 99)
+    assert _roi().clip(edge) is None and r.clip(edge) is not None
+    assert len(r.include_outlines(200, 100)) == 1
+    assert "grown by 5 px" in r.describe()
+
+
 def test_export_cuts_frames_and_labels(tmp_path):
     from fnt.videoTracking.yolo_training import convert_coco_to_yolo
     imgs = tmp_path / "frames"
@@ -256,6 +278,12 @@ def test_the_editor_draws_outlines_and_moves_corners():
     dlg.grab()
     r = dlg.roi()
     assert r.frame_size == (200, 100) and len(r.include) == 1 and len(r.exclude) == 1
+    assert r.margin == 0 and dlg.roi() is r                 # rebuilt only when something changes
+    dlg.spin_margin.setValue(6)
+    assert dlg.roi().margin == 6 and dlg.roi() is not r
+    dlg.grab()                                        # paints the dashed grown outline
+    again = ROIEditorDialog(_frame(), dlg.roi())
+    assert again.spin_margin.value() == 6
 
 
 def test_mask_tracker_draws_and_saves_the_roi(monkeypatch):
@@ -280,6 +308,7 @@ def test_mask_tracker_draws_and_saves_the_roi(monkeypatch):
         c.set_mode("exclude")
         c._points = list(LID)
         c.close_outline()
+        dlg.spin_margin.setValue(3)
         dlg.grab()                                   # paints without error
         return QDialog.Accepted
     monkeypatch.setattr(E.ROIEditorDialog, "exec_", drawn)
@@ -287,8 +316,8 @@ def test_mask_tracker_draws_and_saves_the_roi(monkeypatch):
     with open(os.path.join(d, "project_config.json")) as fh:
         saved = json.load(fh)["roi"]
     assert len(saved["include"]) == 1 and len(saved["exclude"]) == 1
-    assert saved["frame_size"] == [200, 100]
-    assert w.btn_roi.text() == "ROI" and w.preview.roi is not None
+    assert saved["frame_size"] == [200, 100] and saved["margin"] == 3
+    assert w.btn_roi.text() == "ROI" and w.preview.roi.margin == 3
     w.preview.resize(400, 200)
     w.preview.grab()
     w.close()

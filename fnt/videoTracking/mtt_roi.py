@@ -10,9 +10,14 @@ project, says where the model may look:
              everything outside it is filled flat grey.
     exclude  polygons: holes in that area, filled grey too, so nothing there
              is learned or detected (a mouse seen through a box lid)
+    margin   pixels the included area is grown by all round (default 0).
+             Animals are taller than the floor: near a wall the camera sees
+             their backs beyond the floor's edge, and an area drawn on the
+             floor line would cut them off. Excluded holes stay as drawn.
 
 It lives in ``project_config.json`` under ``"roi"`` with the frame size it
-was drawn on (``"frame_size": [w, h]``; other sizes are scaled to it), and is
+was drawn on (``"frame_size": [w, h]``; other sizes are scaled to it, the
+margin too), and is
 copied into each model's ``training_config.json``: training exports frames
 cut and filled, and every way of running that model (post-training
 prediction, Predict, batch sidecars, behaviour and Fusion QC detectors)
@@ -47,6 +52,7 @@ class ROI:
     exclude: List[Polygon] = field(default_factory=list)
     frame_size: Optional[Tuple[int, int]] = None      # (w, h) it was drawn on
     fill: int = FILL
+    margin: float = 0.0                               # px (at frame_size) the included area grows by
 
     # ------------------------------------------------------------- storage
     @classmethod
@@ -59,7 +65,7 @@ class ROI:
             include.append([(x0, y0), (x1 - 1, y0), (x1 - 1, y1 - 1), (x0, y1 - 1)])
         roi = cls(include=include, exclude=_polys(d.get("exclude")),
                   frame_size=tuple(int(v) for v in d["frame_size"]) if d.get("frame_size") else None,
-                  fill=int(d.get("fill", FILL)))
+                  fill=int(d.get("fill", FILL)), margin=max(0.0, float(d.get("margin") or 0)))
         return None if roi.is_empty() else roi
 
     def to_dict(self) -> Dict:
@@ -72,6 +78,8 @@ class ROI:
             d["frame_size"] = [int(v) for v in self.frame_size]
         if self.fill != FILL:
             d["fill"] = int(self.fill)
+        if self.margin and self.include:
+            d["margin"] = round(float(self.margin), 1)
         return d
 
     def is_empty(self) -> bool:
@@ -86,6 +94,8 @@ class ROI:
                 parts.append(f"area {x1 - x0}x{y1 - y0} at ({x0}, {y0})")
             else:
                 parts.append(f"{len(self.include)} included area(s)")
+            if self.margin:
+                parts[-1] += f" (outline grown by {self.margin:g} px)"
         if self.exclude:
             parts.append(f"{len(self.exclude)} excluded area(s)")
         return ", ".join(parts) or "none"
@@ -100,21 +110,47 @@ class ROI:
         def scale(polys):
             return [[(x * sx, y * sy) for x, y in p] for p in polys]
         return ROI(include=scale(self.include), exclude=scale(self.exclude),
-                   frame_size=(w, h), fill=self.fill)
+                   frame_size=(w, h), fill=self.fill, margin=self.margin * (sx + sy) / 2)
 
-    def keep_mask(self, h: int, w: int) -> np.ndarray:
-        """True where the model may look on an ``h`` x ``w`` frame."""
+    def include_mask(self, h: int, w: int) -> np.ndarray:
+        """True inside the included area grown by the margin, before the
+        excluded holes are cut (everywhere when there is no included area)."""
         key = (h, w)
-        cache = self.__dict__.setdefault("_keep_cache", {})
+        cache = self.__dict__.setdefault("_include_cache", {})
         if key not in cache:
             r = self.for_size(w, h)
             if r.include:
                 m = np.zeros((h, w), np.uint8)
                 for p in r.include:
                     cv2.fillPoly(m, [np.round(np.asarray(p)).astype(np.int32)], 1)
+                rad = int(round(r.margin))
+                if rad > 0:
+                    m = cv2.dilate(m, cv2.getStructuringElement(
+                        cv2.MORPH_ELLIPSE, (2 * rad + 1, 2 * rad + 1)))
             else:
                 m = np.ones((h, w), np.uint8)
-            for p in r.exclude:
+            cache[key] = m.astype(bool)
+        return cache[key]
+
+    def include_outlines(self, w: int, h: int) -> List[Polygon]:
+        """The grown included area's outlines on a ``w`` x ``h`` frame (drawn
+        dashed around the outlines as drawn)."""
+        cache = self.__dict__.setdefault("_outline_cache", {})
+        if (w, h) not in cache:
+            contours, _ = cv2.findContours(self.include_mask(h, w).astype(np.uint8),
+                                           cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cache[(w, h)] = [[(float(x), float(y)) for x, y in
+                              cv2.approxPolyDP(c, 0.7, True).reshape(-1, 2)]
+                             for c in contours if len(c) >= 3]
+        return cache[(w, h)]
+
+    def keep_mask(self, h: int, w: int) -> np.ndarray:
+        """True where the model may look on an ``h`` x ``w`` frame."""
+        key = (h, w)
+        cache = self.__dict__.setdefault("_keep_cache", {})
+        if key not in cache:
+            m = self.include_mask(h, w).astype(np.uint8)
+            for p in self.for_size(w, h).exclude:
                 cv2.fillPoly(m, [np.round(np.asarray(p)).astype(np.int32)], 0)
             cache[key] = m.astype(bool)
         return cache[key]

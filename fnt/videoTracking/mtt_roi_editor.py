@@ -3,8 +3,9 @@
 ``ROIEditorDialog`` shows a frame. Click out the corners of the area the
 model sees (Include) and of any holes in it (Exclude); a click on the first
 corner, a double-click, a right-click or Enter closes the outline. Corners
-of finished outlines can be dragged. ``paint_roi`` shades what the model
-will not see, here and over Mask Tracker's preview.
+of finished outlines can be dragged. Margin grows the included area all
+round (dashed line). ``paint_roi`` shades what the model will not see, here
+and over Mask Tracker's preview.
 """
 from __future__ import annotations
 
@@ -17,7 +18,7 @@ from PyQt5.QtGui import (QBrush, QColor, QImage, QPainter, QPainterPath, QPen, Q
                          QPolygonF)
 from PyQt5.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QDialog, QHBoxLayout,
                              QLabel, QListWidget, QPushButton, QRadioButton, QSizePolicy,
-                             QVBoxLayout, QWidget)
+                             QSpinBox, QVBoxLayout, QWidget)
 
 from .mtt_roi import ROI
 
@@ -50,7 +51,8 @@ def paint_roi(painter: QPainter, roi: ROI, img_w: int, img_h: int,
     (ax, ay), (bx, by) = to_widget(0, 0), to_widget(img_w, img_h)
     frame = QPainterPath()
     frame.addRect(QRectF(QPointF(ax, ay), QPointF(bx, by)))
-    inside = path(r.include) if r.include else frame
+    grown = roi.include_outlines(img_w, img_h) if r.include and r.margin >= 0.5 else None
+    inside = path(grown) if grown else path(r.include) if r.include else frame
     holes = path(r.exclude).intersected(inside)
     painter.save()
     painter.setPen(Qt.NoPen)
@@ -65,6 +67,10 @@ def paint_roi(painter: QPainter, roi: ROI, img_w: int, img_h: int,
         for i, p in enumerate(polys):
             hot = highlight == (kind, i)
             painter.setPen(QPen(color, 3.0 if hot else 1.6, Qt.SolidLine))
+            painter.drawPolygon(poly(p))
+    if grown:                                   # the margin's edge: what the model sees
+        painter.setPen(QPen(INCLUDE_COLOR, 1.4, Qt.DashLine))
+        for p in grown:
             painter.drawPolygon(poly(p))
     painter.restore()
 
@@ -88,6 +94,9 @@ class _ROICanvas(QWidget):
         r = roi.for_size(self.img_w, self.img_h) if roi is not None else ROI()
         self.areas = {"include": [list(p) for p in r.include],
                       "exclude": [list(p) for p in r.exclude]}
+        self.margin = float(r.margin)             # px on this frame
+        self._roi_key = None                      # roi() is rebuilt only when these change
+        self._roi_val: Optional[ROI] = None
         self.mode = "include"
         self.highlight: Optional[Tuple[str, int]] = None
         self._points: List[Tuple[float, float]] = []      # the outline being drawn
@@ -131,10 +140,19 @@ class _ROICanvas(QWidget):
         return None
 
     def roi(self) -> Optional[ROI]:
-        r = ROI(include=[list(p) for p in self.areas["include"]],
-                exclude=[list(p) for p in self.areas["exclude"]],
-                frame_size=(self.img_w, self.img_h))
-        return None if r.is_empty() else r
+        # The same object while nothing changes, so its grown outline (a
+        # dilation of the whole frame) is worked out once, not at every repaint.
+        key = (repr(self.areas), self.margin, self.img_w, self.img_h)
+        if key != self._roi_key:
+            r = ROI(include=[list(p) for p in self.areas["include"]],
+                    exclude=[list(p) for p in self.areas["exclude"]],
+                    frame_size=(self.img_w, self.img_h), margin=self.margin)
+            self._roi_key, self._roi_val = key, None if r.is_empty() else r
+        return self._roi_val
+
+    def set_margin(self, px: float) -> None:
+        self.margin = max(0.0, float(px))
+        self._edited()
 
     # ------------------------------------------------------------ editing
     def set_mode(self, mode: str) -> None:
@@ -286,6 +304,20 @@ class ROIEditorDialog(QDialog):
                       "corners to adjust it.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #aaaaaa; font-size: 10px;")
+        self.spin_margin = QSpinBox()
+        self.spin_margin.setRange(0, 400)
+        self.spin_margin.setSuffix(" px")
+        self.spin_margin.setValue(int(round(self.canvas.margin)))
+        self.spin_margin.setToolTip(
+            "Grow the included area by this many pixels all round (dashed line).\n"
+            "Animals are taller than the floor: near a wall the camera sees their\n"
+            "backs beyond the floor's edge, and an outline drawn on the floor line\n"
+            "cuts them off. The model sees the margin and masks reach into it.\n"
+            "Excluded areas stay as drawn. Models trained from now on use it.")
+        self.spin_margin.valueChanged.connect(self.canvas.set_margin)
+        margin_row = QHBoxLayout()
+        margin_row.addWidget(QLabel("Margin:"))
+        margin_row.addWidget(self.spin_margin, 1)
         self.chk_model_view = QCheckBox("Show what the model sees")
         self.chk_model_view.setToolTip("The frame as training and prediction prepare it: cut to\n"
                                        "the box around the included area, the rest grey.")
@@ -316,6 +348,7 @@ class ROIEditorDialog(QDialog):
         side.addWidget(self.rb_exclude)
         side.addWidget(hint)
         side.addSpacing(6)
+        side.addLayout(margin_row)
         side.addWidget(self.chk_model_view)
         side.addSpacing(6)
         side.addWidget(QLabel("Outlines:"))

@@ -90,6 +90,11 @@ model may look:
   input size; everything outside the outline is filled flat grey.
 - **Exclude area**: holes in that area the model must ignore (a lid it sees mice
   through).
+- **Margin**: grows the included area by this many pixels all round (dashed
+  line). Animals are taller than the floor: near a wall the camera sees their
+  backs beyond the floor's edge, and an outline drawn on the floor line cuts
+  their masks off there. Set it to about an animal's height as it looks at the
+  arena's edge; excluded areas stay as drawn.
 
 Close an outline by clicking its first corner again (or double-click,
 right-click, Enter); drag a finished outline's corners to adjust it.
@@ -101,7 +106,9 @@ after it is drawn. Training cuts frames and labels to it, and every way of
 running that model (post-training prediction, Predict, `infer-videos`, the
 behaviour tools, MAD's Fusion QC) prepares frames the same way, maps the masks
 back to full-frame coordinates and drops detections centred outside the area.
-Models trained before the ROI keep seeing whole frames.
+Models trained before the ROI keep seeing whole frames, and models trained
+before a margin was set keep cutting masks at the outline as drawn: retrain to
+use it. Until then, replace a cut prediction with a SAM click on the animal.
 
 !!! note
     This is not FNT's separate **ROI Tool** (zones for occupancy analysis of
