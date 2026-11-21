@@ -17,6 +17,15 @@ from .spectrogram import (
 )
 
 
+
+def drop_peak_freq_samples(calls: List[Dict]) -> List[Dict]:
+    """Remove the peak_freq_1..N keys (Freq Samples off), keeping the rest."""
+    for call in calls:
+        for k in [k for k in call if k.startswith('peak_freq_') and k[10:].isdigit()]:
+            del call[k]
+    return calls
+
+
 class DSPDetector:
     """
     DSP-based USV detector using spectral energy thresholding.
@@ -142,21 +151,23 @@ class DSPDetector:
         if getattr(self.config, 'detect_harmonics', True):
             calls = self._label_harmonics(calls)
 
-        # Sample peak frequencies across each call (optional)
+        # Sample peak frequencies across each call. With freq_samples = 0 the
+        # contour is still sampled (at the default 5 points) so the contour
+        # features and filters work, but the peak_freq_N columns are dropped
+        # from the output - the same rule as a hand-measured call in CAD.
         n_samples = getattr(self.config, 'freq_samples', 5)
-        if n_samples and n_samples > 0:
-            calls = self._sample_peak_frequencies(calls, frequencies, times, Sxx_db)
-        else:
-            # Clean up internal indices
-            for call in calls:
-                call.pop('_start_idx', None)
-                call.pop('_end_idx', None)
+        keep_samples = bool(n_samples and n_samples > 0)
+        calls = self._sample_peak_frequencies(
+            calls, frequencies, times, Sxx_db,
+            n_samples=n_samples if keep_samples else 5)
 
         # Contour-based features and filters (require peak_freq samples)
         calls = self._compute_contour_features(calls)
         calls = self._filter_by_sweep_rate(calls)
         calls = self._filter_by_contour_smoothness(calls)
         calls = self._filter_by_ici(calls)
+        if not keep_samples:
+            drop_peak_freq_samples(calls)
 
         return calls
 
@@ -791,7 +802,11 @@ class DSPDetector:
         # Initialize all as non-harmonic
         for c in calls:
             c['is_harmonic'] = False
-            c['harmonic_of'] = None
+            # The fundamental's call_id is not known here (ids are given by
+            # the caller); -1 = none. The link travels as call_group_id, and
+            # the caller resolves harmonic_of from it (CAD _ensure_call_ids).
+            c['harmonic_of'] = -1
+            c['_fund_ref'] = None
 
         calls_sorted = sorted(calls, key=lambda c: c['start_seconds'])
 
@@ -852,7 +867,7 @@ class DSPDetector:
                 for n in (2, 3):
                     if abs(ratio - n) <= ratio_tol * n:
                         harm_call['is_harmonic'] = True
-                        harm_call['harmonic_of'] = id(fund_call)
+                        harm_call['_fund_ref'] = id(fund_call)  # internal: grouping only
                         # Store the fundamental's start time for easier matching
                         harm_call['harmonic_of_start'] = fund_call['start_seconds']
                         harm_call['harmonic_ratio'] = round(ratio, 2)
@@ -871,11 +886,13 @@ class DSPDetector:
         for c in calls_sorted:
             if c['is_harmonic']:
                 c['call_group_id'] = fund_id_to_group.get(
-                    c.get('harmonic_of'), next_group
+                    c.get('_fund_ref'), next_group
                 )
                 if c['call_group_id'] == next_group:
                     # Orphan harmonic (fundamental lost to a filter) — own group.
                     next_group += 1
+        for c in calls_sorted:
+            c.pop('_fund_ref', None)
 
         return calls_sorted
 
@@ -1021,15 +1038,18 @@ class DSPDetector:
         calls: List[Dict],
         frequencies: np.ndarray,
         times: np.ndarray,
-        Sxx_db: np.ndarray
+        Sxx_db: np.ndarray,
+        n_samples: Optional[int] = None,
     ) -> List[Dict]:
         """
         Sample peak frequencies at evenly-spaced points across each call.
 
-        Adds peak_freq_1 ... peak_freq_N columns where N = config.freq_samples.
+        Adds peak_freq_1 ... peak_freq_N columns where N = ``n_samples``
+        (default config.freq_samples, or 5 when that is 0).
         Each value is the frequency of maximum amplitude at that time sample.
         """
-        n_samples = getattr(self.config, 'freq_samples', 5)
+        if n_samples is None:
+            n_samples = getattr(self.config, 'freq_samples', 5) or 5
         n_freq = Sxx_db.shape[0]
 
         for call in calls:

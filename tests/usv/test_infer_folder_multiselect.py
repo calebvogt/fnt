@@ -40,6 +40,7 @@ def _tree(root, spec):
 def win(qapp):
     class W:
         _pick_inference_folder = MADMainWindow._pick_inference_folder
+        set_inference_folders = MADMainWindow.set_inference_folders
 
         def __init__(self, picks):
             self._picks = picks

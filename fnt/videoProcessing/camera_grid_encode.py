@@ -54,9 +54,13 @@ _REF_CRF = 23
 class GridLayout:
     """A rows x cols arrangement of cameras, with empty cells allowed."""
 
-    def __init__(self, rows=3, cols=3, assignments=None):
+    def __init__(self, rows=3, cols=3, assignments=None, centre_scale=1.0):
         self.rows = rows
         self.cols = cols
+        # On a 3x3 grid, how much larger the centre cell is than a third of
+        # the frame, the four corner cells shrinking to make room (1.2: a
+        # centre camera 20% larger, e.g. the mesocosm's overhead view).
+        self.centre_scale = centre_scale
         # {(row, col): camera_name}; absent cells render black
         self.assignments = dict(assignments or {})
 
@@ -90,7 +94,8 @@ class GridLayout:
 
     def copy(self):
         """An independent copy, for snapshotting a job onto a queue."""
-        return GridLayout(self.rows, self.cols, dict(self.assignments))
+        return GridLayout(self.rows, self.cols, dict(self.assignments),
+                          getattr(self, "centre_scale", 1.0))
 
     @staticmethod
     def filled(cameras, rows, cols):
@@ -153,6 +158,25 @@ class EncodeSettings:
         w = (self.width // layout.cols) & ~1
         h = (self.height // layout.rows) & ~1
         return max(2, w), max(2, h)
+
+    def cell_rect(self, layout, row, col):
+        """(x, y, w, h) of a cell, all even.
+
+        Uniform unless the layout is 3x3 with a centre_scale other than 1:
+        then the middle row and column are that many thirds of the frame and
+        the outer ones split what is left, so the centre camera grows and the
+        others shrink, every cell keeping the frame's aspect ratio.
+        """
+        scale = getattr(layout, "centre_scale", 1.0) or 1.0
+        if layout.rows == 3 and layout.cols == 3 and abs(scale - 1.0) > 1e-6:
+            def sizes(total):
+                mid = int(round(total / 3 * scale)) & ~1
+                out = ((total - mid) // 2) & ~1
+                return [out, mid, total - mid - out]
+            ws, hs = sizes(self.width), sizes(self.height)
+            return sum(ws[:col]), sum(hs[:row]), ws[col], hs[row]
+        cw, ch = self.cell_size(layout)
+        return col * cw, row * ch, cw, ch
 
 
 #: Grid shapes offered in the UI, smallest first, so the first one that holds
@@ -279,17 +303,130 @@ def collect_runs(track, window_start, window_end, min_seconds=0.4, join_tol=1.5)
     return runs
 
 
-def write_concat_list(paths, list_path):
+#: How far past a chunk's edges footage is gathered when following the
+#: burnt-in clocks, so a camera whose clock runs a few seconds off the file
+#: timeline still fills the chunk to its first and last frame.
+SYNC_PAD = 10.0
+
+
+def _synced_runs(track, sync, window_start, window_end, pad=SYNC_PAD):
+    """Runs for a camera placed by its burnt-in clock (see camera_clock).
+
+    Gathered over the window widened by `pad` either side. Each run carries
+    `corr`: pieces ``(l0, l1, a, b)`` in seconds of playback from the run's
+    first frame, the clock error being ``a + b * (l - l0)`` inside each piece.
+
+    A run plays its files back to back, but collect_runs joins files whose
+    timeline starts are up to `join_tol` apart (an NVR's first file of a day
+    is stamped 00:00:00 whatever the last one before midnight reached). Each
+    file's pieces therefore carry that file's gap between where the run plays
+    it and where the timeline puts it; without it every frame after midnight
+    sat up to 1.4 s off for the rest of the day.
+    """
+    # The pad must cover the camera's largest clock error near the window, or
+    # footage the clock places inside it is never gathered (VC-T010 cam1-2 run
+    # two minutes behind their file timeline; across a daylight-saving change an
+    # NVR's 25-hour day spills an hour into the next).
+    near = datetime.timedelta(hours=2)
+    errs = [abs(a) + abs(b) * (t1 - t0).total_seconds() for t0, t1, a, b in sync.pieces
+            if t1 > window_start - near and t0 < window_end + near]
+    err = max(errs, default=0.0)
+    if err > pad - 3.0:
+        pad = err + pad
+    pad_td = datetime.timedelta(seconds=pad)
+    ws = window_start - pad_td
+    we = window_end + pad_td
+    shift = datetime.timedelta(seconds=getattr(track, "clock_offset", 0.0) or 0.0)
+    segs = {s.path: s for s in track.segments}
+    runs = collect_runs(track, ws, we)
+    for run in runs:
+        t0 = ws + datetime.timedelta(seconds=run["offset"]) + shift   # track time
+        corr, played = [], 0.0
+        for k, path in enumerate(run["paths"]):
+            seg = segs[path]
+            f0 = t0 if k == 0 else seg.start
+            f1 = min(seg.end, we + shift)
+            if f1 <= f0:
+                continue
+            gap = (f0 - t0).total_seconds() - played    # timeline minus playback
+            corr += [(played + (p0 - f0).total_seconds(), played + (p1 - f0).total_seconds(),
+                      a + gap, b) for p0, p1, a, b in sync.span(f0, f1)]
+            played += (f1 - f0).total_seconds()
+        run["corr"] = corr or [(0.0, run["duration"], sync.delta(t0), 0.0)]
+        run["offset"] -= pad
+    return runs
+
+
+def _split_late_start(run, durations, max_seek=30.0):
+    """Give a multi-file run's first file its own input when the run starts
+    late in it.
+
+    -ss on a concat input decodes the first file from its beginning, which
+    for a run starting two hours into a file costs minutes before the first
+    frame. A single-file input seeks to the keyframe instead, so the first
+    file goes in alone and the rest of the run starts at its second file.
+    """
+    first = durations.get(run["paths"][0])
+    if len(run["paths"]) < 2 or run["seek"] <= max_seek or not first:
+        return [run]
+    head_len = first - run["seek"]
+    if head_len <= 0 or head_len >= run["duration"]:
+        return [run]
+    head = dict(run, paths=run["paths"][:1], path=run["paths"][0], duration=head_len)
+    tail = dict(run, paths=run["paths"][1:], path=run["paths"][1], seek=0.0,
+                offset=run["offset"] + head_len, duration=run["duration"] - head_len)
+    if run.get("corr"):
+        head["corr"] = [(l0, min(l1, head_len), a, b) for l0, l1, a, b in run["corr"]
+                        if l0 < head_len] or run["corr"][:1]
+        tail["corr"] = []
+        for l0, l1, a, b in run["corr"]:
+            if l1 <= head_len:
+                continue
+            c0 = max(l0, head_len)
+            tail["corr"].append((c0 - head_len, l1 - head_len, a + b * (c0 - l0), b))
+        tail["corr"] = tail["corr"] or [(0.0, tail["duration"], run["corr"][-1][2], 0.0)]
+    return [head, tail]
+
+
+def _corr_expr(corr):
+    """An ffmpeg expression for the clock error at L = seconds into the run."""
+    L = "(PTS-STARTPTS)*TB"
+    if all(b == 0 and abs(a - corr[0][2]) < 1e-4 for _, _, a, b in corr):
+        return f"{corr[0][2]:.4f}"
+    terms = []
+    for i, (l0, l1, a, b) in enumerate(corr):
+        lo = -1e9 if i == 0 else l0          # hold the ends past the first/last piece
+        hi = 1e9 if i == len(corr) - 1 else l1
+        val = f"{a:.4f}" if b == 0 else f"({a:.4f}+{b:.4e}*({L}-{l0:.3f}))"
+        terms.append(f"gte({L},{lo:.3f})*lt({L},{hi:.3f})*{val}")
+    return "(" + "+".join(terms) + ")"
+
+
+def _shown_span(run):
+    """When a run's footage is on screen, in chunk seconds."""
+    corr = run.get("corr")
+    if not corr:
+        return run["offset"], run["offset"] + run["duration"]
+    first, last = corr[0], corr[-1]
+    c0 = first[2]
+    c1 = last[2] + last[3] * (last[1] - last[0])
+    return max(0.0, run["offset"] + c0), run["offset"] + run["duration"] + c1
+
+
+def write_concat_list(paths, list_path, inpoint=None):
     """Write an ffmpeg concat-demuxer list file and return its path.
 
     Lets a run spanning many segment files enter the graph as ONE input.
-    Single quotes are escaped per the demuxer's rules.
+    Single quotes are escaped per the demuxer's rules. `inpoint` (seconds)
+    starts the first file there.
     """
     quote = "'"
     with open(list_path, "w", encoding="utf-8") as fh:
-        for p in paths:
+        for i, p in enumerate(paths):
             escaped = str(p).replace(quote, quote + chr(92) + quote + quote)
             fh.write("file " + quote + escaped + quote + "\n")
+            if i == 0 and inpoint:
+                fh.write(f"inpoint {inpoint:.3f}\n")
     return list_path
 
 
@@ -313,10 +450,18 @@ def build_chunk_command(tracks, layout, settings, window_start, window_end,
         track = tracks.get(cam)
         if track is None:
             continue
-        for run in collect_runs(track, window_start, window_end):
+        sync = getattr(track, "clock_sync", None)
+        if sync is not None:
+            runs = _synced_runs(track, sync, window_start, window_end)
+        else:
+            runs = collect_runs(track, window_start, window_end)
+        durations = {seg.path: seg.duration for seg in track.segments}
+        for run in (piece for r in runs for piece in _split_late_start(r, durations)):
+            t0, t1 = _shown_span(run)
+            if t0 >= duration or t1 <= 0:
+                continue        # gathered by the sync pad but never on screen
             run = dict(run)
-            run["x"] = col * cw
-            run["y"] = row * ch
+            run["x"], run["y"], run["w"], run["h"] = settings.cell_rect(layout, row, col)
             run["camera"] = cam
             placements.append(run)
 
@@ -340,18 +485,30 @@ def build_chunk_command(tracks, layout, settings, window_start, window_end,
 
     for i, run in enumerate(placements):
         fine = min(seek_pad, run["seek"])
-        parts.append(
-            f"[{i}:v]trim=start={fine:.3f}:duration={run['duration']:.3f},"
-            f"setpts=PTS-STARTPTS+{run['offset']:.3f}/TB,"
-            f"scale={cw}:{ch},fps={settings.fps}[c{i}]")
+        if run.get("corr"):
+            # Clock-synced: each frame moves by the camera's measured clock
+            # error at that point, so its burnt-in clock lands on the grid's
+            # time. Frames pushed before the chunk start are dropped; the fps
+            # filter then drops or repeats the odd frame where the correction
+            # steps, which keeps every cell on time.
+            parts.append(
+                f"[{i}:v]trim=start={fine:.3f}:duration={run['duration']:.3f},"
+                f"setpts='PTS-STARTPTS+({run['offset']:.4f}+{_corr_expr(run['corr'])})/TB',"
+                f"trim=start=0,"
+                f"scale={run['w']}:{run['h']},fps={settings.fps}[c{i}]")
+        else:
+            parts.append(
+                f"[{i}:v]trim=start={fine:.3f}:duration={run['duration']:.3f},"
+                f"setpts=PTS-STARTPTS+{run['offset']:.3f}/TB,"
+                f"scale={run['w']}:{run['h']},fps={settings.fps}[c{i}]")
 
     prev = "bg"
     for i, run in enumerate(placements):
         label = f"v{i}"
+        t0, t1 = _shown_span(run)
         parts.append(
             f"[{prev}][c{i}]overlay={run['x']}:{run['y']}"
-            f":enable='between(t,{run['offset']:.3f},"
-            f"{run['offset'] + run['duration']:.3f})'[{label}]")
+            f":enable='between(t,{t0:.3f},{t1:.3f})'[{label}]")
         prev = label
 
     prev = _append_overlays(parts, prev, tracks, layout, settings,
@@ -435,6 +592,7 @@ def _append_overlays(parts, prev, tracks, layout, settings, window_start,
             track = tracks.get(cam)
             if track is None:
                 continue
+            x0, y0, cw, ch = settings.cell_rect(layout, row, col)
             for gap in track.gaps:
                 g0 = (gap.start - window_start).total_seconds()
                 g1 = g0 + gap.duration
@@ -443,18 +601,19 @@ def _append_overlays(parts, prev, tracks, layout, settings, window_start,
                 parts.append(
                     f"[{prev}]drawtext={font}text='NO SIGNAL':"
                     f"fontcolor=red:fontsize={max(16, ch // 9)}:"
-                    f"x={col * cw}+({cw}-text_w)/2:y={row * ch}+({ch}-text_h)/2:"
+                    f"x={x0}+({cw}-text_w)/2:y={y0}+({ch}-text_h)/2:"
                     f"enable='between(t,{max(0.0, g0):.3f},{min(duration, g1):.3f})'"
                     f"[ns{row}{col}{int(g0)}]")
                 prev = f"ns{row}{col}{int(g0)}"
 
     if settings.show_camera_labels:
         for (row, col), cam in sorted(layout.assignments.items()):
+            x0, y0, _, _ = settings.cell_rect(layout, row, col)
             parts.append(
                 f"[{prev}]drawtext={font}text='{_esc(cam)}':"
                 f"fontcolor=yellow:fontsize={font_small}:"
                 f"box=1:boxcolor=black@0.45:boxborderw=4:"
-                f"x={col * cw}+8:y={row * ch}+8[lb{row}{col}]")
+                f"x={x0}+8:y={y0}+8[lb{row}{col}]")
             prev = f"lb{row}{col}"
 
     if settings.show_clock:

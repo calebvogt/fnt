@@ -17,6 +17,9 @@ from typing import Dict, List, Optional
 
 
 PROJECT_INFO_FILENAME = 'mad_project_info.json'
+# Written into a project folder by `mad stop`: an --inference-window-only run on
+# that project stops, with no prompt, and quits.
+STOP_REQUEST_FILENAME = 'STOP_INFERENCE'
 
 
 @dataclass
@@ -90,6 +93,13 @@ class MADProjectConfig:
     #                (the patch is normalized and quantized when it is saved).
     db_norm: str = 'fixed'
     colormap: str = 'viridis'
+    # Context kept on each side of a call when it trains, in milliseconds.
+    # None = the legacy 128 spectrogram frames (~65 ms at hop 128 / 250 kHz),
+    # a width that scales with the grid rather than with time. Examples are
+    # always SAVED with at least the legacy width; training crops them to
+    # this and the GUI's training-window shading draws it, so it can change
+    # at any time without relabelling.
+    context_ms: Optional[float] = None
 
     # Model architecture — user-selectable per training run.
     #   'unet'     : segmentation_models_pytorch U-Net (default)
@@ -103,6 +113,11 @@ class MADProjectConfig:
 
     # Inference.
     mask_threshold: float = 0.5
+    # Store each detection's and label's brightness ridge (frequency contour,
+    # turns, trill; mad_ridge), and fill in the ridges older .mad files lack:
+    # a resumed run fills its skipped recordings, opening a recording fills
+    # what its stored spectrograms allow. On by default.
+    ridge: bool = True
 
     # Call-type classes the user has confirmed (metadata on each saved
     # training example; the segmentation model itself stays binary). The
@@ -211,8 +226,14 @@ class MADProjectConfig:
         known = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
         data = {k: v for k, v in data.items() if k in known}
         cfg = cls(**data)
-        if not cfg.project_dir:
-            cfg.project_dir = os.path.dirname(os.path.abspath(path))
+        # The folder the file sits in IS the project. The stored project_dir
+        # only records where it was created, and trusting it sent a copied or
+        # re-mounted project (another drive letter, the Mac's /Volumes path)
+        # back to the ORIGINAL location for everything derived from it: the
+        # config save, training_data/, models/. A copy saved over the original
+        # project; a re-mounted one saved nowhere, silently, since the GUI's
+        # saves swallow errors.
+        cfg.project_dir = os.path.dirname(os.path.abspath(path))
         if not cfg.project_name and cfg.project_dir:
             cfg.project_name = os.path.basename(os.path.normpath(cfg.project_dir))
         return cfg

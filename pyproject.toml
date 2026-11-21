@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fnt"
-version = "0.1.10"
+version = "0.1.15"
 description = "Toolbox for preprocessing and analyzing neurobehavioral field data"
 readme = "README.md"
 license = {text = "AGPL-3.0-or-later"}
@@ -26,11 +26,12 @@ classifiers = [
 dependencies = [
     # Core scientific stack
     "numpy>=1.24",
-    # Pin to the pandas 2.x line: pandas 3.0 makes Copy-on-Write mandatory and
-    # changes groupby.apply / default string dtype, which the preprocessing
-    # pipeline was not written against. Keeps a fresh `pip install -e .` from
-    # silently jumping to 3.x.
-    "pandas>=2.2,<3",
+    # pandas 3 everywhere (2026-10-13). The code was checked for its
+    # Copy-on-Write, string-dtype and groupby.apply changes, and times are
+    # pinned to nanoseconds wherever raw integers are read (pandas 3 parses to
+    # microseconds). Keeps every machine and the release builds on one major
+    # version.
+    "pandas>=3.0,<4",
     "scipy",
     "matplotlib",
     "pytz",
@@ -53,6 +54,8 @@ dependencies = [
     "segmentation-models-pytorch>=0.3.4",
     # USB serial communication for FED devices
     "pyserial",
+    # FED3 protocol files
+    "pyyaml",
     # SAM2 — AI-assisted mask annotation
     "sam-2 @ git+https://github.com/facebookresearch/sam2.git",
     # OCR — timestamp extraction from DVR video overlays
@@ -90,6 +93,8 @@ all = [
 [project.scripts]
 fnt = "fnt.gui_pyqt:main"
 mad = "fnt.usv.usv_detector.cli:main"
+fnt-fed = "fnt.fed3.cli:main"
+fnt-grid = "fnt.videoProcessing.camera_grid_cli:main"
 
 [project.urls]
 Homepage = "https://github.com/calebvogt/fnt"
@@ -99,4 +104,4 @@ Issues = "https://github.com/calebvogt/fnt/issues"
 include = ["fnt*"]
 
 [tool.setuptools.package-data]
-fnt = ["../icons/*.ico", "../icons/*.png"]
+fnt = ["../icons/*.ico", "../icons/*.png", "fed3/ui/*.svg"]

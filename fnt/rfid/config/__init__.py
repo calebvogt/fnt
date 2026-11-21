@@ -1,12 +1,21 @@
-"""Trial configuration for RFID preprocessing."""
+"""Configuration for RFID preprocessing."""
 
-from .defaults import (TrialConfig, RFIDConfig, Arena, Zone, Antenna,
-                       DEFAULT_EXPORTS, get_default_config,
-                       get_available_templates, get_fnt_version)
-from .config_manager import ConfigManager
+from .defaults import (RFIDConfig, Arena, Paddock, Zone, Antenna, MetadataSpec,
+                       ARENA_PRESETS, OPTIONAL_LAYERS, METADATA_FIELDS,
+                       BOUT_RULES, CROSS_PADDOCK_POLICIES,
+                       animal_settings, get_default_config,
+                       get_available_presets, get_fnt_version, normalise_id,
+                       liddell_8_zone, one_antenna_per_zone)
+from .config_manager import (ConfigManager, default_output_dir, default_name,
+                             resolve_output_dir, read_antenna_csv,
+                             write_antenna_csv, zones_for_antennas)
 
 __all__ = [
-    "TrialConfig", "RFIDConfig", "Arena", "Zone", "Antenna", "DEFAULT_EXPORTS",
-    "get_default_config", "get_available_templates", "get_fnt_version",
-    "ConfigManager",
+    "RFIDConfig", "Arena", "Paddock", "Zone", "Antenna", "MetadataSpec",
+    "ARENA_PRESETS", "OPTIONAL_LAYERS", "METADATA_FIELDS", "BOUT_RULES",
+    "CROSS_PADDOCK_POLICIES", "animal_settings", "get_default_config",
+    "get_available_presets", "get_fnt_version", "normalise_id",
+    "liddell_8_zone", "one_antenna_per_zone",
+    "ConfigManager", "default_output_dir", "default_name", "resolve_output_dir",
+    "read_antenna_csv", "write_antenna_csv", "zones_for_antennas",
 ]

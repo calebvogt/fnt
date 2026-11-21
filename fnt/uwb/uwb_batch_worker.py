@@ -17,7 +17,13 @@ The job file is written by the parent and carries everything needed to reproduce
 the queued job without a GUI:
 
     {"path": <db path>, "table": <table>, "config": <get_config_dict() snapshot>,
-     "conflict_choice": <ExportConflictDialog result>, "temp_frames_dir": <str|null>}
+     "conflict_choice": <ExportConflictDialog result>, "temp_frames_dir": <str|null>,
+     "show_window": <bool, optional>}
+
+With ``"show_window": true`` the worker's UWB window is put on screen, titled
+with the trial and pass, so a run launched from a script still shows its export
+progress. The GUI's own queue leaves it off: its main window already shows the
+batch.
 
 Exit codes: 0 = export finished, 1 = export failed or the database not loadable,
 2 = bad invocation. A native crash surfaces as whatever code Windows assigns.
@@ -28,17 +34,36 @@ import os
 import sys
 
 
+def window_title(job):
+    """'UWB export: T007_VoleCosmData (data pass)' for a visible worker."""
+    name = os.path.splitext(os.path.basename(job.get("path") or ""))[0] or "trial"
+    cfg = job.get("config") or {}
+    if job.get("reuse_smoothed"):
+        phase = "animation" if cfg.get("save_animation") else "plots"
+    else:
+        phase = "data"
+    return f"UWB export: {name} ({phase} pass)"
+
+
 def _run(job_path):
-    # Offscreen: the worker builds the real window (the export pipeline reads its
-    # widgets) but never shows it, so no window appears and no display is needed.
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    # The log uses ✓/✗; a cp1252 console would turn the first one into an
+    # exception. Setting PYTHONIOENCODING here is too late for this process.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    with open(job_path, "r", encoding="utf-8") as f:
+        job = json.load(f)
+    show = bool(job.get("show_window"))
+    if not show:
+        # Offscreen: the worker builds the real window (the export pipeline
+        # reads its widgets) but never shows it, so no display is needed.
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
     from PyQt5.QtWidgets import QApplication
     from PyQt5.QtCore import QEventLoop
-
-    with open(job_path, "r", encoding="utf-8") as f:
-        job = json.load(f)
 
     app = QApplication(sys.argv)
 
@@ -52,6 +77,9 @@ def _run(job_path):
     # the multi-GB fast-scrub index build, and makes the tag/day scan synchronous.
     win._batch_active = True
     win._suppress_dialogs()
+    if show:
+        win.setWindowTitle(window_title(job))
+        win.show()
 
     # Mirror the window's log to stdout so the parent can stream progress.
     _orig_log = win.log_message

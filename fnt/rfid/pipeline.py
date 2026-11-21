@@ -1,193 +1,360 @@
-"""Run one trial end to end and write its analysis folder.
+"""Run a dataset end to end and write its analysis folder.
 
-The stage order is fixed because each stage consumes the previous one's table.
-What varies is which of the analysis layers below the GBI get written, which
-``TrialConfig.exports`` decides.
+    downloads -> reads -> cleaned reads -> bouts -> summaries (+ QC, + layers)
 
-Nothing here is interactive: the GUI drives this through ``run_trial`` and
-receives progress through the callback, so the same code path serves a batch
-run over many trials.
+Nothing here is interactive. The GUI drives :func:`run` from a worker thread
+and receives progress through the callback; a script or a test calls the same
+function, so there is one code path whichever way a run is started.
+
+The analysis folder is written only after every stage has succeeded, so a
+failed run never leaves half a set of tables looking like a finished one.
 """
 
 from __future__ import annotations
 
 import os
+import time
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime
 
+import numpy as np
 import pandas as pd
 
-from .config.config_manager import (ConfigManager, LOG_NAME, analysis_dir,
-                                    check_dir_usable, csv_dir, ensure_dir)
-from .config.defaults import TrialConfig
+from .config.config_manager import (ConfigManager, check_dir_usable, csv_dir,
+                                    default_name, ensure_dir, output_inside_downloads,
+                                    provenance, resolve_output_dir)
+from .config.defaults import RFIDConfig
+from .core import qc as QC
 from .core.bout_detector import detect_bouts
-from .core.displacement import annotate_ownership, detect_displacements
-from .core.edgelist import co_presence_bouts, edgelist
-from .core.gbi_generator import create_gbi, melt_gbi
-from .core.hinde_index import hinde_index, hinde_summary
-from .core.preprocessor import RFIDPreprocessor, ReadsResult
-from .core.social_network import social_networks
-from .core.zone_ownership import zone_ownership
+from .core.cleaning import CleanResult, clean_reads
+from .core.file_readers import DownloadResult, list_download_files, read_downloads
+from .core.metadata import AnimalTable, load_animals
+from .core.summaries import animal_days, co_occupancy, zone_holders
+
+# Output tables, in the order they are written. QC tables carry a qc_ prefix.
+MAIN_TABLES = ["reads", "bouts", "animal_days", "zone_holders", "co_occupancy"]
+QC_TABLES = ["qc_files", "qc_unknown_tags", "qc_unmapped_antennas", "qc_animals",
+             "qc_cross_paddock", "qc_two_places", "qc_stationary_tags",
+             "qc_found_dead", "qc_dropped_reads"]
 
 
 @dataclass
-class TrialResult:
-    """Everything one run produced, in memory, plus where it was written."""
-    config: TrialConfig
+class RunResult:
+    """Everything a run produced, in memory, plus where it was written."""
+    config: RFIDConfig
     output_dir: str = ""
-    reads_result: ReadsResult | None = None
     tables: dict[str, pd.DataFrame] = field(default_factory=dict)
+    stats: dict = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
     written: list[str] = field(default_factory=list)
     log: list[str] = field(default_factory=list)
     error: str | None = None
+    cancelled: bool = False
+    origin: pd.Timestamp | None = None
+    animals: AnimalTable | None = None
+    input_files: list[str] = field(default_factory=list)
 
     @property
-    def reads(self) -> pd.DataFrame:
-        return self.tables.get("reads", pd.DataFrame())
-
-    @property
-    def bouts(self) -> pd.DataFrame:
-        return self.tables.get("bouts", pd.DataFrame())
-
-    @property
-    def gbi(self) -> pd.DataFrame:
-        return self.tables.get("gbi", pd.DataFrame())
+    def ok(self) -> bool:
+        return self.error is None and not self.cancelled
 
 
-def _write_csv(table: pd.DataFrame, output_dir: str, trial: str, name: str,
-               written: list[str]) -> None:
-    if table is None or table.empty:
-        return
-    path = os.path.join(csv_dir(output_dir, create=True), f"{trial}_{name}.csv")
-    table.to_csv(path, index=False)
-    written.append(path)
+def _format_times(frame: pd.DataFrame) -> pd.DataFrame:
+    """Datetime columns as 'YYYY-MM-DD HH:MM:SS.mmm' text for the CSVs.
+
+    Done with numpy's C formatter: ``strftime`` on a million-row column takes
+    seconds, this takes a fraction of one.
+    """
+    out = frame.copy()
+    for col in out.columns:
+        if pd.api.types.is_datetime64_any_dtype(out[col]):
+            values = out[col].to_numpy(dtype="datetime64[ms]")
+            text = np.datetime_as_string(values, unit="ms")
+            text = np.char.replace(text, "T", " ")
+            text[np.isnat(values)] = ""
+            out[col] = text
+        elif pd.api.types.is_float_dtype(out[col]):
+            # float noise (15.260000000000002) is not precision anyone measured
+            out[col] = out[col].round(6)
+    return out
 
 
-def run_trial(config: TrialConfig, progress=None, write: bool = True,
-              bout_algorithm: str = "segment") -> TrialResult:
-    """Process one trial. Returns its tables whether or not they were written."""
-    result = TrialResult(config=config)
-    lines: list[str] = []
+def write_table(frame: pd.DataFrame, output_dir: str, name: str, table: str) -> str:
+    path = os.path.join(csv_dir(output_dir, create=True), f"{name}_{table}.csv")
+    _format_times(frame).to_csv(path, index=False)
+    return path
 
-    def say(message: str) -> None:
-        stamped = f"[{datetime.now():%H:%M:%S}] {message}"
-        lines.append(stamped)
+
+def home_paddocks(config: RFIDConfig, animals: AnimalTable) -> dict:
+    return {a: config.arena.home_paddock(t)
+            for a, t in zip(animals.animals["animal"], animals.animals["trial"])}
+
+
+def legacy_layers(config: RFIDConfig, reads: pd.DataFrame, bouts: pd.DataFrame,
+                  animals: AnimalTable, say) -> dict[str, pd.DataFrame]:
+    """The optional layers carried over from the earlier module.
+
+    They were written against ``name / zone / noon_day / field_time`` columns;
+    this adapts the new tables to that schema (zone = zone_id) rather than
+    rewriting layers that are opt-in.
+    """
+    from .core.gbi_generator import create_gbi
+    tables: dict[str, pd.DataFrame] = {}
+    layers = config.layers
+    if not any(layers.values()) or bouts.empty:
+        return tables
+    trial = config.name or "rfid"
+    info = animals.animals.set_index("animal")
+    names = sorted(bouts["animal"].astype(str).unique())
+    sex_by_name = {a: info["sex"].get(a, "") for a in names}
+    lb = pd.DataFrame({
+        "trial": trial, "name": bouts["animal"].astype(str),
+        "sex": bouts["sex"], "zone": bouts["zone_id"].astype(str),
+        "noon_day": bouts["day"], "field_time": bouts["start"],
+        "field_time_stop": bouts["stop"], "duration_s": bouts["duration_s"]})
+    say("Optional layers: building the GBI...")
+    gbi = create_gbi(lb, names, sex_by_name, config.min_bout_s, say)
+    if layers.get("gbi"):
+        tables["gbi"] = gbi
+    males = [a for a in names if sex_by_name.get(a) == "M"]
+    if layers.get("edgelist"):
+        from .core.edgelist import co_presence_bouts, edgelist
+        pair_bouts = co_presence_bouts(gbi, names, say)
+        tables["co_presence_bouts"] = pair_bouts
+        tables["edgelist"] = edgelist(pair_bouts)
+    if layers.get("displacement"):
+        from .core.displacement import annotate_ownership, detect_displacements
+        from .core.zone_ownership import zone_ownership
+        lr = pd.DataFrame({"trial": trial, "name": reads["animal"].astype(str),
+                           "sex": reads["animal"].astype(str).map(info["sex"]),
+                           "code": reads["animal"].astype(str).map(info["code"]),
+                           "zone": reads["zone_id"].astype(str),
+                           "noon_day": reads["day"]})
+        ownership = zone_ownership(lr)
+        tables["zone_ownership"] = ownership
+        tables["displacement"] = annotate_ownership(
+            detect_displacements(gbi, males, say), ownership)
+    if layers.get("hinde"):
+        from .core.hinde_index import hinde_index, hinde_summary
+        for scope in ("broad", "narrow"):
+            events = hinde_index(gbi, scope, names, say)
+            tables[f"hinde_{scope}"] = events
+            tables[f"hinde_{scope}_summary"] = hinde_summary(events)
+    if layers.get("sna"):
+        try:
+            from .core.social_network import social_networks
+            # the GBI's animal columns are animal keys, so key the metadata on them
+            meta = animals.animals.assign(name=animals.animals["animal"])
+            nets = social_networks(gbi, meta, names, None, say)
+            tables["sna_node_stats"] = nets["node_stats"]
+            tables["sna_net_stats"] = nets["net_stats"]
+        except ImportError as exc:
+            say(f"WARNING: social networks skipped - {exc}")
+    return tables
+
+
+def run(config: RFIDConfig, progress=None, write: bool = True,
+        cancelled=None) -> RunResult:
+    """Process one dataset. Returns its tables whether or not they were written.
+
+    ``progress(percent, message)`` is called as the run goes; ``cancelled()``
+    is polled between stages (and between files while reading) and stops the
+    run cleanly when it returns True.
+    """
+    result = RunResult(config=config)
+    started = time.time()
+    pct = [0]
+
+    def say(message: str, percent: int | None = None) -> None:
+        if percent is not None:
+            pct[0] = percent
+        result.log.append(f"[{datetime.now():%H:%M:%S}] {message}")
         if progress:
-            progress(message)
+            progress(pct[0], message)
 
-    ok, problems = ConfigManager.validate(config)
-    if not ok:
-        result.error = "; ".join(problems)
-        result.log = [f"Configuration is not runnable: {p}" for p in problems]
+    def check():
+        if cancelled and cancelled():
+            raise InterruptedError("cancelled")
+
+    blocking, warnings = config.problems()
+    if blocking:
+        result.error = "; ".join(blocking)
+        for p in blocking:
+            say(f"Configuration is not runnable: {p}")
         return result
-
-    trial = config.trial_id or os.path.basename(os.path.normpath(config.raw_dir))
-    output_dir = config.output_dir or analysis_dir(config.raw_dir, config.trial_id)
+    for w in warnings:
+        say(f"WARNING: {w}")
+    result.warnings.extend(warnings)
+    if not config.name:
+        config.name = default_name(config.download_dirs)
+    output_dir = resolve_output_dir(config)
     result.output_dir = output_dir
     if write:
+        inside = output_inside_downloads(output_dir, config.download_dirs)
+        if inside:
+            result.error = (f"The analysis folder {output_dir} is inside the download "
+                            f"folder {inside}. Outputs never go into raw-data folders; "
+                            f"choose a folder beside it.")
+            say(result.error)
+            return result
         unusable = check_dir_usable(output_dir)
         if unusable:
             result.error = unusable
-            result.log = [unusable]
+            say(unusable)
             return result
-        ensure_dir(output_dir)
 
     try:
-        say(f"=== {trial} ===")
+        say(f"=== {config.name} ===", 0)
+        say("Loading metadata...", 2)
+        animals = load_animals(config.metadata)
+        result.animals = animals
+        for w in animals.warnings:
+            say(f"WARNING: {w}")
+        result.warnings.extend(animals.warnings)
+        say(f"{len(animals.animals)} animals, {len(animals.tags)} tags "
+            f"(header on row {animals.header_row})")
+        check()
 
-        # --- stage 1: reads ------------------------------------------------
-        reads_result = RFIDPreprocessor(config).run(say)
-        result.reads_result = reads_result
-        reads = reads_result.reads
-        result.tables["reads"] = reads
-        for warning in reads_result.warnings():
-            say(f"WARNING: {warning}")
+        paths = list_download_files(config.download_dirs, config.include_subfolders)
+        result.input_files = paths
+        if not paths:
+            raise FileNotFoundError("No download files (.xlsx, .xls, .txt, .csv) in "
+                                    + ", ".join(config.download_dirs))
+        say(f"Reading {len(paths)} file(s)...", 5)
+
+        def file_progress(message):
+            say(message)
+        downloads: DownloadResult = read_downloads(
+            paths, config.date_order, config.time_resolution, file_progress, cancelled)
+        for w in downloads.warnings:
+            say(f"WARNING: {w}")
+        result.warnings.extend(downloads.warnings)
+        used = int((downloads.files["status"] == "used").sum())
+        say(f"{downloads.raw_rows:,} rows in {used} file(s) -> "
+            f"{len(downloads.reads):,} unique reads", 45)
+        skipped = downloads.files[downloads.files["status"].isin(["not a download", "error"])]
+        for _, row in skipped.iterrows():
+            say(f"Skipped {row['file']} ({row['status']}: {row['note']})")
+        if downloads.reads.empty:
+            raise ValueError("No readable reads in the download folder(s)")
+        check()
+
+        say("Cleaning reads...", 50)
+        clean: CleanResult = clean_reads(downloads.reads, animals, config,
+                                         lambda m: say(m))
+        for w in clean.warnings:
+            say(f"WARNING: {w}")
+        result.warnings.extend(clean.warnings)
+        result.origin = clean.origin
+        say(f"Day 1 starts {clean.origin} (local wall clock)")
+        reads = clean.reads
         if reads.empty:
-            result.error = "No reads survived preprocessing"
-            say(result.error)
-            return result
+            raise ValueError("No reads survived cleaning - check the antenna table "
+                             "and the metadata tag columns")
+        check()
 
-        meta = reads.drop_duplicates("name")[
-            [c for c in ("name", "code", "sex", "phase", "group", "strain")
-             if c in reads.columns]]
-        animals = sorted(reads["name"].unique())
-        sex_by_name = meta.set_index("name")["sex"].to_dict()
-        males = [a for a in animals if sex_by_name.get(a) == "M"]
+        say("Detecting bouts...", 65)
+        bouts = detect_bouts(reads, config.bout_gap_s, config.min_bout_s,
+                             config.bout_rule, animals.animals, lambda m: say(m))
+        check()
 
-        # --- stage 2: bouts -------------------------------------------------
-        bouts = detect_bouts(reads, config.bout_threshold_s,
-                             config.min_duration_s, bout_algorithm, say)
-        result.tables["bouts"] = bouts
+        say("Summaries...", 72)
+        home = home_paddocks(config, animals)
+        tables = result.tables
+        tables["reads"] = reads[["animal", "tag", "reader", "paddock", "antenna",
+                                 "location", "zone", "zone_id", "away", "day", "t"]]
+        tables["bouts"] = bouts
+        tables["animal_days"] = animal_days(reads, bouts, animals.animals,
+                                            config.arena.zone_xy(), home)
+        tables["zone_holders"] = zone_holders(reads, animals.animals,
+                                              config.holder_share, config.holder_sex, home)
+        tables["co_occupancy"] = co_occupancy(bouts, animals.animals)
+        say(f"{len(tables['animal_days']):,} animal-days, "
+            f"{len(tables['zone_holders']):,} zone-days, "
+            f"{len(tables['co_occupancy']):,} pair-days of co-occupancy")
+        check()
 
-        # --- stage 3: GBI ---------------------------------------------------
-        gbi = create_gbi(bouts, animals, sex_by_name, config.min_duration_s, say)
-        result.tables["gbi"] = gbi
+        say("Quality control...", 80)
+        ident = clean.identified
+        tables["qc_files"] = downloads.files
+        tables["qc_unknown_tags"] = clean.unknown_tags
+        tables["qc_unmapped_antennas"] = clean.unmapped
+        tables["qc_animals"] = QC.animal_roster(animals.animals, ident, reads,
+                                                clean.last_entries, home)
+        tables["qc_cross_paddock"] = QC.cross_paddock(ident, config.cross_paddock_policy)
+        tables["qc_two_places"] = QC.two_places(ident, config.two_place_share)
+        tables["qc_stationary_tags"] = QC.stationary_tags(
+            ident, config.entrance_locations, config.bout_gap_s,
+            config.stationary_hour_fraction)
+        tables["qc_found_dead"] = clean.last_entries
+        tables["qc_dropped_reads"] = QC.dropped_summary(clean.dropped, ident)
+        n_two = len(tables["qc_two_places"])
+        n_still = len(tables["qc_stationary_tags"])
+        if n_two:
+            say(f"QC: {n_two} animal-day(s) with two tags in two places")
+        if n_still:
+            say(f"QC: {n_still} tag-day(s) read by one antenna all day")
+        check()
 
-        exports = config.exports
-        if exports.get("bout_summary"):
-            result.tables["bout_summary"] = melt_gbi(gbi, meta)
-        if exports.get("zone_ownership") or exports.get("displacement"):
-            ownership = zone_ownership(reads)
-            result.tables["zone_ownership"] = ownership
-        else:
-            ownership = pd.DataFrame()
+        if any(config.layers.values()):
+            say("Optional layers...", 85)
+            tables.update(legacy_layers(config, reads, bouts, animals, lambda m: say(m)))
+            check()
 
-        if exports.get("edgelist"):
-            pair_bouts = co_presence_bouts(gbi, animals, say)
-            result.tables["co_presence_bouts"] = pair_bouts
-            result.tables["edgelist"] = edgelist(pair_bouts)
+        result.stats = {
+            "files_used": used,
+            "raw_rows": downloads.raw_rows,
+            "unique_reads": len(downloads.reads),
+            "animals_in_metadata": len(animals.animals),
+            "tags_in_metadata": len(animals.tags),
+            "dropped": clean.dropped,
+            "unknown_tags": len(clean.unknown_tags),
+            "cleaned_reads": len(reads),
+            "animals_read": int(reads["animal"].nunique()),
+            "away_reads": int(reads["away"].sum()),
+            "bouts": len(bouts),
+            "animal_hours_in_zones": round(float(bouts["duration_s"].sum()) / 3600, 2),
+            "day_origin": str(clean.origin),
+            "first_day": int(reads["day"].min()), "last_day": int(reads["day"].max()),
+        }
 
-        if exports.get("displacement"):
-            events = detect_displacements(gbi, males, say)
-            result.tables["displacement"] = annotate_ownership(
-                events, ownership, days=config.analysis_days)
-
-        for scope in ("broad", "narrow"):
-            if exports.get(f"hinde_{scope}"):
-                events = hinde_index(gbi, scope, animals, say)
-                result.tables[f"hinde_{scope}"] = events
-                result.tables[f"hinde_{scope}_summary"] = hinde_summary(events)
-
-        if exports.get("sna"):
-            try:
-                nets = social_networks(gbi, meta, animals,
-                                       config.analysis_days, say)
-                result.tables.update({"sna_node_stats": nets["node_stats"],
-                                      "sna_net_stats": nets["net_stats"]})
-            except ImportError as exc:
-                say(f"WARNING: social networks skipped - {exc}")
-
-        # --- write -----------------------------------------------------------
         if write:
-            for name, table in result.tables.items():
-                if exports.get(name, True):
-                    _write_csv(table, output_dir, trial, name, result.written)
+            say("Writing tables...", 90)
+            ensure_dir(output_dir)
+            names = MAIN_TABLES + QC_TABLES + [k for k in tables
+                                               if k not in MAIN_TABLES + QC_TABLES]
+            for key in names:
+                if key not in tables:
+                    continue
+                if key == "reads" and not config.write_reads:
+                    continue
+                result.written.append(write_table(tables[key], output_dir,
+                                                  config.name, key))
+                say(f"Wrote {os.path.basename(result.written[-1])}")
+            result.stats["run_seconds"] = round(time.time() - started, 1)
             ConfigManager.save(config, output_dir, extra={
-                "bout_algorithm": bout_algorithm,
-                "run_stats": {
-                    "raw_rows": reads_result.raw_read_count,
-                    "unique_reads": reads_result.unique_read_count,
-                    "reads": len(reads),
-                    "bouts": len(bouts),
-                    "gbi_intervals": len(gbi),
-                    "animals": len(animals),
-                },
-                "warnings": reads_result.warnings(),
-                "files": [os.path.basename(p) for p in result.written]})
-            say(f"Wrote {len(result.written)} table(s) to {csv_dir(output_dir)}")
+                "provenance": provenance(paths, config.metadata.path),
+                "run_stats": result.stats,
+                "warnings": result.warnings,
+                "outputs": [os.path.relpath(p, output_dir) for p in result.written]})
+            say(f"Wrote {len(result.written)} table(s) and fnt_config.json to {output_dir}")
+        result.stats["run_seconds"] = round(time.time() - started, 1)
+        say(f"Done in {result.stats['run_seconds']:.1f} s", 100)
 
+    except InterruptedError:
+        result.cancelled = True
+        say("Cancelled - nothing was written")
     except Exception as exc:                              # noqa: BLE001
         result.error = f"{type(exc).__name__}: {exc}"
         say(f"FAILED: {result.error}")
-        lines.append(traceback.format_exc())
+        result.log.append(traceback.format_exc())
 
-    result.log = lines
-    if write and result.output_dir:
+    if write and result.output_dir and os.path.isdir(result.output_dir):
         try:
-            with open(os.path.join(result.output_dir, LOG_NAME), "w",
-                      encoding="utf-8") as fh:
-                fh.write("\n".join(lines))
+            log_path = os.path.join(result.output_dir, f"{config.name}_messageLog.txt")
+            with open(log_path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(result.log) + "\n")
         except OSError:
             pass
     return result

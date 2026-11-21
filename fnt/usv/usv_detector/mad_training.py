@@ -27,6 +27,9 @@ import numpy as np
 class UNetTrainingConfig:
     project_dir: str
     run_name: str = ""               # auto-filled from timestamp if empty
+    # Appended to the auto-filled name: <ts>_<arch>_n=<labels>_<suffix>
+    # (e.g. ft_r7), so a tagged run still says how many labels it holds.
+    run_suffix: str = ""
     # Decoder architecture (all via segmentation_models_pytorch):
     #   'unet'   : smp.Unet (baseline)
     #   'unetpp' : smp.UnetPlusPlus (denser skips, finer detail)
@@ -42,6 +45,12 @@ class UNetTrainingConfig:
     # Seed for the train/val split. Recorded in the run summary so a reported
     # number can be reproduced exactly.
     split_seed: int = 42
+    # Hold out exactly these recordings (wav basenames) instead of drawing a
+    # split. Two runs are only comparable on the same held-out recordings, and
+    # the seeded draw is not stable across retrains: any change to the label
+    # set re-draws it. ``mad train --holdout-from RUN`` fills this from an
+    # earlier run's summary.
+    holdout_groups: Optional[List[str]] = None
     # How train/val is grouped:
     #   'call' — DEFAULT. Hold out whole calls (masks), regardless of which
     #            recording they came from. Every labelled file trains. This is
@@ -84,6 +93,39 @@ class UNetTrainingConfig:
     # modest label set. Turn off to reproduce un-augmented behavior.
     augment: bool = True
 
+    # Faint-call augmentation (train tiles only, and only with ``augment``).
+    # Attenuates the labelled calls in a tile toward the local noise floor, so
+    # the model also sees each call as it would arrive from across the arena.
+    # The ±10% gain jitter above cannot do this: a distant call is 10-20 dB
+    # down, and scaling the whole normalized tile moves call and background
+    # together. Done in the power domain against a per-frequency-row floor,
+    # and never below ``faint_min_snr_db`` -- attenuating a call into the noise
+    # while still labelling it would teach the model to hallucinate.
+    augment_faint: bool = True
+    faint_p: float = 0.3
+    faint_db_range: Tuple[float, float] = (3.0, 18.0)
+    faint_min_snr_db: float = 3.0
+
+    # Learning-rate schedule. 'plateau' halves the rate when val_loss stops
+    # improving for ``lr_plateau_patience`` epochs (floor: 1/1000 of the start);
+    # 'none' keeps it fixed, which is how every run before 2026-10 trained.
+    # A fixed 1e-3 leaves the model bouncing around the minimum it has found
+    # for the rest of the run -- the gap between train and val loss at the
+    # best epoch says the last stretch of each run was spent there.
+    lr_schedule: str = "plateau"     # 'plateau' | 'none'
+    lr_plateau_patience: int = 8
+    lr_plateau_factor: float = 0.5
+
+    # At most this many examples from any one recording (labels and hard
+    # negatives capped separately; 0 = no cap). One densely-labelled bout can
+    # otherwise outweigh the rest of the project -- a 906-label file against
+    # 1,181 labels across 64 recordings -- and a model fitted mostly to one
+    # recording's acoustics is a worse detector everywhere else. Whole
+    # examples are dropped, never pixels: a dropped call still trains as a
+    # positive wherever it falls inside a kept example's window, so the cap
+    # cannot turn a real call into background.
+    max_examples_per_recording: int = 150
+
     # Segmentation loss: 'bce_dice' (default, symmetric) or 'focal_tversky'
     # (recall-weighted via beta>alpha — better for thin/faint structure that a
     # symmetric loss under-segments). gamma focuses on hard examples.
@@ -109,6 +151,18 @@ class UNetTrainingConfig:
 
     wav_paths: List[str] = field(default_factory=list)
 
+    # Fine-tune: start from this checkpoint (a weights.pt or its run folder)
+    # instead of ImageNet. A human-in-the-loop round adds a few recordings to
+    # a model that already works, so retraining from scratch each round costs
+    # hours to relearn what the last run knew. With a file-level split the
+    # parent's held-out recordings stay held out (see _split_tiles), so the
+    # child is scored on recordings NEITHER run trained on.
+    init_from: str = ""
+
+    # Context trained on each side of a call, in ms (None = each patch as
+    # saved). From the project's context_ms; see mad_examples.crop_to_context.
+    context_ms: Optional[float] = None
+
     def resolve_run_dir(self, n_examples: int = 0) -> str:
         if self.run_name:
             name = self.run_name
@@ -116,6 +170,8 @@ class UNetTrainingConfig:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             arch = (self.model_arch or "unet").lower()
             name = f"{ts}_{arch}_n={n_examples}"
+            if self.run_suffix:
+                name += f"_{self.run_suffix}"
         return str(Path(self.project_dir) / "models" / name)
 
 
@@ -229,12 +285,50 @@ def grouped_split(
     return train_idx, val_idx, val_groups
 
 
+def _pinned_split(groups, n_total: int, holdout, usable) -> Dict:
+    """Hold out exactly the recordings in ``holdout``.
+
+    Fails rather than falling back: the point of pinning is that two runs are
+    scored on the same recordings, and a quietly substituted split would make
+    the comparison it exists for meaningless. A pinned recording with no
+    examples any more is reported in ``holdout_missing``, not an error.
+    """
+    if not groups or len(groups) != n_total:
+        raise RuntimeError("A pinned hold-out needs the source recording of "
+                           "every training tile.")
+    want = {os.path.basename(str(h)) for h in holdout}
+    keys = [os.path.basename(str(g[0])) for g in groups]
+    in_val = np.array([k in want for k in keys], dtype=bool)
+    val_idx = np.flatnonzero(in_val).astype(np.int64)
+    train_idx = np.flatnonzero(~in_val).astype(np.int64)
+    present = sorted(set(keys) & want)
+    if len(val_idx) == 0 or len(train_idx) == 0 or not usable(train_idx,
+                                                               val_idx):
+        raise RuntimeError(
+            f"The pinned hold-out ({len(present)} of {len(want)} recordings "
+            "present) leaves calls on only one side of the split.")
+    return {
+        'degraded_from': [], 'train_idx': train_idx, 'val_idx': val_idx,
+        'split_level': 'file', 'val_groups': present,
+        'n_groups': len(set(keys)), 'n_val_groups': len(present),
+        'val_held_out': True, 'pinned': True,
+        'holdout_missing': sorted(want - set(present)),
+    }
+
+
 def _split_tiles(
     groups: List[Tuple[str, str]], n_total: int, val_fraction: float,
     seed: int = 42, positives: Optional[np.ndarray] = None,
-    mode: str = "call",
+    mode: str = "call", fixed_val_groups: Optional[List[str]] = None,
+    holdout: Optional[List[str]] = None,
 ) -> Dict:
     """Pick the strongest split the label set supports, and say which one.
+
+    Two ways to fix the held-out recordings instead of drawing them:
+    ``holdout`` (``--holdout-from``) pins them on request and fails if it
+    cannot -- see :func:`_pinned_split`; ``fixed_val_groups`` is a fine-tune
+    inheriting its parent's, and falls back to a fresh split if unusable. An
+    explicit ``holdout`` wins when both are given.
 
     Preference order, because each level is a weaker guarantee than the last:
 
@@ -260,7 +354,34 @@ def _split_tiles(
             return True
         return bool(positives[train_idx].any()) and bool(positives[val_idx].any())
 
+    if holdout:
+        return _pinned_split(groups, n_total, holdout, _usable)
+
     degraded: List[str] = []
+
+    # A fine-tune inherits its parent's held-out recordings. A fresh seeded
+    # split over a label set that has grown would hand some of the parent's
+    # TRAINING recordings to validation -- recordings the weights have already
+    # fit -- and the score would read high for the wrong reason.
+    if (fixed_val_groups and mode in ('file', 'auto') and groups
+            and len(groups) == n_total):
+        keys = [g[0] for g in groups]
+        fixed = set(fixed_val_groups)
+        val_idx = np.array([i for i, k in enumerate(keys) if k in fixed],
+                           dtype=np.int64)
+        train_idx = np.array([i for i, k in enumerate(keys) if k not in fixed],
+                             dtype=np.int64)
+        if len(val_idx) and len(train_idx) and _usable(train_idx, val_idx):
+            present = sorted(fixed & set(keys))
+            return {
+                'degraded_from': [], 'train_idx': train_idx,
+                'val_idx': val_idx, 'split_level': 'file',
+                'val_groups': present, 'n_groups': len(set(keys)),
+                'n_val_groups': len(present), 'val_held_out': True,
+                'inherited': True,
+            }
+        degraded.append('inherited')
+
     levels = [('file', [g[0] for g in groups] if groups else []),
               ('call', [g[1] for g in groups] if groups else [])]
     if mode == 'file':
@@ -461,13 +582,21 @@ class _AugmentedTileDataset:
                  p_freq_mask=0.5, max_freq_frac=0.15, n_freq_masks=2,
                  p_time_mask=0.5, max_time_frac=0.15, n_time_masks=2,
                  p_noise=0.5, noise_std=0.03,
-                 p_gain=0.5, gain_range=(0.9, 1.1)):
+                 p_gain=0.5, gain_range=(0.9, 1.1),
+                 p_faint=0.0, faint_db_range=(3.0, 18.0),
+                 faint_min_snr_db=3.0, db_min=-100.0, db_max=-20.0):
         import torch
         self._torch = torch
         self.specs = specs      # (N, H, W) float32, ~[0,1]
         self.targets = targets
         self.weights = weights
         self.rng = np.random.default_rng(seed)
+        self.p_faint = float(p_faint)
+        self.faint_db_range = (float(faint_db_range[0]),
+                               float(faint_db_range[1]))
+        self.faint_min_snr_db = float(faint_min_snr_db)
+        self.db_min = float(db_min)
+        self.db_span = float(db_max) - float(db_min)
         self.p_time_shift, self.max_shift_frac = p_time_shift, max_shift_frac
         self.p_freq_mask, self.max_freq_frac, self.n_freq_masks = \
             p_freq_mask, max_freq_frac, n_freq_masks
@@ -478,6 +607,47 @@ class _AugmentedTileDataset:
 
     def __len__(self):
         return self.specs.shape[0]
+
+    def attenuate_calls(self, s, t, att_db=None):
+        """Return ``s`` with its labelled calls moved ``att_db`` dB toward the
+        noise floor (random within ``faint_db_range`` when not given).
+
+        Works in power: observed = call + noise, so a call ``att_db`` further
+        away is ``floor + (observed - floor) * 10^(-att/10)``. Scaling the dB
+        values directly would also darken the noise under the call, which is
+        not what distance does. The floor is each frequency row's median --
+        calls cover under 1% of a tile's pixels, so the row median is the
+        noise, and the floor at 20 kHz and at 100 kHz differ by far more than
+        one global number allows.
+
+        A call already within ``faint_min_snr_db`` + the smallest attenuation
+        of its floor is left alone: it is as faint as it can usefully be made,
+        and pushing it further would leave a label on noise.
+        """
+        call = t > 0.5
+        if not call.any() or self.db_span <= 0:
+            return s
+        db = self.db_min + s.astype(np.float64) * self.db_span
+        floor_db = np.median(db, axis=1, keepdims=True)
+        p = np.power(10.0, db / 10.0)
+        floor = np.power(10.0, np.broadcast_to(floor_db, db.shape) / 10.0)
+        snr_db = 10.0 * np.log10(
+            max(float(np.median(p[call])), 1e-30)
+            / max(float(np.median(floor[call])), 1e-30))
+        lo, hi = self.faint_db_range
+        room = snr_db - self.faint_min_snr_db
+        if att_db is None:
+            if room < lo:
+                return s
+            att_db = float(self.rng.uniform(lo, min(hi, room)))
+        else:
+            att_db = float(min(att_db, max(0.0, room)))
+        if att_db <= 0:
+            return s
+        excess = np.clip(p - floor, 0.0, None)
+        p2 = np.where(call, floor + excess * (10.0 ** (-att_db / 10.0)), p)
+        s2 = (10.0 * np.log10(p2) - self.db_min) / self.db_span
+        return np.clip(s2, 0.0, 1.0).astype(s.dtype)
 
     def _bands(self, n_masks, length, max_frac):
         for _ in range(n_masks):
@@ -500,6 +670,11 @@ class _AugmentedTileDataset:
                 s = np.roll(s, sh, axis=1)
                 t = np.roll(t, sh, axis=1)
                 w = np.roll(w, sh, axis=1)
+        # --- distance: the calls fainter, the target unchanged. Before the
+        # masks and noise, which then act on the attenuated tile as they
+        # would on a real distant call.
+        if self.p_faint > 0 and self.rng.random() < self.p_faint:
+            s = self.attenuate_calls(s, t)
         # --- spectral (input spec only) ---
         if self.rng.random() < self.p_freq_mask:
             for a, b in self._bands(self.n_freq_masks, H, self.max_freq_frac):
@@ -726,6 +901,67 @@ ProgressFn = Callable[[int, int, Dict], None]
 # progress(epoch, total_epochs, metrics_dict)
 
 
+def lr_plateau_patience(cfg) -> int:
+    """Epochs of no improvement before the rate drops.
+
+    Never slower to react than early stopping: with a short early-stop
+    patience the run would otherwise end before the rate was ever allowed to
+    fall, and the schedule would be decoration.
+    """
+    pat = max(1, int(getattr(cfg, 'lr_plateau_patience', 8)))
+    es = int(getattr(cfg, 'early_stop_patience', 0) or 0)
+    if es > 0:
+        pat = max(1, min(pat, es // 2))
+    return pat
+
+
+def make_lr_scheduler(optim, cfg):
+    """The configured LR scheduler for ``optim``, or None. Stepped once per
+    epoch with the validation loss."""
+    if getattr(cfg, 'lr_schedule', 'none') != 'plateau':
+        return None
+    import torch
+    return torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optim, mode='min', factor=float(cfg.lr_plateau_factor),
+        patience=lr_plateau_patience(cfg),
+        threshold=float(cfg.early_stop_min_delta), threshold_mode='abs',
+        min_lr=float(cfg.learning_rate) * 1e-3)
+
+
+#: Checkpoint fields a fine-tune must share with its parent. Weights learned on
+#: one spectrogram grid or intensity scale mean nothing on another, and the
+#: failure would not be loud -- just a worse model.
+_INIT_MUST_MATCH = ('model_arch', 'encoder_name', 'nperseg', 'noverlap',
+                    'nfft', 'db_min', 'db_max', 'db_norm', 'tile_freq_bins',
+                    'tile_time_frames')
+
+
+def load_init_checkpoint(cfg: UNetTrainingConfig) -> Dict:
+    """The checkpoint ``cfg.init_from`` names, refused on any mismatch.
+
+    Returns the checkpoint dict with its resolved path under ``'_path'``.
+    """
+    import torch
+    path = cfg.init_from
+    if os.path.isdir(path):
+        path = os.path.join(path, 'weights.pt')
+    if not os.path.isfile(path):
+        raise RuntimeError(f"Cannot fine-tune: no checkpoint at {path}")
+    ckpt = torch.load(path, map_location='cpu', weights_only=False)
+    if not isinstance(ckpt, dict) or 'state_dict' not in ckpt:
+        raise RuntimeError(f"Cannot fine-tune: {path} is not a MAD checkpoint")
+    run = asdict(cfg)
+    bad = [f"{k}: checkpoint {ckpt[k]!r}, this run {run[k]!r}"
+           for k in _INIT_MUST_MATCH
+           if k in ckpt and k in run and ckpt[k] != run[k]]
+    if bad:
+        raise RuntimeError(
+            f"Cannot fine-tune from {path} -- it was trained on different "
+            "settings:\n  " + "\n  ".join(bad))
+    ckpt['_path'] = os.path.abspath(path)
+    return ckpt
+
+
 def train_unet(
     cfg: UNetTrainingConfig,
     progress: Optional[ProgressFn] = None,
@@ -753,6 +989,7 @@ def train_unet(
     # ---- collect tiles from the self-contained example store ----
     if progress:
         progress(0, cfg.n_epochs, {'status': 'collecting_tiles'})
+    capped: Dict = {}
     specs, targets, weights, groups = collect_training_examples(
         cfg.training_data_dir,
         tile_time_frames=cfg.tile_time_frames,
@@ -766,7 +1003,13 @@ def train_unet(
         return_groups=True,
         placements=cfg.tile_placements,
         seed=cfg.split_seed,
+        max_per_recording=int(getattr(cfg, 'max_examples_per_recording', 0)
+                              or 0),
+        cap_report=capped,
+        context_ms=getattr(cfg, 'context_ms', None),
     )
+    if progress and capped:
+        progress(0, cfg.n_epochs, {'status': 'capped', 'capped': capped})
 
     # How many recordings actually carry labels. Reported because the split
     # line used to assert "All labels are on ONE recording" whenever the level
@@ -814,9 +1057,18 @@ def train_unet(
     # split that is balanced by tile count can still be empty of calls on one
     # side, which silently produces a model that only ever predicts background.
     tile_positive = (targets.reshape(n_total, -1) > 0.5).any(axis=1)
+    # Read (and vet) the parent before splitting: a fine-tune's validation set
+    # is its parent's held-out recordings.
+    init_ckpt = (load_init_checkpoint(cfg)
+                 if getattr(cfg, 'init_from', '') else None)
+    inherit = None
+    if init_ckpt is not None and init_ckpt.get('split_level') == 'file':
+        inherit = list(init_ckpt.get('val_groups') or [])
     split = _split_tiles(groups, n_total, cfg.val_fraction, seed=cfg.split_seed,
                          positives=tile_positive,
-                         mode=getattr(cfg, 'split_mode', 'call'))
+                         mode=getattr(cfg, 'split_mode', 'call'),
+                         fixed_val_groups=inherit,
+                         holdout=getattr(cfg, 'holdout_groups', None))
     train_idx, val_idx = split['train_idx'], split['val_idx']
 
     # Refuse to burn a GPU run on an unlearnable split. Reaching here means no
@@ -866,6 +1118,9 @@ def train_unet(
             'n_groups': split['n_groups'],
             'n_val_groups': split['n_val_groups'],
             'val_groups': split['val_groups'],
+            'pinned': bool(split.get('pinned')),
+            'holdout_missing': split.get('holdout_missing', []),
+            'inherited': bool(split.get('inherited')),
             'n_train_tiles': int(len(train_idx)), 'n_val_tiles': n_val,
             'n_label_recordings': n_label_recordings,
         })
@@ -876,7 +1131,12 @@ def train_unet(
     # Train tiles are augmented on the fly when enabled; val is always raw.
     if getattr(cfg, 'augment', False):
         train_ds = _AugmentedTileDataset(
-            specs[train_idx], targets[train_idx], weights[train_idx])
+            specs[train_idx], targets[train_idx], weights[train_idx],
+            p_faint=(cfg.faint_p if getattr(cfg, 'augment_faint', False)
+                     else 0.0),
+            faint_db_range=tuple(cfg.faint_db_range),
+            faint_min_snr_db=cfg.faint_min_snr_db,
+            db_min=cfg.db_min, db_max=cfg.db_max)
     else:
         train_ds = TensorDataset(
             to_tensor(specs[train_idx]),
@@ -915,10 +1175,16 @@ def train_unet(
                                    'device_desc': dev_desc,
                                    'requested': cfg.device})
     model = build_model(
-        cfg.model_arch, cfg.encoder_name, cfg.encoder_weights,
+        cfg.model_arch, cfg.encoder_name,
+        # A fine-tune overwrites every weight next, so skip the download.
+        cfg.encoder_weights if init_ckpt is None else None,
         in_channels=1, classes=1,
-    ).to(device)
+    )
+    if init_ckpt is not None:
+        model.load_state_dict(init_ckpt['state_dict'])
+    model = model.to(device)
     optim = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate)
+    scheduler = make_lr_scheduler(optim, cfg)
 
     # Name the run by the number of accepted labels (confirmed calls), which is
     # what the user tracks — not the tile count (long calls split into several
@@ -1058,6 +1324,9 @@ def train_unet(
         best_thr = max(dice_sweep, key=dice_sweep.get)
         pos_frac = pos_px / max(1.0, sup_px)  # how sparse the masks are
 
+        lr_now = float(optim.param_groups[0]['lr'])
+        if scheduler is not None:
+            scheduler.step(val_loss)
         improved = val_loss < best_val - cfg.early_stop_min_delta
         if improved:
             best_val = val_loss
@@ -1081,6 +1350,8 @@ def train_unet(
             'patience': cfg.early_stop_patience,
             'n_train_tiles': train_n, 'n_val_tiles': val_n,
             'global_batch': global_batch,
+            # The rate this epoch trained at (before any reduction it caused).
+            'lr': lr_now,
         }
         if improved:
             best_metrics = metrics
@@ -1136,6 +1407,14 @@ def train_unet(
                     'n_train_tiles': int(len(train_idx)),
                     'n_val_tiles': n_val,
                     'trained': datetime.now().isoformat(timespec='seconds'),
+                    # The run folder's name, so anything this checkpoint
+                    # labels says which run it was -- the file is always
+                    # called weights.pt, which says nothing.
+                    'run_name': run_dir.name,
+                    # The parent of a fine-tune, so a chain of rounds can
+                    # be traced back to where it started.
+                    'init_from': (init_ckpt or {}).get('_path', ''),
+                    'split_inherited': bool(split.get('inherited')),
                     # The threshold this checkpoint actually scores best at.
                     # 0.5 is only a convention, and on sparse masks the best
                     # operating point is routinely elsewhere — carrying it with
@@ -1185,11 +1464,21 @@ def train_unet(
         # How the split was made. Every val_* number above must be read through
         # this: only 'file' means "measured on a recording the model never saw".
         'split_level': split['split_level'],
+        'split_inherited': bool(split.get('inherited')),
         'val_held_out': split['val_held_out'],
         'n_groups': split['n_groups'],
         'n_val_groups': split['n_val_groups'],
         'val_groups': split['val_groups'],
+        # True when the held-out recordings were dictated (--holdout-from)
+        # rather than drawn, i.e. this run is scored on another run's set.
+        'holdout_pinned': bool(split.get('pinned')),
+        'holdout_missing': split.get('holdout_missing', []),
         'n_label_recordings': n_label_recordings,
+        # Recordings the per-recording cap trimmed: {name: {kind: (kept,
+        # total)}}. n_labels above is what the store holds; this is what
+        # actually trained.
+        'capped_recordings': {k: {kk: list(vv) for kk, vv in v.items()}
+                              for k, v in capped.items()},
         'split_seed': cfg.split_seed,
         # Positive-pixel balance — the number that explains an all-background
         # collapse after the fact (see the _balance note above).

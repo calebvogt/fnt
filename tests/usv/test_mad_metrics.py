@@ -83,6 +83,21 @@ def test_a_run_name_yields_the_label_count(tmp_path):
         'timestamp': '20260908_203506', 'arch': 'unet', 'n_labels': 161}
 
 
+def test_a_tagged_run_name_keeps_its_label_count(tmp_path):
+    """Fine-tunes are named ..._n=1398_ft_r6 so the count stays readable."""
+    assert MM.parse_run_name("20261015_172153_unet_n=1398_ft_r6") == {
+        'timestamp': '20261015_172153', 'arch': 'unet', 'n_labels': 1398,
+        'tag': 'ft_r6'}
+
+
+def test_a_run_suffix_follows_the_label_count(tmp_path):
+    from fnt.usv.usv_detector.mad_training import UNetTrainingConfig
+    run = UNetTrainingConfig(project_dir=str(tmp_path), run_suffix="ft_r7")
+    name = os.path.basename(run.resolve_run_dir(n_examples=1500))
+    assert MM.parse_run_name(name)['n_labels'] == 1500
+    assert name.endswith("_unet_n=1500_ft_r7")
+
+
 def test_a_hand_renamed_directory_is_skipped_not_fatal(tmp_path):
     assert MM.parse_run_name("my_best_model") == {}
 

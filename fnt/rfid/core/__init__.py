@@ -1,42 +1,33 @@
 """Core RFID preprocessing stages.
 
-The pipeline runs in this order, each stage taking the previous one's table:
+    downloads -> reads -> cleaned reads -> bouts -> summaries, QC
 
-    raw exports -> reads -> bouts -> GBI -> {ownership, contacts, networks}
+``file_readers`` parses Biomark downloads, ``metadata`` the animal table,
+``cleaning`` applies identity, place and every cleaning rule, ``bout_detector``
+builds bouts, ``summaries`` the per-day tables and ``qc`` the reports.
 
-Every stage below the GBI is an analysis layer: it reads the GBI and writes its
-own table, and none of them feed each other except displacement, which needs
-zone ownership to say whether a winner was at home.
+The GBI, edgelist, displacement, Hinde and social-network modules are optional
+layers carried over from the earlier module (see ``RFIDConfig.layers``).
 """
 
-from .file_readers import (read_biomark_txt, read_rfid_file, read_download_dir,
-                           summarise_downloads)
-from .preprocessor import (RFIDPreprocessor, ReadsResult, load_metadata,
-                           tag_lookup, pad_tag)
-from .bout_detector import BoutDetector, detect_bouts
-from .gbi_generator import GBIGenerator, create_gbi, melt_gbi
-from .zone_ownership import (zone_ownership, daily_owners, zones_owned_per_day)
-from .edgelist import EdgelistGenerator, co_presence_bouts, edgelist
-from .displacement import (DisplacementDetector, detect_displacements,
-                           annotate_ownership)
-from .hinde_index import HindeIndexCalculator, hinde_index, hinde_summary
-from .social_network import (SocialNetworkAnalyzer, social_networks,
-                             sri_matrix, network_for_day)
+from .file_readers import (read_downloads, list_download_files, read_export,
+                           read_biomark_txt, read_xlsx_text, normalise_tag_value,
+                           normalise_tags, parse_scan_times, DownloadResult)
+from .metadata import (load_animals, AnimalTable, read_grid, list_sheets,
+                       detect_header_row, header_names, guess_mapping,
+                       excel_date, excel_time, combine_date_time)
+from .cleaning import clean_reads, CleanResult, day_index, resolve_origin
+from .bout_detector import detect_bouts, BOUT_COLUMNS
+from .summaries import animal_days, zone_holders, co_occupancy, overlapping_bouts
+from . import qc
 
 __all__ = [
-    # readers
-    "read_biomark_txt", "read_rfid_file", "read_download_dir",
-    "summarise_downloads",
-    # stage 1
-    "RFIDPreprocessor", "ReadsResult", "load_metadata", "tag_lookup", "pad_tag",
-    # stage 2
-    "BoutDetector", "detect_bouts",
-    # stage 3
-    "GBIGenerator", "create_gbi", "melt_gbi",
-    # analysis layers
-    "zone_ownership", "daily_owners", "zones_owned_per_day",
-    "EdgelistGenerator", "co_presence_bouts", "edgelist",
-    "DisplacementDetector", "detect_displacements", "annotate_ownership",
-    "HindeIndexCalculator", "hinde_index", "hinde_summary",
-    "SocialNetworkAnalyzer", "social_networks", "sri_matrix", "network_for_day",
+    "read_downloads", "list_download_files", "read_export", "read_biomark_txt",
+    "read_xlsx_text", "normalise_tag_value", "normalise_tags", "parse_scan_times",
+    "DownloadResult",
+    "load_animals", "AnimalTable", "read_grid", "list_sheets", "detect_header_row",
+    "header_names", "guess_mapping", "excel_date", "excel_time", "combine_date_time",
+    "clean_reads", "CleanResult", "day_index", "resolve_origin",
+    "detect_bouts", "BOUT_COLUMNS",
+    "animal_days", "zone_holders", "co_occupancy", "overlapping_bouts", "qc",
 ]

@@ -1,145 +1,127 @@
 # RFID Processing Module
 
-Preprocessing and analysis for **passive RFID** tracking of animals moving
-between antenna-instrumented resource zones. Built for field enclosure studies
-where each zone carries one or more antennas and animals wear PIT tags.
+Preprocessing for **passive RFID** (PIT-tag) tracking with Biomark readers:
+animals wear one or more tags, antennas sit at resource zones, and the reader
+logs every pass. This module turns the reader downloads into analysis-ready
+tables, with QC reports on everything it removed or found suspicious. It does
+for RFID what `fnt/uwb` does for UWB, and like every FNT tool it is wholly
+standalone (no imports from other tools).
 
-## Design
+User documentation: `docs/tools/rfid.md`.
 
-**One trial, one config, one output folder** — the same shape as the UWB module.
-A trial's analysis folder sits beside its raw exports and is self-describing:
+## Layout
 
 ```
-T001_Alpha/
-    LID_2021_ALPHA_RFID_DL_1.txt        raw exports, never modified
-    LID_2021_ALPHA_RFID_DL_1.xlsx
-    ...
-    T001_FNT/
-        fnt_config.json                 settings, provenance, run stats, warnings
-        _messageLog.txt
-        csvs/                           every table the run produced
-        plots/
-        animations/
+fnt/rfid/
+    rfid_preprocessing_pyqt.py   RFIDPreprocessingWindow (the GUI)
+    rfid_dialogs.py              metadata mapping, arena, identities, lost tags
+    rfid_worker.py               QThread wrapper around pipeline.run
+    pipeline.py                  run(config) -> RunResult; writes the analysis folder
+    config/
+        defaults.py              RFIDConfig, Arena (Paddock/Zone/Antenna), presets
+        config_manager.py        fnt_config.json, provenance, antenna CSV, paths
+    core/
+        file_readers.py          Biomark .xlsx/.xls/.txt/.csv, twins, truncation
+        metadata.py              animal table: header row, mapping, Excel dates, tags
+        cleaning.py              identity, place, cross-paddock, windows, lost tags,
+                                 found dead, days
+        bout_detector.py         gap/zone/day bouts (+ vectorised legacy R rule)
+        summaries.py             animal_days, zone_holders, co_occupancy
+        qc.py                    roster, cross-paddock, two places, stationary tags
+        gbi_generator.py ...     optional legacy layers (see below)
 ```
-
-This replaces an earlier workflow that concatenated every trial into single
-`ALLTRIAL_*.csv` files. Per-trial folders make a run reproducible (the config
-that produced a folder lives in it) and make re-running one trial cheap.
 
 ## Pipeline
 
 ```
-raw exports → reads → bouts → GBI → { ownership, contacts, networks }
+downloads -> reads -> cleaned reads -> bouts -> summaries  (+ QC, + optional layers)
 ```
-
-| Stage | Output | What it is |
-|---|---|---|
-| Reads | `<trial>_reads.csv` | One row per tag detection, with animal identity, zone, coordinates, day, and elapsed time |
-| Bouts | `<trial>_bouts.csv` | One row per continuous stay in a zone |
-| GBI | `<trial>_gbi.csv` | Group-by-individual matrix: one row per interval in which the set of animals present cannot change |
-| Bout summary | `<trial>_bout_summary.csv` | The GBI in long form — one row per animal per interval, carrying who else was there |
-| Zone ownership | `<trial>_zone_ownership.csv` | Each male's share of a zone's reads per day, and his rank |
-| Co-presence | `<trial>_co_presence_bouts.csv`, `<trial>_edgelist.csv` | Continuous encounters per pair, and their aggregation |
-| Displacement | `<trial>_displacement.csv` | Male 1→n→1 turnovers in a zone, typed by who owned it |
-| Hinde index | `<trial>_hinde_{broad,narrow}.csv` | Who closes distance and who breaks it |
-| Social networks | `<trial>_sna_{node,net}_stats.csv` | SRI association networks with igraph metrics, per day |
-
-Reads, bouts and the GBI are the preprocessing itself and are always produced.
-Everything below them is an analysis layer selected in `TrialConfig.exports`.
-
-## Input
-
-**Reader exports.** Biomark Device Manager `.txt` (fixed-width), `.xlsx`, and
-CSV are all read. Every file in the trial folder is ingested and the union
-deduplicated — downloads overlap by design, and in real data a `.txt` export can
-be silently truncated while its `.xlsx` sibling is complete. Taking the union
-makes that harmless instead of lossy.
-
-**Metadata.** A CSV or Excel table with at minimum `name`, `sex`, and the tag
-columns (`tag_1`, `tag_2` by default). `code`, `phase`, `group`, `strain` (or
-`genotype`), and `trial` are used when present.
-
-> Tag IDs are 15-significant-digit decimals. Anything that stores them as a
-> number drops the trailing digit — `985.113004548310` becomes
-> `985.11300454831`, which matches no animal. They are read as text throughout
-> and re-padded on load.
-
-## Arena
-
-Zones and antennas are configured together, because assigning several antennas
-to one zone is the normal case (a wall and a floor antenna per zone):
 
 ```python
-from fnt.rfid import Arena, get_default_config
+from fnt.rfid.config import RFIDConfig, MetadataSpec, liddell_8_zone
+from fnt.rfid.pipeline import run
 
-cfg = get_default_config("8_zone_paddock")   # 2x4 zones, 16 antennas
-cfg.arena.antenna_zone_map()                 # {1: 1, ..., 9: 1, ..., 16: 8}
+cfg = RFIDConfig(name="LID_2021",
+                 download_dirs=[r".../T001_Alpha", r".../T002_Bravo"],
+                 timezone="America/New_York", day_origin="2021-05-07 12:00:00")
+cfg.arena = liddell_8_zone(2)                      # A = reader 1, B = reader 2
+cfg.arena.paddocks[0].trials = ["T001"]            # who lives where
+cfg.arena.paddocks[1].trials = ["T002"]
+cfg.metadata = MetadataSpec(path=r".../LID_2021_metadata.xlsx", sheet="metadata",
+                            columns={"name": "name", "sex": "sex", "trial": "trial",
+                                     "release_date": "drop_date",
+                                     "release_time": "drop_time"},
+                            tag_columns=["tag_1", "tag_2"])
+cfg.animals["Calypso"] = {"lost_tags": [{"tag": "985.113004548427",
+                                         "start": "2021-05-16 12:00:00"}]}
+cfg.animals["Isac"] = {"dead_mode": "last_entry"}
+
+result = run(cfg, progress=lambda pct, msg: print(pct, msg))
+result.tables["bouts"]            # every table is returned as well as written
 ```
 
-`Arena.grid()` lays out a regular grid; individual antennas can then be moved or
-reassigned. Validation refuses a config with a zone that has no antenna (it
-could never record an animal) or an antenna assigned to a zone that does not
-exist, and a run reports antennas that produced no reads — a dead antenna
-otherwise looks exactly like an unvisited zone.
+## Design decisions
 
-## Usage
+**(reader, antenna) -> zone_id.** Zones are paddock + zone (`A3`), antennas are
+keyed by reader and antenna. The earlier module keyed on antenna number alone,
+which cannot tell reader 1's antenna 3 (Alpha) from reader 2's (Bravo).
 
-```python
-from fnt.rfid import get_default_config
-from fnt.rfid.pipeline import run_trial
+**Other paddock's reader.** A read by another paddock's reader is kept in that
+paddock with `away = True` (default), dropped, or folded into the animal's own
+paddock as the original pipeline did. The home paddock comes from the
+metadata trial value, matched against each paddock's `trials`, ID or name.
 
-cfg = get_default_config("8_zone_paddock")
-cfg.trial_id = "T001"
-cfg.raw_dir = r"...\Data\RFID\T001_Alpha"
-cfg.metadata_path = r"...\Data\metadata.csv"
-cfg.reader_ids = [1]                 # readers installed in THIS enclosure
-cfg.exports.update({"displacement": True, "sna": True})
+**Twins and truncation.** Same-stem `.txt`/`.csv` and `.xlsx`: the spreadsheet
+is used; the twin is read and compared, and fewer records or records the
+spreadsheet lacks are reported. Every file's last line is checked.
 
-result = run_trial(cfg, progress=print)
-result.tables["gbi"]                 # tables are returned as well as written
-```
+**Tags** are compared as `"%.12f"` strings of their numeric value; non-numeric
+tags as trimmed upper-case text. DEC tag first, HEX as a fallback.
 
-## Choices worth knowing about
+**Found dead, last entry.** Entry = a read on an entrance-location antenna
+after a gap > bout gap (gap measured over the animal's reads, both tags). The
+cut is last entry + one bout gap, reads strictly after it dropped - the same
+rule as the R reference. An optional "found at" time bounds the search.
 
-**Bout detection** defaults to `segment`: a new bout begins whenever the gap
-reaches the threshold or the zone changes, so no bout can contain a gap or a
-zone change. An `r_compat` algorithm reproduces the original R pipeline's
-control flow exactly, for regenerating published numbers — it pairs bout starts
-to stops by position rather than adjacency, which mis-pairs about 2.3% of bouts.
+**Days** are `ceil((t - origin) / 24 h)` on the local wall clock: a read
+exactly at the origin is the last moment of day 0. Auto origin = noon on the
+date of the earliest metadata release (not the first read: readers are tested
+before animals go in).
 
-**Timestamp resolution** defaults to `ms`. The R pipeline lost sub-second
-precision by writing reads to CSV and reading them back, so its 50 s threshold
-was applied to whole-second times; `time_resolution="s"` reproduces that.
+**Bouts** split on animal, zone_id, day, or a gap > `bout_gap_s` (a gap of
+exactly the threshold continues). Gaps are compared after rounding to the
+microsecond so a 50.000 s gap is not 50.0000000001 s. Ties in time break by
+antenna then tag, as in the R reference. Duration = max(stop - start, 1 s).
 
-**Foreign reader reads** — detections of this trial's animals on another
-enclosure's reader — are dropped by default and counted in the run's warnings.
-They are real events but not valid observations of this arena.
+**Co-occupancy** is an interval sweep per zone_id (sort by start;
+`searchsorted` finds each bout's later-starting partners), so the work grows
+with the number of overlaps. On LID it agrees to the millisecond with the
+GBI-based edgelist on all 752 pair-days.
 
-**Zero-length GBI intervals** occur when one animal's bout ends exactly as
-another's begins. Both animals count as present: these are the clearest
-hand-off events in the data, and an implementation that probes slightly later
-loses all of them.
+**Timezone** is optional: with one, gaps are measured on UTC so a DST change
+does not add or remove an hour; without one, the reader's clock is taken as
+never changing.
 
-**Two network metrics were renamed** from the R pipeline, which mislabelled
-them. `net_spectral_radius` (was `net_eigen_centrality`) is the leading
-eigenvalue of the unweighted adjacency, not a centralisation score.
-`net_mean_dist_weighted` (was `net_mean_dist`) is a weighted shortest-path
-length, not a count of edges — with SRI weights it lands near 0.02.
+**Nothing is written into a download folder**, and nothing is written at all
+until every stage has succeeded.
 
-## Dependencies
+## Optional layers
 
-`pandas`, `numpy`, `openpyxl` (Excel input), and `python-igraph` for the social
-network layer.
-
-> On Windows the `python-igraph` wheel needs `VCOMP140.DLL`, the MSVC OpenMP
-> runtime, which is absent unless the Visual C++ Redistributable is installed.
-> The module falls back to a copy shipped inside scikit-learn if one is present;
-> otherwise it raises with an explanation rather than a bare "DLL load failed".
+`gbi_generator`, `edgelist`, `zone_ownership`, `displacement`, `hinde_index`
+and `social_network` predate this rebuild. They now run on string zone IDs and
+have tests (`tests/rfid/test_rfid_legacy_layers.py`), but they are
+interpretive, so `RFIDConfig.layers` has them all off by default. The social
+network layer needs `python-igraph`.
 
 ## Validation
 
-Every stage was validated row-for-row against the outputs of the R pipeline it
-replaces, on the 2021_LID two-trial dataset: 1,402,867 reads, 70,796 bouts,
-43,837 + 45,810 GBI intervals, 510 ownership rows, 1,355 displacement events,
-17,589 broad contact events, and 508 node × 24 network statistics rows all
-reproduce exactly. See `tests/rfid/` for the properties that are pinned.
+`tests/rfid/test_rfid_lid_acceptance.py` runs the 2021 LID dataset (when
+present) against an independent R reimplementation: 1,523,161 rows ->
+1,404,510 unique reads, 1,643 unknown-tag reads, 1,670 away reads, 47,705
+lost-tag and 89,459 found-dead reads removed, 65,473 bouts and 1,439
+animal-hours in zones - all exact.
+
+## Dependencies
+
+`pandas`, `numpy`, `openpyxl`, `pytz`, PyQt5; `xlrd` only for legacy `.xls`
+downloads; `python-igraph` only for the social-network layer.

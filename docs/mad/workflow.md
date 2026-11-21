@@ -172,6 +172,65 @@ harmonics the model finds, and it learns to stop.
 **Q** runs the selected model on just the visible window — useful for spot
 checks without a full run.
 
+**Play** (and **Het**) starts just before the selected call when it is on
+screen, so a wide view doesn't mean waiting through the audio to its left; the
+lead is half a second of listening (15 ms of audio at 0.03x). With nothing
+selected, Play starts at the left edge of the view.
+
+**Fixing a call's shape.** Right-click a call → **Edit shape** to repaint it:
+Paint (P) adds, Eraser (E, or right-drag) removes, Enter saves the new shape and
+accepts the call, Esc leaves it as it was.
+
+**Joining a call that came out in pieces.** A faint or oscillating call often
+comes out of the model as several pieces. Shift-click the pieces (or drag a box
+around them), right-click one of them and choose **Edit N shapes together**:
+every selected call goes into one shape edit. Paint the stretches that join
+them (erase anything that does not belong) and press Enter. Calls that now
+touch, through your stroke or because they already overlapped, become one
+accepted call; it stays tied to the model detection you right-clicked (the
+queued call's, in a call queue). A selected call you did not touch and did not
+join keeps its status, so a pending detection stays pending; one whose shape
+you changed on its own is saved as an edited shape and accepted, as with Edit
+shape. A stroke that reaches none of the calls is a join that fell short:
+Enter says so and leaves the edit open. Esc cancels with nothing changed, and
+one Ctrl+Z undoes the whole edit. **Merge N selected calls** on the same menu
+joins pieces that already touch, without painting.
+
+**Call queues.** A focus list (`--focus list.txt`) can name detections as well
+as recordings: `recording<TAB>detection<TAB>note`, the detection being its
+number (blob_id). Next (N) and Back (B) then walk those calls in the list's
+order across recordings, each opened centred and selected, with the note in
+the status bar; deciding the queued call moves on to the next one. Deciding it
+also puts its training window (the call plus the context on each side) into
+training, so with Auto-advance on MAD first selects each pending detection
+inside that window, nearest first, and moves on only once none is left; each
+decision widens the window, so a call in a bout can lead through the whole
+bout. The header shows how many are still pending in the window, and Skip (S)
+leaves them undecided (trained as background) and goes to the next queued
+call. Editing a pending call's shape (right-click → Edit shape, then Enter)
+accepts it, so it counts as a decision here too: editing the queued call, or
+a pending call in its window during that walk, moves on exactly as Accept
+would. The same holds for Edit N shapes together when it changes or joins the
+queued call. While you work on one call, MAD reads the queue's next recording in the
+background, so stepping to it skips the few seconds a 10-minute recording takes
+to decode. Moving forward (deciding, Skip, Next) goes to the next queued call
+still to decide: calls already decided, in the window walk or an earlier
+session, are passed over, and after the last call the queue returns to the
+first one you skipped. Back (B) steps one call at a time, decided or not, so
+earlier decisions can be revisited. The counter reads "Call 37/200", the header
+says how many calls are left to decide, and the queue reopens on the first
+undecided call at or after where it was left. A queue never
+looks like an ordinary focus: the window title says "call queue", the line above
+the spectrogram starts with a cyan **CALL QUEUE 37/200** tag, the queued call
+has a dashed cyan frame labelled QUEUED CALL (V hides it with the other
+overlays, so the call can be seen clean), and in the Detections list its row
+is bold cyan with a ▶ while the recording's other detections are dimmed (they
+are context, not part of the queue). Skip (S), the Audio list's Prev / Next and
+clicking a recording all move through the queue too; clicking a recording
+opens its next undecided queued call. Use it to judge a
+random sample of detections (an honest precision) or the calls two models
+disagree on. Lines without a detection keep the ordinary per-recording focus.
+
 The **Min score** slider hides pending calls below a confidence. It never hides
 accepted or rejected calls, and the count label always says how many are hidden.
 The completion prompt will not claim a file is done while the filter is hiding
@@ -188,6 +247,36 @@ normally where a model goes from "finds the obvious ones" to usable.
 Where to spend labeling time: sort the Detections list by **Score** and work the
 middle — calls near the decision threshold are where a label changes the model
 most. Confidently right and confidently wrong calls teach it little.
+
+### When the spectrogram can't decide: Fusion QC
+
+A running wheel, a mouse chewing or scrabbling in bedding, and a faint call can
+look alike in a spectrogram. If the arena was filmed, **Fusion QC** (right end of
+the controls bar) shows what was happening at the microphone over the view (plus
+1 s either side):
+
+- the camera that watched the microphone, synced to the playhead both ways —
+  Play the audio and the frame keeps pace; drag the video's slider, or play it
+  silently, and the playhead line moves on the spectrogram;
+- the mice that camera's Mask Tracker model finds, outlined (every few frames;
+  colours tell mice apart within a frame, they are not identities);
+- the RFID reads and visit bouts at the microphone's zone, one row per mouse,
+  under the video;
+- **Layout ▸ Arena**: every camera at once, laid out as the arena is, each zone
+  camera labelled with the mice RFID places in it at that moment — calls carry
+  between zones, so a call on one microphone can come from the next zone;
+- frames during the selected detection get a red border.
+
+It needs a `video_qc.json` in the project folder: how to read each recording's
+trial, channel and start time (from its file name or the Avisoft log), which
+camera watched each channel, where each camera's files are and how to read their
+start times, and optionally the Mask Tracker model per camera, the RFID tables,
+the arena layout and per-trial clock offsets. The fields are documented at the
+top of `fnt/usv/usv_detector/mad_video.py`. Without the file the button stays off.
+
+Clocks: each sensor kept its own clock, so check the time a camera burns into its
+frames against the one Fusion QC prints above it, and set `offsets_s` (video) and
+`rfid.offsets_s` per trial once you know them.
 
 ---
 
@@ -287,9 +376,14 @@ is the record; nothing else is written during a run.
 **File ▸ Export Annotations to CSV…** turns it into one standalone
 `<recording>_FNT_MAD_annotations.csv` per wav — the same per-file profile SLEAP
 and DLC use. Export when you are done reviewing, not before: the CSV is a
-snapshot, and re-exporting after more review simply overwrites it. There is
-deliberately no aggregate table; concatenate what you need in your analysis
-code.
+snapshot, and re-exporting after more review simply overwrites it.
+
+**File ▸ Export…** (or `mad export`) writes the whole run as a few tables in
+one folder instead: one row per recording, one per detection and one per
+labelled call, with optional spectrogram images of the labelled calls.
+Exporting again into the same folder reads only the recordings that changed, so
+it can be re-run while a batch is still going. See
+[Exporting tables](export.md).
 
 Every row is one call: onset/offset, frequency box and contour metrics (peak,
 bandwidth, slope, excursion, sinuosity), spectral shape (centroid, entropy,

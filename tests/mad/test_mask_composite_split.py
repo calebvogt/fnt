@@ -146,6 +146,12 @@ def _collect(kind, own, nb):
                            np.zeros((H, W), bool) if kind == "negative" else own,
                            meta_for(5, 12, 20, 30, kind=kind), "ex1",
                            neighbors_patch=nb)
+        if nb is not None:
+            # A neighbour is a confirmed call: training rebuilds every window
+            # from the labels in the store, so it has to be one.
+            ms.td_save_example(os.path.join(d, "training_data.h5"),
+                               np.zeros((H, W), np.uint8), nb,
+                               meta_for(25, 33, 40, 50), "nb1")
         # Tile at the patch's own size so output indices match patch indices;
         # the default 512-row tile pads from the bottom and shifts every index.
         s, t, w = mx.collect_training_examples(
@@ -402,6 +408,37 @@ def test_the_rebuild_carries_neighbours_across():
     assert np.array_equal(got["mask"] > 0, own), "and it must not merge them"
 
 
+def test_the_rebuild_waits_out_a_brief_lock_on_the_old_store(monkeypatch):
+    """Windows refuses the final swap (WinError 5) while anything holds the
+    old store open, even to read it. On 2026-11-10 an inference run on the
+    same project did, for a moment, and the training run was refused. The
+    swap now retries; only a lock that outlasts the retries fails."""
+    from scipy.io import wavfile
+    from fnt.usv.usv_detector import mad_examples as mex
+    from fnt.usv.usv_detector import fnt_mask_store as _ms
+    own, _nb = two_blobs()
+    real, calls = os.replace, []
+
+    def flaky(src, dst):
+        calls.append(dst)
+        if len(calls) < 3:
+            raise PermissionError(5, "Access is denied")
+        real(src, dst)
+    import time
+    monkeypatch.setattr(os, "replace", flaky)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    with tempfile.TemporaryDirectory() as d:
+        wav = os.path.join(d, "rec.wav")
+        wavfile.write(wav, SR, np.zeros(SR // 10, np.int16))
+        ms.td_save_example(_ms.masks_sibling_path(wav),
+                           np.zeros((H, W), np.uint8), own,
+                           meta_for(5, 12, 20, 30), "ex1")
+        out = os.path.join(d, "training_data")
+        assert mex.rebuild_training_store(out, [wav]) == 1
+        assert len(calls) == 3
+        assert os.path.isfile(os.path.join(out, "training_data.h5"))
+
+
 def test_a_rebuilt_store_still_supervises_the_neighbour():
     """End to end: sidecar -> rebuild -> training target."""
     from scipy.io import wavfile
@@ -414,6 +451,9 @@ def test_a_rebuilt_store_still_supervises_the_neighbour():
         ms.td_save_example(_ms.masks_sibling_path(wav),
                            np.zeros((H, W), np.uint8), own,
                            meta_for(5, 12, 20, 30), "ex1", neighbors_patch=nb)
+        ms.td_save_example(_ms.masks_sibling_path(wav),
+                           np.zeros((H, W), np.uint8), nb,
+                           meta_for(25, 33, 40, 50), "nb1")
         out = os.path.join(d, "training_data")
         rebuild_training_store(out, [wav])
         _s, t, _w = mx.collect_training_examples(

@@ -29,6 +29,7 @@ class YOLOInference:
         self._use_masks: bool = use_masks
         self._frame_count: int = 0
         self._empty_count: int = 0
+        self.roi = None          # the model's region of interest (mtt_roi), if trained with one
 
     def load_model(self):
         from ultralytics import YOLO
@@ -44,6 +45,9 @@ class YOLOInference:
             self.categories = config.get("categories", {})
             if self._inference_size == 0:
                 self._inference_size = config.get("imgsz", 640)
+            from .mtt_roi import ROI
+            self._roi_all = ROI.from_dict(config.get("roi"))
+            self.roi = self._roi_all.for_source(None) if self._roi_all is not None else None
 
         weights_path = os.path.join(self.model_dir, "weights_best.pt")
         if not os.path.exists(weights_path):
@@ -54,7 +58,15 @@ class YOLOInference:
         imgsz = self._inference_size if self._inference_size > 0 else 640
         mask_str = "masks" if self._use_masks else "boxes-only"
         print(f"[YOLO Inference] Model loaded on {device}, "
-              f"inference={imgsz}px, {mask_str}")
+              f"inference={imgsz}px, {mask_str}"
+              + (f", ROI: {self.roi.describe()}" if self.roi is not None else ""))
+
+    def use_source(self, path: str) -> None:
+        """Prepare frames of the video (or training frame) at ``path`` with its
+        trial folder's own ROI, when the model was trained with per-trial ones."""
+        roi_all = getattr(self, "_roi_all", None)
+        if roi_all is not None and roi_all.by_folder:
+            self.roi = roi_all.for_source(path)
 
     def _resolve_device(self) -> str:
         import torch
@@ -83,6 +95,10 @@ class YOLOInference:
             raise RuntimeError("Model not loaded. Call load_model() first.")
 
         orig_h, orig_w = frame_rgb.shape[:2]
+        origin = (0, 0)
+        if self.roi is not None:        # the frame as the model was trained on it
+            frame_rgb, origin = self.roi.apply(frame_rgb)
+        img_h, img_w = frame_rgb.shape[:2]
         imgsz = self._inference_size if self._inference_size > 0 else 640
         max_det = max_detections if max_detections > 0 else 300
 
@@ -98,6 +114,7 @@ class YOLOInference:
             device=self.device,
             verbose=False,
             retina_masks=True,
+            iou=0.5,       # NMS: one box per animal (Ultralytics' 0.7 kept stacked duplicates)
         )
 
         if not results or len(results) == 0:
@@ -134,18 +151,31 @@ class YOLOInference:
 
         masks = None
         if self._use_masks and r.masks is not None:
-            mask_data = r.masks.data.cpu().numpy()
+            # To bool on the device first: a quarter of the bytes to copy back
+            # than the float masks, for the same nonzero test as astype(bool).
+            mask_data = r.masks.data.bool().cpu().numpy()
             n = mask_data.shape[0]
-            if mask_data.shape[1] != orig_h or mask_data.shape[2] != orig_w:
-                full_masks = np.zeros((n, orig_h, orig_w), dtype=bool)
+            if mask_data.shape[1] != img_h or mask_data.shape[2] != img_w:
+                full_masks = np.zeros((n, img_h, img_w), dtype=bool)
                 for i in range(n):
                     full_masks[i] = cv2.resize(
-                        mask_data[i].astype(np.uint8), (orig_w, orig_h),
+                        mask_data[i].astype(np.uint8), (img_w, img_h),
                         interpolation=cv2.INTER_NEAREST,
                     ).astype(bool)
                 masks = full_masks
             else:
                 masks = mask_data.astype(bool)
+
+        if self.roi is not None:
+            # Back on the full frame; detections centred outside the ROI dropped.
+            boxes = boxes + np.array([*origin, *origin], np.float32)
+            if masks is not None:
+                masks, kept = self.roi.to_frame(masks, orig_h, orig_w)
+                masks = masks[kept]
+            else:
+                kept = [i for i, b in enumerate(boxes)
+                        if self.roi.allows((b[0] + b[2]) / 2, (b[1] + b[3]) / 2, orig_h, orig_w)]
+            boxes, scores, labels = boxes[kept], scores[kept], labels[kept]
 
         return {
             "boxes": boxes,

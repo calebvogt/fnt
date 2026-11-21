@@ -92,6 +92,16 @@ class MADInferenceConfig:
     # together, so they must genuinely share a band to merge. A harmonic
     # overlaps its fundamental almost completely; sweep fragments barely.
     merge_concurrent_fraction: float = 0.5
+    # Build the next file's spectrogram on a background thread while this one
+    # scans on the GPU (see run_inference_on_files). Same output either way.
+    prefetch_next: bool = True
+    # Build the inference spectrogram on the GPU (CUDA only) when it
+    # reproduces the CPU one -- 14.5 s -> 1.2 s per 10-minute recording.
+    gpu_spectrogram: bool = True
+    # Store each detection's brightness ridge (mad_ridge) with it, and fill in
+    # the ridges a resumed run's already-analysed recordings lack. The
+    # project's ``ridge`` setting; on by default.
+    ridge: bool = True
     # Optional per-wav processing parameters — filled from model checkpoint
     # when not specified.
     nperseg: Optional[int] = None
@@ -125,6 +135,57 @@ def _resolve_device(pref: str) -> str:
 # ----------------------------------------------------------------------
 # Model loading
 # ----------------------------------------------------------------------
+#: File stems that name a checkpoint's role, not the model. Every training run
+#: saves ``weights.pt``, so a stem from this set says nothing about which run.
+_GENERIC_CHECKPOINT_STEMS = frozenset(
+    {"weights", "best", "model", "checkpoint", "last"})
+
+
+def model_label(model_path) -> str:
+    """The name to record against anything ``model_path`` produced.
+
+    The run folder (``20261006_134117_unet_n=1012``) when the file itself has a
+    generic name, which every MAD run's does; otherwise the file's own stem.
+    Every stored detection used to say ``weights``, so a recording holding
+    reviewed detections from an older run beside fresh ones from a newer run
+    could not say which were which.
+    """
+    if not model_path:
+        return ""
+    p = Path(str(model_path))
+    if p.stem.lower() in _GENERIC_CHECKPOINT_STEMS and p.parent.name:
+        return p.parent.name
+    return p.stem
+
+
+def stored_decision_ids(wav_path: str) -> List[int]:
+    """Integer blob ids that any stored example for ``wav_path`` refers to.
+
+    Those are the prediction ids an accept or a reject was made on. A new run
+    must number its detections above all of them, or a fresh detection takes
+    over an old decision's id. String ids (hand labels, prefixed ids) cannot
+    collide with a run's integer ids and are skipped.
+    """
+    from .fnt_mask_store import store_paths_for, td_iter_meta
+    out: List[int] = []
+    name = Path(wav_path).name
+    for store in store_paths_for(wav_path):
+        if not Path(store).is_file():
+            continue
+        try:
+            for meta in td_iter_meta(store):
+                if Path(str(meta.get('source_wav', ''))).name != name:
+                    continue
+                b = meta.get('blob_id')
+                if isinstance(b, (int, np.integer)):
+                    out.append(int(b))
+                elif isinstance(b, str) and b.strip().isdigit():
+                    out.append(int(b.strip()))
+        except Exception:
+            continue
+    return out
+
+
 def load_model(model_path: str, device: str = "auto"):
     """Load a U-Net checkpoint saved by :func:`train_unet`.
 
@@ -1148,6 +1209,9 @@ _EXTRA_COLS = [
     'total_energy_db', 'snr_db', 'peak_time_frac', 'amplitude_modulation',
     'fill_ratio', 'aspect_ratio',
     'model_name', 'threshold', 'min_blob_pixels',
+    # Brightness ridge inside the mask (mad_ridge): turns of the brightest
+    # continuous path, its rate and depth, and whether that makes a trill.
+    'ridge_turns', 'ridge_rate_hz', 'ridge_depth_khz', 'ridge_trill',
 ]
 
 # Harmonic grouping (see mad_harmonics). Written by the review GUI, not by
@@ -1425,25 +1489,9 @@ def write_embeddings_npz(path: str, results: List[Dict]) -> int:
 # ----------------------------------------------------------------------
 # End-to-end per-file run
 # ----------------------------------------------------------------------
-def run_inference_on_file(
-    wav_path: str,
-    cfg: MADInferenceConfig,
-    model=None, ckpt=None, device: Optional[str] = None,
-    progress: Optional[Callable[[str, int, int], None]] = None,
-    wait_if_paused: Optional[Callable[[], None]] = None,
-) -> Dict:
-    """Run inference on one wav, write sibling PNG + CSV, return summary.
-
-    ``progress`` is invoked with ``(stage, i, n)`` where ``stage`` is one
-    of ``'spec'``, ``'infer'``, ``'blobs'`` so the GUI can show a live
-    bar even for files that take a while.
-    """
-    if model is None:
-        model, ckpt, device = load_model(cfg.model_path, cfg.device)
-    assert ckpt is not None
-    assert device is not None
-
-    # Fall back to checkpoint-saved spec params when cfg leaves them None.
+def _spec_params(cfg: MADInferenceConfig, ckpt: Dict):
+    """``(nperseg, noverlap, nfft, db_min, db_max, db_norm)`` for a run:
+    the config's where it sets them, the checkpoint's otherwise."""
     nperseg = int(cfg.nperseg if cfg.nperseg is not None else ckpt.get('nperseg', 512))
     noverlap = int(cfg.noverlap if cfg.noverlap is not None else ckpt.get('noverlap', 384))
     nfft = int(cfg.nfft if cfg.nfft is not None else ckpt.get('nfft', 1024))
@@ -1453,12 +1501,156 @@ def run_inference_on_file(
     # trained on per-file ranges sees garbage if fed fixed-range input.
     db_norm = str(cfg.db_norm if cfg.db_norm is not None
                   else ckpt.get('db_norm', 'fixed'))
-    tile_freq_bins = int(ckpt.get('tile_freq_bins', cfg.tile_freq_bins))
-    tile_time_frames = int(ckpt.get('tile_time_frames', cfg.tile_time_frames))
+    return nperseg, noverlap, nfft, db_min, db_max, db_norm
 
+
+def backfill_pred_specs(wav_path: str, db_min: float = -100.0,
+                        db_max: float = -20.0, db_norm: str = 'fixed',
+                        overwrite: bool = False, ridges: bool = True) -> int:
+    """Add the spectrogram image under each stored prediction crop of a
+    recording analysed before MAD saved them (/pred_specs), recomputed from
+    the audio on the grid recorded in its .mad file. ``db_*`` must be the
+    model's (MAD's defaults: fixed, -100 to -20 dB). Crops that already have
+    one are left alone unless ``overwrite``. With ``ridges`` the new images'
+    ridges are stored too. Returns the number filled."""
+    from .fnt_mask_store import (masks_sibling_path, get_grid_attrs,
+                                 read_all_pred_masks, spec_crop,
+                                 PRED_SPEC_GROUP)
+    import h5py
+    h5 = masks_sibling_path(wav_path)
+    crops = read_all_pred_masks(h5, include_spec=True)
+    todo = {k: c for k, c in crops.items() if overwrite or 'spec' not in c}
+    if not todo:
+        return 0
+    g = get_grid_attrs(h5)
+    nperseg, noverlap, nfft = (int(g.get('nperseg', 512)),
+                               int(g.get('noverlap', 384)),
+                               int(g.get('nfft', 1024)))
+    audio, sr = load_audio(wav_path)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    from .mad_dataset import db_range_for
+    db_min, db_max = db_range_for(db_norm, db_min, db_max, audio=audio,
+                                  sample_rate=sr, nperseg=nperseg,
+                                  noverlap=noverlap, nfft=nfft)
+    spec = compute_full_spec_image(np.asarray(audio, dtype=np.float32), sr,
+                                   nperseg=nperseg, noverlap=noverlap,
+                                   nfft=nfft, db_min=db_min, db_max=db_max,
+                                   as_uint8=True)
+    del audio
+    with h5py.File(h5, 'a') as f:
+        sgrp = f.require_group(PRED_SPEC_GROUP)
+        for key, c in todo.items():
+            if key in sgrp:
+                del sgrp[key]
+            sgrp.create_dataset(key, data=spec_crop(spec, c['f_off'], c['t_off'],
+                                                    c['mask'].shape),
+                                compression='gzip', compression_opts=4)
+    # The images make the brightness ridge measurable (no audio needed).
+    if ridges:
+        from .fnt_mask_store import add_pred_ridges
+        add_pred_ridges(h5, overwrite=overwrite)
+    return len(todo)
+
+
+def fill_ridges(wav_path: str, db_min: float = -100.0, db_max: float = -20.0,
+                db_norm: str = 'fixed', use_audio: bool = True) -> Dict:
+    """Complete the brightness ridges of one recording's .mad, and stamp it.
+
+    Detections without a ridge get one from their stored spectrogram, or, with
+    ``use_audio``, from the audio first (as :func:`backfill_pred_specs`; the
+    ``db_*`` must be those of the model that made them). Labels without one get
+    theirs from their own patch. A file not yet stamped with the current ridge
+    version also has its multi-piece masks recomputed, one ridge per piece.
+    Without the audio, detections lacking a spectrogram keep no ridge and
+    nothing is recomputed; the file stays unstamped, so a later fill looks
+    again.
+
+    Returns ``{needed, pred, examples, specs, stamped}`` (whether the file
+    lacked anything, ridges stored, spectrograms added). Does nothing when ridges are off (fnt_mask_store.set_ridge_enabled)
+    or the file is stamped already. Never run on a file another process is
+    writing."""
+    from .fnt_mask_store import (add_example_ridges, add_pred_ridges,
+                                 mark_ridges_complete, masks_sibling_path,
+                                 ridge_enabled, ridge_status)
+    out = {'needed': False, 'pred': 0, 'examples': 0, 'specs': 0,
+           'stamped': False}
+    if not ridge_enabled():
+        return out
+    h5 = masks_sibling_path(wav_path)
+    st = ridge_status(h5)
+    if not st['needed']:
+        return out
+    out['needed'] = True
+    complete = use_audio or not st['pred_no_spec']
+    if st['pred_no_spec'] and use_audio:
+        out['specs'] = backfill_pred_specs(wav_path, db_min=db_min,
+                                           db_max=db_max, db_norm=db_norm,
+                                           ridges=False)
+    out['pred'] = add_pred_ridges(h5, redo_pieces=complete)
+    out['examples'] = add_example_ridges(h5, redo_pieces=complete)
+    if complete:
+        mark_ridges_complete(h5)
+        out['stamped'] = True
+    return out
+
+
+def fill_ridges_for_run(wav_paths: List[str], cfg: MADInferenceConfig,
+                        ckpt: Optional[Dict] = None,
+                        progress: Optional[Callable] = None,
+                        should_stop: Optional[Callable[[], bool]] = None,
+                        wait_if_paused: Optional[Callable[[], None]] = None,
+                        on_done: Optional[Callable[[Dict], None]] = None
+                        ) -> List[Dict]:
+    """:func:`fill_ridges` over recordings this run's model analysed earlier,
+    with that model's spectrogram settings (from ``ckpt``, else read from
+    ``cfg.model_path``). ``progress`` as in :func:`run_inference_on_files`,
+    with stage ``'ridge'``; ``on_done`` gets each file's result with its
+    ``wav_path`` (and ``error`` when the fill failed)."""
+    if not getattr(cfg, 'ridge', True) or not wav_paths:
+        return []
+    if ckpt is None:
+        import torch
+        ckpt = torch.load(cfg.model_path, map_location='cpu',
+                          weights_only=False)
+    _, _, _, db_min, db_max, db_norm = _spec_params(cfg, ckpt)
+    out: List[Dict] = []
+    m = len(wav_paths)
+    for j, wav in enumerate(wav_paths):
+        if wait_if_paused is not None:
+            wait_if_paused()
+        if should_stop and should_stop():
+            break
+        if progress:
+            progress(j, m, Path(wav).name, 'ridge', 0, 1)
+        try:
+            r = fill_ridges(wav, db_min=db_min, db_max=db_max, db_norm=db_norm)
+        except Exception as e:
+            r = {'error': str(e)}
+        r['wav_path'] = wav
+        out.append(r)
+        if on_done is not None:
+            try:
+                on_done(r)
+            except Exception:
+                pass
+    return out
+
+
+def prepare_file(wav_path: str, cfg: MADInferenceConfig, ckpt: Dict,
+                 device: Optional[str] = None) -> Dict:
+    """Decode a recording and build the model's input spectrogram.
+
+    The CPU half of a file's inference -- on a 10-minute recording, 1.2 s of
+    decoding and 14.6 s of spectrogram against an 11.8 s GPU scan -- split out
+    so :func:`run_inference_on_files` can build the next file's while this one
+    scans. Returns ``{wav_path, spec, sr, audio_dur, db_min, db_max, t_spec,
+    spec_backend}``. On CUDA the spectrogram is built on the GPU when it
+    reproduces the CPU one (``cfg.gpu_spectrogram``; see
+    mad_dataset.spec_image_for_device).
+    """
     import time as _time
-    if progress:
-        progress('spec', 0, 1)
+    nperseg, noverlap, nfft, db_min, db_max, db_norm = _spec_params(cfg, ckpt)
     _t_spec0 = _time.perf_counter()
     audio, sr = load_audio(wav_path)
     if audio.ndim > 1:
@@ -1477,11 +1669,19 @@ def run_inference_on_file(
     # asarray, not astype: load_audio already returns float32, and astype
     # copies regardless of dtype — a second 600 MB block for a 10-minute
     # recording, alive at the same moment as the original.
-    spec = compute_full_spec_image(
-        np.asarray(audio, dtype=np.float32), sr,
-        nperseg=nperseg, noverlap=noverlap, nfft=nfft,
-        db_min=db_min, db_max=db_max, as_uint8=True,
-    )
+    if (getattr(cfg, 'gpu_spectrogram', True)
+            and str(device or '').startswith('cuda')):
+        from .mad_dataset import spec_image_for_device
+        spec, backend = spec_image_for_device(
+            np.asarray(audio, dtype=np.float32), sr, nperseg, noverlap, nfft,
+            db_min, db_max, device=str(device))
+    else:
+        spec = compute_full_spec_image(
+            np.asarray(audio, dtype=np.float32), sr,
+            nperseg=nperseg, noverlap=noverlap, nfft=nfft,
+            db_min=db_min, db_max=db_max, as_uint8=True,
+        )
+        backend = 'cpu'
     # The audio is finished with — everything downstream works off the
     # spectrogram. Holding it through the scan and blob phases pinned 600 MB
     # for ~75 s of every file and, worse, kept a large block busy exactly when
@@ -1503,7 +1703,53 @@ def run_inference_on_file(
     # 5x300 s files, commit flat at 2725 MB, no live ndarray >= 1 MB between
     # files). ``mem`` in each run summary is what will localise the rest.
     del audio
-    t_spec = _time.perf_counter() - _t_spec0
+    return {'wav_path': wav_path, 'spec': spec, 'sr': sr,
+            'audio_dur': audio_dur, 'db_min': db_min, 'db_max': db_max,
+            't_spec': _time.perf_counter() - _t_spec0, 'spec_backend': backend}
+
+
+def run_inference_on_file(
+    wav_path: str,
+    cfg: MADInferenceConfig,
+    model=None, ckpt=None, device: Optional[str] = None,
+    progress: Optional[Callable[[str, int, int], None]] = None,
+    wait_if_paused: Optional[Callable[[], None]] = None,
+    prepared: Optional[Dict] = None,
+) -> Dict:
+    """Run inference on one wav, write sibling PNG + CSV, return summary.
+
+    ``progress`` is invoked with ``(stage, i, n)`` where ``stage`` is one
+    of ``'spec'``, ``'infer'``, ``'blobs'`` so the GUI can show a live
+    bar even for files that take a while.
+
+    ``prepared`` is this file's :func:`prepare_file` result when it was built
+    ahead of time; without it (or for another file) it is built here.
+    """
+    if model is None:
+        model, ckpt, device = load_model(cfg.model_path, cfg.device)
+    assert ckpt is not None
+    assert device is not None
+
+    # Fall back to checkpoint-saved spec params when cfg leaves them None.
+    nperseg, noverlap, nfft, db_min, db_max, db_norm = _spec_params(cfg, ckpt)
+    tile_freq_bins = int(ckpt.get('tile_freq_bins', cfg.tile_freq_bins))
+    tile_time_frames = int(ckpt.get('tile_time_frames', cfg.tile_time_frames))
+
+    import time as _time
+    if progress:
+        progress('spec', 0, 1)
+    prefetched = bool(prepared is not None and 'spec' in prepared
+                      and prepared.get('wav_path') == wav_path)
+    if not prefetched:
+        prepared = prepare_file(wav_path, cfg, ckpt, device)
+    spec, sr = prepared['spec'], prepared['sr']
+    audio_dur, t_spec = prepared['audio_dur'], prepared['t_spec']
+    db_min, db_max = prepared['db_min'], prepared['db_max']
+    spec_backend = prepared.get('spec_backend', 'cpu')
+    # Time this file actually held the run up: the wait for a spectrogram
+    # built in the background, or the whole build when it was not.
+    t_wait = float(prepared.get('t_wait', 0.0)) if prefetched else t_spec
+    del prepared
     if progress:
         progress('spec', 1, 1)
 
@@ -1557,7 +1803,7 @@ def run_inference_on_file(
     from .fnt_mask_store import (masks_sibling_path as _masks_path,
                                  read_all_pred_masks)
     try:
-        old_crops = read_all_pred_masks(_masks_path(wav_path))
+        old_crops = read_all_pred_masks(_masks_path(wav_path), include_spec=True)
     except Exception:
         old_crops = {}
 
@@ -1640,6 +1886,32 @@ def run_inference_on_file(
             # Don't let a label-store hiccup block inference.
             pass
 
+    # Rejected calls stay rejected. This used to come from the CSV's
+    # 'rejected' rows (reviewed_rows above), and silently stopped when the CSV
+    # became an export only: every re-run re-proposed calls the reviewer had
+    # already turned down -- 66 detections sitting on rejected calls across the
+    # anosmia sidecars, and 19 rejections duplicating an earlier one, each a
+    # second hard negative for the same call. The store's rejected examples
+    # keep the exact traced mask, so suppress those, tight to the call.
+    #
+    # Not the label shield above: a rejected region is never painted as a
+    # confirmed call. "Re-detect from scratch" (preserve_labels off) skips it
+    # like it skips everything else.
+    if cfg.preserve_labels:
+        try:
+            from .mad_examples import reconstruct_file_mask
+            from .fnt_mask_store import REJECTED_KINDS, store_paths_for
+            sidecars = [p for p in store_paths_for(wav_path)
+                        if Path(p).is_file()]
+            if sidecars:
+                rej_mask = reconstruct_file_mask(
+                    "", Path(wav_path).name, prob.shape,
+                    extra_stores=sidecars, kinds=REJECTED_KINDS)
+                if rej_mask.any():
+                    prob[_dilate_mask(rej_mask > 0, LABEL_SHIELD_PAD)] = 0.0
+        except Exception:
+            pass
+
     if progress:
         progress('blobs', 0, 1)
     _t_blob0 = _time.perf_counter()
@@ -1659,14 +1931,22 @@ def run_inference_on_file(
             concurrent_fraction=cfg.merge_concurrent_fraction)
     rows = blobs_to_rows(blobs, nperseg=nperseg, noverlap=noverlap, nfft=nfft,
                          sr=sr, db_min=db_min, db_max=db_max, spec=spec)
-    # Re-key the fresh predictions so their int blob_ids never collide with the
-    # reviewed predictions we're keeping (whose ids came from an earlier run).
+    # Re-key the fresh predictions so their int blob_ids never collide with an
+    # id a stored decision already points at. Taking the floor from the CSV's
+    # reviewed rows alone stopped working when the CSV became an export: with
+    # no CSV every run numbered from 0, and a new detection inherited the id of
+    # an old, unrelated accept or reject. Review then hid it as "already
+    # loaded" (confirmed_ids) and the store counted it as decided -- 456
+    # detections across 52 anosmia recordings, 404 of them behind an accepted
+    # label. The store's examples are the record of every decision, so they
+    # set the floor.
     kept_int_ids = [r['blob_id'] for r in reviewed_rows]
+    kept_int_ids += stored_decision_ids(wav_path)
     id_offset = (max(kept_int_ids) + 1) if kept_int_ids else 0
     for i, r in enumerate(rows):
         r['blob_id'] = id_offset + i
     # Provenance: which model + settings produced these predictions.
-    model_name = Path(cfg.model_path).stem if cfg.model_path else ''
+    model_name = model_label(cfg.model_path)
     for r in rows:
         r['model_name'] = model_name
         r['threshold'] = cfg.threshold
@@ -1690,7 +1970,7 @@ def run_inference_on_file(
     h5_path = None
     try:
         from .fnt_mask_store import (masks_sibling_path, write_pred_masks,
-                                     set_grid_attrs, delete_prob)
+                                     set_grid_attrs, delete_prob, spec_crop)
         h5_path = masks_sibling_path(wav_path)
         set_grid_attrs(h5_path, sample_rate=sr, nperseg=nperseg,
                        noverlap=noverlap, nfft=nfft,
@@ -1712,10 +1992,15 @@ def run_inference_on_file(
             if c is not None:
                 crops.append({'blob_id': r['blob_id'], 'mask': c['mask'],
                               'f_off': c['f_off'], 't_off': c['t_off'],
-                              **_prov(r)})
+                              'spec': c.get('spec'), **_prov(r)})
+        # Each new detection also keeps the image under its mask
+        # (/pred_specs): what the call looks like inside the mask, for contour
+        # measures without the audio.
         for i, b in enumerate(blobs):
             crops.append({'blob_id': id_offset + i, 'mask': b['mask'],
                           'f_off': b['f_low'], 't_off': b['t_start'],
+                          'spec': spec_crop(spec, b['f_low'], b['t_start'],
+                                            np.shape(b['mask'])),
                           **_prov(rows[i] if i < len(rows) else {})})
         write_pred_masks(h5_path, crops)
         # Stamp the run itself, so a file that came back empty is recorded as
@@ -1725,12 +2010,18 @@ def run_inference_on_file(
         set_infer_run_attrs(
             h5_path,
             last_infer_at=datetime.now().isoformat(timespec='seconds'),
-            last_infer_model=str(Path(cfg.model_path).parent.name),
+            last_infer_model=model_label(cfg.model_path),
             last_infer_threshold=float(cfg.threshold),
             last_infer_min_blob=int(cfg.min_blob_pixels),
             last_infer_merge=1.0 if cfg.merge_consecutive else 0.0,
             last_infer_n=float(len(blobs)),
         )
+        # The detections just got their ridges (each new one keeps its image);
+        # complete the labels' and stamp the file, so no later fill reopens it.
+        try:
+            fill_ridges(wav_path, use_audio=False)
+        except Exception:
+            pass
         # Reclaim disk from any legacy full-grid prob map for this file.
         delete_prob(h5_path)
     except Exception:
@@ -1739,7 +2030,10 @@ def run_inference_on_file(
     if progress:
         progress('blobs', 1, 1)
 
-    total = t_spec + t_infer + t_blobs
+    # Wall time this file took in the run: a spectrogram built in the
+    # background while the previous file scanned counts only as long as
+    # the run waited for it.
+    total = t_wait + t_infer + t_blobs
     # Two rates, because they answer different questions and reporting one
     # under the other's name is how an ETA comes out at half the truth.
     #
@@ -1777,6 +2071,9 @@ def run_inference_on_file(
             'device': device,
             'audio_dur_s': round(audio_dur, 1),
             't_spec': round(t_spec, 2),
+            't_wait': round(t_wait, 2),
+            'spec_backend': spec_backend,
+            'prefetched': prefetched,
             't_infer': round(t_infer, 2),
             't_blobs': round(t_blobs, 2),
             't_total': round(total, 2),
@@ -1988,6 +2285,8 @@ def run_inference_on_files(
     on_device: Optional[Callable[[str], None]] = None,
     on_file_done: Optional[Callable[[Dict], None]] = None,
     on_retry_start: Optional[Callable[[int], None]] = None,
+    ridge_fill: Optional[List[str]] = None,
+    on_ridge_done: Optional[Callable[[Dict], None]] = None,
 ) -> List[Dict]:
     """Run inference on a batch of wavs. Loads the model once.
 
@@ -1999,6 +2298,12 @@ def run_inference_on_files(
     the GUI log device + per-file speed live. ``on_retry_start(n)`` fires once
     before the retry pass, with the number of files it will re-attempt.
 
+    ``ridge_fill``: recordings this model analysed before (a resumed run's
+    skipped ones). Their missing brightness ridges are filled after the
+    inference (:func:`fill_ridges_for_run`, stage ``'ridge'``), each result
+    going to ``on_ridge_done`` rather than into the returned list. With
+    ``cfg.ridge`` off the run stores no ridges at all.
+
     Every summary carries a ``mem`` dict (see :func:`_mem_snapshot`), on the
     error path too — the memory reading at the moment of a failure is the one
     most worth having.
@@ -2008,6 +2313,22 @@ def run_inference_on_files(
     returned list, so callers counting ``'error'`` keys see the true final
     state; its summary is marked ``retry: True``.
     """
+    from .fnt_mask_store import ridge_enabled, set_ridge_enabled
+    ridge_was = ridge_enabled()
+    set_ridge_enabled(getattr(cfg, 'ridge', True))
+    try:
+        return _run_inference_on_files(
+            wav_paths, cfg, progress, should_stop, wait_if_paused, on_device,
+            on_file_done, on_retry_start, ridge_fill, on_ridge_done)
+    finally:
+        set_ridge_enabled(ridge_was)
+
+
+def _run_inference_on_files(wav_paths, cfg, progress, should_stop,
+                            wait_if_paused, on_device, on_file_done,
+                            on_retry_start, ridge_fill,
+                            on_ridge_done) -> List[Dict]:
+    """The body of :func:`run_inference_on_files`, with its ridge switch set."""
     model, ckpt, device = load_model(cfg.model_path, cfg.device)
     if on_device is not None:
         try:
@@ -2017,7 +2338,8 @@ def run_inference_on_files(
     results: List[Dict] = []
     n = len(wav_paths)
 
-    def _run_one(wav: str, i: int, retry: bool = False) -> Dict:
+    def _run_one(wav: str, i: int, retry: bool = False,
+                 prepared: Optional[Dict] = None) -> Dict:
         name = Path(wav).name + (" (retry)" if retry else "")
 
         def _inner(stage: str, si: int, sn: int, _i=i, _n=n, _name=name):
@@ -2025,13 +2347,18 @@ def run_inference_on_files(
                 progress(_i, _n, _name, stage, si, sn)
 
         before = _mem_snapshot()
+        # Only passed when there is one: a background build that failed is
+        # simply redone here, so its error is reported exactly as before.
+        extra = ({'prepared': prepared}
+                 if prepared is not None and 'error' not in prepared else {})
         try:
             s = run_inference_on_file(
                 wav, cfg, model=model, ckpt=ckpt, device=device,
-                progress=_inner, wait_if_paused=wait_if_paused,
+                progress=_inner, wait_if_paused=wait_if_paused, **extra,
             )
         except Exception as e:
             s = {'wav_path': wav, 'error': str(e)}
+        del extra, prepared
         # Before the reading, so `mem` reports what is actually still held
         # rather than what has merely not been collected yet.
         _collect_cycles()
@@ -2048,13 +2375,51 @@ def run_inference_on_files(
         except Exception:
             pass
 
-    for i, wav in enumerate(wav_paths):
-        if wait_if_paused is not None:
-            wait_if_paused()
-        if should_stop and should_stop():
-            break
-        results.append(_run_one(wav, i))
-        _emit(results[-1])
+    # Prefetch: build file i+1's spectrogram on a background thread while file
+    # i scans. Per 10-minute recording that is ~16 s of CPU (decode +
+    # spectrogram) against ~12 s of GPU, done one after the other -- so most
+    # of the CPU half can hide behind the scan. One file ahead only: each
+    # spectrogram is 600 MB.
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor
+    pool = (ThreadPoolExecutor(1, thread_name_prefix="mad-prefetch")
+            if getattr(cfg, 'prefetch_next', True) and n > 1 else None)
+    pending: Dict[int, object] = {}
+
+    def _prepare(j: int) -> Dict:
+        try:
+            return prepare_file(wav_paths[j], cfg, ckpt, device)
+        except Exception as e:      # redone in the foreground; see _run_one
+            return {'wav_path': wav_paths[j], 'error': str(e)}
+
+    def _queue(j: int) -> None:
+        if pool is not None and j < n and j not in pending:
+            pending[j] = pool.submit(_prepare, j)
+
+    try:
+        for i, wav in enumerate(wav_paths):
+            if wait_if_paused is not None:
+                wait_if_paused()
+            if should_stop and should_stop():
+                break
+            prepared = None
+            if pool is not None:
+                _queue(i)
+                _queue(i + 1)
+                _t0 = _time.perf_counter()
+                prepared = pending.pop(i).result()
+                prepared['t_wait'] = _time.perf_counter() - _t0
+            results.append(_run_one(wav, i, prepared=prepared))
+            prepared = None
+            _emit(results[-1])
+    finally:
+        # A stop leaves at most one build running: let it finish rather than
+        # abandon a thread mid-allocation, and drop what it made.
+        if pool is not None:
+            for f in pending.values():
+                f.cancel()
+            pool.shutdown(wait=True)
+            pending.clear()
 
     # --- one retry pass over the failures --------------------------------
     # A batch failure here is nearly always an out-of-memory one, and it is not
@@ -2086,4 +2451,9 @@ def run_inference_on_files(
                 if not s.get('error'):
                     results[i] = s
                 _emit(s)
+    if ridge_fill and not (should_stop and should_stop()):
+        fill_ridges_for_run(ridge_fill, cfg, ckpt=ckpt, progress=progress,
+                            should_stop=should_stop,
+                            wait_if_paused=wait_if_paused,
+                            on_done=on_ridge_done)
     return results

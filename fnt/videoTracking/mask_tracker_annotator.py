@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -113,6 +114,28 @@ class SAM2ImageSegmenter:
 
         best_idx = int(np.argmax(scores))
         return masks[best_idx].astype(bool), float(scores[best_idx])
+
+    def predict_candidates(
+        self,
+        positive_points: List[Tuple[int, int]],
+        negative_points: Optional[List[Tuple[int, int]]] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """All of SAM2's candidate masks for these prompts (k x H x W boolean)
+        and their scores. Its top score is not always the object clicked: a
+        click on a blurry tail scored the whole dish highest, and a click with
+        an exclusion still scored both overlapping mice highest. The Mask
+        Tracker chooses among them (AnnotationPreviewWidget.choose_candidate).
+        """
+        if self.predictor is None:
+            raise RuntimeError("Model not loaded. Call load_model() first.")
+        points = list(positive_points) + list(negative_points or [])
+        labels = [1] * len(positive_points) + [0] * len(negative_points or [])
+        masks, scores, _ = self.predictor.predict(
+            point_coords=np.array(points, dtype=np.float32),
+            point_labels=np.array(labels, dtype=np.int32),
+            multimask_output=True,
+        )
+        return np.asarray(masks) > 0, np.asarray(scores, dtype=float)
 
 
 # Polygon simplification tolerance (pixels) for CONTOURS DERIVED FROM MASKS.
@@ -405,6 +428,22 @@ class COCOAnnotationManager:
                 self._auto_save()
                 return
 
+    def reject_annotation(self, ann_id: int, rejected: bool = True):
+        """Mark a prediction rejected (or not). A rejected mask stays in the
+        project as a record of what the model got wrong, as MAD keeps rejected
+        detections: it is never a training label (it keeps its inferred flag),
+        the frame's training image shows that spot as background once the
+        frame is reviewed, and later predictions on the same spot are dropped.
+        """
+        for ann in self.annotations:
+            if ann["id"] == ann_id:
+                if rejected:
+                    ann["rejected"] = True
+                else:
+                    ann.pop("rejected", None)
+                self._auto_save()
+                return
+
     def is_inferred(self, ann_id: int) -> bool:
         for ann in self.annotations:
             if ann["id"] == ann_id:
@@ -433,12 +472,14 @@ class COCOAnnotationManager:
                 return int(img["height"]), int(img["width"])
         return None
 
-    def update_annotation_polygon(self, ann_id: int, points: list):
+    def update_annotation_polygon(self, ann_id: int, points: list, extra: Optional[list] = None):
         """Replace an annotation's shape with a hand-edited polygon.
 
         The edited outline is rasterised and stored as RLE like every other
         mask, so the storage format stays uniform: readers never need to
-        handle a mix of shapes within one project's new annotations.
+        handle a mix of shapes within one project's new annotations. ``extra``
+        holds the mask's other pieces (a tail past another mouse), kept as they
+        were.
         """
         if len(points) < 3:
             return
@@ -450,8 +491,8 @@ class COCOAnnotationManager:
                 return
             h, w = dims
             mask = np.zeros((h, w), dtype=np.uint8)
-            pts = np.array(points, dtype=np.int32).reshape(-1, 1, 2)
-            cv2.fillPoly(mask, [pts], 1)
+            pieces = [points] + [q for q in (extra or []) if len(q) >= 3]
+            cv2.fillPoly(mask, [np.array(q, dtype=np.int32).reshape(-1, 1, 2) for q in pieces], 1)
             mask = mask.astype(bool)
             ann["segmentation"] = mask_to_rle(mask)
             ann["bbox"] = list(mask_bbox(mask))
@@ -531,19 +572,146 @@ class COCOAnnotationManager:
                 return c["name"]
         return "unknown"
 
-    def export(self, output_path: str, exclude_inferred: bool = False):
+    # -- empty frames ----------------------------------------------------
+    # A frame the reviewer marked as holding no object. It is stored as a flag
+    # on the COCO image ("empty": true) and trains as a background image. The
+    # flag only counts while the frame has no accepted mask, so a mask drawn
+    # later wins without every entry point having to clear it. A frame whose
+    # every prediction was rejected, with nothing accepted, is empty too: the
+    # reviewer saw the model's guesses and found no animal. Unmarking such a
+    # frame (E) stores "empty": false, which keeps it out of the empties.
+    def _image_entry(self, image_id: int) -> Optional[Dict]:
+        for img in self.images:
+            if img["id"] == image_id:
+                return img
+        return None
+
+    @staticmethod
+    def _empty_rule(flag, anns: List[Dict]) -> bool:
+        """Is a frame with this "empty" flag and these annotations empty?"""
+        if flag is False or any(not a.get("inferred", False) for a in anns):
+            return False
+        return bool(flag) or (bool(anns) and all(a.get("rejected") for a in anns))
+
+    def is_image_empty(self, filename: str) -> bool:
+        img_id = self._image_id_map.get(filename)
+        img = self._image_entry(img_id) if img_id is not None else None
+        return bool(img) and self._empty_rule(img.get("empty"), self.get_annotations_for_image(img_id))
+
+    def _empty_image_ids(self) -> set:
+        """Ids of every empty frame, in one pass over the annotations."""
+        by_image: Dict[int, List[Dict]] = {}
+        for a in self.annotations:
+            by_image.setdefault(a["image_id"], []).append(a)
+        return {img["id"] for img in self.images
+                if self._empty_rule(img.get("empty"), by_image.get(img["id"], []))}
+
+    def rejected_count(self, filename: str) -> int:
+        """Predictions rejected on the frame."""
+        img_id = self._image_id_map.get(filename)
+        return 0 if img_id is None else sum(
+            1 for a in self.annotations if a["image_id"] == img_id and a.get("rejected"))
+
+    def set_image_empty(self, filename: str, width: int, height: int, empty: bool = True) -> int:
+        """Mark (or unmark) a frame as empty. Marking drops the frame's pending
+        (inferred) masks; a frame with an accepted mask is refused (-1).
+        Returns the image id."""
+        img_id = self.get_or_add_image(filename, width, height)
+        img = self._image_entry(img_id)
+        if empty:
+            if self.count_annotations_for_image(img_id, exclude_inferred=True):
+                return -1
+            # Pending predictions go; rejected ones stay (a record of the
+            # model's mistakes on a frame now known to hold no animal).
+            self.annotations = [a for a in self.annotations
+                                if a["image_id"] != img_id or a.get("rejected")]
+            img["empty"] = True
+        elif img.get("empty"):
+            img.pop("empty")
+        elif self.is_image_empty(filename):
+            img["empty"] = False        # every prediction rejected, yet not empty
+        self._auto_save()
+        return img_id
+
+    # -- skipped frames --------------------------------------------------
+    # S / Skip on a queue frame is counted on the COCO image ("skipped": n).
+    # A reviewer skips a frame mostly when the model's guess is too poor to fix
+    # by hand, so the skipped frames are the hard cases to bring back once a
+    # better model predicts them. A finished frame (an accepted mask, or marked
+    # empty) no longer counts as skipped.
+    def mark_skipped(self, filename: str, width: int, height: int) -> int:
+        """Count one more skip of the frame; returns its skip count."""
+        img = self._image_entry(self.get_or_add_image(filename, width, height))
+        img["skipped"] = int(img.get("skipped", 0)) + 1
+        self._auto_save()
+        return img["skipped"]
+
+    def skip_count(self, filename: str) -> int:
+        """Times the frame was skipped, or 0 once it is finished."""
+        img_id = self._image_id_map.get(filename)
+        img = self._image_entry(img_id) if img_id is not None else None
+        if not img or not img.get("skipped") or self.is_image_empty(filename) or any(
+                a["image_id"] == img_id and not a.get("inferred") and not a.get("rejected")
+                for a in self.annotations):
+            return 0
+        return int(img["skipped"])
+
+    def skipped_images(self) -> List[str]:
+        """File names of the frames skipped and still unfinished."""
+        return [img["file_name"] for img in self.images if self.skip_count(img["file_name"])]
+
+    def count_empty_images(self) -> int:
+        return len(self._empty_image_ids())
+
+    def export(self, output_path: str, exclude_inferred: bool = False,
+               only: Optional[set] = None):
+        """Write the COCO JSON.
+
+        ``exclude_inferred=True`` is the training export: accepted masks only,
+        and only the images a reviewer has finished with -- those with an
+        accepted mask, or marked empty. An image whose masks are all still
+        pending (or that only ever had predictions) is left out: every image in
+        the file trains, and one with no annotation trains as "no object here",
+        which would teach the model that the mice it could not yet see are
+        background.
+
+        ``only`` (frame file names) narrows the export further to those frames:
+        when new classes are labelled on a subset, the other frames would teach
+        the new objects as background.
+        """
+        images = self.images
         if exclude_inferred:
             anns = [a for a in self.annotations if not a.get("inferred", False)]
+            keep = {a["image_id"] for a in anns}
+            keep |= self._empty_image_ids()
+            images = [img for img in self.images if img["id"] in keep]
         else:
             anns = self.annotations
+        if only is not None:
+            names = {os.path.basename(n) for n in only}
+            images = [img for img in images if os.path.basename(img["file_name"]) in names]
+            ids = {img["id"] for img in images}
+            anns = [a for a in anns if a["image_id"] in ids]
         data = {
-            "images": self.images,
+            "images": images,
             "annotations": anns,
             "categories": self.categories,
         }
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-        with open(output_path, "w") as f:
+        # Write, then rename over the old file: the labels are saved on every
+        # action, so a crash or a dropped network drive mid-write would
+        # otherwise leave a truncated annotations.json.
+        tmp = output_path + ".tmp"
+        with open(tmp, "w") as f:
             json.dump(data, f, indent=2)
+        for attempt in range(10):
+            try:
+                os.replace(tmp, output_path)
+                break
+            except PermissionError:     # Windows: the file is open elsewhere
+                if attempt == 9:
+                    raise
+                time.sleep(0.1)
 
     def load(self, json_path: str):
         with open(json_path) as f:

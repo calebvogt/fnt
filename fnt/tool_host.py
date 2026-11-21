@@ -121,6 +121,42 @@ def install_slot_excepthook():
     sys.excepthook = hook
 
 
+def install_qt_message_handler():
+    """Copy Qt's own warnings and fatal messages into the crash log.
+
+    Neither hook above sees Qt aborting on its own account: "QThread:
+    Destroyed while thread is still running" is a qFatal(), so the process dies
+    with 0xC0000409 in Qt5Core.dll and, under pythonw.exe, the message goes
+    nowhere. A Mask Tracker session died exactly that way. The handler writes
+    the message (and, for a fatal one, every thread's Python stack) before Qt
+    aborts.
+    """
+    try:
+        from PyQt5.QtCore import QtCriticalMsg, QtFatalMsg, QtWarningMsg, qInstallMessageHandler
+    except Exception:
+        return
+    names = {QtWarningMsg: "warning", QtCriticalMsg: "critical", QtFatalMsg: "FATAL"}
+
+    def handler(mode, context, message):
+        if mode not in names:
+            return
+        try:
+            if _FAULT_LOG is None:
+                return
+            where = ""
+            if context is not None and context.file:
+                where = f" ({context.file}:{context.line})"
+            _FAULT_LOG.write(f"\n----- Qt {names[mode]} {datetime.now():%Y-%m-%d %H:%M:%S}"
+                             f"{where} -----\n{message}\n")
+            if mode == QtFatalMsg:
+                faulthandler.dump_traceback(file=_FAULT_LOG, all_threads=True)
+            _FAULT_LOG.flush()
+        except Exception:
+            pass
+
+    qInstallMessageHandler(handler)
+
+
 def resource_path(relative_path):
     """Locate a bundled resource, working from source and from PyInstaller."""
     try:
@@ -250,6 +286,7 @@ def main(argv=None):
     # faulthandler covers native crashes; this covers the far more
     # common Python exception in a slot, which Qt turns into an abort.
     install_slot_excepthook()
+    install_qt_message_handler()
 
     from PyQt5.QtGui import QIcon
     from PyQt5.QtWidgets import QApplication, QMessageBox

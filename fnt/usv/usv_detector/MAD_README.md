@@ -709,4 +709,5 @@ of sync.
 | `mad_project.py` | Project config / on-disk layout; folds pre-merge two-list projects into one `audio_files` registry. |
 | `mad_registry.py` | Referenced-recording registry: fingerprints, re-resolving moved files. |
 | `mad_labels.py` | Sibling-path helpers (CSV naming, etc.). |
+| `mad_export.py` | Folder-wide tables (recordings, detections, labelled calls, call images) from the `.mad` files, incremental; File ▸ Export… (`../mad_export_dialog.py`) and `mad export`. |
 | `fnt_mask_store.py` | Shared HDF5 mask storage (CAD + MAD); `/calls`, `/pred_calls`, training store, repack. |

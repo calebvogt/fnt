@@ -15,6 +15,8 @@ Batch video preprocessing combining downsampling, re-encoding, and format conver
 - **Format conversion** — change container format (`.mp4`, `.avi`, `.mkv`)
 - **Quality presets** — CRF-based quality control
 - **Batch processing** — process entire folders of videos with progress tracking
+- **Damaged AVIs keep their real length** — an AVI that fails, comes out short, or lost its header is rebuilt from the frames that survive, each at its real time, black where frames are lost (`avi_recovery.py`; also `python -m fnt.videoProcessing.avi_recovery <file.avi>`)
+- **Lost frames in mp4/mkv are black, not frozen** — jumps in a video's timestamps (lost frames) are found before the encode (`frame_gaps.py`), and the frames the encode puts there are drawn black instead of repeating the last frame; listed in `proc/recovered_frames/<name>_frames.csv`
 
 ### Video Trim and Crop
 

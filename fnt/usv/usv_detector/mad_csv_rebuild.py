@@ -122,6 +122,37 @@ def _pending_rows(h5_path: str, seen: set, nperseg: int, noverlap: int,
     return out
 
 
+_RIDGE_COLS = ("ridge_turns", "ridge_rate_hz", "ridge_depth_khz", "ridge_trill")
+
+
+def _add_ridge_fields(h5_path: str, rows: Dict[str, Dict]) -> None:
+    """The brightness-ridge measures onto each row: from the detection's crop
+    (accepted, rejected or pending alike: the crop is kept after review), then
+    from the call's training example. A label's own ridge wins -- its mask is
+    the reviewed one, possibly edited -- and covers calls painted by hand; a
+    rejected example only fills a row its crop left blank."""
+    from . import fnt_mask_store as _ms
+
+    def put(row, rec, only_blank=False):
+        for k in _RIDGE_COLS:
+            v = rec.get(k)
+            if v is None or (isinstance(v, float) and v != v):
+                continue
+            if only_blank and row.get(k) not in (None, ""):
+                continue
+            row[k] = round(v, 3) if isinstance(v, float) else v
+
+    for key, crop in _ms.read_all_pred_masks(h5_path).items():
+        row = rows.get(str(key))
+        if row is not None:
+            put(row, crop)
+    for eid, rec in _ms.read_example_ridges(h5_path).items():
+        key = str(rec["blob_id"]) if rec.get("blob_id") is not None else str(eid)
+        row = rows.get(key)
+        if row is not None:
+            put(row, rec, only_blank=rec["kind"] != "label")
+
+
 def _recompute_features(wav_path: str, rows, grid: Dict, masks) -> int:
     """Fill each row's derived acoustic metrics from the audio.
 
@@ -241,6 +272,7 @@ def rebuild_annotations_csv(wav_path: str, *, dry_run: bool = False,
         h5_path, set(from_h5),
         int(grid.get("nperseg", 512)), int(grid.get("noverlap", 384)),
         int(grid.get("nfft", 1024)), int(grid.get("sample_rate", 0))))
+    _add_ridge_fields(h5_path, from_h5)
 
     # A crop with no example AND no CSV row is an unreviewed prediction the CSV
     # never knew about — normally impossible, but real in files whose CSV was
@@ -285,7 +317,7 @@ def rebuild_annotations_csv(wav_path: str, *, dry_run: bool = False,
         row = dict(existing.get(key, {}))
         row.update({k: v for k, v in fields.items()
                     if k in _AUTHORITATIVE or k in ("blob_id", "source",
-                                                    "area_pixels")})
+                                                    "area_pixels") + _RIDGE_COLS})
         rows.append(row)
         report[fields["status"]] = report.get(fields["status"], 0) + 1
 

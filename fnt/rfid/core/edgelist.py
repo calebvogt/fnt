@@ -12,6 +12,10 @@ present. Contiguity is required - one interval's stop being the next one's
 start - so a pair that leaves and returns records two encounters rather than
 one long one. Other animals coming and going do not split the encounter, which
 is the point: this measures the pair's association, not the group's.
+
+Optional layer, off by default. It predates the zone_id rebuild and was kept
+because it works on string zone keys (``A1``, ``B3``) and is tested, but it is
+interpretive rather than preprocessing - see ``RFIDConfig.layers``.
 """
 
 from __future__ import annotations
@@ -65,7 +69,7 @@ def co_presence_bouts(gbi: pd.DataFrame, animals: list[str] | None = None,
         frame = pd.DataFrame({"g": group, "i": idx})
         for g, part in frame.groupby("g", sort=True):
             lo, hi = part["i"].iloc[0], part["i"].iloc[-1]
-            rows.append((trial, int(day[lo]), int(zone[lo]), a, b,
+            rows.append((trial, int(day[lo]), zone[lo], a, b,
                          start[lo], stop[hi],
                          (stop[hi] - start[lo]) / np.timedelta64(1, "s")))
 

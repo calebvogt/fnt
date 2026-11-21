@@ -22,6 +22,10 @@ which is not the same as consecutive in time - a row where neither animal is
 present is skipped rather than breaking the run. That is how the R original
 behaved and it is the right call: an interval in which neither animal is in the
 zone does not interrupt a contact between them, it just is not about them.
+
+Optional layer, off by default. It predates the zone_id rebuild and was kept
+because it works on string zone keys (``A1``, ``B3``) and is tested, but it is
+interpretive rather than preprocessing - see ``RFIDConfig.layers``.
 """
 
 from __future__ import annotations
@@ -77,7 +81,7 @@ def hinde_index(gbi: pd.DataFrame, scope: str = "broad",
                 second = b if first == a else a
                 stayed = a if presence[a][after] == 1 else b
                 broke = b if stayed == a else a
-                rows.append((trial, int(day[during]), int(z), start[during],
+                rows.append((trial, int(day[during]), z, start[during],
                              stop[during], float(duration[during]),
                              first, second, second, broke))
 

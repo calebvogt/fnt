@@ -45,6 +45,12 @@ class MaskInferenceConfig:
     # identity swap or re-running behavior classification means re-detecting
     # the whole video.
     save_masks: bool = True
+    # Detect and track every Nth frame only (1: every frame). The frames in
+    # between are read but not analysed, so frame numbers and times stay those
+    # of the video; trajectories hold the analysed frames, and the tracked
+    # video plays them at fps / N (same length as the source).
+    # max_disappeared_frames counts analysed frames.
+    frame_step: int = 1
 
 
 _SYSTEM_PROFILE_CACHE: Optional[Dict] = None
@@ -605,8 +611,15 @@ class MultiObjectTracker:
                 at_limit = (self.config.max_detections > 0
                             and len(self.active_tracks) >= self.config.max_detections)
                 if at_limit:
+                    # As many tracks as animals: the detection is one of them seen again elsewhere, so it
+                    # continues the nearest track that has no detection on this frame. A track already
+                    # given a detection this frame is never taken over (that put two animals under one
+                    # ID and dropped one); with every track taken, the detection is an extra and is left out.
+                    free = [tid for tid in self.active_tracks if tid not in matched]
+                    if not free:
+                        continue
                     best_tid = min(
-                        self.active_tracks,
+                        free,
                         key=lambda tid: np.sqrt(
                             (self.active_tracks[tid]["centroid"][0] - det["centroid"][0])**2
                             + (self.active_tracks[tid]["centroid"][1] - det["centroid"][1])**2
@@ -630,7 +643,11 @@ class MultiObjectTracker:
         self, dist_matrix, track_ids, current_dets, max_dist, frame_idx, fps,
     ) -> Tuple[set, set]:
         from scipy.optimize import linear_sum_assignment
-        row_indices, col_indices = linear_sum_assignment(dist_matrix)
+        # Pairs beyond max_dist can never match, so they must not steer the assignment: left at their
+        # distance, a far-off pair could make the total smaller by giving a nearby track the wrong detection
+        # (a swap). A prohibitive cost leaves them out.
+        gated = np.where(dist_matrix <= max_dist, dist_matrix, 1e9)
+        row_indices, col_indices = linear_sum_assignment(gated)
 
         matched_rows = set()
         used_cols = set()
@@ -797,8 +814,13 @@ def run_inference_on_video(
     frame_callback: Optional[Callable] = None,
     track_callback: Optional[Callable] = None,
     create_tracked_video: bool = True,
+    run_info: Optional[Dict] = None,
 ) -> Dict:
     """Run full inference + tracking pipeline on a video.
+
+    The output folder also gets ``run_settings.json`` (model, settings,
+    ``run_info``, timing, frames without a detection) and ``inference.log``
+    (see ``mtt_runs``).
 
     Args:
         video_path: Path to video file.
@@ -812,7 +834,10 @@ def run_inference_on_video(
     Returns:
         Dict with 'output_dir', 'csv_path', 'num_tracks', 'total_frames'.
     """
-    import platform, time
+    import platform, sys, time
+    from dataclasses import asdict
+    from datetime import datetime
+    from . import mtt_runs
 
     _saved_fd = None
     _null_fd = None
@@ -825,8 +850,23 @@ def run_inference_on_video(
             _saved_fd = None
 
     mask_writer = None
+    tee = mtt_runs.LogTee(sys.stdout)
+    _real_stdout = sys.stdout
+    sys.stdout = tee
+    rec: Dict = {
+        "video": video_path, "model_dir": model_dir, "settings": asdict(config),
+        "create_tracked_video": create_tracked_video,
+        "started": datetime.now().isoformat(timespec="seconds"), "complete": False,
+    }
+    rec.update(run_info or {})
+    output_dir = None
+    stopped = False
+    n_no_det = 0
+    frame_idx = 0
+    t_start = time.time()
     try:
         architecture = _detect_architecture(model_dir)
+        rec["architecture"] = architecture
         if architecture == "yolov11-seg":
             from .yolo_inference import YOLOInference
             inference = YOLOInference(model_dir, device=config.device,
@@ -837,6 +877,12 @@ def run_inference_on_video(
                                           inference_size=config.inference_size,
                                           use_masks=config.use_masks)
         inference.load_model()
+        if hasattr(inference, "use_source"):      # per-trial ROI, if the model has them
+            inference.use_source(video_path)
+            r = getattr(inference, "roi", None)
+            if r is not None and getattr(getattr(inference, "_roi_all", None), "by_folder", None):
+                print(f"[MTT Inference]   ROI for this video: {r.describe()}")
+            rec["roi"] = r.to_dict() if r is not None else None
 
         cap = cv2.VideoCapture(video_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -844,8 +890,11 @@ def run_inference_on_video(
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 
+        step = max(1, int(getattr(config, "frame_step", 1) or 1))
+        rec.update(frames=total_frames, fps=fps, width=w, height=h)
         print(f"[MTT Inference] Video: {os.path.basename(video_path)}")
-        print(f"[MTT Inference]   {total_frames} frames, {fps:.1f} fps, {w}x{h}")
+        print(f"[MTT Inference]   {total_frames} frames, {fps:.1f} fps, {w}x{h}"
+              + (f", every {step}th frame analysed ({fps / step:.2f} per s)" if step > 1 else ""))
         print(f"[MTT Inference]   confidence={config.confidence_threshold}, "
               f"max_detections={config.max_detections}, "
               f"max_disappear={'never' if config.max_disappeared_frames == 0 else config.max_disappeared_frames}, "
@@ -860,7 +909,7 @@ def run_inference_on_video(
         writer = None
         if create_tracked_video:
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(annotated_path, fourcc, fps, (w, h))
+            writer = cv2.VideoWriter(annotated_path, fourcc, fps / step, (w, h))
 
         if config.save_masks:
             from .track_store import TrackMaskWriter, tracks_path_for
@@ -887,9 +936,19 @@ def run_inference_on_video(
         while True:
             if should_stop and should_stop():
                 print(f"[MTT Inference] Stopped by user at frame {frame_idx}/{total_frames}")
+                stopped = True
                 break
 
             t0 = time.time()
+            if step > 1 and frame_idx % step:
+                # Between analysed frames: decoded (the codec needs it) but
+                # not converted, detected or drawn.
+                if not cap.grab():
+                    break
+                frame_idx += 1
+                if progress:
+                    progress(frame_idx, total_frames)
+                continue
             ret, frame = cap.read()
             if not ret:
                 break
@@ -900,6 +959,8 @@ def run_inference_on_video(
                 frame_rgb, config.confidence_threshold, config.max_detections,
             )
             t2 = time.time()
+            if len(detections["scores"]) == 0:
+                n_no_det += 1
 
             matched = tracker.update(detections, frame_idx, fps, frame_hw=(h, w))
             if mask_writer is not None and matched:
@@ -921,7 +982,7 @@ def run_inference_on_video(
                 writer.write(annotated)
             t5 = time.time()
 
-            if frame_callback and (frame_idx % 3 == 0 or frame_idx == 0):
+            if frame_callback and ((frame_idx // step) % 3 == 0 or frame_idx == 0):
                 annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
                 frame_callback(annotated_rgb, frame_idx)
 
@@ -964,7 +1025,11 @@ def run_inference_on_video(
             tracks_h5 = mask_writer.path
             n_mask_rows = mask_writer.n_rows
             mask_writer.close()
-            size_mb = os.path.getsize(tracks_h5) / (1024 * 1024)
+            from .track_store import long_path
+            # long_path: a store path past Windows' 260 characters (NVR camera
+            # names) made getsize raise here, after every frame was tracked
+            # and before the CSV was written.
+            size_mb = os.path.getsize(long_path(tracks_h5)) / (1024 * 1024)
             print(f"[MTT Inference] Masks: {n_mask_rows} detections -> "
                   f"{os.path.basename(tracks_h5)} ({size_mb:.1f} MB)")
 
@@ -983,6 +1048,7 @@ def run_inference_on_video(
             print(f"[MTT Inference] {n_tracks} unique tracks written to {output_dir}/")
         if writer:
             print(f"[MTT Inference] Annotated video: {annotated_path}")
+        rec.update(complete=not stopped, tracks=n_tracks)
 
         return {
             "output_dir": output_dir,
@@ -1001,6 +1067,19 @@ def run_inference_on_video(
                 mask_writer.close()
             except Exception:
                 pass
+        sys.stdout = _real_stdout
+        if output_dir and os.path.isdir(output_dir):
+            elapsed = time.time() - t_start
+            rec.update(finished=datetime.now().isoformat(timespec="seconds"),
+                       elapsed_s=round(elapsed, 1), frames_processed=frame_idx,
+                       frames_without_detection=n_no_det,
+                       fps_processed=round(frame_idx / elapsed, 2) if elapsed > 0 else None)
+            if stopped:
+                rec["stopped"] = True
+            try:
+                mtt_runs.write_run_record(output_dir, rec, tee.lines)
+            except Exception as e:
+                print(f"[MTT Inference] Could not write the run record ({e})")
         if _saved_fd is not None:
             os.dup2(_saved_fd, 2)
             os.close(_saved_fd)

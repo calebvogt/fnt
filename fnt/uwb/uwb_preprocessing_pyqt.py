@@ -58,6 +58,9 @@ from fnt.uwb.identities import (
     tag_label, hex_label, identity_field_problems, describe_problems,
     OFF_INTERVALS, off_intervals, merge_intervals, inside_intervals)
 from fnt.uwb import uwb_roi
+from fnt.uwb.downsampling import (
+    DOWNSAMPLING_NONE, DOWNSAMPLING_RANDOM, DOWNSAMPLING_METHODS,
+    DEFAULT_DOWNSAMPLING_HZ, DEFAULT_DOWNSAMPLING_SEED, downsample_reads)
 
 
 # Columns the processing pipeline actually consumes. Wiser tables carry ~20
@@ -445,8 +448,10 @@ ROI_BOUTS_TOOLTIP = (
     "Columns: SexID, Day, ROI, bout_start, bout_stop, duration_s, n_reads.\n"
     "\n"
     "STRICT. A single fix outside the region ends the bout, and the next fix "
-    "back inside starts a new one. Nothing is bridged, no dropout is filled "
-    "in, and no duration is rounded — millisecond edges throughout.\n"
+    "back inside starts a new one; so does a recording gap longer than the "
+    "Time gap setting (the one that splits the track into segments), even "
+    "inside one region. Nothing is bridged, no dropout is filled in, and no "
+    "duration is rounded — millisecond edges throughout.\n"
     "\n"
     "A LONE READ inside a region reports identical bout_start and bout_stop "
     "and duration 0.0 s, with n_reads = 1. That is what was observed: the "
@@ -605,6 +610,17 @@ OUTLIER_SIGMA_TOOLTIP = (
 VELOCITY_MIN_DT_TOOLTIP = (
     "The shortest interval the velocity threshold is allowed to divide by.\n\nSpeed is distance over time, and this system's reports can arrive a millisecond apart. Dividing a few centimetres of positional noise by a millisecond gives tens of m/s, so an unfloored velocity threshold mostly measures HOW CLOSELY SPACED THE REPORTS WERE rather than how fast the animal moved - it deletes tightly spaced fixes wherever they occur.\n\nOn this project's pilot data the raw interval put 41% of fixes over 1 m/s with a median step of only 9 cm; flooring at 0.5 s brings that to 2%.\n\nSet 0 for the old unfloored behaviour (what configs written before this option restore, so an old trial reproduces exactly).")
 
+DOWNSAMPLING_TOOLTIP = (
+    "Thin each tag's reads to a common rate BEFORE the thresholds and the smoothing.\n\n"
+    "• None (all reads) (default): every read is used.\n"
+    "• Random: each tag's time line is cut into bins of 1 / (reads per second) seconds and ONE read per bin, picked at random, is kept. A tag that already reports at or below that rate is left almost untouched; a faster tag is brought down to it.\n\n"
+    "WHY. Tags flashed with different rate pairs (10/1, 4/1, 1/1) record the same movement with very different numbers of reads. The thresholds compare consecutive reads, and Savitzky-Golay smooths over 31 of them - about 3-4 s of a 10/1 tag's track but 30-40 s of a 1/1 tag's - so distance, speed and chases come out lower for an animal on a slow tag because of the tag, not the animal. Downsampling every tag to the slowest tags' rate gives every animal the same input. Tag Statistics... shows each tag's measured rate.\n\n"
+    "The pick is random but reproducible: it depends only on the tag, the read's time and a fixed seed recorded in fnt_config.json, so re-running the export, or previewing any stretch of it, keeps the same reads.")
+
+DOWNSAMPLING_HZ_TOOLTIP = (
+    "The most reads per second each tag keeps (one read per 1 / this many seconds).\n\n"
+    "Set it to the rate of the slowest tags in the trial, the same value for every trial you will compare: 1 brings 10/1 and 4/1 tags down to a 1/1 tag's ceiling. A 1/1 tag that misses pings delivers less than 1 read/s on average; to match that rate exactly, use its median rate from Tag Statistics...")
+
 
 def hampel_deviation(x, y, window=31, group=None,
                      mad_floor=HAMPEL_MAD_FLOOR_M):
@@ -703,49 +719,82 @@ def hampel_keep(x, y, window=31, n_sigma=6.0, group=None,
 EWMA_METHOD = "Forward-Backward Exponentially Weighted Moving Average"
 SAVGOL_METHOD = "Savitzky-Golay"
 
+# "Export every smoothing method": each method's own coordinates, written to
+# the smoothed CSV beside smoothed_x/smoothed_y as <prefix>_x/<prefix>_y, so a
+# downstream analysis can compare smoothers without re-exporting. Always all
+# four (the primary method's included), so the file's columns do not depend on
+# which method was primary. Everything inside FNT still reads smoothed_x/y.
+ALT_SMOOTHING_METHODS = (
+    (SAVGOL_METHOD, 'sg'),
+    ("Rolling Average", 'rollmean'),
+    ("Rolling Median", 'rollmedian'),
+    (EWMA_METHOD, 'ewma'),
+)
+ALT_SMOOTHING_COLUMNS = tuple(
+    f'{prefix}_{axis}' for _, prefix in ALT_SMOOTHING_METHODS for axis in 'xy')
+
+
+def alt_smoothing_record(window, units):
+    """What each extra column holds, for fnt_config.json.
+
+    Every method uses the export's Smoothing Window and units (Savitzky-Golay
+    at order 2; for EWMA the window is the span, in reads or in seconds).
+    """
+    w = int(max(1, window))
+    rec = {
+        'sg_x/sg_y': {'method': SAVGOL_METHOD, 'window': w, 'units': units,
+                      'polyorder': 2},
+        'rollmean_x/rollmean_y': {'method': "Rolling Average",
+                                  'window': w, 'units': units},
+        'rollmedian_x/rollmedian_y': {'method': "Rolling Median",
+                                      'window': w, 'units': units},
+        'ewma_x/ewma_y': {'method': EWMA_METHOD, 'span': w, 'units': units},
+    }
+    if units == "Seconds":
+        rec['ewma_x/ewma_y']['halflife_s'] = round(ewma_halflife_s(w), 4)
+    return rec
+
+
+def _not_alt_smoothing_column(col):
+    """usecols filter: the readers that load the whole smoothed CSV skip the
+    extra smoothing columns, which they never use."""
+    return col not in ALT_SMOOTHING_COLUMNS
+
 
 def smoothing_window_fields(method, window, units, *, window_key,
                             units_key, span_key="smoothing_span"):
     """How a method's window settings should be SERIALISED.
 
-    Only the rolling methods actually have a window. Savitzky-Golay derives
-    its own from the data (31 samples or the group length, whichever is
-    smaller) and never reads the control; EWMA reads the same control as a
-    sample SPAN, with no units at all - the units combo is hidden for it, so
-    whatever it holds is left over from another method.
+    Every smoothing method now has a window and units (Seconds or Samples);
+    "None" has neither, so both are null. EWMA in Samples also writes its span
+    as ``smoothing_span``, the key FNT versions before the units choice read.
 
-    Writing a number and a unit for those two asserted something the run had
-    not done: a config reading ``window: 30, window_units: "Seconds"`` under
-    EWMA had in fact smoothed with a 30-SAMPLE span, and nothing in the file
-    said so. Null means "not applicable to this method", and ``smoothing_span``
-    names the one value that did apply.
+    Configs written before every method had units carry null units for
+    Savitzky-Golay (then fixed at 31 samples) and EWMA (then a span of
+    samples); resolve_window reads those back as what they ran.
 
     Returns a dict of the keys to merge into the config.
     """
-    if method == EWMA_METHOD:
-        return {window_key: None, units_key: None, span_key: int(window)}
-    if method == SAVGOL_METHOD:
-        # No span key either: Savitzky-Golay takes no parameter from the user,
-        # so there is nothing to record.
+    method = clean_smoothing_method(method)
+    if not smoothing_has_window(method):
         return {window_key: None, units_key: None}
-    return {window_key: window, units_key: units}
+    out = {window_key: int(window), units_key: units}
+    if method == EWMA_METHOD and units == "Samples":
+        out[span_key] = int(window)
+    return out
 
 
-def smoothing_window_value(cfg, *, window_key, span_key="smoothing_span"):
-    """The window/span to restore from a config, or None if it said nothing.
+def smoothing_window_setting(cfg, *, method_key, window_key, units_key,
+                             span_key="smoothing_span"):
+    """(window, units) to restore from a config, or (None, None).
 
-    ``smoothing_span`` wins where present. Falling back to the window key
-    keeps every config written before this split loading correctly: those
-    stored the EWMA span in the window field, so the number is right even
-    though the label was not.
+    Configs that name their units are taken at their word; older ones are
+    read as what they ran (see fnt.uwb.smoothing.resolve_window): a
+    Savitzky-Golay config with no units ran over 31 samples whatever its
+    window field held, an EWMA one over ``smoothing_span`` samples.
     """
-    span = cfg.get(span_key)
-    if isinstance(span, (int, float)) and not isinstance(span, bool):
-        return int(span)
-    val = cfg.get(window_key)
-    if isinstance(val, (int, float)) and not isinstance(val, bool):
-        return int(val)
-    return None
+    return resolve_window(cfg.get(method_key), cfg.get(window_key),
+                          cfg.get(units_key), cfg.get(span_key))
 
 
 def draw_context_layers(ax, layers, *, bg_image=None, bg_extent=None,
@@ -1257,67 +1306,13 @@ def smoothed_csv_timestamps(df, tz):
                           utc=True).dt.tz_convert(tz)
 
 
-def forward_backward_ewma(series, span):
-    """Zero-phase exponential weighted moving average (filtfilt-style cascade).
-
-    The Wiser hardware applies a causal EWMA, which necessarily lags the true
-    signal. Post-hoc we know each sample's future, so we run the EWMA forward,
-    then run a second EWMA backward over that result. The two passes impose
-    equal and opposite group delays, so the lag cancels exactly.
-
-    Reversing with [::-1] changes row order but preserves index labels, so the
-    final reversal restores the original ordering and the returned Series still
-    aligns correctly when used inside groupby(...).transform(...).
-    """
-    forward = series.ewm(span=span, adjust=False).mean()
-    return forward[::-1].ewm(span=span, adjust=False).mean()[::-1]
-
-
-def rolling_smooth_xy(data, agg, window_value, time_based):
-    """Centred (zero-phase) rolling smoothing of location_x/location_y per tag.
-
-    Shared by the interactive preview/export path and the plot-worker fallback
-    so both interpret the smoothing window identically.
-
-    Parameters
-    ----------
-    data : DataFrame with 'shortid', 'Timestamp', 'location_x', 'location_y'.
-    agg : 'mean' (Rolling Average) or 'median' (Rolling Median).
-    window_value : the window size. When ``time_based`` it is a duration in
-        seconds; otherwise it is a count of consecutive samples.
-    time_based : if True the window is a real-time span (e.g. '30s') evaluated
-        against each tag's Timestamp, so the degree of smoothing is independent
-        of the (irregular, well-under-1 Hz) reporting rate — 30 s of data is
-        averaged regardless of how many fixes landed in that interval. If False
-        the window is a fixed number of consecutive fixes, so its wall-clock
-        span drifts with the reporting rate (the historical behaviour).
-
-    In both modes the window is **centred**, so each output sample uses roughly
-    equal amounts of past and future data and smoothing adds no temporal lag.
-    Writes 'smoothed_x'/'smoothed_y' back into ``data`` and returns it.
-    """
-    def _agg(roller):
-        return roller.mean() if agg == 'mean' else roller.median()
-
-    if time_based:
-        # Time-based rolling needs a monotonic DatetimeIndex, so sort each tag
-        # by Timestamp, roll, then scatter the result back to the original rows.
-        win = f"{int(window_value)}s"
-        data['smoothed_x'] = np.nan
-        data['smoothed_y'] = np.nan
-        for _, g in data.groupby('shortid'):
-            g_sorted = g.sort_values('Timestamp')
-            idx = pd.DatetimeIndex(g_sorted['Timestamp'])
-            for src, dst in (('location_x', 'smoothed_x'), ('location_y', 'smoothed_y')):
-                s = pd.Series(g_sorted[src].to_numpy(), index=idx)
-                rolled = _agg(s.rolling(win, center=True, min_periods=1))
-                data.loc[g_sorted.index, dst] = rolled.to_numpy()
-    else:
-        window_size = max(3, int(window_value))  # sample-count floor of 3
-        for src, dst in (('location_x', 'smoothed_x'), ('location_y', 'smoothed_y')):
-            data[dst] = data.groupby('shortid')[src].transform(
-                lambda x: _agg(x.rolling(window=window_size, center=True, min_periods=1)))
-    return data
+# Every smoothing method, by time (Seconds) or by reads (Samples): fnt/uwb/smoothing.py.
+# forward_backward_ewma and rolling_smooth_xy stay importable from here.
+from fnt.uwb.smoothing import (  # noqa: E402
+    forward_backward_ewma, rolling_smooth_xy, smooth_xy, resolve_window,
+    has_window as smoothing_has_window, clean_method as clean_smoothing_method,
+    DEFAULT_WINDOW as SMOOTHING_DEFAULT_WINDOW, describe as describe_smoothing,
+    ewma_halflife_s)
 
 
 # Shared, math-level description of every smoothing method. Used verbatim as
@@ -1330,9 +1325,13 @@ SMOOTHING_METHODS_TOOLTIP = (
     "future is known, so the window is centred and smoothing adds no temporal\n"
     "lag — unlike the causal filter the Wiser hardware must run live.\n"
     "\n"
-    "The Smoothing Window / units control sets the window for the two rolling\n"
-    "methods; Forward-Backward Exponentially Weighted Moving Average uses it as a sample span; Savitzky-Golay and\n"
-    "None ignore it.\n"
+    "Every method takes the Smoothing Window in Seconds or in Samples (reads).\n"
+    "Seconds smooths the same stretch of time on every tag; Samples smooths a\n"
+    "fixed number of reads, which is a different stretch of time on tags with\n"
+    "different read rates (31 reads = ~4 s on a 10/1 tag, ~40 s on a 1/1 tag).\n"
+    "Use Seconds whenever tags read at different rates. Switching method\n"
+    "restores that method's own last window (defaults: Savitzky-Golay 31\n"
+    "samples, EWMA 20 samples, rolling 30 s, i.e. the old behaviour).\n"
     "\n"
     "• None\n"
     "    No smoothing. The raw (already threshold-filtered) fixes are used as-is.\n"
@@ -1357,9 +1356,10 @@ SMOOTHING_METHODS_TOOLTIP = (
     "\n"
     "• Savitzky-Golay\n"
     "    Fits a low-order polynomial to each centred window by least squares and\n"
-    "    evaluates it at the window's centre. Here the window length is\n"
-    "    min(31, n) samples (forced odd) with polynomial order 2 — a local\n"
-    "    quadratic; the Smoothing Window setting does not apply. Because it\n"
+    "    evaluates it at the window's centre, with polynomial order 2 (a local\n"
+    "    quadratic). Samples: a window of N reads (forced odd, at most the\n"
+    "    tag's length). Seconds: the same fit over the reads within +/- W/2 s of\n"
+    "    each read, on their real times (no even spacing needed). Because it\n"
     "    models curvature instead of flattening it, Savitzky-Golay preserves\n"
     "    peaks, turns and the height of sharp features better than averaging.\n"
     "\n"
@@ -1373,10 +1373,13 @@ SMOOTHING_METHODS_TOOLTIP = (
     "    again backward, imposing an equal and opposite delay, so the lag cancels\n"
     "    exactly and the output stays centred on the real trajectory. Filtering\n"
     "    twice squares the frequency response, so expect noticeably stronger\n"
-    "    smoothing than a single pass at the same span. The span is always in\n"
-    "    samples. This is the same filter family the Wiser hardware applies in\n"
-    "    real time (where it must stay causal, hence laggy); to match a hardware\n"
-    "    filter value F, use span = 2F - 1."
+    "    smoothing than a single pass at the same span. Samples: the span is a\n"
+    "    number of reads. Seconds: the span is W seconds - each read's weight\n"
+    "    halves every ln(2) x W / 2 s (0.35 W) of time away, on the real read\n"
+    "    times, so a 10 s span weighs the same stretch of time on every tag.\n"
+    "    This is the same filter family the Wiser hardware applies in real time\n"
+    "    (where it must stay causal, hence laggy); to match a hardware filter\n"
+    "    value F, use Samples with span = 2F - 1."
 )
 
 
@@ -2747,8 +2750,9 @@ class PlotSaverWorker(QThread):
             # Load from CSV if available (much faster and ensures consistency)
             if self.csv_path and os.path.exists(self.csv_path):
                 self.progress.emit("Loading data from CSV...")
-                data = pd.read_csv(self.csv_path, low_memory=False)
-                
+                data = pd.read_csv(self.csv_path, low_memory=False,
+                                   usecols=_not_alt_smoothing_column)
+
                 data['Timestamp'] = smoothed_csv_timestamps(data, self.timezone)
                 
                 self.progress.emit(f"Loaded {len(data)} records from CSV")
@@ -2891,34 +2895,10 @@ class PlotSaverWorker(QThread):
             self.finished.emit(False, f"Error generating plots: {str(e)}")
 
     def apply_smoothing(self, data, method):
-        """Apply smoothing to trajectory data"""
-        def apply_savgol_filter(group):
-            window_length = min(31, len(group))
-            if window_length % 2 == 0:
-                window_length -= 1
-            polyorder = min(2, window_length - 1)
-            if len(group) > polyorder:
-                return savgol_filter(group, window_length=window_length, polyorder=polyorder)
-            return group
-        
-        if method == "Savitzky-Golay":
-            data['smoothed_x'] = data.groupby('shortid')['location_x'].transform(apply_savgol_filter)
-            data['smoothed_y'] = data.groupby('shortid')['location_y'].transform(apply_savgol_filter)
-        elif method in ("Rolling Average", "Rolling Median"):
-            # Same interpretation as the interactive path: window is seconds
-            # (time-based, centred) or a sample count, per the units setting.
-            agg = 'mean' if method == "Rolling Average" else 'median'
-            time_based = self.rolling_window_units == "Seconds"
-            rolling_smooth_xy(data, agg, self.rolling_window, time_based)
-        elif method == "Forward-Backward Exponentially Weighted Moving Average":
-            # No minimum floor here — a span of 1-2 is legitimate for EWMA
-            span = max(1, self.rolling_window)
-            data['smoothed_x'] = data.groupby('shortid')['location_x'].transform(
-                lambda x: forward_backward_ewma(x, span))
-            data['smoothed_y'] = data.groupby('shortid')['location_y'].transform(
-                lambda x: forward_backward_ewma(x, span))
-
-        return data
+        """Apply smoothing to trajectory data (same code as the interactive
+        path: fnt.uwb.smoothing.smooth_xy, window in seconds or samples)."""
+        return smooth_xy(data, method, self.rolling_window,
+                         self.rolling_window_units)
     
     def save_daily_paths_per_tag(self, data, output_dir, db_name):
         """Save daily paths - one PNG per tag with all days
@@ -5472,33 +5452,31 @@ class UWBQuickVisualizationWindow(QWidget):
         self.spin_rolling_window.setValue(30)
         self.spin_rolling_window.setEnabled(False)
         self.spin_rolling_window.setToolTip(
-            "Size of the smoothing window. How it is read depends on the units "
-            "selector to the right and on the smoothing method:\n"
+            "Size of the smoothing window, for every method. How it is read "
+            "depends on the units selector to the right:\n"
             "\n"
-            "• Rolling Average / Rolling Median, units = Seconds: a real-time "
-            "window (e.g. 30 = a 30-second window centred on each fix). The "
-            "amount of smoothing is independent of the reporting rate.\n"
-            "• Rolling Average / Rolling Median, units = Samples: a fixed count "
-            "of consecutive fixes (e.g. 30 = 30 fixes). Its wall-clock span "
-            "varies with the reporting rate.\n"
-            "• Forward-Backward Exponentially Weighted Moving Average: the span (always in samples), which sets "
-            "the decay rate (alpha = 2 / (span + 1)). To match a Wiser hardware "
-            "filter value F, use span = 2F - 1.\n"
+            "• Seconds: a real-time window (e.g. 10 = 10 s centred on each "
+            "fix). The amount of smoothing is the same stretch of time on "
+            "every tag, whatever its read rate.\n"
+            "• Samples: a fixed count of consecutive fixes (e.g. 31 = 31 "
+            "fixes). Its wall-clock span varies with the read rate.\n"
+            "• Forward-Backward Exponentially Weighted Moving Average: the "
+            "span. In Samples alpha = 2 / (span + 1) (to match a Wiser "
+            "hardware filter value F, use span = 2F - 1); in Seconds each "
+            "read's weight halves every 0.35 x span seconds.\n"
             "\n"
             "Larger values produce smoother trajectories but lose fine detail. "
             "The window is centred in every mode, so smoothing adds no lag."
         )
         self.rolling_window_layout.addWidget(self.spin_rolling_window)
 
-        # Units selector: does the number above mean seconds or samples? Only
-        # meaningful for the rolling methods (EWMA/Savitzky-Golay ignore it), so
-        # on_smoothing_changed shows/hides it with the method.
+        # Units selector: does the number above mean seconds or samples? Every
+        # smoothing method reads it.
         self.combo_window_units = QComboBox()
         self.combo_window_units.addItems(["Seconds", "Samples"])
         self.combo_window_units.setCurrentText("Seconds")
         self.combo_window_units.setToolTip(
-            "How to interpret the Smoothing Window value (Rolling Average / "
-            "Rolling Median only):\n"
+            "How to interpret the Smoothing Window value (every method):\n"
             "\n"
             "• Seconds (default): a real-time window evaluated on each tag's "
             "timestamps. A value of 30 averages all fixes within a 30-second "
@@ -5550,9 +5528,21 @@ class UWBQuickVisualizationWindow(QWidget):
         self.spin_velocity_min_dt.setDecimals(2)
         self.spin_velocity_min_dt.setSingleStep(0.05)
         self.spin_velocity_min_dt.setValue(0.50)
+        # Downsampling, the first step of the pipeline. Hidden like the
+        # thresholds: the visible controls are the preview's.
+        self.combo_downsampling = QComboBox()
+        self.combo_downsampling.addItems(list(DOWNSAMPLING_METHODS))
+        self.spin_downsampling_hz = QDoubleSpinBox()
+        self.spin_downsampling_hz.setRange(0.05, 20.0)
+        self.spin_downsampling_hz.setDecimals(2)
+        self.spin_downsampling_hz.setValue(DEFAULT_DOWNSAMPLING_HZ)
+        # No widget: the seed only needs to be fixed and recorded, and a
+        # config can set it.
+        self.downsampling_seed = DEFAULT_DOWNSAMPLING_SEED
         for _w in (self.chk_outlier_filter, self.spin_outlier_window,
                    self.spin_outlier_sigma, self.spin_velocity_min_dt,
-                   self.chk_adjacency_filter, self.spin_excursion_s):
+                   self.chk_adjacency_filter, self.spin_excursion_s,
+                   self.combo_downsampling, self.spin_downsampling_hz):
             _w.setVisible(False)
 
         # No standalone "Clear Previous Exports" button: clearing is offered by
@@ -5572,6 +5562,27 @@ class UWBQuickVisualizationWindow(QWidget):
             "Useful as a reference baseline."
         )
         export_layout.addWidget(self.chk_export_raw_csv)
+
+        self.chk_export_all_smoothing = QCheckBox(
+            "Add every smoothing method to the Smoothed CSV")
+        self.chk_export_all_smoothing.setChecked(False)
+        self.chk_export_all_smoothing.setToolTip(
+            "Besides smoothed_x/smoothed_y (the method chosen above, which every "
+            "plot, zone, contact, chase and animation output uses), write each "
+            "smoothing method's own coordinates as extra columns:\n"
+            "\n"
+            "  sg_x, sg_y                  Savitzky-Golay (31 samples, order 2)\n"
+            "  rollmean_x, rollmean_y      Rolling Average\n"
+            "  rollmedian_x, rollmedian_y  Rolling Median\n"
+            "  ewma_x, ewma_y              Forward-Backward EWMA\n"
+            "\n"
+            "The rolling methods use the Smoothing Window and units above; the "
+            "EWMA uses the same number as its span in samples. All are computed "
+            "from the same filtered location_x/location_y, and their settings "
+            "are recorded in fnt_config.json (all_smoothing_columns), so a "
+            "downstream analysis can compare smoothers without re-exporting. "
+            "Adds roughly a fifth to the file size per method.")
+        export_layout.addWidget(self.chk_export_all_smoothing)
 
         # The filtered + smoothed CSV is ALWAYS exported (it's the canonical
         # analysis product and the source for plots/animations/proximity), so it
@@ -8226,6 +8237,33 @@ class UWBQuickVisualizationWindow(QWidget):
         v.addWidget(self.chk_preview_trail_points)
 
 
+        # Downsampling first, because it runs first: the thresholds and the
+        # smoother below only ever see the reads it keeps.
+        pds_row = QHBoxLayout()
+        pds_row.addWidget(QLabel("Downsampling:"))
+        self.combo_preview_downsampling = QComboBox()
+        self.combo_preview_downsampling.addItems(list(DOWNSAMPLING_METHODS))
+        self.combo_preview_downsampling.setToolTip(DOWNSAMPLING_TOOLTIP)
+        self.combo_preview_downsampling.currentTextChanged.connect(
+            self.on_preview_downsampling_changed)
+        pds_row.addWidget(self.combo_preview_downsampling)
+        self.lbl_preview_downsampling_hz = QLabel("to at most")
+        pds_row.addWidget(self.lbl_preview_downsampling_hz)
+        self.spin_preview_downsampling_hz = QDoubleSpinBox()
+        self.spin_preview_downsampling_hz.setRange(0.05, 20.0)
+        self.spin_preview_downsampling_hz.setDecimals(2)
+        self.spin_preview_downsampling_hz.setSingleStep(0.05)
+        self.spin_preview_downsampling_hz.setValue(DEFAULT_DOWNSAMPLING_HZ)
+        self.spin_preview_downsampling_hz.setSuffix(" reads/s")
+        self.spin_preview_downsampling_hz.setFixedWidth(100)
+        self.spin_preview_downsampling_hz.setToolTip(DOWNSAMPLING_HZ_TOOLTIP)
+        self.spin_preview_downsampling_hz.valueChanged.connect(
+            self.invalidate_preview_cache)
+        pds_row.addWidget(self.spin_preview_downsampling_hz)
+        pds_row.addStretch()
+        v.addLayout(pds_row)
+        self._show_downsampling_rate()
+
         # Preview thresholding — independent of the Export thresholds, so you can
         # see the track with/without each applied AND tune the cutoff live. Each
         # toggle carries its own value spinbox (defaults match Export: 2.0).
@@ -8468,8 +8506,7 @@ class UWBQuickVisualizationWindow(QWidget):
         # Smoothing Window for the preview — its own controls (independent of
         # Export Options) so you can see live how the window size and the
         # seconds/samples interpretation change the track. on_preview_smoothing_
-        # changed shows/hides these per method (None/Savitzky-Golay expose
-        # nothing, EWMA hides the units since its span is always in samples).
+        # changed hides them for None and restores each method's own window.
         pwin_row = QHBoxLayout()
         self.lbl_preview_window = QLabel("Smoothing Window:")
         pwin_row.addWidget(self.lbl_preview_window)
@@ -8477,18 +8514,19 @@ class UWBQuickVisualizationWindow(QWidget):
         self.spin_preview_window.setRange(1, 600)
         self.spin_preview_window.setValue(30)
         self.spin_preview_window.setToolTip(
-            "Size of the preview smoothing window. Read as seconds or samples "
-            "per the units selector; for Forward-Backward Exponentially Weighted Moving Average it is the span "
-            "(alpha = 2 / (span + 1)). Larger = smoother, less detail.")
+            "Size of the preview smoothing window, for every method. Read as "
+            "seconds or samples per the units selector; for Forward-Backward "
+            "Exponentially Weighted Moving Average it is the span. Use Seconds "
+            "when tags read at different rates. Larger = smoother, less detail.")
         self.spin_preview_window.valueChanged.connect(self.invalidate_preview_cache)
         pwin_row.addWidget(self.spin_preview_window)
         self.combo_preview_window_units = QComboBox()
         self.combo_preview_window_units.addItems(["Seconds", "Samples"])
         self.combo_preview_window_units.setCurrentText("Seconds")
         self.combo_preview_window_units.setToolTip(
-            "How to read the preview Smoothing Window (Rolling Average / Median "
-            "only): Seconds = a real-time window, independent of the reporting "
-            "rate; Samples = a fixed count of consecutive fixes.")
+            "How to read the preview Smoothing Window (every method): Seconds = "
+            "a real-time window, the same stretch of time on every tag whatever "
+            "its read rate; Samples = a fixed count of consecutive fixes.")
         self.combo_preview_window_units.currentTextChanged.connect(self.invalidate_preview_cache)
         pwin_row.addWidget(self.combo_preview_window_units)
         pwin_row.addStretch()
@@ -10241,6 +10279,15 @@ class UWBQuickVisualizationWindow(QWidget):
             g, _dropped = self._trim_to_tag_window(g, tag, tz)
             if not len(g):
                 continue
+            # Downsample here rather than inside _filter_and_smooth, so the
+            # threshold read-out below describes the reads the thresholds
+            # will actually see. The pick depends only on each read, so this
+            # slice keeps exactly the reads the export keeps.
+            if self.combo_preview_downsampling.currentText() == DOWNSAMPLING_RANDOM:
+                g = downsample_reads(g, self.spin_preview_downsampling_hz.value(),
+                                     seed=self.downsampling_seed)
+                if not len(g):
+                    continue
             # Threshold BOTH velocity and jump on the raw coordinates, then
             # smooth (see _filter_and_smooth: thresholding velocity on the
             # smoothed track was tried and produced a jumpy result).
@@ -10273,7 +10320,8 @@ class UWBQuickVisualizationWindow(QWidget):
                 outlier_sigma=self.spin_preview_outlier_sigma.value(),
                 velocity_min_dt=self.spin_preview_velocity_min_dt.value(),
                 adjacency=self.chk_preview_adjacency.isChecked(),
-                excursion_s=self.spin_preview_excursion.value())
+                excursion_s=self.spin_preview_excursion.value(),
+                downsampling=DOWNSAMPLING_NONE)   # already applied above
             if len(g):
                 # Re-measure on the SURVIVING, SMOOTHED fixes: the marker
                 # readout describes the track actually drawn, whose steps both
@@ -10423,14 +10471,43 @@ class UWBQuickVisualizationWindow(QWidget):
         Savitzky-Golay expose no window; the rolling methods expose window +
         units; EWMA exposes the window (as its span) but not the units.
         """
-        method = self.combo_preview_smoothing.currentText()
-        is_ewma = method == "Forward-Backward Exponentially Weighted Moving Average"
-        is_rolling = method in ("Rolling Average", "Rolling Median")
-        needs_param = is_ewma or is_rolling
-        self.lbl_preview_window.setText("Span (samples):" if is_ewma else "Smoothing Window:")
+        method = clean_smoothing_method(self.combo_preview_smoothing.currentText())
+        is_ewma = method == EWMA_METHOD
+        needs_param = smoothing_has_window(method)
+        # Each method keeps its own window: leaving one stores what it had,
+        # arriving at one restores its last (or default) window and units, so
+        # trying Savitzky-Golay after a 30 s rolling mean does not silently
+        # run Savitzky-Golay over 30 s.
+        memory = self.__dict__.setdefault(
+            '_preview_window_memory', dict(SMOOTHING_DEFAULT_WINDOW))
+        prev = getattr(self, '_preview_window_method', None)
+        if prev is not None and prev != method and smoothing_has_window(prev):
+            memory[prev] = (self.spin_preview_window.value(),
+                            self.combo_preview_window_units.currentText())
+        if needs_param and prev != method:
+            w, u = memory.get(method, SMOOTHING_DEFAULT_WINDOW[method])
+            for wdg in (self.spin_preview_window, self.combo_preview_window_units):
+                wdg.blockSignals(True)
+            self.spin_preview_window.setValue(int(w))
+            self.combo_preview_window_units.setCurrentText(u)
+            for wdg in (self.spin_preview_window, self.combo_preview_window_units):
+                wdg.blockSignals(False)
+        self._preview_window_method = method
+        self.lbl_preview_window.setText("Span:" if is_ewma else "Smoothing Window:")
         self.spin_preview_window.setVisible(needs_param)
         self.lbl_preview_window.setVisible(needs_param)
-        self.combo_preview_window_units.setVisible(is_rolling)
+        self.combo_preview_window_units.setVisible(needs_param)
+        self.invalidate_preview_cache()
+
+    def _show_downsampling_rate(self):
+        """Show the reads-per-second box only when a downsampling is chosen."""
+        on = self.combo_preview_downsampling.currentText() != DOWNSAMPLING_NONE
+        self.lbl_preview_downsampling_hz.setVisible(on)
+        self.spin_preview_downsampling_hz.setVisible(on)
+
+    def on_preview_downsampling_changed(self, *_):
+        """Downsampling changed: show/hide its rate, then reload the chunks."""
+        self._show_downsampling_rate()
         self.invalidate_preview_cache()
 
     def on_preview_trail_changed(self, *_):
@@ -10657,6 +10734,15 @@ class UWBQuickVisualizationWindow(QWidget):
                 if self.combo_color_by.itemText(i).strip().lower() == want:
                     self.combo_color_by.setCurrentIndex(i)
                     break
+        except Exception:
+            pass
+        # Its own block, so a window still being built (the export widgets
+        # exist before the preview's) cannot skip the mirroring above.
+        try:
+            self.combo_downsampling.setCurrentText(
+                self.combo_preview_downsampling.currentText())
+            self.spin_downsampling_hz.setValue(
+                round(self.spin_preview_downsampling_hz.value(), 2))
         except Exception:
             pass
 
@@ -11001,7 +11087,8 @@ class UWBQuickVisualizationWindow(QWidget):
             # each fix its sampling interval instead - what this used to do -
             # ran exactly one second per visit ahead of the CSV.
             t_ns = ts.values.astype('datetime64[ns]').astype('int64')
-            for r_i, t0, t1, secs, _n in RB.region_bouts(zi, t_ns):
+            for r_i, t0, t1, secs, _n in RB.region_bouts(
+                    zi, t_ns, max_gap_s=self.roi_bout_max_gap_s()):
                 by_animal.setdefault((label, r_i), []).append(
                     (t0 / 1e9, t1 / 1e9, secs))
             if label not in seen:
@@ -11565,8 +11652,9 @@ class UWBQuickVisualizationWindow(QWidget):
         """One row per visit: a run of consecutive fixes inside one region.
 
         Strict by design. A single fix outside the region ends the bout, and
-        the next fix back inside starts a new one — nothing is bridged and no
-        duration is rounded. A lone fix inside a region reports identical
+        the next fix back inside starts a new one; so does a recording gap
+        longer than the Time gap setting (``roi_bout_max_gap_s``) — nothing is
+        bridged and no duration is rounded. A lone fix inside a region reports identical
         start and stop and 0.0 s (roi_bouts.LONE_READ_S), because its real
         span cannot be observed; n_reads = 1 marks it.
 
@@ -11596,7 +11684,8 @@ class UWBQuickVisualizationWindow(QWidget):
         for column, regions in sets:
             names = [r.get('name', f'{column} {i + 1}')
                      for i, r in enumerate(regions)]
-            for r_i, t0, t1, secs, n_reads in RB.region_bouts(idx[column], t_ns):
+            for r_i, t0, t1, secs, n_reads in RB.region_bouts(
+                    idx[column], t_ns, max_gap_s=self.roi_bout_max_gap_s()):
                 rows.append({
                     'SexID': label,
                     'ROI': names[r_i],
@@ -11744,6 +11833,14 @@ class UWBQuickVisualizationWindow(QWidget):
             f"\u2713 Exported {fname} ({len(df)} row(s), "
             f"{df['ROI'].nunique()} region(s) over {df['Day'].nunique()} day(s))")
         return path
+
+    def roi_bout_max_gap_s(self):
+        """The longest recording gap a ROI bout may span: the Time gap setting,
+        so a visit breaks exactly where the track's segments do (see
+        roi_bouts.MAX_GAP_S for why a bout must not bridge an outage)."""
+        from fnt.uwb import roi_bouts as RB
+        spin = getattr(self, 'spin_time_gap', None)
+        return float(spin.value()) if spin is not None else RB.MAX_GAP_S
 
     def region_bouts_from_csv(self, csv_path, sets, selected_tags=None):
         """Re-derive ROI bouts from an existing smoothed CSV.
@@ -13109,6 +13206,11 @@ class UWBQuickVisualizationWindow(QWidget):
         self.spin_preview_outlier_window.setValue(31)
         self.spin_preview_outlier_sigma.setValue(6.0)
         self.spin_preview_velocity_min_dt.setValue(0.50)
+        self.combo_downsampling.setCurrentText(DOWNSAMPLING_NONE)
+        self.combo_preview_downsampling.setCurrentText(DOWNSAMPLING_NONE)
+        self.spin_downsampling_hz.setValue(DEFAULT_DOWNSAMPLING_HZ)
+        self.spin_preview_downsampling_hz.setValue(DEFAULT_DOWNSAMPLING_HZ)
+        self.downsampling_seed = DEFAULT_DOWNSAMPLING_SEED
         self.chk_export_behavior.setChecked(False)
         self.on_social_network_toggled()
         self.chk_save_plots.setChecked(False)
@@ -14266,14 +14368,12 @@ class UWBQuickVisualizationWindow(QWidget):
     
     def on_smoothing_changed(self, method):
         """Handle smoothing method change"""
-        clean_method = method.replace(" (default)", "")
-        is_ewma = clean_method == "Forward-Backward Exponentially Weighted Moving Average"
-        is_rolling = clean_method in ("Rolling Average", "Rolling Median")
-        # Savitzky-Golay sizes its own window, so only the rolling methods and
-        # EWMA expose the parameter spinbox.
-        needs_param = is_ewma or is_rolling
+        clean_method = clean_smoothing_method(method)
+        is_ewma = clean_method == EWMA_METHOD
+        # Every method but None takes the window (seconds or samples).
+        needs_param = smoothing_has_window(clean_method)
 
-        self.lbl_rolling_window.setText("Span (samples):" if is_ewma else "Smoothing Window:")
+        self.lbl_rolling_window.setText("Span:" if is_ewma else "Smoothing Window:")
         self.spin_rolling_window.setEnabled(needs_param)
         # These export widgets are inherited from the preview and stay hidden;
         # only their values matter. Re-showing them here is what made the span
@@ -14417,6 +14517,7 @@ class UWBQuickVisualizationWindow(QWidget):
                     f"Daily animation days restored from the saved settings: "
                     f"{len(wanted & set(self.daily_animation_day_checkboxes))}"
                     f" of {len(self.daily_animation_day_checkboxes)} day(s).")
+        self._relabel_animation_days()
         self._sync_all_days_checkbox()
 
     def on_all_days_clicked(self):
@@ -14612,6 +14713,7 @@ class UWBQuickVisualizationWindow(QWidget):
         if dialog.exec_() != QDialog.Accepted:
             return
         self.tag_identities = dialog.get_identities()
+        self._relabel_animation_days()
         self.log_message(f"Updated identities for {len(self.tag_identities)} tags")
         # The active windows just changed: cached chunks were built under the
         # old ones and the timeline may now cover a different span.
@@ -14973,40 +15075,26 @@ class UWBQuickVisualizationWindow(QWidget):
         preview can drive smoothing from its own independent window controls.
         """
         win = self.spin_rolling_window.value() if window is None else window
-        use_seconds = ((self.combo_window_units.currentText() == "Seconds")
-                       if units is None else (units == "Seconds"))
+        units = self.combo_window_units.currentText() if units is None else units
+        # Every method reads the window in Seconds (the same stretch of time on
+        # every tag, whatever its read rate) or Samples (a count of reads).
+        return smooth_xy(data, method, win, units)
 
-        def apply_savgol(group):
-            window_length = min(31, len(group))
-            if window_length % 2 == 0:
-                window_length -= 1
-            polyorder = min(2, window_length - 1)
-            if len(group) > polyorder:
-                return savgol_filter(group, window_length=window_length, polyorder=polyorder)
-            return group
+    def add_alt_smoothing_columns(self, data, window=None, units=None):
+        """Add every method's coordinates (ALT_SMOOTHING_COLUMNS) to ``data``.
 
-        if method == "Savitzky-Golay":
-            data['smoothed_x'] = data.groupby('shortid')['location_x'].transform(apply_savgol)
-            data['smoothed_y'] = data.groupby('shortid')['location_y'].transform(apply_savgol)
-        elif method in ("Rolling Average", "Rolling Median"):
-            # The window value is interpreted as seconds (time-based, centred on
-            # each tag's Timestamp) or as a fixed sample count, per the units
-            # selector next to the spinbox. Time-based is the default and is
-            # independent of the irregular, sub-1 Hz reporting rate.
-            agg = 'mean' if method == "Rolling Average" else 'median'
-            rolling_smooth_xy(data, agg, win, use_seconds)
-        elif method == "Forward-Backward Exponentially Weighted Moving Average":
-            # Window doubles as the EWMA span. No minimum floor — a span of
-            # 1-2 is legitimate (span=1 gives alpha=1, i.e. passthrough).
-            span = max(1, win)
-
-            data['smoothed_x'] = data.groupby('shortid')['location_x'].transform(
-                lambda x: forward_backward_ewma(x, span))
-            data['smoothed_y'] = data.groupby('shortid')['location_y'].transform(
-                lambda x: forward_backward_ewma(x, span))
-
+        Each method runs on its own copy of the filtered location_x/location_y,
+        through the same apply_smoothing_to_data the primary method uses, so
+        e.g. rollmean_x equals smoothed_x when Rolling Average is primary.
+        """
+        base = data[['shortid', 'Timestamp', 'location_x', 'location_y']]
+        for method, prefix in ALT_SMOOTHING_METHODS:
+            out = self.apply_smoothing_to_data(base.copy(), method,
+                                               window=window, units=units)
+            data[f'{prefix}_x'] = out['smoothed_x'].to_numpy()
+            data[f'{prefix}_y'] = out['smoothed_y'].to_numpy()
         return data
-    
+
     def reset_filter_stats(self):
         """Clear accumulated filter statistics at the start of an export run."""
         self.filter_stats = {}
@@ -15016,14 +15104,38 @@ class UWBQuickVisualizationWindow(QWidget):
                            jump_thresh=None, window=None, units=None,
                            outlier=None, outlier_window=None,
                            outlier_sigma=None, velocity_min_dt=None,
-                           adjacency=None, excursion_s=None):
-        """Threshold, then smooth (the original order).
+                           adjacency=None, excursion_s=None,
+                           downsampling=None, downsampling_hz=None):
+        """Downsample, threshold, then smooth.
+
+        Downsampling runs first, so a fast tag reaches the thresholds and the
+        smoother at the same rate as a slow one (see fnt.uwb.downsampling).
+        ``downsampling``/``downsampling_hz`` override the Export widgets, as
+        the threshold arguments do.
 
         BOTH the velocity and jump thresholds run on the raw coordinates BEFORE
         smoothing, so the noisy/teleport fixes are removed and the smoother gets
         clean input. (Thresholding the velocity on the smoothed track instead
         let the noise into the smoother and produced a jumpy result.)
         """
+        method = (self.combo_downsampling.currentText()
+                  if downsampling is None else downsampling)
+        if method == DOWNSAMPLING_RANDOM and len(data):
+            hz = (self.spin_downsampling_hz.value()
+                  if downsampling_hz is None else downsampling_hz)
+            n_before = len(data)
+            data = downsample_reads(data, hz, seed=self.downsampling_seed)
+            if collect_stats:
+                self.log_message(
+                    f"  Downsampled to at most {hz:g} read/s: kept {len(data):,} "
+                    f"of {n_before:,} reads ({100 * len(data) / n_before:.1f}%)")
+                s = getattr(self, 'filter_stats', None) or {}
+                s['reads_before_downsampling'] = (
+                    s.get('reads_before_downsampling', 0) + n_before)
+                s['removed_downsampling'] = (
+                    s.get('removed_downsampling', 0) + n_before - len(data))
+                self.filter_stats = s
+
         use_vel = self.chk_velocity_filter.isChecked() if velocity is None else velocity
         use_jmp = self.chk_jump_filter.isChecked() if jump is None else jump
         use_out = (self.chk_outlier_filter.isChecked()
@@ -15206,6 +15318,9 @@ class UWBQuickVisualizationWindow(QWidget):
         if collect_stats:
             s = getattr(self, 'filter_stats', None) or {}
             self.filter_stats = {
+                # Anything another step counted (downsampling) is carried
+                # through rather than dropped by the rebuild.
+                **s,
                 'initial_count': s.get('initial_count', 0) + initial_count,
                 'removed_outlier': s.get('removed_outlier', 0) + removed_outlier,
                 'removed_velocity': s.get('removed_velocity', 0) + removed_velocity,
@@ -15284,6 +15399,16 @@ class UWBQuickVisualizationWindow(QWidget):
             'table_name': self.table_name,
             'selected_tags': [tag for tag, cb in self.tag_checkboxes.items() if cb.isChecked()],
             'timezone': self.combo_timezone.currentText(),
+            # First step of the pipeline. The rate and seed are written only
+            # when downsampling is on, so a config never claims a rate its
+            # export did not use.
+            'downsampling': self.combo_downsampling.currentText(),
+            'downsampling_hz': (self.spin_downsampling_hz.value()
+                                if self.combo_downsampling.currentText()
+                                != DOWNSAMPLING_NONE else None),
+            'downsampling_seed': (int(self.downsampling_seed)
+                                  if self.combo_downsampling.currentText()
+                                  != DOWNSAMPLING_NONE else None),
             'velocity_filter': self.chk_velocity_filter.isChecked(),
             'velocity_threshold': self.spin_velocity_threshold.value(),
             'jump_filter': self.chk_jump_filter.isChecked(),
@@ -15314,7 +15439,12 @@ class UWBQuickVisualizationWindow(QWidget):
             'show_battery': self.chk_show_battery.isChecked(),
             'export_raw_csv': self.chk_export_raw_csv.isChecked(),
             'export_smoothed_csv': self.chk_export_smoothed_csv.isChecked(),
-            'proximity_detection': self.chk_proximity_detection.isChecked(),
+            'export_all_smoothing': self.chk_export_all_smoothing.isChecked(),
+            'all_smoothing_columns': (
+                alt_smoothing_record(self.spin_rolling_window.value(),
+                                     self.combo_window_units.currentText())
+                if self.chk_export_all_smoothing.isChecked() else None),
+            'proximity_detection':self.chk_proximity_detection.isChecked(),
             'proximity_threshold': self.spin_proximity_threshold.value(),
             # Analysis settings, so they ARE inherited between trials -
             # unlike the regions themselves, which belong to one arena.
@@ -15400,6 +15530,8 @@ class UWBQuickVisualizationWindow(QWidget):
     # Kind drives how the value is read/written ('text' for combos, 'value' for
     # spinboxes, 'checked' for checkboxes).
     _PREVIEW_CONFIG_WIDGETS = {
+        'downsampling': ('combo_preview_downsampling', 'text'),
+        'downsampling_hz': ('spin_preview_downsampling_hz', 'value'),
         'smoothing': ('combo_preview_smoothing', 'text'),
         'window': ('spin_preview_window', 'value'),
         'window_units': ('combo_preview_window_units', 'text'),
@@ -15537,6 +15669,14 @@ class UWBQuickVisualizationWindow(QWidget):
             except Exception:
                 continue
 
+        # The window and units of a config with no preview smoothing: read the
+        # top-level keys as what the run did (Savitzky-Golay with null units =
+        # 31 samples, EWMA = its smoothing_span in samples).
+        if 'smoothing' not in preview and 'smoothing_method' in config:
+            self._apply_preview_window(*smoothing_window_setting(
+                config, method_key='smoothing_method',
+                window_key='rolling_window', units_key='rolling_window_units'))
+
         # The social radius is stored as the export's centre-to-centre
         # proximity threshold; the preview owns half of it.
         if ('social_radius' not in preview and 'proximity_threshold' in config
@@ -15546,6 +15686,16 @@ class UWBQuickVisualizationWindow(QWidget):
                     float(config['proximity_threshold']) / 2.0)
             except (TypeError, ValueError):
                 pass
+
+    def _apply_preview_window(self, window, units):
+        """Set the preview Smoothing Window and units (None = leave as is)."""
+        if window is None or getattr(self, 'spin_preview_window', None) is None:
+            return
+        try:
+            self.spin_preview_window.setValue(int(window))
+            self.combo_preview_window_units.setCurrentText(units)
+        except Exception:
+            pass
 
     def apply_preview_config(self, cfg):
         """Restore preview settings saved by get_preview_config.
@@ -15575,15 +15725,12 @@ class UWBQuickVisualizationWindow(QWidget):
                     w.setChecked(bool(val))
             except Exception:
                 continue
-        # The window/span, after the generic pass: a null 'window' is skipped
-        # above, so the value has to come from 'smoothing_span' (or, for a
-        # config written before the split, from 'window' itself).
-        span = smoothing_window_value(cfg, window_key='window')
-        if span is not None and getattr(self, 'spin_preview_window', None):
-            try:
-                self.spin_preview_window.setValue(span)
-            except Exception:
-                pass
+        # The window and its units, after the generic pass (which skips the
+        # nulls older configs wrote for Savitzky-Golay and EWMA): read as what
+        # the run did - see smoothing_window_setting.
+        self._apply_preview_window(*smoothing_window_setting(
+            cfg, method_key='smoothing', window_key='window',
+            units_key='window_units'))
         if not DISPLACEMENT_ENABLED:
             # Trials configured before displacement was parked have
             # beh_displace: true saved. Honouring it would put a hidden
@@ -15694,16 +15841,17 @@ class UWBQuickVisualizationWindow(QWidget):
                 if index >= 0:
                     self.combo_smoothing.setCurrentIndex(index)
             
-            # Null when the method has no window (EWMA / Savitzky-Golay), so
-            # neither of these can be fed to a widget unchecked: setValue(None)
-            # raises, and this sits inside the loader's single try - one null
-            # would abort the load and silently drop every setting after it.
-            span = smoothing_window_value(config, window_key='rolling_window')
-            if span is not None:
-                self.spin_rolling_window.setValue(span)
-
-            if config.get('rolling_window_units'):
-                idx = self.combo_window_units.findText(config['rolling_window_units'])
+            # Older configs wrote nulls for Savitzky-Golay and EWMA, so neither
+            # value can be fed to a widget unchecked: setValue(None) raises, and
+            # this sits inside the loader's single try - one null would abort
+            # the load and silently drop every setting after it.
+            # smoothing_window_setting reads them as what the run did.
+            win, units = smoothing_window_setting(
+                config, method_key='smoothing_method',
+                window_key='rolling_window', units_key='rolling_window_units')
+            if win is not None:
+                self.spin_rolling_window.setValue(win)
+                idx = self.combo_window_units.findText(units)
                 if idx >= 0:
                     self.combo_window_units.setCurrentIndex(idx)
             
@@ -15754,7 +15902,22 @@ class UWBQuickVisualizationWindow(QWidget):
             _min_dt = float(config.get('velocity_min_dt') or 0.0)
             self.spin_velocity_min_dt.setValue(_min_dt)
             self.spin_preview_velocity_min_dt.setValue(_min_dt)
-            
+            # A config from before downsampling existed used every read, so an
+            # absent key means none, as for the thresholds above.
+            _ds = config.get('downsampling') or DOWNSAMPLING_NONE
+            if _ds not in DOWNSAMPLING_METHODS:
+                self.log_message(f"Unknown downsampling '{_ds}' in the config; "
+                                 f"using every read.")
+                _ds = DOWNSAMPLING_NONE
+            self.combo_downsampling.setCurrentText(_ds)
+            self.combo_preview_downsampling.setCurrentText(_ds)
+            if config.get('downsampling_hz') is not None:
+                self.spin_downsampling_hz.setValue(float(config['downsampling_hz']))
+                self.spin_preview_downsampling_hz.setValue(
+                    float(config['downsampling_hz']))
+            self.downsampling_seed = int(
+                config.get('downsampling_seed') or DEFAULT_DOWNSAMPLING_SEED)
+
             if 'time_gap' in config:
                 self.spin_time_gap.setValue(config['time_gap'])
             
@@ -15842,6 +16005,10 @@ class UWBQuickVisualizationWindow(QWidget):
 
             if 'export_smoothed_csv' in config:
                 self.chk_export_smoothed_csv.setChecked(config['export_smoothed_csv'])
+
+            if 'export_all_smoothing' in config:
+                self.chk_export_all_smoothing.setChecked(
+                    bool(config['export_all_smoothing']))
 
             # 'export_downsampled_csv' / 'downsample_hz' are obsolete (the
             # downsampled export was removed); ignored if present in old configs.
@@ -16172,6 +16339,47 @@ class UWBQuickVisualizationWindow(QWidget):
                 self._animation_tags = sel
                 self.lbl_anim_tags.setText(f"{len(sel)} of {len(tags)} tags")
 
+    @staticmethod
+    def trial_day_numbers(days, first_start=None):
+        """``{date: N}``: each listed date's day of the trial.
+
+        Dates before the trial's first Start are not trial days. A database
+        that still holds an earlier trial's reads (VC-T010's opens on 3/11,
+        its animals went in on 6/6) used to number the first day 'Day 12'.
+        ``first_start`` None, or one that leaves no day, numbers every date.
+        """
+        days = [str(d) for d in days]
+        if first_start is not None:
+            first = pd.Timestamp(first_start).strftime('%Y-%m-%d')
+            days = [d for d in days if d >= first] or days
+        return {d: i + 1 for i, d in enumerate(days)}
+
+    def _first_trial_start(self):
+        """Earliest Start (limited, not Auto) across the configured tags, or
+        None unless every configured tag has one: a tag without a Start has
+        data from the database's first day."""
+        starts = []
+        for info in (self.tag_identities or {}).values():
+            if (IdentityAssignmentDialog._mode_of(info, 'start') != 'manual'
+                    or not info.get('start_time')):
+                return None
+            try:
+                ts = pd.Timestamp(info['start_time'])
+            except (ValueError, TypeError):
+                return None
+            if ts is pd.NaT:
+                return None
+            starts.append(ts.tz_localize(None) if ts.tzinfo is not None else ts)
+        return min(starts) if starts else None
+
+    def _relabel_animation_days(self):
+        """Day boxes carry the trial day number (see trial_day_numbers)."""
+        nums = self.trial_day_numbers(self.daily_animation_day_checkboxes,
+                                      self._first_trial_start())
+        for d, cb in self.daily_animation_day_checkboxes.items():
+            cb.setText(f"Day {nums[d]}: {d}" if d in nums
+                       else f"Before the trial: {d}")
+
     def _snapshot_anim_settings(self):
         """Freeze every animation setting at export time.
 
@@ -16189,8 +16397,9 @@ class UWBQuickVisualizationWindow(QWidget):
         # days 6-7 used to write them as Day1/Day2, which collided with the
         # real days 1-2 on the next run and made an incremental export
         # unreadable.
-        trial_days = list(all_cbs.keys())
-        day_numbers = {d: i + 1 for i, d in enumerate(trial_days)}
+        day_numbers = self.trial_day_numbers(all_cbs.keys(),
+                                             self._first_trial_start())
+        trial_days = list(day_numbers)
         gen_daily = self.chk_daily_animations.isChecked()
         return {
             'trailing_window': self.spin_animation_trail.value(),
@@ -16693,6 +16902,15 @@ class UWBQuickVisualizationWindow(QWidget):
             return default_temp_dir
         return None
 
+    def _batch_anim_temp_dir(self, db_dir, db_name):
+        """Temp-frames folder for a batch render: the run's chosen folder, else
+        a ``temp_frames`` folder inside animation_Tracking -- never
+        animation_Tracking itself, because the render deletes this folder when
+        it finishes and would take the finished videos with it."""
+        return (getattr(self, '_batch_temp_frames_dir', None)
+                or os.path.join(db_dir, f"{db_name}_FNT_analysis",
+                                'animation_Tracking', 'temp_frames'))
+
     @staticmethod
     def _describe_missing_days(gaps, day_numbers, fps, speed_text, limit=8):
         """'Day 3 (2026-09-17) and Day 5 (2026-09-19) have no video at 30 fps / 240x'."""
@@ -16831,7 +17049,8 @@ class UWBQuickVisualizationWindow(QWidget):
             # Load data from CSV if provided (for consistency with plots)
             if csv_path and os.path.exists(csv_path):
                 self.log_message(f"Loading animation data from CSV...")
-                anim_data = pd.read_csv(csv_path, low_memory=False)
+                anim_data = pd.read_csv(csv_path, low_memory=False,
+                                        usecols=_not_alt_smoothing_column)
                 anim_data['Timestamp'] = smoothed_csv_timestamps(
                     anim_data, self.combo_timezone.currentText())
                 self.log_message(f"Loaded {len(anim_data)} records from CSV")
@@ -16892,6 +17111,24 @@ class UWBQuickVisualizationWindow(QWidget):
             rendered_days = []   # days this run actually produced
             selected_days = list(s['selected_days']) if generate_daily else []
             force_full_render = False
+
+            # A day the Start/Stop trim leaves empty can never have a video, so
+            # it is not a gap in the full video. VC-T006's day 11 (3/2, after
+            # its 3/1 12:52 cut) used to count as missing, which threw away the
+            # ten daily videos and re-rendered the whole span in one 195,000-
+            # frame pass (it died two-fifths of the way through).
+            if trial_days and not anim_data.empty:
+                have = set(pd.Series(anim_data['Timestamp'].dt.normalize().unique())
+                           .dt.strftime('%Y-%m-%d'))
+                empty_days = [d for d in trial_days if d not in have]
+                if empty_days:
+                    self.log_message(
+                        "No tracking data on "
+                        + ", ".join(f"Day {day_numbers.get(d, '?')} ({d})"
+                                    for d in empty_days)
+                        + " after the Start/Stop trim: left out of the full animation.")
+                    trial_days = [d for d in trial_days if d in have]
+                    selected_days = [d for d in selected_days if d in have]
 
             # A full video is meant to be the WHOLE trial. Before rendering
             # anything, check that every day will have a video at THESE
@@ -18139,7 +18376,7 @@ class UWBQuickVisualizationWindow(QWidget):
 
     #: Columns of the smoothed CSV that must parse as numbers.
     _SMOOTHED_NUMERIC_COLS = ('shortid', 'timestamp', 'location_x', 'location_y',
-                              'smoothed_x', 'smoothed_y')
+                              'smoothed_x', 'smoothed_y') + ALT_SMOOTHING_COLUMNS
 
     #: Columns of the social-overlap bouts CSV that must parse as numbers.
     _BOUTS_NUMERIC_COLS = ('Day', 'duration_s', 'mean_distance', 'n_reads')
@@ -18277,7 +18514,12 @@ class UWBQuickVisualizationWindow(QWidget):
         for col in df.columns:
             if pd.api.types.is_numeric_dtype(df[col]):
                 continue                       # already parsed above
-            want = df[col].astype(str)
+            # A missing value is written as an empty cell, but astype(str)
+            # renders it 'NaT' / 'None' / 'nan'. Compared as text, every
+            # legitimately missing value - a day with no moonrise - read as
+            # a stray value and aborted the whole export.
+            missing = df[col].isna().to_numpy()
+            want = df[col].astype(str).where(~missing, '')
             if want.nunique() > self._VOCAB_MAX_UNIQUE:
                 # Free text (timestamps): re-rendering can differ legitimately,
                 # so require only that it still parses as the time it was.
@@ -18290,8 +18532,14 @@ class UWBQuickVisualizationWindow(QWidget):
                     # FIRST element and coerces everything else to NaT, so the
                     # whole-second rows were being reported as corruption and
                     # the export aborted on a file that was perfectly good.
-                    bad = pd.to_datetime(back[col], format='ISO8601',
-                                         errors='coerce').isna()
+                    # utc=True: a trial across a daylight-saving change has two
+                    # offsets ('-06:00' then '-07:00'), and without it pandas
+                    # raises "Mixed timezones detected" even with
+                    # errors='coerce' (VC-T014 across 2026-11-01). Only
+                    # "is it still a time" is checked, so UTC loses nothing.
+                    bad = (pd.to_datetime(back[col], format='ISO8601', utc=True,
+                                          errors='coerce').isna()
+                           & ~missing)        # a NaT written stays empty
                     if bad.any():
                         first = back[col][bad].iloc[0]
                         problems.append(
@@ -18573,9 +18821,7 @@ class UWBQuickVisualizationWindow(QWidget):
         self._anim_temp_frames_dir = None
         if save_animation:
             if batch:
-                self._anim_temp_frames_dir = (
-                    getattr(self, '_batch_temp_frames_dir', None)
-                    or os.path.join(db_dir, f"{db_name}_FNT_analysis", 'animation_Tracking'))
+                self._anim_temp_frames_dir = self._batch_anim_temp_dir(db_dir, db_name)
             else:
                 _anim_dir = os.path.join(db_dir, f"{db_name}_FNT_analysis", 'animation_Tracking')
                 self._anim_temp_frames_dir = self._prompt_animation_temp_dir(_anim_dir)
@@ -18804,6 +19050,15 @@ class UWBQuickVisualizationWindow(QWidget):
                 # the run summary would report whatever the last call left
                 # behind (a preview chunk, or a previous export).
                 self.reset_filter_stats()
+                self.log_message("Smoothing: " + describe_smoothing(
+                    smoothing_method, self.spin_rolling_window.value(),
+                    self.combo_window_units.currentText()))
+                if self.combo_downsampling.currentText() != DOWNSAMPLING_NONE:
+                    self.log_message(
+                        f"Downsampling: {self.combo_downsampling.currentText()}, "
+                        f"at most {self.spin_downsampling_hz.value():g} read/s per "
+                        f"tag (seed {self.downsampling_seed}), before the "
+                        f"thresholds and the smoothing")
 
                 # Stream the smoothed CSV one tag at a time rather than holding
                 # the whole processed dataset in RAM and writing it in one shot
@@ -18943,6 +19198,9 @@ class UWBQuickVisualizationWindow(QWidget):
                     # velocity threshold (on the smoothed track).
                     if len(tag_data) > 0:
                         tag_data = self._filter_and_smooth(tag_data, smoothing_method)
+                        if (self.chk_export_all_smoothing.isChecked()
+                                and len(tag_data)):
+                            tag_data = self.add_alt_smoothing_columns(tag_data)
 
                     # Let the window repaint / process the Stop button between
                     # tags, right after the heaviest per-tag work.
@@ -19188,9 +19446,13 @@ class UWBQuickVisualizationWindow(QWidget):
 
 
                 except Exception as e:
-                    self.log_message(f"Error during proximity/social-network export: {e}")
+                    self.log_message(f"✗ Error during proximity/social-network export: {e}")
                     import traceback
                     traceback.print_exc()
+                    # The SocialOverlapBouts CSV was asked for and is missing,
+                    # so the export has failed. VC-T014 (a DST bug here) came
+                    # back "export OK" without it.
+                    self._last_export_failed = True
 
                 self.log_message("=" * 50)
             

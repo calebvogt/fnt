@@ -167,6 +167,50 @@ def test_a_file_whose_only_state_is_a_rejection_still_loads():
     assert got == {'rejected': 1}, got
 
 
+def test_a_rejected_prediction_reopens_once_not_twice():
+    """Rejecting a model prediction stores a demoted example that keeps the
+    prediction's blob_id. Reopening keyed that example by its example id while
+    the crop's row is keyed by blob_id, so the two never met: the call came
+    back as a red "Reject" with the same detection, still pending, under it."""
+    w, _wav, root = _session(n_labels=1, reject_index=None, with_predictions=True)
+    _reopen(w)
+    sg = w.spectrogram
+    idx = next(i for i, a in enumerate(sg.annotations)
+               if str(a.get('blob_id')) == '901')
+    sg._selected_ann_idx = idx
+    w._reject_current_pred()
+    _delete_csvs(root)
+    got = _reopen(w)
+    assert got == {'confirmed': 1, 'prediction': 1, 'rejected': 1}, got
+    rejected = [a for a in sg.annotations if a.get('status') == 'rejected']
+    assert str(rejected[0].get('blob_id')) == '901', rejected[0].get('blob_id')
+
+
+def test_a_stale_rejection_does_not_claim_a_new_blob_with_its_number():
+    """Re-running inference numbers blobs from 1 again, so an old rejection's
+    blob_id can name a different call in the new run. Matching by number alone
+    would mark that call rejected; the rejection must also overlap it."""
+    w, wav, root = _session(n_labels=1, reject_index=None, with_predictions=True)
+    _reopen(w)
+    sg = w.spectrogram
+    idx = next(i for i, a in enumerate(sg.annotations)
+               if str(a.get('blob_id')) == '901')
+    sg._selected_ann_idx = idx
+    w._reject_current_pred()
+    # A new run: blob 901 is now somewhere else entirely.
+    h5 = MS.masks_sibling_path(wav)
+    MS.clear_pred_masks(h5)
+    m = np.zeros((10, 12), np.uint8)
+    m[2:8, 3:9] = 1
+    MS.write_pred_masks(h5, [{'blob_id': 901, 'mask': m, 'f_off': 450,
+                              't_off': 3000, 'score': 0.8, 'class': 'USV'}])
+    _delete_csvs(root)
+    got = _reopen(w)
+    assert got == {'confirmed': 1, 'prediction': 1, 'rejected': 1}, got
+    pred = [a for a in sg.annotations if a.get('status') == 'prediction']
+    assert str(pred[0].get('blob_id')) == '901'
+
+
 def test_the_count_badges_come_from_the_store():
     w, wav, root = _session()
     _delete_csvs(root)

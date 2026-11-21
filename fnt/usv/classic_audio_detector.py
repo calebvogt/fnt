@@ -104,6 +104,9 @@ class DSPDetectionWorker(QThread):
             max_mean_sweep_rate=self.config.get('max_mean_sweep_rate', 0.0),
             max_contour_jitter=self.config.get('max_contour_jitter', 0.0),
             min_ici_ms=self.config.get('min_ici_ms', 0.0),
+            # 0 = Freq Samples off: the contour is still measured, but the
+            # peak_freq_N columns are left out (as for a hand-measured call).
+            freq_samples=int(self.config.get('freq_samples', 5) or 0),
         )
 
         detector = DSPDetector(config)
@@ -1788,7 +1791,7 @@ class ClassicAudioDetectorWindow(QMainWindow):
 
         self.btn_add_usv = QPushButton("+ Add Label (P)")
         self.btn_add_usv.setStyleSheet("background-color: #6b4c9a;")
-        self.btn_add_usv.setToolTip("Manually draw a new USV detection box on the spectrogram.\nClick and drag on the spectrogram to define the region.")
+        self.btn_add_usv.setToolTip("Add a new call: places a box (40 ± 4 kHz, 30 ms) in the middle of the view.\nDrag its edges to fit the call; it is re-measured when you let go.")
         self.btn_add_usv.clicked.connect(self.add_new_usv)
         self.btn_add_usv.setEnabled(False)
         btn_row2.addWidget(self.btn_add_usv)
@@ -3191,6 +3194,18 @@ class ClassicAudioDetectorWindow(QMainWindow):
         self.detections_df = None
         self.current_detection_idx = 0
     @staticmethod
+    def _add_harmonic_call_numbers(df):
+        """Resolve each harmonic's fundamental to a human-readable call_number
+        (call_id is the stable link; call_number is for the reader). Written
+        on every save, the first one after a detection run included."""
+        if df is None or len(df) == 0 or 'harmonic_of' not in df.columns:
+            return df
+        id_to_num = dict(zip(df['call_id'].astype(int), df['call_number'].astype(int)))
+        df['harmonic_of_call_number'] = df['harmonic_of'].astype('int64').map(
+            lambda cid: id_to_num.get(int(cid), '') if int(cid) >= 0 else '')
+        return df
+
+    @staticmethod
     def _ensure_call_ids(df):
         """Ensure stable harmonic-linking columns on a detections DataFrame.
 
@@ -3225,8 +3240,16 @@ class ClassicAudioDetectorWindow(QMainWindow):
             df['harmonic_of'] = -1
         if 'harmonic_rank' not in df.columns:
             df['harmonic_rank'] = 0
-        df['harmonic_of'] = df['harmonic_of'].fillna(-1).astype(int)
+        df['harmonic_of'] = df['harmonic_of'].fillna(-1).astype('int64')
         df['harmonic_rank'] = df['harmonic_rank'].fillna(0).astype(int)
+        # A link must name a call_id in this file. Older automatic runs wrote a
+        # Python object address here (DSP detect_harmonics); drop any such
+        # link so it is re-derived from call_group_id below.
+        valid = set(df['call_id'].astype(int).tolist())
+        bad = (df['harmonic_of'] >= 0) & ~df['harmonic_of'].isin(valid)
+        if bad.any():
+            df.loc[bad, 'harmonic_of'] = -1
+            df.loc[bad, 'harmonic_rank'] = 0
         if 'is_harmonic' not in df.columns:
             return df
         is_harm = df['is_harmonic'].fillna(False).astype(bool)
@@ -3633,8 +3656,9 @@ class ClassicAudioDetectorWindow(QMainWindow):
 
             # Peak freq sampling
             n_samples = getattr(detector_config, 'freq_samples', 5)
-            if n_samples and n_samples > 0:
-                calls = detector._sample_peak_frequencies(calls, frequencies, times, Sxx_db)
+            calls = detector._sample_peak_frequencies(
+                calls, frequencies, times, Sxx_db,
+                n_samples=n_samples if n_samples and n_samples > 0 else 5)
 
             calls = detector._compute_contour_features(calls)
             calls = detector._filter_by_sweep_rate(calls)
@@ -3874,6 +3898,7 @@ class ClassicAudioDetectorWindow(QMainWindow):
             self._ensure_call_ids(df)
             if 'call_number' not in df.columns:
                 df.insert(0, 'call_number', range(1, len(df) + 1))
+            self._add_harmonic_call_numbers(df)
 
             # Stamp the exact DSP config that produced these rows for reproducibility.
             if self.dsp_worker is not None:
@@ -5143,15 +5168,7 @@ class ClassicAudioDetectorWindow(QMainWindow):
         self._ensure_call_ids(self.detections_df)
         # Refresh call_number column before saving
         self.detections_df['call_number'] = range(1, len(self.detections_df) + 1)
-        # Resolve each harmonic's fundamental to a human-readable call_number
-        # (call_id is the stable link; call_number is for the reader).
-        id_to_num = dict(zip(self.detections_df['call_id'].astype(int),
-                             self.detections_df['call_number'].astype(int)))
-        self.detections_df['harmonic_of_call_number'] = (
-            self.detections_df['harmonic_of'].astype(int).map(
-                lambda cid: id_to_num.get(int(cid), '') if int(cid) >= 0 else ''
-            )
-        )
+        self._add_harmonic_call_numbers(self.detections_df)
         # Ensure call_number is the first column
         cols = self.detections_df.columns.tolist()
         if 'call_number' in cols:

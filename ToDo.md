@@ -19,9 +19,13 @@
 - Show USV rate for each resource zone to the right of the animation. 
 - Show the UWB tracking alongside the actual footage; 
 
-# Doric WiFP
-- RIP my old matlab code from changwoo and get it to work with the WiFP data. 
-- basically we want to replicate many of the features outlined here: https://neuro.doriclenses.com/pages/data-analysis-solutions
+# Fiber photometry (fnt/fiberPhotometry; was Doric WiFP)
+- done 2026-11-02 (dev 4fedbc9): Warden lab MATLAB, GuPPy and PhAT pipelines, dropout removal, video timed by its own frame rate, CLI, dated run folders, scrubbable preview with IMU + link rows.
+- deep comparison of the three pipelines before writing the user docs (draft held back; docs/tools/fiber-photometry.md not yet added).
+- behaviour events -> photometry: import a bouts table (HiDRA bouts.csv, BORIS, FNT ethogram, Mask Tracker behaviour classifier) and make event-locked dF/F / z-score averages (PETHs) with per-animal baselines.
+- LabJack LJStreamUD .dat reader (2020 PhD rig: 250 Hz, v0 = 473 nm, v1 = 405 nm, v2 = camera TTL) beside doric.py; validate on the 2020 dLight1.2 M005 resident-intruder session against the MATLAB outputs.
+- rig noise on the Doric NC500: 3.32 Hz and 39.7 Hz lines (present without video; firmware?) and a 9.94 Hz line with the USB IR camera (100 Hz - 3 x 30 fps). Test on a fluorescent target: camera on/off, IR covered, 24 vs 30 fps, mains vs Jackery vs battery, powered hub.
+- GRAB sensors: check whether the 415 nm reference moves with transients (needs a GRAB-mut control) before trusting the isosbestic fit.
 
 
 
@@ -89,7 +93,11 @@ random, so it is correctable.
 
 # Sleap EthoScope / Behavioral Catagorizer
 - create behavioral classifiers for ethogram like behaviors; clustering here? or just use keypoint-moseq?
--
+- FIRST STEP (Caleb 2026-11-02): low-dimensional, unsupervised behaviour states straight from the tracking we already have, no labelling. Per animal and frame (or 1-s bin): speed, acceleration, mask area / elongation (Mask Tracker), distance and approach velocity to each other animal, nearest-neighbour distance (UWB or masks), rolling medians / SDs over a few windows (Kathleen Murphy's feature list under UWB above). Reduce (PCA / UMAP), cluster (k-means, HDBSCAN or hierarchical; Kathleen tried spectral and hierarchical), then name the clusters by watching sample clips (rest, move, chase, follow, huddle). Output a bouts table that the photometry and UWB tools can read.
+- HiDRA (High-Dimensional Rodent Annotator, preprint 2026-10, https://www.biorxiv.org/content/10.64898/2026.10.18.758876v1, code https://github.com/neuroethology/HiDRA, weights BSD-3 at huggingface.co/Neuroethology/HiDRA; code licence not stated on GitHub). Zero-shot classifier for 33 mouse behaviours (82 lab-specific heads, 15 labs) from pose: 7 keypoints (nose, ears, neck, body centre, tail base, tail tip), 1-4 animals, needs fps + pix/cm; bouts.csv + per-frame probabilities; finetune.py for own labels; ~8 GB GPU.
+	- try first on mice: the 2020 M005 resident-intruder video (needs SLEAP 7-keypoint tracking).
+	- voles only via fine-tuning (short tail breaks tail keypoints; huddle / partner behaviours not in the 33); not for the overhead mesocosm (voles 20-40 px).
+	- the tweet's video shows coloured blobs per animal; HiDRA's input is pose keypoints, so those are probably drawn from the keypoints (check before assuming it uses masks).
 
 
 # Imaging Tool (CZI Viewer)

@@ -1,34 +1,18 @@
 """RFID preprocessing for the FNT toolbox.
 
-Turns raw RFID reader exports into a trial's analysis-ready tables: reads,
-movement bouts, a group-by-individual matrix, and the zone-ownership, contact
-and social-network layers derived from it.
-
-One trial, one config, one output folder - see :class:`TrialConfig`.
+Turns Biomark reader downloads into analysis-ready tables: cleaned reads,
+bouts, per animal-day summaries, zone holders and pairwise co-occupancy, with
+QC reports on everything that was removed or looks wrong. One config, one
+analysis folder - see :class:`RFIDConfig` and :func:`fnt.rfid.pipeline.run`.
+The GUI is :class:`fnt.rfid.rfid_preprocessing_pyqt.RFIDPreprocessingWindow`.
 """
 
-from .config import (TrialConfig, RFIDConfig, Arena, Zone, Antenna,
-                     get_default_config, get_available_templates, ConfigManager)
-from .core import (
-    RFIDPreprocessor, ReadsResult,
-    BoutDetector, detect_bouts,
-    GBIGenerator, create_gbi, melt_gbi,
-    zone_ownership, daily_owners, zones_owned_per_day,
-    EdgelistGenerator, co_presence_bouts, edgelist,
-    DisplacementDetector, detect_displacements, annotate_ownership,
-    HindeIndexCalculator, hinde_index, hinde_summary,
-    SocialNetworkAnalyzer, social_networks,
-)
+from .config import (RFIDConfig, Arena, Paddock, Zone, Antenna, MetadataSpec,
+                     ConfigManager, get_default_config, get_available_presets,
+                     liddell_8_zone, one_antenna_per_zone)
 
 __all__ = [
-    "TrialConfig", "RFIDConfig", "Arena", "Zone", "Antenna",
-    "get_default_config", "get_available_templates", "ConfigManager",
-    "RFIDPreprocessor", "ReadsResult",
-    "BoutDetector", "detect_bouts",
-    "GBIGenerator", "create_gbi", "melt_gbi",
-    "zone_ownership", "daily_owners", "zones_owned_per_day",
-    "EdgelistGenerator", "co_presence_bouts", "edgelist",
-    "DisplacementDetector", "detect_displacements", "annotate_ownership",
-    "HindeIndexCalculator", "hinde_index", "hinde_summary",
-    "SocialNetworkAnalyzer", "social_networks",
+    "RFIDConfig", "Arena", "Paddock", "Zone", "Antenna", "MetadataSpec",
+    "ConfigManager", "get_default_config", "get_available_presets",
+    "liddell_8_zone", "one_antenna_per_zone",
 ]

@@ -44,9 +44,10 @@ TOOL_REGISTRY = {
                  post_show="show_start_dialog"),   # New / Open project chooser
         ToolSpec("rfid_preprocessing", "fnt.rfid.rfid_preprocessing_pyqt",
                  "RFIDPreprocessingWindow", "RFID PreProcessing"),
-        # NOTE: the FED Processing tool is deliberately NOT registered here. It
-        # still opens in-process from fnt.gui_pyqt.run_fed_processing and is
-        # owned separately; isolating it is that owner's call.
+        # FED3 runs devices that keep going without it, so its window can live
+        # in its own process like every other tool: a crash costs the window,
+        # never the experiment. One copy only, since two would fight over ports.
+        ToolSpec("fed3", "fnt.fed3.ui.window", "FedWindow", "FED3", multi=False),
 
         # --- Video processing ---
         ToolSpec("video_trim", "fnt.videoProcessing.video_trim_pyqt",
@@ -101,8 +102,8 @@ TOOL_REGISTRY = {
         # --- Misc ---
         ToolSpec("github_csv_transfer", "fnt.gitProcessing.github_csv_transfer_pyqt",
                  "GitHubCSVTransferWindow", "GitHub CSV Transfer"),
-        ToolSpec("doric_processor", "fnt.DoricFP.doric_processor_pyqt",
-                 "DoricProcessorWindow", "Doric Processor"),
+        ToolSpec("fiber_photometry", "fnt.fiberPhotometry.fiber_photometry_pyqt",
+                 "FiberPhotometryWindow", "Fiber Photometry"),
     ]
 }
 

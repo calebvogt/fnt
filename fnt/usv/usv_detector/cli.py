@@ -5,8 +5,10 @@ be scripted into batch and HPC workflows without the GUI. Installed as the
 ``mad`` console script (see ``pyproject.toml``)::
 
     mad analyze    --model weights.pt --input recordings/
-    mad train      --project my_project/ --epochs 30
+    mad train      --project my_project/ --split-mode file
     mad embeddings --model weights.pt --input recordings/ --out emb.npz
+    mad export     --input recordings/ --out tables/
+    mad join-fragments recordings/ --gap-ms 10 --max-df-khz 5
 
 Heavy deps (torch, segmentation-models-pytorch) are imported lazily by the
 underlying pipeline, so ``mad --help`` stays fast.
@@ -140,10 +142,69 @@ def _apply_sampling(wavs, args) -> list:
 # ----------------------------------------------------------------------
 # analyze
 # ----------------------------------------------------------------------
+def _group_harmonics_for(wav_path: str) -> None:
+    """Group one recording's detections into calls, as the GUI does after
+    each file of a run. A failure is reported and never fails the file: the
+    detections are already written and correct."""
+    from .fnt_mask_store import masks_sibling_path
+    from .mad_harmonics import group_recording
+    try:
+        store = masks_sibling_path(wav_path)
+        if os.path.isfile(store):
+            group_recording(store, os.path.basename(wav_path))
+    except Exception as e:
+        print(f"  harmonic grouping failed for "
+              f"{os.path.basename(wav_path)}: {e}", file=sys.stderr, flush=True)
+
+
+def _print_ridge_fill(r: dict) -> None:
+    """One line per recording a ridge fill changed (or failed on); silent for
+    files that had nothing to fill."""
+    wav = os.path.basename(r.get('wav_path', '?'))
+    if 'error' in r:
+        print(f"  [FAIL] ridges {wav}: {r['error']}", file=sys.stderr, flush=True)
+    elif r.get('pred') or r.get('examples') or r.get('specs'):
+        print(f"  [ridge] {wav}: {r.get('pred', 0)} detection(s), "
+              f"{r.get('examples', 0)} label(s)"
+              + (f" ({r['specs']} spectrogram(s) from the audio)"
+                 if r.get('specs') else ""), flush=True)
+
+
 def _cmd_analyze(args: argparse.Namespace) -> int:
     from .mad_inference import MADInferenceConfig, run_inference_on_files
 
-    wavs = _expand_inputs(args.input)
+    if os.path.isdir(args.model):
+        args.model = os.path.join(args.model, 'weights.pt')
+    wavs = _expand_inputs(args.input) if args.input else []
+    if args.project:
+        from .mad_project import MADProjectConfig
+        try:
+            proj = MADProjectConfig.load(args.project)
+        except Exception as e:
+            print(f"Could not open project {args.project}: {e}",
+                  file=sys.stderr, flush=True)
+            return 2
+        seen = {os.path.normcase(os.path.abspath(w)) for w in wavs}
+        missing = 0
+        for e in proj.audio_entries():
+            key = os.path.normcase(os.path.abspath(e.path))
+            if key in seen:
+                continue
+            if not e.exists():
+                missing += 1      # a moved recording is soft; say so, go on
+                continue
+            seen.add(key)
+            wavs.append(e.path)
+        if missing:
+            print(f"  {missing} registered recording(s) not found on disk "
+                  "— skipped.", file=sys.stderr, flush=True)
+        # What a GUI run on this project would use, unless told otherwise.
+        if not args.log_root and not args.run_dir:
+            args.log_root = proj.project_dir
+        if not args.training_data_dir:
+            args.training_data_dir = proj.training_data_dir
+        if not getattr(proj, 'ridge', True):
+            args.no_ridge = True
     if not wavs:
         print("No .wav files found in the given input(s).", file=sys.stderr, flush=True)
         return 2
@@ -162,6 +223,9 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         merge_require_freq_overlap=not args.merge_ignore_freq,
         batch_size=args.batch_size,
         amp=not args.no_amp,
+        prefetch_next=not args.no_prefetch,
+        gpu_spectrogram=not args.cpu_spectrogram,
+        ridge=not getattr(args, 'no_ridge', False),
     )
 
     from .mad_batch import (
@@ -186,6 +250,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
     #     set the silent files are the overwhelming majority, so without this
     #     a resume re-does most of the work it was supposed to skip.
     # "Re-detect from scratch" means redo everything, so it disables resume.
+    done: list = []
     if not args.no_resume and not args.no_preserve_labels:
         manifest_done = completed_by_settings(read_roots, settings)
         todo, done = partition_done(wavs, settings, manifest_done)
@@ -194,7 +259,15 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
                   f"these settings, {len(todo)} to go.", flush=True)
         wavs = todo
         if not wavs:
-            print("Nothing to do — every file is already analyzed.", flush=True)
+            print("Nothing to infer — every file is already analyzed.", flush=True)
+            if done and cfg.ridge:
+                from .fnt_mask_store import set_ridge_enabled
+                from .mad_inference import fill_ridges_for_run
+                set_ridge_enabled(True)
+                print(f"  Checking the ridges of {len(done)} analyzed file(s)…",
+                      flush=True)
+                res = fill_ridges_for_run(done, cfg, on_done=_print_ridge_fill)
+                return 1 if any('error' in r for r in res) else 0
             return 0
 
     run_dir = args.run_dir or new_run_dir(log_root)
@@ -212,6 +285,11 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
     print(f"  Run log: {run_dir}", flush=True)
 
     def _on_done(summary: dict):
+        # Grouped before the manifest records the file, so a run killed in
+        # between redoes the file rather than leaving it ungrouped and marked
+        # done.
+        if 'error' not in summary and args.group_harmonics:
+            _group_harmonics_for(summary.get('wav_path', ''))
         # Flushed per file, so a killed run resumes from exactly here.
         try:
             manifest.record(summary)
@@ -225,9 +303,14 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         print(f"  [ok]   {wav}: {summary.get('n_blobs', 0)} detection(s) "
               f"in {t.get('t_total', '?')}s ({t.get('device', '?')})")
 
+    if done and cfg.ridge:
+        print(f"  After them: the ridges of {len(done)} analyzed file(s).",
+              flush=True)
     try:
         results = run_inference_on_files(cfg=cfg, wav_paths=wavs,
-                                         on_file_done=_on_done)
+                                         on_file_done=_on_done,
+                                         ridge_fill=done if cfg.ridge else None,
+                                         on_ridge_done=_print_ridge_fill)
     finally:
         manifest.close()
 
@@ -241,6 +324,167 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
 # ----------------------------------------------------------------------
 # train
 # ----------------------------------------------------------------------
+def add_training_args(p: argparse.ArgumentParser) -> None:
+    """Every training setting, shared by ``mad train`` and the GUI's
+    ``--train`` launch so the two cannot drift apart.
+
+    Defaults match the GUI's training panel, so "train a new model" means the
+    same thing whichever way it is started. A flag left at its default is
+    reported by :func:`training_overrides` as *not given*, which is how a GUI
+    launch knows to keep the value already in its panel.
+    """
+    g = p.add_argument_group('training')
+    g.add_argument('--epochs', type=int, default=1000,
+                   help="Maximum epochs (default: 1000; early stopping ends "
+                        "the run well before).")
+    g.add_argument('--patience', type=int, default=40,
+                   help="Early-stop patience in epochs (default: 40; 0 "
+                        "disables).")
+    g.add_argument('--batch-size', type=int, default=16)
+    g.add_argument('--lr', type=float, default=1e-3,
+                   help="Starting learning rate (default: 1e-3).")
+    g.add_argument('--lr-schedule', default='plateau',
+                   choices=['plateau', 'none'],
+                   help="'plateau' halves the rate when val loss stalls "
+                        "(default); 'none' keeps it fixed.")
+    g.add_argument('--lr-patience', type=int, default=8,
+                   help="Epochs without improvement before the rate is "
+                        "halved (default: 8).")
+    g.add_argument('--arch', default='',
+                   help="unet | unetpp | manet | hrnet (default: project's).")
+    g.add_argument('--encoder', default='resnet18')
+    g.add_argument('--device', default='auto',
+                   choices=['auto', 'cuda', 'mps', 'cpu'])
+    g.add_argument('--loss', default='bce_dice',
+                   choices=['bce_dice', 'focal_tversky'],
+                   help="Segmentation loss (default: bce_dice).")
+    g.add_argument('--split-mode', default='call',
+                   choices=['call', 'auto', 'file'],
+                   help="How validation is held out: 'call' (default) holds "
+                        "out individual calls, so validation shares "
+                        "recordings with training and reads optimistic; "
+                        "'file' holds out whole recordings -- the honest "
+                        "measure of a recording the model has never seen.")
+    g.add_argument('--split-seed', type=int, default=42,
+                   help="Seed for the train/validation split (default: 42).")
+    g.add_argument('--val-fraction', type=float, default=None,
+                   help="Override the project's validation fraction.")
+    g.add_argument('--no-augment', dest='augment', action='store_false',
+                   help="Turn off all training augmentation.")
+    g.add_argument('--no-faint-aug', dest='faint_aug', action='store_false',
+                   help="Turn off faint-call (distance) augmentation.")
+    g.add_argument('--faint-p', type=float, default=0.3,
+                   help="Fraction of training tiles made fainter "
+                        "(default: 0.3).")
+    g.add_argument('--faint-db', type=float, nargs=2, default=(3.0, 18.0),
+                   metavar=('MIN', 'MAX'),
+                   help="Attenuation range in dB (default: 3 18).")
+    g.add_argument('--max-per-recording', type=int, default=150,
+                   help="Cap on examples drawn from any one recording, "
+                        "labels and negatives counted separately (default: "
+                        "150; 0 = no cap).")
+    g.add_argument('--tile-placements', type=int, default=3,
+                   help="Times each call is placed into a training tile "
+                        "(default: 3).")
+    g.add_argument('--run-name', default='',
+                   help="Name for the model run dir (default: timestamped).")
+    g.add_argument('--run-suffix', default='',
+                   help="Tag appended to the timestamped name, keeping the "
+                        "label count: <date>_<time>_unet_n=<labels>_<tag> "
+                        "(e.g. ft_r7).")
+    g.add_argument('--holdout-from', default=None, metavar='RUN',
+                   help="Hold out the same recordings as an earlier run (its "
+                        "folder, name, or training_summary.json), so the two "
+                        "are scored on one validation set.")
+    g.add_argument('--init-from', default='', metavar='WEIGHTS',
+                   help="Fine-tune: start from this weights.pt (or its run "
+                        "folder) instead of ImageNet. With --split-mode file "
+                        "the parent's held-out recordings stay held out. "
+                        "Pair with a lower --lr (e.g. 3e-4) and --patience.")
+    g.add_argument('--context-ms', type=float, default=None, metavar='MS',
+                   help="Context trained on each side of a call, in ms "
+                        "(default: the project's context_ms; unset = each "
+                        "example as saved, ~65 ms at 250 kHz / hop 128).")
+
+
+#: argparse dest -> UNetTrainingConfig field, for every training flag.
+_TRAIN_FIELD = {
+    'epochs': 'n_epochs', 'patience': 'early_stop_patience',
+    'batch_size': 'batch_size', 'lr': 'learning_rate',
+    'lr_schedule': 'lr_schedule', 'lr_patience': 'lr_plateau_patience',
+    'arch': 'model_arch', 'encoder': 'encoder_name', 'device': 'device',
+    'loss': 'loss', 'split_mode': 'split_mode', 'split_seed': 'split_seed',
+    'val_fraction': 'val_fraction', 'augment': 'augment',
+    'faint_aug': 'augment_faint', 'faint_p': 'faint_p',
+    'faint_db': 'faint_db_range',
+    'max_per_recording': 'max_examples_per_recording',
+    'tile_placements': 'tile_placements', 'run_name': 'run_name',
+    'run_suffix': 'run_suffix',
+    'holdout_from': 'holdout_groups',
+    'init_from': 'init_from', 'context_ms': 'context_ms',
+}
+
+
+def resolve_holdout(spec: str, project_dir: str = "") -> List[str]:
+    """The recordings an earlier run held out, from its folder, its name
+    (under ``<project>/models``) or its ``training_summary.json``."""
+    import json
+    cands = [spec, os.path.join(spec, 'training_summary.json')]
+    if project_dir:
+        run = os.path.join(project_dir, 'models', spec)
+        cands += [os.path.join(run, 'training_summary.json')]
+    for c in cands:
+        if os.path.isfile(c) and c.endswith('.json'):
+            with open(c) as fh:
+                groups = json.load(fh).get('val_groups') or []
+            if not groups:
+                raise ValueError(f"{c} records no held-out recordings")
+            return [str(g) for g in groups]
+    raise FileNotFoundError(f"No training_summary.json found for '{spec}'")
+
+
+def suppress_training_defaults(p: argparse.ArgumentParser) -> None:
+    """Make every training flag absent from the namespace unless given.
+
+    For the GUI launch, which applies only what was asked for on top of its
+    own panel. Comparing against the defaults instead would silently drop an
+    explicit ``--split-mode call`` whenever the panel happened to say 'file'.
+    """
+    # On the actions themselves: set_defaults() would also seed the namespace
+    # with the SUPPRESS sentinel string, which argparse then tries to convert
+    # with each flag's type.
+    for action in p._actions:
+        if action.dest in _TRAIN_FIELD:
+            action.default = argparse.SUPPRESS
+
+
+def training_overrides(args: argparse.Namespace) -> dict:
+    """``UNetTrainingConfig`` keyword arguments from parsed training flags.
+
+    Only flags present on ``args`` are returned, so a parser built with
+    :func:`suppress_training_defaults` yields just what was given.
+    """
+    out = {}
+    for dest, field_name in _TRAIN_FIELD.items():
+        if not hasattr(args, dest):
+            continue
+        val = getattr(args, dest)
+        if dest == 'arch' and not val:
+            continue
+        if dest == 'val_fraction' and val is None:
+            continue
+        if dest == 'context_ms' and val is None:
+            continue
+        if dest == 'faint_db':
+            val = (float(val[0]), float(val[1]))
+        if dest == 'holdout_from':
+            if not val:
+                continue
+            val = resolve_holdout(val, getattr(args, 'project', '') or '')
+        out[field_name] = val
+    return out
+
+
 def _cmd_train(args: argparse.Namespace) -> int:
     from .mad_project import MADProjectConfig
     from .mad_training import UNetTrainingConfig, train_unet
@@ -267,23 +511,17 @@ def _cmd_train(args: argparse.Namespace) -> int:
     print(f"Training store rebuilt from {len(wavs)} recording(s): "
           f"{n_lab} example(s)", flush=True)
 
+    kw = training_overrides(args)
+    kw.setdefault('model_arch', proj.model_arch or "unet")
+    kw.setdefault('val_fraction', proj.val_fraction)
+    kw.setdefault('context_ms', getattr(proj, 'context_ms', None))
     cfg = UNetTrainingConfig(
         project_dir=proj.project_dir,
-        run_name=args.run_name or "",
-        model_arch=args.arch or proj.model_arch or "unet",
-        encoder_name=args.encoder,
-        n_epochs=args.epochs,
-        batch_size=args.batch_size,
-        learning_rate=args.lr,
-        device=args.device,
-        val_fraction=(args.val_fraction if args.val_fraction is not None
-                      else proj.val_fraction),
-        loss=args.loss,
-        split_mode=args.split_mode,
-        early_stop_patience=args.patience,
         nperseg=proj.nperseg, noverlap=proj.noverlap, nfft=proj.nfft,
         db_min=proj.db_min, db_max=proj.db_max,
+        db_norm=getattr(proj, 'db_norm', 'fixed') or 'fixed',
         training_data_dir=proj.training_data_dir,
+        **kw,
     )
 
     def _progress(epoch: int, n_epochs: int, info: dict):
@@ -300,9 +538,17 @@ def _cmd_train(args: argparse.Namespace) -> int:
             level = info.get('split_level', '?')
             print(f"  split: {level}-level — "
                   f"{info.get('n_val_groups', 0)}/{info.get('n_groups', 0)} "
-                  f"group(s) held out, "
+                  f"group(s) held out"
+                  f"{' (pinned)' if info.get('pinned') else ''}, "
                   f"{info.get('n_train_tiles', 0)} train / "
                   f"{info.get('n_val_tiles', 0)} val tiles", flush=True)
+            miss = info.get('holdout_missing') or []
+            if miss:
+                print(f"  pinned hold-out: {len(miss)} recording(s) have no "
+                      f"examples now: {', '.join(miss[:5])}", flush=True)
+            if info.get('inherited'):
+                print("  (held-out recordings inherited from the parent model)",
+                      flush=True)
             if not info.get('val_held_out', True):
                 print("  WARNING: validation is not held out at the recording "
                       "level — val scores will flatter the model.",
@@ -314,13 +560,33 @@ def _cmd_train(args: argparse.Namespace) -> int:
                 msg += f"  train_loss={tl:.4f}"
             if vl is not None:
                 msg += f"  val_loss={vl:.4f}"
+            vd = info.get('val_dice')
+            if vd is not None:
+                msg += f"  val_dice={vd:.3f}"
+            lr = info.get('lr')
+            if lr is not None:
+                msg += f"  lr={lr:.1e}"
             print(msg, flush=True)
+        elif status == 'capped':
+            for rec, kinds in sorted((info.get('capped') or {}).items()):
+                parts = ", ".join(f"{k} {kept}/{tot}"
+                                  for k, (kept, tot) in sorted(kinds.items()))
+                print(f"  capped {rec}: {parts}", flush=True)
         elif status == 'early_stop':
             print(f"  early stop at epoch {epoch}", flush=True)
         # 'batch' / 'epoch_preview' / 'done' are intentionally not printed.
 
     print(f"Training {cfg.model_arch} on project '{proj.project_name}' "
-          f"({cfg.n_epochs} epochs, encoder={cfg.encoder_name})", flush=True)
+          f"(max {cfg.n_epochs} epochs, patience {cfg.early_stop_patience}, "
+          f"encoder={cfg.encoder_name}, split={cfg.split_mode}, "
+          f"lr={cfg.learning_rate:g} {cfg.lr_schedule}, augment="
+          f"{'on' if cfg.augment else 'off'}"
+          f"{'+faint' if cfg.augment and cfg.augment_faint else ''}, "
+          f"cap={cfg.max_examples_per_recording or 'off'})", flush=True)
+    if cfg.init_from:
+        print(f"  fine-tuning from {cfg.init_from}", flush=True)
+    if cfg.context_ms is not None:
+        print(f"  context: {cfg.context_ms:g} ms each side of a call", flush=True)
     try:
         summary = train_unet(cfg, progress=_progress)
     except RuntimeError as e:
@@ -378,9 +644,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     # analyze
     pa = sub.add_parser('analyze', help="Run a trained model over wav files.")
-    pa.add_argument('--model', required=True, help="Path to weights.pt.")
-    pa.add_argument('--input', required=True, nargs='+',
+    pa.add_argument('--model', required=True,
+                    help="Path to weights.pt, or the model run folder.")
+    pa.add_argument('--input', nargs='+', default=[],
                     help="Wav files and/or folders to analyze.")
+    pa.add_argument('--project', default='',
+                    help="Analyze every recording registered in this MAD "
+                         "project (with or instead of --input). Also sets the "
+                         "defaults the GUI would use: runs log to the "
+                         "project's batch_runs, and its labels are shielded.")
+    pa.add_argument('--no-group-harmonics', dest='group_harmonics',
+                    action='store_false', default=True,
+                    help="Skip grouping each recording's harmonics into calls "
+                         "after its detections are written (on by default, "
+                         "matching the GUI).")
+    pa.add_argument('--no-ridge', action='store_true',
+                    help="Store no brightness ridges (on by default, or as the "
+                         "--project's ridge setting says). With ridges on, a "
+                         "resumed run also fills the ridges its skipped, "
+                         "already-analysed recordings lack.")
     pa.add_argument('--threshold', type=float, default=0.5,
                     help="Probability threshold (default 0.5).")
     pa.add_argument('--min-blob-pixels', type=int, default=8,
@@ -405,6 +687,14 @@ def build_parser() -> argparse.ArgumentParser:
                          "on a GPU with spare VRAM; does not change results.")
     pa.add_argument('--no-amp', action='store_true',
                     help="Disable fp16 mixed precision (CUDA only).")
+    pa.add_argument('--no-prefetch', action='store_true',
+                    help="Build each spectrogram only when its file "
+                         "comes up, instead of during the previous "
+                         "file's scan (slower; same output).")
+    pa.add_argument('--cpu-spectrogram', action='store_true',
+                    help="Build spectrograms on the CPU even on a CUDA "
+                         "GPU (the GPU one matches it to one grey "
+                         "level and is ~12x faster).")
     pa.add_argument('--no-resume', action='store_true',
                     help="Re-analyze files that already carry detections from "
                          "this model at these settings (default is to skip "
@@ -426,26 +716,7 @@ def build_parser() -> argparse.ArgumentParser:
     # train
     pt = sub.add_parser('train', help="Train a model from a MAD project.")
     pt.add_argument('--project', required=True, help="MAD project directory.")
-    pt.add_argument('--epochs', type=int, default=30)
-    pt.add_argument('--arch', default='',
-                    help="unet | unetpp | manet | hrnet (default: project's).")
-    pt.add_argument('--encoder', default='resnet18')
-    pt.add_argument('--batch-size', type=int, default=8)
-    pt.add_argument('--lr', type=float, default=1e-3)
-    pt.add_argument('--device', default='auto',
-                    choices=['auto', 'cuda', 'mps', 'cpu'])
-    pt.add_argument('--loss', default='bce_dice',
-                    choices=['bce_dice', 'focal_tversky'],
-                    help="Segmentation loss (default: bce_dice).")
-    pt.add_argument('--split-mode', default='call',
-                    choices=['call', 'auto', 'file'],
-                    help="How validation is held out (default: call).")
-    pt.add_argument('--val-fraction', type=float, default=None,
-                    help="Override the project's validation fraction.")
-    pt.add_argument('--patience', type=int, default=10,
-                    help="Early-stop patience in epochs (0 disables).")
-    pt.add_argument('--run-name', default='',
-                    help="Name for the model run dir (default: timestamped).")
+    add_training_args(pt)
     pt.set_defaults(func=_cmd_train)
 
     # embeddings
@@ -460,12 +731,460 @@ def build_parser() -> argparse.ArgumentParser:
                     choices=['auto', 'cuda', 'mps', 'cpu'])
     pe.set_defaults(func=_cmd_embeddings)
 
+    # add-specs
+    ps = sub.add_parser('add-specs',
+                        help="Add the spectrogram under each stored detection "
+                             "to .mad files made before MAD saved it.")
+    ps.add_argument('--input', required=True, nargs='+',
+                    help="Wav files/folders whose .mad files hold detections.")
+    ps.add_argument('--db-min', type=float, default=-100.0,
+                    help="The model's dB floor (default -100).")
+    ps.add_argument('--db-max', type=float, default=-20.0,
+                    help="The model's dB ceiling (default -20).")
+    ps.add_argument('--db-norm', default='fixed',
+                    help="The model's dB normalisation (default fixed).")
+    ps.add_argument('--overwrite', action='store_true',
+                    help="Recompute crops that already have one.")
+    ps.set_defaults(func=_cmd_add_specs)
+
+    # add-ridge
+    pr = sub.add_parser('add-ridge',
+                        help="Add the brightness ridge (turns, rate, depth, trill) of each "
+                             "stored detection and labelled call; fills missing detection "
+                             "spectrograms from the audio first.")
+    pr.add_argument('--input', required=True, nargs='+',
+                    help="Wav files/folders whose .mad files hold detections or labels, "
+                         "and/or training stores (training_data.h5) to fill directly.")
+    pr.add_argument('--db-min', type=float, default=-100.0,
+                    help="The model's dB floor, for missing spectrograms (default -100).")
+    pr.add_argument('--db-max', type=float, default=-20.0,
+                    help="The model's dB ceiling, for missing spectrograms (default -20).")
+    pr.add_argument('--db-norm', default='fixed',
+                    help="The model's dB normalisation (default fixed).")
+    pr.add_argument('--model', default='',
+                    help="The model that made the detections (weights.pt or its "
+                         "folder): its spectrogram settings replace the --db-* "
+                         "values for missing spectrograms.")
+    pr.add_argument('--overwrite', action='store_true',
+                    help="Recompute ridges that are already stored.")
+    pr.set_defaults(func=_cmd_add_ridge)
+
+    # wheel
+    pw = sub.add_parser('wheel',
+                        help="Flag running-wheel squeaks among stored detections: "
+                             "short detections whose frequency band repeats at the "
+                             "beat of the wheel's low-register thumps.")
+    pw.add_argument('--input', required=True, nargs='+',
+                    help="Wav files/folders whose .mad files hold detections.")
+    pw.add_argument('--overwrite', action='store_true',
+                    help="Recompute recordings that are already done.")
+    pw.add_argument('--workers', type=int, default=1,
+                    help="Recordings processed in parallel (default 1).")
+    pw.add_argument('--low-priority', action='store_true',
+                    help="Run the workers at idle CPU priority.")
+    pw.add_argument('--model', default='',
+                    help="Only recordings whose last inference was this model (its "
+                         "run folder name, or a start of it).")
+    pw.add_argument('--settle-minutes', type=float, default=10.0,
+                    help="Leave out .mad files written in the last N minutes, which "
+                         "MAD may still be writing (default 10; 0 keeps all).")
+    pw.set_defaults(func=_cmd_wheel)
+
+    # join-fragments
+    pj = sub.add_parser('join-fragments',
+                        help="Join pending detections that are pieces of one call "
+                             "(short gap, pitch carrying on across it) into one "
+                             "detection, in the .mad files; reversible with --undo.")
+    pj.add_argument('inputs', nargs='+',
+                    help=".mad files, wav files (their .mad) and/or folders (walked "
+                         "to the bottom).")
+    pj.add_argument('--gap-ms', type=float, default=10.0,
+                    help="Largest gap bridged, ms (default 10).")
+    pj.add_argument('--max-df-khz', type=float, default=5.0,
+                    help="Largest step from the earlier piece's end frequency to "
+                         "the later one's start frequency, kHz (default 5).")
+    pj.add_argument('--end-frames', type=int, default=3,
+                    help="Ridge frames averaged at each end for those "
+                         "frequencies (default 3).")
+    pj.add_argument('--concurrent-fraction', type=float, default=0.5,
+                    help="Pieces overlapping in time by more than this fraction of "
+                         "the shorter must share a frequency band (default 0.5).")
+    pj.add_argument('--band-rule', action='store_true',
+                    help="Also apply inference's band gating (pieces' bands overlap "
+                         "or lie within --band-max-gap-bins).")
+    pj.add_argument('--band-max-gap-bins', type=int, default=8,
+                    help="Band gap allowed by --band-rule, bins (default 8).")
+    pj.add_argument('--no-harmonics', dest='harmonics', action='store_false',
+                    default=True,
+                    help="Leave harmonic grouping as it is (default: regroup the "
+                         "detections the joins affect).")
+    pj.add_argument('--undo', action='store_true',
+                    help="Put back the detections a join replaced, exactly.")
+    pj.add_argument('--dry-run', action='store_true',
+                    help="Report what would change; write nothing.")
+    pj.add_argument('--settle-minutes', type=float, default=10.0,
+                    help="Leave out .mad files written in the last N minutes, which "
+                         "MAD may still be writing (default 10; 0 keeps all).")
+    pj.set_defaults(func=_cmd_join_fragments)
+
+    # stop
+    pst = sub.add_parser('stop',
+                         help="Stop a MAD inference run started with "
+                              "--inference-window-only on a project: it finishes the "
+                              "current file and quits, with no prompt.")
+    pst.add_argument('--project', required=True, nargs='+',
+                     help="Project folder(s) (or their mad_project_info.json) of the "
+                          "running inference.")
+    pst.set_defaults(func=_cmd_stop)
+
+    # export
+    px = sub.add_parser('export',
+                        help="Write folder-wide CSV tables from the .mad files: one "
+                             "row per recording, per detection and per labelled call.")
+    px.add_argument('--input', nargs='+', default=[],
+                    help="Folders (walked to the bottom) and/or wav files whose .mad "
+                         "files to export.")
+    px.add_argument('--project', default='',
+                    help="Export the recordings registered in this MAD project "
+                         "(with or instead of --input).")
+    px.add_argument('--out', default='',
+                    help="Folder for the tables (created if needed). Exporting again "
+                         "into it reads only new and changed .mad files.")
+    px.add_argument('--detections', action='store_true',
+                    help="mad_recordings.csv and mad_detections.csv (the default when "
+                         "no table is named).")
+    px.add_argument('--labels', action='store_true',
+                    help="mad_labelled_calls.csv: every accepted call, with MAD's call "
+                         "metrics recomputed from the audio.")
+    px.add_argument('--images', action='store_true',
+                    help="A spectrogram PNG per labelled call in mad_call_images/ "
+                         "(implies --labels).")
+    px.add_argument('--model', default='',
+                    help="Only recordings whose last inference was this model (its "
+                         "run folder name, or a unique start of it). Default: the "
+                         "most common.")
+    px.add_argument('--list-models', action='store_true',
+                    help="List the models the input's .mad files were last analysed "
+                         "with, and how many of each, then stop.")
+    px.add_argument('--harmonics', action='store_true',
+                    help="Include harmonics (harmonic_n > 1). Default: fundamentals "
+                         "only.")
+    px.add_argument('--full', action='store_true',
+                    help="Read every .mad again, instead of copying the rows of "
+                         "recordings unchanged since the last export.")
+    px.add_argument('--settle-minutes', type=float, default=10.0,
+                    help="Leave out .mad files written in the last N minutes, which "
+                         "MAD may still be writing (default 10; 0 keeps all).")
+    px.set_defaults(func=_cmd_export)
+
     return p
+
+
+def _cmd_export(args) -> int:
+    """Folder-wide tables from the .mad files (mad_export), with a line per step
+    and a progress line every 500 recordings."""
+    import time
+    from .mad_export import (ExportOptions, export, find_stores, model_counts,
+                             scan_models)
+    wavs = []
+    if args.project:
+        from .mad_project import MADProjectConfig
+        try:
+            wavs = [e.path for e in MADProjectConfig.load(args.project).audio_entries()]
+        except Exception as e:
+            print(f"Could not open project {args.project}: {e}",
+                  file=sys.stderr, flush=True)
+            return 2
+    folders = [p for p in args.input if os.path.isdir(p)]
+    wavs += [p for p in args.input if os.path.isfile(p)]
+    missing = [p for p in args.input if not os.path.exists(p)]
+    if missing:
+        print(f"Not found: {', '.join(missing)}", file=sys.stderr, flush=True)
+        return 2
+    if not folders and not wavs:
+        print("Name the recordings to export: --input and/or --project.",
+              file=sys.stderr, flush=True)
+        return 2
+
+    last = {'t': 0.0}
+
+    def _progress(stage, i, n, name):
+        # A line every 500 recordings or 10 s, and at the end of each stage:
+        # one per file would be 40,000 lines for a full run.
+        now = time.time()
+        if i == n or i % 500 == 0 or now - last['t'] > 10:
+            last['t'] = now
+            label = {'scan': 'models read', 'detections': 'recordings',
+                     'labels': 'recordings (labels)'}.get(stage, stage)
+            print(f"  [{i:,}/{n:,}] {label}" + (f"  {name}" if name else ""),
+                  flush=True)
+
+    if args.list_models:
+        stores = find_stores(folders, wavs)
+        counts = model_counts(scan_models(stores, progress=_progress))
+        print(f"{len(stores):,} recording(s) with a .mad file", flush=True)
+        for m, n in counts.most_common():
+            print(f"  {n:7,}  {m}", flush=True)
+        if not counts:
+            print("  none has been through inference", flush=True)
+        return 0
+    if not args.out:
+        print("Name the folder for the tables: --out.", file=sys.stderr, flush=True)
+        return 2
+    opts = ExportOptions(
+        out_dir=args.out, folders=folders, wavs=wavs,
+        detections=args.detections or not (args.labels or args.images),
+        labels=args.labels or args.images, images=args.images,
+        model=args.model or None, harmonics=args.harmonics,
+        incremental=not args.full, settle_s=max(0.0, args.settle_minutes) * 60.0)
+    try:
+        rep = export(opts, progress=_progress,
+                     log=lambda m: print(m, flush=True))
+    except ValueError as e:
+        print(str(e), file=sys.stderr, flush=True)
+        return 2
+    print(f"Done: tables in {os.path.abspath(args.out)}", flush=True)
+    return 1 if rep.get('stopped') or rep.get('error') else 0
+
+
+def _cmd_add_specs(args) -> int:
+    """Backfill /pred_specs for every given recording with stored detections."""
+    from .fnt_mask_store import masks_sibling_path, has_pred_masks
+    from .mad_inference import backfill_pred_specs
+    wavs = [w for w in _expand_inputs(args.input)
+            if has_pred_masks(masks_sibling_path(w))]
+    n_files = n_crops = 0
+    for i, w in enumerate(wavs, 1):
+        try:
+            k = backfill_pred_specs(w, db_min=args.db_min, db_max=args.db_max,
+                                    db_norm=args.db_norm,
+                                    overwrite=args.overwrite)
+        except Exception as e:
+            print(f"[{i}/{len(wavs)}] {os.path.basename(w)}: failed ({e})",
+                  flush=True)
+            continue
+        n_files += bool(k)
+        n_crops += k
+        print(f"[{i}/{len(wavs)}] {os.path.basename(w)}: {k} detection(s)",
+              flush=True)
+    print(f"added spectrograms to {n_crops} detection(s) in {n_files} file(s)")
+    return 0
+
+
+def _cmd_add_ridge(args) -> int:
+    """Store the brightness ridge (mad_ridge) of every detection and every labelled
+    call in the given recordings' .mad files, and of every example in any training
+    store (.h5) given directly. Detections recorded before MAD kept their spectrogram
+    get it from the audio first (as add-specs). A recording already complete (stamped
+    with the current ridge version) is passed over unless --overwrite. Never run on
+    files MAD is writing."""
+    from .fnt_mask_store import (add_example_ridges, add_pred_ridges, has_pred_masks,
+                                 mark_ridges_complete, masks_sibling_path,
+                                 read_all_pred_masks, td_count)
+    from .mad_inference import backfill_pred_specs, fill_ridges
+    if args.model:
+        from .mad_inference import MADInferenceConfig, _spec_params
+        import torch
+        path = (os.path.join(args.model, 'weights.pt') if os.path.isdir(args.model)
+                else args.model)
+        ckpt = torch.load(path, map_location='cpu', weights_only=False)
+        _, _, _, args.db_min, args.db_max, args.db_norm = _spec_params(
+            MADInferenceConfig(model_path=path), ckpt)
+        print(f"Spectrogram settings of {os.path.basename(os.path.dirname(path))}: "
+              f"{args.db_norm}, {args.db_min:g} to {args.db_max:g} dB", flush=True)
+    stores = [p for p in args.input if os.path.isfile(p)
+              and p.lower().endswith(('.h5', '.mad'))]
+    wavs = [w for w in _expand_inputs([p for p in args.input if p not in stores])
+            if os.path.isfile(masks_sibling_path(w))]
+    n_files = n_calls = n_labels = 0
+    for i, w in enumerate(wavs, 1):
+        h5 = masks_sibling_path(w)
+        k = e = 0
+        try:
+            if not args.overwrite:
+                r = fill_ridges(w, db_min=args.db_min, db_max=args.db_max,
+                                db_norm=args.db_norm)
+                k, e = r['pred'], r['examples']
+            else:
+                if has_pred_masks(h5):
+                    crops = read_all_pred_masks(h5, include_spec=True)
+                    if any('spec' not in c for c in crops.values()):
+                        backfill_pred_specs(w, db_min=args.db_min, db_max=args.db_max,
+                                            db_norm=args.db_norm)
+                    k = add_pred_ridges(h5, overwrite=True)
+                if td_count(h5):
+                    e = add_example_ridges(h5, overwrite=True)
+                if k or e:
+                    mark_ridges_complete(h5)
+        except Exception as ex:
+            print(f"[{i}/{len(wavs)}] {os.path.basename(w)}: failed ({ex})", flush=True)
+            continue
+        n_files += bool(k or e)
+        n_calls += k
+        n_labels += e
+        print(f"[{i}/{len(wavs)}] {os.path.basename(w)}: {k} detection(s), "
+              f"{e} label(s)", flush=True)
+    for s in stores:
+        try:
+            k = add_pred_ridges(s, overwrite=args.overwrite)
+            e = add_example_ridges(s, overwrite=args.overwrite)
+        except Exception as ex:
+            print(f"{os.path.basename(s)}: failed ({ex})", flush=True)
+            continue
+        n_files += bool(k or e)
+        n_calls += k
+        n_labels += e
+        print(f"{os.path.basename(s)}: {k} detection(s), {e} label(s)", flush=True)
+    print(f"added ridges to {n_calls} detection(s) and {n_labels} label(s) "
+          f"in {n_files} file(s)")
+    return 0
+
+
+def _wheel_one(args):
+    w, overwrite, low, model = args
+    if low:
+        try:
+            import psutil
+            psutil.Process().nice(getattr(psutil, 'IDLE_PRIORITY_CLASS', 19))
+        except Exception:
+            pass
+    from .wheel_noise import run_recording
+    try:
+        return w, run_recording(w, overwrite=overwrite, model=model)
+    except Exception as ex:
+        return w, {'status': f'failed ({ex})', 'n': 0, 'squeaks': 0}
+
+
+def _cmd_stop(args) -> int:
+    """Ask the --inference-window-only run on each project to stop: write the
+    STOP_INFERENCE file it watches for (see MADMainWindow.watch_stop_request)."""
+    from .mad_project import STOP_REQUEST_FILENAME
+    for p in args.project:
+        d = os.path.dirname(p) if os.path.isfile(p) else p
+        if not os.path.isdir(d):
+            print(f"no such project folder: {d}", file=sys.stderr)
+            return 1
+        with open(os.path.join(d, STOP_REQUEST_FILENAME), 'w') as f:
+            f.write("stop\n")
+        print(f"stop requested: {d}")
+    return 0
+
+
+def _cmd_wheel(args) -> int:
+    """Flag running-wheel squeaks among the detections of the given recordings
+    (wheel_noise) and store them in each .mad under /wheel. Recordings already
+    done for their current detections are passed over unless --overwrite;
+    .mad files written in the last --settle-minutes are left alone, since MAD
+    may still be writing them."""
+    import time
+    from .fnt_mask_store import masks_sibling_path
+    wavs = []
+    for w in _expand_inputs(args.input):
+        h5 = masks_sibling_path(w)
+        if not os.path.isfile(h5):
+            continue
+        if args.settle_minutes and time.time() - os.path.getmtime(h5) < 60 * args.settle_minutes:
+            continue
+        wavs.append(w)
+    jobs = [(w, args.overwrite, args.low_priority, args.model) for w in wavs]
+    if args.workers > 1:
+        from multiprocessing import Pool
+        pool = Pool(args.workers)
+        results = pool.imap_unordered(_wheel_one, jobs)
+    else:
+        pool, results = None, map(_wheel_one, jobs)
+    n_files = n_dets = n_sq = 0
+    try:
+        for i, (w, r) in enumerate(results, 1):
+            if r['status'] == 'ok':
+                n_files += 1
+                n_dets += r['n']
+                n_sq += r['squeaks']
+                print(f"[{i}/{len(jobs)}] {os.path.basename(w)}: {r['squeaks']}/{r['n']} "
+                      f"squeak(s), wheel running {r['running_s']:.0f} s", flush=True)
+            elif r['status'] not in ('done', 'other_model'):
+                print(f"[{i}/{len(jobs)}] {os.path.basename(w)}: {r['status']}", flush=True)
+    finally:
+        if pool is not None:
+            pool.close()
+            pool.join()
+    print(f"flagged {n_sq} of {n_dets} detection(s) as wheel squeaks in {n_files} file(s)")
+    return 0
+
+
+def _cmd_join_fragments(args) -> int:
+    """Join fragments among the pending detections of the given .mad files
+    (mad_join), or undo it. A line per file that changes, then totals."""
+    import time
+    from .mad_join import JoinConfig, find_stores, join_file, undo_file
+    missing = [p for p in args.inputs if not os.path.exists(p)]
+    if missing:
+        print(f"Not found: {', '.join(missing)}", file=sys.stderr, flush=True)
+        return 2
+    stores = find_stores(args.inputs)
+    if args.settle_minutes:
+        now = time.time()
+        recent = [s for s in stores
+                  if now - os.path.getmtime(s) < 60 * args.settle_minutes]
+        if recent:
+            print(f"Leaving out {len(recent)} .mad file(s) written in the last "
+                  f"{args.settle_minutes:g} min (--settle-minutes)", flush=True)
+        stores = [s for s in stores if s not in recent]
+    cfg = JoinConfig(max_gap_s=args.gap_ms / 1000.0, max_df_khz=args.max_df_khz,
+                     end_frames=args.end_frames,
+                     concurrent_fraction=args.concurrent_fraction,
+                     band_rule=args.band_rule,
+                     band_max_gap_bins=args.band_max_gap_bins)
+    tag = " (dry run)" if args.dry_run else ""
+    n_files = before = after = joined = failed = 0
+    for i, s in enumerate(stores, 1):
+        name = os.path.basename(s)
+        try:
+            if args.undo:
+                r = undo_file(s, dry_run=args.dry_run)
+            else:
+                r = join_file(s, cfg, dry_run=args.dry_run, harmonics=args.harmonics)
+        except Exception as e:
+            failed += 1
+            print(f"[{i}/{len(stores)}] {name}: failed ({e})", file=sys.stderr, flush=True)
+            continue
+        if args.undo:
+            if r['status'] == 'stale':
+                print(f"[{i}/{len(stores)}] {name}: re-analysed since the join; its "
+                      f"copies were out of date and are dropped", flush=True)
+            elif r['status'] == 'ok':
+                n_files += 1
+                joined += r['joins']
+                print(f"[{i}/{len(stores)}] {name}: {r['joins']} joined call(s) "
+                      f"split back{tag}"
+                      + (f", {r['kept']} kept (reviewed since)" if r['kept'] else ""),
+                      flush=True)
+            continue
+        if r['status'] != 'ok':
+            print(f"[{i}/{len(stores)}] {name}: {r['status']}", flush=True)
+            continue
+        n_files += 1
+        before += r['before']
+        after += r['after']
+        joined += r['n_joined']
+        if r['n_joined'] or r['restored']:
+            print(f"[{i}/{len(stores)}] {name}: {r['before']} -> {r['after']} "
+                  f"detection(s), {r['n_joined']} joined{tag}", flush=True)
+    if args.undo:
+        print(f"split {joined} joined call(s) back in {n_files} file(s){tag}")
+    else:
+        print(f"{before} -> {after} detection(s) in {n_files} file(s): "
+              f"{joined} call(s) joined from fragments{tag}")
+    return 1 if failed else 0
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    # Headless runs have no window, so Windows treats them as background work
+    # and throttles them: 47 s per recording instead of 27 (see power.py).
+    from .power import keep_full_speed
+    keep_full_speed()
     return args.func(args)
 
 

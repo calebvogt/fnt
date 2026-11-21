@@ -1,4 +1,4 @@
-"""FNT Mask Tracker Tool (MTT).
+"""FNT Mask Tracker (MTT).
 
 Unified GUI for instance segmentation annotation and Mask R-CNN training.
 Two tabs:
@@ -19,6 +19,7 @@ import random
 import re
 import shutil
 import sys
+from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -28,12 +29,12 @@ import numpy as np
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QProgressBar, QMessageBox,
-    QGroupBox, QSpinBox, QComboBox, QDialog, QAction, QMenuBar,
+    QGroupBox, QSpinBox, QComboBox, QDialog, QGridLayout, QAction, QMenuBar,
     QListWidget, QListWidgetItem, QSizePolicy, QScrollArea,
     QTreeWidget, QTreeWidgetItem, QHeaderView,
     QInputDialog, QStatusBar, QFrame, QMenu, QTabWidget, QTabBar,
     QDoubleSpinBox, QDialogButtonBox, QLineEdit, QCheckBox, QSlider,
-    QTextEdit, QSplitter, QToolTip,
+    QTextEdit, QSplitter, QToolTip, QAbstractSpinBox, QAbstractSlider,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPointF, QRectF, QTimer, QSettings
 from PyQt5.QtGui import (
@@ -150,19 +151,125 @@ BEHAVIOR_PRESETS = {
 # ======================================================================
 # Annotation data structures
 # ======================================================================
+class PathLabel(QLabel):
+    """A word-wrapping label that can also break inside paths.
+
+    A plain wrapping QLabel cannot break a path (no spaces), so its minimum
+    width is the whole path: one long project folder widened the Mask tab's
+    content to ~620 px inside a ~360 px panel on Windows and clipped every row.
+    A zero-width space after each separator gives the layout break points;
+    text() still returns what was set.
+    """
+
+    _BREAK_AFTER = ("\\", "/", "_", "-", ".")
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(parent)
+        self._raw = ""
+        self.setWordWrap(True)
+        self.setText(text)
+
+    def setText(self, text: str):
+        self._raw = text or ""
+        shown = self._raw
+        for ch in self._BREAK_AFTER:
+            shown = shown.replace(ch, ch + "​")
+        super().setText(shown)
+
+    def text(self) -> str:
+        return self._raw
+
+
 class AnnotationObject:
     def __init__(self, points: List[Tuple[float, float]], category: str,
-                 ann_id: int = -1, is_ai: bool = False, inferred: bool = False):
+                 ann_id: int = -1, is_ai: bool = False, inferred: bool = False,
+                 score: Optional[float] = None, rejected: bool = False):
         self.points = list(points)
+        # Other pieces of the same mask (a tail coming out past another mouse):
+        # drawn with it; ``points`` stays the largest piece (vertices, label).
+        self.extra: List[List[Tuple[float, float]]] = []
         self.category = category
         self.ann_id = ann_id
         self.is_ai = is_ai
         self.inferred = inferred
+        self.score = score              # the model's confidence in this one mask
+        self.rejected = rejected        # a prediction the reviewer rejected (kept as a record)
+        self._anchor_key = None
+        self._anchor: Optional[Tuple[float, float]] = None
+
+    def label_anchor(self) -> Tuple[float, float]:
+        """Where the label and its dot go: the point inside the mask farthest
+        from its edge (the middle of a mouse's back). The mean of the outline's
+        vertices, used before, was pulled along the tail, whose long thin
+        outline holds many of them."""
+        key = hash(tuple(map(tuple, self.points)))
+        if key == self._anchor_key and self._anchor is not None:
+            return self._anchor
+        pts = np.asarray(self.points, dtype=np.float64)
+        x0, y0 = np.floor(pts.min(axis=0)) - 1
+        x1, y1 = np.ceil(pts.max(axis=0)) + 2
+        m = np.zeros((int(y1 - y0), int(x1 - x0)), np.uint8)
+        cv2.fillPoly(m, [np.round(pts - (x0, y0)).astype(np.int32)], 1)
+        if m.any():
+            d = cv2.distanceTransform(m, cv2.DIST_L2, 3)
+            iy, ix = np.unravel_index(int(np.argmax(d)), d.shape)
+            self._anchor = (float(ix + x0), float(iy + y0))
+        else:
+            self._anchor = (float(pts[:, 0].mean()), float(pts[:, 1].mean()))
+        self._anchor_key = key
+        return self._anchor
 
 
 # ======================================================================
 # Category selector dialog (replaces QInputDialog dropdown)
 # ======================================================================
+PICKER_KEYS = "1234567890QWERTYUIOP"
+
+
+class ClassPickerDialog(QDialog):
+    """A keypad for the class of the mask just accepted (projects with several classes).
+
+    One button per class with its key (1-9, 0, then Q-P); a key or a click picks, Enter
+    keeps the highlighted class (the active one), Esc goes back to the pending mask."""
+
+    def __init__(self, categories: List[str], current: str = "", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Class")
+        self.categories = list(categories)[:len(PICKER_KEYS)]
+        self.selected: Optional[str] = None
+        self._default = current if current in self.categories else (self.categories[0] if self.categories else None)
+        self.setStyleSheet(
+            "QDialog { background-color: #2b2b2b; color: #cccccc; }"
+            "QPushButton { background-color: #3c3c3c; border: 1px solid #555; text-align: left; "
+            "border-radius: 3px; padding: 6px 10px; color: #dddddd; }"
+            "QPushButton:hover { background-color: #4a4a4a; }"
+            "QPushButton:default { border: 2px solid #2979ff; }")
+        grid = QGridLayout(self)
+        prompt = QLabel("Class? Key or click; Enter keeps the highlighted one.")
+        prompt.setWordWrap(True)
+        grid.addWidget(prompt, 0, 0, 1, 2)
+        for i, cat in enumerate(self.categories):
+            btn = QPushButton(f"{PICKER_KEYS[i]}   {cat}")
+            btn.setAutoDefault(False)
+            if cat == self._default:
+                btn.setDefault(True)
+            btn.clicked.connect(lambda _c, c=cat: self._pick(c))
+            grid.addWidget(btn, 1 + i // 2, i % 2)
+
+    def _pick(self, cat: str):
+        self.selected = cat
+        self.accept()
+
+    def keyPressEvent(self, e):
+        text = e.text().upper()
+        if text and text in PICKER_KEYS[:len(self.categories)]:
+            self._pick(self.categories[PICKER_KEYS.index(text)])
+        elif e.key() in (Qt.Key_Return, Qt.Key_Enter) and self._default:
+            self._pick(self._default)
+        else:
+            super().keyPressEvent(e)
+
+
 class CategorySelectDialog(QDialog):
     """List-based category selector with the last-used category pre-selected."""
 
@@ -300,7 +407,21 @@ class AnnotationPreviewWidget(QWidget):
     approve_annotation_requested = pyqtSignal(int)
     edit_mode_blocked = pyqtSignal()
     edit_cancelled = pyqtSignal()
-    category_hotkey = pyqtSignal(int)          # 0-based class index (keys 1-9)
+    category_hotkey = pyqtSignal(int)          # 0-based class index (keys 1-9, 0 = 10th)
+    empty_frame_requested = pyqtSignal()       # mark / unmark the frame empty (button)
+    queue_step_requested = pyqtSignal(int)     # N / B: next / back in the queue
+    sam_toggle_requested = pyqtSignal()        # M: SAM labeling on / off (as in MAD)
+    e_key_requested = pyqtSignal()             # E: empty frame (queue) / extract (video)
+    sam_pending_changed = pyqtSignal()         # SAM pending objects changed (U, right-click)
+    skip_requested = pyqtSignal()              # S: leave this frame, go to the next to label
+    tool_requested = pyqtSignal(str)           # P / X: Paint / Eraser on or off
+    brush_radius_changed = pyqtSignal(int)     # wheel in Paint / Eraser
+    edit_as_pending_requested = pyqtSignal(int)  # menu: edit a saved mask as a pending object
+    review_requested = pyqtSignal(str)         # A / R / Shift+A: accept, reject, accept_all
+    prediction_selected = pyqtSignal()         # a click picked the prediction to review
+    replace_prediction_requested = pyqtSignal(int)  # SAM click on a prediction: drop it
+    masks_view_changed = pyqtSignal(bool)      # V: masks shown / hidden
+    edit_cancelled_restore = pyqtSignal(object)  # Esc on an Edit Mask: the saved masks to put back
     reassign_annotation_requested = pyqtSignal(int, str)  # obj_idx, new class
 
     def __init__(self, parent=None):
@@ -308,18 +429,27 @@ class AnnotationPreviewWidget(QWidget):
         self.setMinimumSize(400, 300)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setFocusPolicy(Qt.StrongFocus)
+        # Set by the window: asked before Enter saves pending masks (the class keypad);
+        # False keeps them pending. And whether the tool stays on after a save.
+        self.before_finish = None
+        self.keep_tool_after_save = False
         self.setMouseTracking(True)
 
         self._image_rgb: Optional[np.ndarray] = None
         self._pixmap: Optional[QPixmap] = None
         self._img_w = 0
         self._img_h = 0
+        # The project's region of interest (mtt_roi.ROI): what the model will
+        # not see is shaded, with the masks (V hides both).
+        self.roi = None
 
         self._zoom = 1.0
         self._pan_x = 0.0
         self._pan_y = 0.0
         self._panning = False
         self._pan_start = None
+        self.busy_text: Optional[str] = None     # set_busy(): overlay + clicks ignored
+        self._ai_click_start = None
 
         self.drawing_mode = "navigate"
         self._drawing_active = False
@@ -331,6 +461,27 @@ class AnnotationPreviewWidget(QWidget):
         self._ai_mask: Optional[np.ndarray] = None
         self._ai_mask_contour_pts: List[Tuple[float, float]] = []
         self._ai_score: float = 0.0
+        # SAM objects: one pending object per mouse. A click on or near a
+        # pending object refines it (a foot or tail SAM left out), as in MAD;
+        # a click elsewhere starts a new one, and Shift+click always does (a
+        # mouse touching another). Right-click inside an object excludes that
+        # spot from it. Each object is predicted from its own points, so
+        # touching mice stay apart, and Enter saves every object as its own
+        # mask. Paint and Eraser edit the pending objects directly.
+        self._ai_objects: List[Dict] = []
+        self._ai_queue: List[int] = []                 # object ids waiting for SAM
+        self._ai_history: List[Tuple] = []             # undo stack (U)
+        self._ai_next_id = 1
+        # The pending object being edited: the Eraser erases from it alone (two
+        # mice side by side: a stroke along their shared edge ate into both).
+        self._focus_id: Optional[int] = None
+        self.brush_radius = 8                          # image px
+        self._painting = False
+        self._paint_erasing = False                    # this stroke erases
+        self._paint_last: Optional[Tuple[int, int]] = None
+        self._paint_target: Optional[int] = None
+        self._stroke_snapshot: Optional[Dict] = None
+        self._cursor_widget_pos: Optional[Tuple[int, int]] = None
 
         self.annotation_keys_enabled = True
 
@@ -344,6 +495,11 @@ class AnnotationPreviewWidget(QWidget):
         self.available_categories: List[str] = []
 
         self.annotations: List[AnnotationObject] = []
+        # The model's mask under review (A / R act on it); None = the first.
+        self.review_idx: Optional[int] = None
+        # V: the masks drawn over the frame, or the bare frame (as MAD's
+        # Spec + Mask / Spec only). Clicks still work while they are hidden.
+        self.show_masks = True
 
         self._pending_annotation: Optional[List[Tuple[float, float]]] = None
         self._pending_is_ai = False
@@ -366,6 +522,17 @@ class AnnotationPreviewWidget(QWidget):
         self.annotations.clear()
         self.update()
 
+    def cancel_pending(self):
+        """Esc / Clear: drop the pending objects. A mask brought back with Edit
+        Mask goes back saved, as in MAD: what the Eraser removed stays removed,
+        pixels painted on (a proposal until Enter) are dropped. The window puts
+        it back from (stored annotation, pixels erased)."""
+        restore = [(o["origin"], o["erase"]) for o in self._ai_objects if o.get("origin")]
+        self._clear_drawing()
+        self.update()
+        if restore:
+            self.edit_cancelled_restore.emit(restore)
+
     def _clear_drawing(self):
         self._drawing_active = False
         self._drawing_accepted = False
@@ -375,14 +542,464 @@ class AnnotationPreviewWidget(QWidget):
         self._ai_mask = None
         self._ai_mask_contour_pts.clear()
         self._ai_score = 0.0
+        self._ai_objects.clear()
+        self._ai_queue.clear()
+        self._ai_history.clear()
+        self._focus_id = None
+        self._painting = False
+        self._stroke_snapshot = None
         self._editing_obj_idx = None
         self._pending_annotation = None
         self.update()
+
+    # -- SAM / paint pending objects -------------------------------------
+    #: Objects smaller than this (px) are not saved on Enter.
+    MIN_OBJECT_PX = 30
+    #: Pending-object outline colours, one per object in turn.
+    _OBJECT_COLORS = [(255, 220, 50), (80, 200, 255), (255, 120, 200), (120, 255, 120),
+                      (255, 160, 60), (190, 140, 255)]
+    #: Drawing modes that work on pending objects (Enter saves them).
+    OBJECT_TOOLS = ("ai", "paint", "erase")
+
+    def _object(self, obj_id: int) -> Optional[Dict]:
+        return next((o for o in self._ai_objects if o["id"] == obj_id), None)
+
+    def _new_object(self) -> Dict:
+        obj = {"id": self._ai_next_id, "pos": [], "neg": [], "sam": None, "score": None,
+               "add": None, "erase": None, "mask": None, "outline": [], "version": 0}
+        self._ai_next_id += 1
+        self._ai_objects.append(obj)
+        self._focus_id = obj["id"]
+        return obj
+
+    def focus_object(self) -> Optional[Dict]:
+        """The pending object being edited (the newest one touched), or None."""
+        obj = self._object(self._focus_id) if self._focus_id is not None else None
+        if obj is None and self._ai_objects:
+            obj = self._ai_objects[-1]
+            self._focus_id = obj["id"]
+        return obj
+
+    def object_at(self, ix: float, iy: float) -> Optional[Dict]:
+        """The pending object whose mask covers image point (ix, iy), newest first."""
+        x, y = int(ix), int(iy)
+        for o in reversed(self._ai_objects):
+            m = o["mask"]
+            if m is not None and 0 <= y < m.shape[0] and 0 <= x < m.shape[1] and m[y, x]:
+                return o
+        return None
+
+    def _near_px(self) -> int:
+        """A click this close (image px) to a pending object refines it: 2% of
+        the longer image side (38 px at 1920), at least 6."""
+        return max(6, int(round(0.02 * max(self._img_w, self._img_h))))
+
+    def object_near(self, ix: float, iy: float) -> Optional[Dict]:
+        """The pending object under image point (ix, iy), else the nearest one
+        within :meth:`_near_px`, else None."""
+        hit = self.object_at(ix, iy)
+        if hit is not None:
+            return hit
+        x, y, r = int(ix), int(iy), self._near_px()
+        best, best_d = None, None
+        for o in self._ai_objects:
+            m = o["mask"]
+            if m is None:
+                continue
+            y0, x0 = max(0, y - r), max(0, x - r)
+            ys, xs = np.nonzero(m[y0:y + r + 1, x0:x + r + 1])
+            if ys.size == 0:
+                continue
+            d = float(np.min(np.hypot(ys + y0 - y, xs + x0 - x)))
+            if d <= r and (best_d is None or d < best_d):
+                best, best_d = o, d
+        return best
+
+    def _queue(self, obj: Dict):
+        obj["version"] += 1
+        if obj["pos"] and obj["id"] not in self._ai_queue:
+            self._ai_queue.append(obj["id"])
+
+    def _combine(self, obj: Dict):
+        """Object mask = SAM mask, plus painted pixels, minus erased pixels."""
+        m = np.zeros((self._img_h, self._img_w), bool)
+        if obj["sam"] is not None:
+            m |= obj["sam"]
+        if obj["add"] is not None:
+            m |= obj["add"]
+        if obj["erase"] is not None:
+            m &= ~obj["erase"]
+        obj["mask"] = m if m.any() else None
+        pieces = self._mask_pieces(m) if obj["mask"] is not None else []
+        obj["outline"] = pieces[0] if pieces else []
+        obj["extra"] = pieces[1:]
+
+    def add_sam_click(self, ix: float, iy: float, positive: bool = True,
+                      new_object: bool = False) -> Optional[int]:
+        """A SAM click at image point (ix, iy). Positive: refine the pending
+        object it lands on or near, else (or with ``new_object``) start a new
+        one. Negative: exclude the spot from the object it lands in (ignored
+        elsewhere). Returns the object id, or None."""
+        pt = (int(ix), int(iy))
+        if new_object:
+            target = None
+        else:
+            target = self.object_near(ix, iy) if positive else self.object_at(ix, iy)
+        if not positive:
+            if target is None:
+                return None
+            target["neg"].append(pt)
+            self._ai_history.append(("neg", target["id"]))
+        elif target is None:
+            target = self._new_object()
+            target["pos"].append(pt)
+            self._ai_history.append(("new", target["id"]))
+        else:
+            target["pos"].append(pt)
+            self._ai_history.append(("pos", target["id"]))
+        self._focus_id = target["id"]
+        self._drawing_active = True
+        self._queue(target)
+        self.update()
+        return target["id"]
+
+    def has_ai_jobs(self) -> bool:
+        return bool(self._ai_queue)
+
+    def next_ai_job(self):
+        """(object id, version, positive points, negative points) of the next
+        object to predict, taken off the queue; None if nothing waits."""
+        while self._ai_queue:
+            obj = self._object(self._ai_queue.pop(0))
+            if obj is not None and obj["pos"]:
+                return obj["id"], obj["version"], list(obj["pos"]), list(obj["neg"])
+        return None
+
+    #: A refined mask may grow to at most this many times the object's last
+    #: SAM mask (a click on a blurry tail scored the whole dish highest).
+    MAX_GROWTH = 2.5
+
+    def choose_candidate(self, obj: Dict, cands: np.ndarray,
+                         scores: Optional[np.ndarray] = None) -> int:
+        """Index of the SAM candidate mask to use for ``obj``: the best-scoring
+        one that covers all of its clicks, none of its excluded spots, and no
+        more than MAX_GROWTH times its last mask; each rule is dropped in turn
+        (size, then the clicks, then the exclusions) when no candidate passes.
+        SAM's own top score was both overlapping mice after one was excluded."""
+        h, w = cands.shape[1:]
+        sc = np.zeros(len(cands)) if scores is None else np.asarray(scores, float)
+        order = [int(i) for i in np.argsort(-sc, kind="stable")]
+        prev = None if obj["sam"] is None else int(obj["sam"].sum())
+
+        def hits(m, pts):
+            return [bool(m[y, x]) for x, y in pts if 0 <= y < h and 0 <= x < w]
+
+        def no_neg(m):
+            return not any(hits(m, obj["neg"]))
+
+        def all_pos(m):
+            return all(hits(m, obj["pos"]))
+
+        def small(m):
+            return prev is None or int(m.sum()) <= self.MAX_GROWTH * prev
+
+        for rule in (lambda m: no_neg(m) and all_pos(m) and small(m),
+                     lambda m: no_neg(m) and all_pos(m),
+                     no_neg):
+            ok = [i for i in order if rule(cands[i])]
+            if ok:
+                return ok[0]
+        return order[0]
+
+    def set_object_mask(self, obj_id: int, version: int, mask: np.ndarray,
+                        scores: Optional[np.ndarray] = None) -> bool:
+        """Store SAM's prediction for an object: ``mask`` is one mask or SAM's
+        candidates (with ``scores``), chosen by :meth:`choose_candidate`; the
+        components holding one of its positive points (else the largest) are
+        kept, holes filled. Ignored if the object is gone or its points
+        changed meanwhile (a newer prediction is queued)."""
+        obj = self._object(obj_id)
+        if obj is None or obj["version"] != version:
+            return False
+        cands = np.asarray(mask)
+        if cands.ndim == 2:
+            cands = cands[None]
+        cands = cands > 0
+        if cands.shape[1:] != (self._img_h, self._img_w):
+            return False
+        i = self.choose_candidate(obj, cands, scores)
+        m = cands[i]
+        obj["score"] = None if scores is None else float(np.asarray(scores)[i])
+        if m.any():
+            n, lbl = cv2.connectedComponents(m.astype(np.uint8), connectivity=8)
+            keep = {int(lbl[y, x]) for x, y in obj["pos"]
+                    if 0 <= y < lbl.shape[0] and 0 <= x < lbl.shape[1] and lbl[y, x] > 0}
+            if not keep:
+                keep = {int(np.argmax(np.bincount(lbl.ravel())[1:])) + 1}
+            m = np.isin(lbl, list(keep))
+            # A mouse has no holes; fill them (SAM's lower-scored candidates
+            # can be speckled).
+            cs, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL,
+                                     cv2.CHAIN_APPROX_NONE)
+            filled = np.zeros(m.shape, np.uint8)
+            cv2.drawContours(filled, cs, -1, 1, thickness=-1)
+            m = filled > 0
+        obj["sam"] = m
+        self._combine(obj)
+        self.update()
+        return True
+
+    def add_pending_mask(self, mask: np.ndarray, origin: Optional[Dict] = None) -> Optional[int]:
+        """A finished mask brought back as a pending object (edit it with SAM,
+        Paint or Eraser; Enter saves it again). ``origin`` is the stored
+        annotation it came from: Esc puts that back unchanged."""
+        m = np.asarray(mask) > 0
+        if m.shape != (self._img_h, self._img_w) or not m.any():
+            return None
+        obj = self._new_object()
+        obj["origin"] = origin
+        obj["add"] = m.copy()
+        self._combine(obj)
+        self._ai_history.append(("new", obj["id"]))
+        self._drawing_active = True
+        self.update()
+        return obj["id"]
+
+    def has_ai_pending(self) -> bool:
+        return any(o["mask"] is not None for o in self._ai_objects)
+
+    def pending_components(self) -> List[np.ndarray]:
+        """The masks Enter saves: one per pending object (big enough)."""
+        return [o["mask"] for o in self._ai_objects
+                if o["mask"] is not None and int(o["mask"].sum()) >= self.MIN_OBJECT_PX]
+
+    def undo_ai_click(self) -> bool:
+        """U: undo the last SAM click or paint / erase stroke."""
+        if not self._ai_history:
+            return False
+        entry = self._ai_history.pop()
+        kind = entry[0]
+        if kind == "stroke":
+            created, snap = entry[1], entry[2]
+            for oid, (add, erase) in snap.items():
+                obj = self._object(oid)
+                if obj is not None:
+                    obj["add"], obj["erase"] = add, erase
+                    self._combine(obj)
+            for oid in created:
+                obj = self._object(oid)
+                if obj is not None:
+                    self._ai_objects.remove(obj)
+        else:
+            obj = self._object(entry[1])
+            if obj is not None:
+                if kind == "new":
+                    self._ai_objects.remove(obj)
+                    if obj["id"] in self._ai_queue:
+                        self._ai_queue.remove(obj["id"])
+                else:
+                    (obj["pos"] if kind == "pos" else obj["neg"]).pop()
+                    if obj["pos"]:
+                        self._queue(obj)
+                    else:
+                        obj["sam"] = None
+                        self._combine(obj)
+        if not self._ai_objects:
+            self._drawing_active = False
+        self.update()
+        return True
+
+    def drop_object_at(self, ix: float, iy: float) -> bool:
+        """Shift+right-click: remove the pending object under (ix, iy)."""
+        obj = self.object_at(ix, iy)
+        if obj is None:
+            return False
+        self._ai_objects.remove(obj)
+        if obj["id"] in self._ai_queue:
+            self._ai_queue.remove(obj["id"])
+        self._ai_history = [h for h in self._ai_history
+                            if not (h[0] != "stroke" and h[1] == obj["id"])]
+        if not self._ai_objects:
+            self._drawing_active = False
+        self.update()
+        return True
+
+    # paint / erase strokes
+    def _disc(self, cx: int, cy: int) -> Tuple[slice, slice, np.ndarray]:
+        r = max(1, int(self.brush_radius))
+        y0, y1 = max(0, cy - r), min(self._img_h, cy + r + 1)
+        x0, x1 = max(0, cx - r), min(self._img_w, cx + r + 1)
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        return slice(y0, y1), slice(x0, x1), (yy - cy) ** 2 + (xx - cx) ** 2 <= r * r
+
+    def _snap(self, obj: Dict):
+        if self._stroke_snapshot is not None and obj["id"] not in self._stroke_snapshot["snap"]:
+            self._stroke_snapshot["snap"][obj["id"]] = (
+                None if obj["add"] is None else obj["add"].copy(),
+                None if obj["erase"] is None else obj["erase"].copy())
+
+    def _stamp(self, cx: int, cy: int, combine: bool = True):
+        """One brush disc at image point (cx, cy) into the target object's
+        layers. ``combine`` False leaves the object's mask and outline to the
+        caller (a stroke recomputes them once per mouse move, not per disc:
+        per disc, a fast stroke fell behind the mouse and ran on after it)."""
+        ys, xs, disc = self._disc(cx, cy)
+        if disc.size == 0:
+            return
+        if self._paint_erasing:
+            for obj in [self._object(self._paint_target)] if self._paint_target is not None else []:
+                if obj is None or obj["mask"] is None or not (obj["mask"][ys, xs] & disc).any():
+                    continue
+                self._snap(obj)
+                if obj["erase"] is None:
+                    obj["erase"] = np.zeros((self._img_h, self._img_w), bool)
+                obj["erase"][ys, xs] |= disc
+                if obj["add"] is not None:
+                    obj["add"][ys, xs] &= ~disc
+                if combine:
+                    self._combine(obj)
+        else:
+            obj = self._object(self._paint_target)
+            if obj is None:
+                return
+            self._snap(obj)
+            if obj["add"] is None:
+                obj["add"] = np.zeros((self._img_h, self._img_w), bool)
+            obj["add"][ys, xs] |= disc
+            if obj["erase"] is not None:
+                obj["erase"][ys, xs] &= ~disc
+            if combine:
+                self._combine(obj)
+
+    def _stamp_line(self, p0: Tuple[int, int], p1: Tuple[int, int]):
+        steps = max(1, int(max(abs(p1[0] - p0[0]), abs(p1[1] - p0[1])) / max(1, self.brush_radius / 2)))
+        for i in range(1, steps + 1):
+            t = i / steps
+            self._stamp(int(round(p0[0] + (p1[0] - p0[0]) * t)),
+                        int(round(p0[1] + (p1[1] - p0[1]) * t)), combine=False)
+        obj = self._object(self._paint_target) if self._paint_target is not None else None
+        if obj is not None:
+            self._combine(obj)
+
+    def _touches(self, obj: Dict, ix: float, iy: float, r: float) -> bool:
+        """Whether ``obj``'s mask has a pixel within ``r`` px of (ix, iy)."""
+        m = obj.get("mask")
+        if m is None:
+            return False
+        r = max(1, int(round(r)))
+        x, y = int(ix), int(iy)
+        y0, y1 = max(0, y - r), min(m.shape[0], y + r + 1)
+        x0, x1 = max(0, x - r), min(m.shape[1], x + r + 1)
+        if y0 >= y1 or x0 >= x1:
+            return False
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        return bool((m[y0:y1, x0:x1] & ((yy - y) ** 2 + (xx - x) ** 2 <= r * r)).any())
+
+    def _begin_stroke(self, ix: float, iy: float, erase: bool, new_object: bool = False):
+        self._painting = True
+        self._paint_erasing = erase
+        self._stroke_snapshot = {"created": [], "snap": {}}
+        if not erase:
+            # On a pending object: that one. Touching the object being edited
+            # (within the brush, so a stroke started just off its edge extends
+            # it rather than starting a new object that then takes the Eraser's
+            # focus): that one. Anywhere else, or with Shift: a new object, so
+            # an animal next to the one being edited gets its own mask instead
+            # of being merged into it.
+            target = None if new_object else self.object_at(ix, iy)
+            if target is None and not new_object:
+                f = self.focus_object()
+                if f is not None and self._touches(f, ix, iy, self.brush_radius + 2):
+                    target = f
+            if target is None:
+                target = self._new_object()
+                self._stroke_snapshot["created"].append(target["id"])
+            self._paint_target = target["id"]
+            self._focus_id = target["id"]
+        else:
+            # The Eraser works on the object being edited; with none, on the one
+            # under the brush.
+            target = self.focus_object() if self._focus_id is not None else None
+            if target is not None and not self._touches(target, ix, iy, self.brush_radius + 2):
+                # Off the object being edited: the one under the brush, if any
+                # (a Paint stroke beside it may have started a new object)
+                target = self.object_at(ix, iy) or target
+            if target is None:
+                target = self.object_at(ix, iy)
+            self._paint_target = target["id"] if target is not None else None
+        self._drawing_active = True
+        self._paint_last = (int(ix), int(iy))
+        self._stamp(*self._paint_last)
+        self.update()
+
+    def _end_stroke(self):
+        if not self._painting:
+            return
+        self._painting = False
+        snap = self._stroke_snapshot or {"created": [], "snap": {}}
+        self._stroke_snapshot = None
+        if snap["created"] or snap["snap"]:
+            self._ai_history.append(("stroke", snap["created"], snap["snap"]))
+        # objects erased away entirely are dropped
+        self._ai_objects = [o for o in self._ai_objects if o["mask"] is not None or o["pos"]]
+        if not self._ai_objects:
+            self._drawing_active = False
+        self.update()
+
+    @staticmethod
+    def _mask_pieces(mask: np.ndarray) -> List[List[Tuple[float, float]]]:
+        """Every piece's outline, largest first (``_mask_outline`` is the first)."""
+        from .mask_tracker_annotator import MASK_SIMPLIFY_EPS
+        contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        out = []
+        for c in sorted(contours, key=cv2.contourArea, reverse=True):
+            approx = cv2.approxPolyDP(c, MASK_SIMPLIFY_EPS, True)
+            pts = [(float(q[0][0]), float(q[0][1])) for q in approx]
+            if len(pts) >= 3:
+                out.append(pts)
+        return out
+
+    @staticmethod
+    def _mask_outline(mask: np.ndarray) -> List[Tuple[float, float]]:
+        from .mask_tracker_annotator import MASK_SIMPLIFY_EPS
+        contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return []
+        approx = cv2.approxPolyDP(max(contours, key=cv2.contourArea), MASK_SIMPLIFY_EPS, True)
+        return [(float(p[0][0]), float(p[0][1])) for p in approx]
 
     def _reset_view(self):
         self._zoom = 1.0
         self._pan_x = 0.0
         self._pan_y = 0.0
+
+    def zoom_by(self, factor: float, at: Optional[Tuple[float, float]] = None) -> None:
+        """Zoom by ``factor`` (0.5x-20x of the fitted frame), keeping the
+        point ``at`` (widget pixels; default the middle of the view) still."""
+        if self._pixmap is None:
+            return
+        old = self._zoom
+        self._zoom = max(0.5, min(20.0, old * factor))
+        if self._zoom == old:
+            return
+        mx, my = at if at is not None else (self.width() / 2, self.height() / 2)
+        base = self._base_scale()
+        # where the fitted frame's corner sits before panning (see _img_to_widget)
+        cx = (self.width() - self._img_w * base) / 2
+        cy = (self.height() - self._img_h * base) / 2
+        r = self._zoom / old
+        self._pan_x = (mx - cx) - (mx - cx - self._pan_x) * r
+        self._pan_y = (my - cy) - (my - cy - self._pan_y) * r
+        self.zoom_changed.emit(self._zoom)
+        self.update()
+
+    def fit_view(self) -> None:
+        """The whole frame fitted to the view again (100%)."""
+        self._reset_view()
+        self.zoom_changed.emit(self._zoom)
+        self.update()
 
     def _base_scale(self) -> float:
         if self._pixmap is None:
@@ -428,8 +1045,14 @@ class AnnotationPreviewWidget(QWidget):
                     return oi, pi
         return None
 
-    def _find_annotation_at(self, wx: float, wy: float) -> Optional[int]:
+    def _find_annotation_at(self, wx: float, wy: float, labels: bool = True) -> Optional[int]:
+        """The mask under widget point (wx, wy); with ``labels``, a mask's name
+        label (and its dot) picks it too."""
         pt = QPointF(wx, wy)
+        for oi, rect in (reversed(list(getattr(self, "_label_rects", {}).items()))
+                         if labels else ()):
+            if oi < len(self.annotations) and rect.contains(pt):
+                return oi
         for oi in range(len(self.annotations) - 1, -1, -1):
             ann = self.annotations[oi]
             if len(ann.points) < 3:
@@ -490,20 +1113,20 @@ class AnnotationPreviewWidget(QWidget):
     def wheelEvent(self, event: QWheelEvent):
         if self._pixmap is None:
             return
-        delta = event.angleDelta().y()
-        factor = 1.15 if delta > 0 else 1.0 / 1.15
-        old_zoom = self._zoom
-        self._zoom = max(0.5, min(20.0, self._zoom * factor))
-        if self._zoom == old_zoom:
+        if self.drawing_mode in ("paint", "erase") and not (event.modifiers() & Qt.ControlModifier):
+            # In Paint / Eraser the wheel sizes the brush (Ctrl+wheel zooms), as in MAD.
+            step = 1 if event.angleDelta().y() > 0 else -1
+            self.brush_radius = int(max(1, min(80, self.brush_radius + step * max(1, self.brush_radius // 8))))
+            self.brush_radius_changed.emit(self.brush_radius)
+            self.update()
             return
-        mx, my = event.x(), event.y()
-        self._pan_x = mx - (mx - self._pan_x) * (self._zoom / old_zoom)
-        self._pan_y = my - (my - self._pan_y) * (self._zoom / old_zoom)
-        self.zoom_changed.emit(self._zoom)
-        self.update()
+        delta = event.angleDelta().y()
+        if delta == 0:              # a sideways trackpad swipe: not a zoom out
+            return
+        self.zoom_by(1.15 if delta > 0 else 1.0 / 1.15, (event.x(), event.y()))
 
     def mousePressEvent(self, event: QMouseEvent):
-        if self._pixmap is None:
+        if self._pixmap is None or self.busy_text:
             return
 
         if event.button() == Qt.MiddleButton:
@@ -517,13 +1140,26 @@ class AnnotationPreviewWidget(QWidget):
                 if self._editing_obj_idx is not None:
                     self._insert_contour_point(event.x(), event.y())
                     return
-                if self.drawing_mode == "ai" and self._drawing_active:
+                if self.drawing_mode in self.OBJECT_TOOLS:
                     coords = self._widget_to_img(event.x(), event.y())
-                    if coords:
-                        self._ai_negative_points.append((int(coords[0]), int(coords[1])))
-                        self.update()
-                        self._request_ai_prediction()
-                    return
+                    if self.drawing_mode == "paint" and coords:
+                        # Right-drag erases without leaving the brush, as in MAD.
+                        self._edit_saved_mask_at(event.x(), event.y(), *coords)
+                        self._begin_stroke(coords[0], coords[1], erase=True)
+                        return
+                    if coords and self.object_at(*coords) is not None:
+                        if event.modifiers() & Qt.ShiftModifier:
+                            self.drop_object_at(*coords)          # Shift: drop it
+                        elif self.drawing_mode == "ai":
+                            self.add_sam_click(*coords, positive=False)   # exclude spot
+                            self._request_ai_prediction()
+                        self.sam_pending_changed.emit()
+                        return
+                    # Anywhere else nothing, as in MAD (the menu's "Add Manual
+                    # Mask" here read as if SAM mode had switched itself off),
+                    # except on a finished mask: its menu.
+                    if self._find_annotation_at(event.x(), event.y()) is None:
+                        return
                 self._show_context_menu(event.globalPos(), event.x(), event.y())
             elif hasattr(self, "_cls_mask_handler") and self._cls_mask_handler:
                 coords = self._widget_to_img(event.x(), event.y())
@@ -558,6 +1194,13 @@ class AnnotationPreviewWidget(QWidget):
                 return
 
             if self.drawing_mode == "navigate":
+                # A click on one of the model's masks picks it for review.
+                hit_ann = self._find_annotation_at(event.x(), event.y())
+                if (hit_ann is not None and self.annotations[hit_ann].inferred
+                        and not self.annotations[hit_ann].rejected):
+                    self.review_idx = hit_ann
+                    self.prediction_selected.emit()
+                    self.update()
                 self._panning = True
                 self._pan_start = (event.x(), event.y(), self._pan_x, self._pan_y)
                 self.setCursor(Qt.ClosedHandCursor)
@@ -568,7 +1211,8 @@ class AnnotationPreviewWidget(QWidget):
                 return
             ix, iy = coords
 
-            hit = self._find_point_at(event.x(), event.y())
+            hit = (self._find_point_at(event.x(), event.y())
+                   if self.drawing_mode not in self.OBJECT_TOOLS else None)
             if hit is not None:
                 self._drag_obj_idx, self._drag_pt_idx = hit
                 self._dragging_point = True
@@ -582,42 +1226,61 @@ class AnnotationPreviewWidget(QWidget):
                 self._current_points.append((ix, iy))
                 self.update()
 
+            elif self.drawing_mode in ("paint", "erase"):
+                shift = bool(event.modifiers() & Qt.ShiftModifier)
+                if not shift:
+                    self._edit_saved_mask_at(event.x(), event.y(), ix, iy)
+                self._begin_stroke(ix, iy, erase=self.drawing_mode == "erase",
+                                   new_object=shift and self.drawing_mode == "paint")
             elif self.drawing_mode == "ai":
-                # In AI mode, single-click pans (like navigate mode).
-                # Double-click places points — see mouseDoubleClickEvent.
+                # In SAM mode a click places a point (on release, so a drag
+                # still pans), as in MAD; see mouseReleaseEvent.
                 self._panning = True
                 self._pan_start = (event.x(), event.y(), self._pan_x, self._pan_y)
+                self._ai_click_start = (event.x(), event.y())
                 self.setCursor(Qt.ClosedHandCursor)
 
+    def _edit_saved_mask_at(self, wx: float, wy: float, ix: float, iy: float):
+        """A Paint / Eraser stroke that starts on a saved mask (and no pending
+        object) brings that mask back as a pending object first, so the stroke
+        edits it; clicking a saved mask with the Eraser used to do nothing."""
+        if self.object_at(ix, iy) is not None or self._ai_objects:
+            return          # a mask is being edited: strokes stay on it
+        # Only the mask itself, not its name label: on a small animal the label
+        # covers its neighbour, and painting that neighbour grabbed this mask
+        # and merged the two (2026-11-12, two voles side by side).
+        idx = self._find_annotation_at(wx, wy, labels=False)
+        if idx is not None:
+            self.edit_as_pending_requested.emit(idx)
+
     def mouseDoubleClickEvent(self, event: QMouseEvent):
-        """Double-click places AI mask points when in SAM labeling mode."""
-        if self._pixmap is None:
-            return
-        if event.button() != Qt.LeftButton:
-            return
-        if not self.annotation_keys_enabled:
-            return
-        if self.drawing_mode != "ai":
-            return
+        """SAM points come from single clicks (press + release); the second
+        click of a double-click must not add a duplicate point."""
+        return
+
+    #: A SAM-mode press that moves less than this (px) before release is a
+    #: click (place a point); more is a pan.
+    _CLICK_SLOP = 5
+
+    def _add_ai_point(self, wx: float, wy: float, new_object: bool = False):
+        """A SAM click at widget position (wx, wy): refines the pending object it
+        lands on or near, else starts a new one (always new with Shift)."""
         if self._editing_obj_idx is not None:
-            # An accidental double-click while reshaping a mask used to start a
-            # second, unrelated SAM mask on top of the one being edited.
             self.edit_mode_blocked.emit()
             return
-
-        coords = self._widget_to_img(event.x(), event.y())
+        coords = self._widget_to_img(wx, wy)
         if coords is None:
             return
-        ix, iy = coords
-
-        if not self._drawing_active:
-            self._drawing_active = True
-            self._ai_positive_points.clear()
-            self._ai_negative_points.clear()
-            self._ai_mask = None
-            self._ai_mask_contour_pts.clear()
-        self._ai_positive_points.append((int(ix), int(iy)))
-        self.update()
+        # A SAM click on one of the model's masks (and no pending object there)
+        # replaces it: the prediction is dropped (Ctrl+Z restores it) and SAM
+        # segments the animal from the click. Reviewing a coarse prediction was
+        # reject, then click, then Enter.
+        if self.object_near(*coords) is None:
+            hit = self._find_annotation_at(wx, wy)
+            if (hit is not None and self.annotations[hit].inferred
+                    and not self.annotations[hit].rejected):
+                self.replace_prediction_requested.emit(hit)
+        self.add_sam_click(coords[0], coords[1], positive=True, new_object=new_object)
         self._request_ai_prediction()
 
     def _show_context_menu(self, global_pos, wx: float, wy: float):
@@ -676,13 +1339,9 @@ class AnnotationPreviewWidget(QWidget):
                 if self.annotations[i].inferred:
                     self.approve_annotation_requested.emit(i)
         elif action == act_edit and hit_idx is not None:
-            if self.annotations[hit_idx].inferred:
-                self.approve_annotation_requested.emit(hit_idx)
-            # Drop any half-drawn mask so the edit starts from a clean slate.
-            self._clear_drawing()
-            self._editing_obj_idx = hit_idx
-            self.mode_changed.emit("Editing Mask")
-            self.update()
+            # Back as a pending object (dashed) to reshape with SAM, Paint or
+            # Eraser; Enter saves it again.
+            self.edit_as_pending_requested.emit(hit_idx)
         elif action == act_delete and hit_idx is not None:
             self.delete_annotation_requested.emit(hit_idx)
         elif action in class_actions and hit_idx is not None:
@@ -692,6 +1351,17 @@ class AnnotationPreviewWidget(QWidget):
                 self.delete_annotation_requested.emit(i)
 
     def mouseMoveEvent(self, event: QMouseEvent):
+        if self.drawing_mode in ("paint", "erase"):
+            self._cursor_widget_pos = (event.x(), event.y())
+            if self._painting:
+                coords = self._widget_to_img(event.x(), event.y())
+                if coords is not None and self._paint_last is not None:
+                    p = (int(coords[0]), int(coords[1]))
+                    self._stamp_line(self._paint_last, p)
+                    self._paint_last = p
+            self.update()
+            if self._painting:
+                return
         if self._panning and self._pan_start is not None:
             dx = event.x() - self._pan_start[0]
             dy = event.y() - self._pan_start[1]
@@ -707,9 +1377,27 @@ class AnnotationPreviewWidget(QWidget):
                 self.update()
 
     def mouseReleaseEvent(self, event: QMouseEvent):
+        click = getattr(self, "_ai_click_start", None)
+        self._ai_click_start = None
+        if self._painting:
+            self._end_stroke()
+            self.sam_pending_changed.emit()
+            return
+        if self.busy_text:
+            click = None
         if self._panning:
             self._panning = False
             self.setCursor(Qt.ArrowCursor)
+            if (click is not None and event.button() == Qt.LeftButton
+                    and self.drawing_mode == "ai"
+                    and abs(event.x() - click[0]) <= self._CLICK_SLOP
+                    and abs(event.y() - click[1]) <= self._CLICK_SLOP):
+                # A click, not a drag: undo the few pixels of pan and place
+                # the point where the button went down.
+                if self._pan_start is not None:
+                    self._pan_x, self._pan_y = self._pan_start[2], self._pan_start[3]
+                self._add_ai_point(click[0], click[1],
+                                   new_object=bool(event.modifiers() & Qt.ShiftModifier))
             return
         if self._dragging_point:
             self._dragging_point = False
@@ -728,7 +1416,8 @@ class AnnotationPreviewWidget(QWidget):
                 self.update()
                 self.annotation_edited.emit(idx)
             elif self._drawing_active:
-                self._finish_annotation()
+                if self.before_finish is None or self.before_finish():
+                    self._finish_annotation()
             else:
                 self.advance_frame_requested.emit()
         elif event.key() == Qt.Key_Escape:
@@ -737,10 +1426,10 @@ class AnnotationPreviewWidget(QWidget):
                 self.mode_changed.emit("Navigate")
                 self.update()
                 self.edit_cancelled.emit()
-            elif self.drawing_mode == "ai" and self._drawing_active:
-                # Cancel current AI prediction but stay in AI mode
-                self._clear_drawing()
-                self.update()
+            elif self.drawing_mode in self.OBJECT_TOOLS and self._drawing_active:
+                # Drop the pending objects (an edited saved mask goes back as it
+                # was) but keep the tool.
+                self.cancel_pending()
             else:
                 self._clear_drawing()
                 self.drawing_mode = "navigate"
@@ -751,26 +1440,41 @@ class AnnotationPreviewWidget(QWidget):
             backwards = bool(event.modifiers() & Qt.ShiftModifier)
             self.timeline_advance_requested.emit(-1 if backwards else 1)
         elif event.key() == Qt.Key_A and not self._drawing_active:
-            # Approve all inferred annotations on current frame
-            has_inferred = any(a.inferred for a in self.annotations)
-            if has_inferred:
-                for i in range(len(self.annotations) - 1, -1, -1):
-                    if self.annotations[i].inferred:
-                        self.approve_annotation_requested.emit(i)
+            # As in MAD: A accepts the prediction under review, Shift+A every
+            # prediction on the frame.
+            self.review_requested.emit(
+                "accept_all" if event.modifiers() & Qt.ShiftModifier else "accept")
+        elif event.key() in (Qt.Key_R, Qt.Key_D, Qt.Key_Delete) and not self._drawing_active \
+                and self._editing_obj_idx is None:
+            self.review_requested.emit("reject")
+        elif event.key() in (Qt.Key_N, Qt.Key_B) and not self._drawing_active \
+                and self._editing_obj_idx is None:
+            # N / B: next / back in the Training Frames Queue, row by row.
+            self.queue_step_requested.emit(1 if event.key() == Qt.Key_N else -1)
+        elif event.key() == Qt.Key_S and self._editing_obj_idx is None:
+            self.skip_requested.emit()
+        elif event.key() == Qt.Key_U and self.drawing_mode in self.OBJECT_TOOLS \
+                and not self._painting:
+            if self.undo_ai_click():
+                self.sam_pending_changed.emit()
+        elif event.key() == Qt.Key_M and self._editing_obj_idx is None:
+            self.sam_toggle_requested.emit()
+        elif event.key() == Qt.Key_V:
+            self.set_show_masks(not self.show_masks)
+        elif event.key() in (Qt.Key_P, Qt.Key_X) and self._editing_obj_idx is None \
+                and not self._painting:
+            self.tool_requested.emit("paint" if event.key() == Qt.Key_P else "erase")
+        elif event.key() == Qt.Key_E and not self._drawing_active \
+                and self._editing_obj_idx is None:
+            self.e_key_requested.emit()
         elif Qt.Key_1 <= event.key() <= Qt.Key_9:
             self.category_hotkey.emit(event.key() - Qt.Key_1)
-        elif event.key() in (Qt.Key_Plus, Qt.Key_Equal):
-            self._zoom = min(20.0, self._zoom * 1.2)
-            self.zoom_changed.emit(self._zoom)
-            self.update()
-        elif event.key() == Qt.Key_Minus:
-            self._zoom = max(0.5, self._zoom / 1.2)
-            self.zoom_changed.emit(self._zoom)
-            self.update()
         elif event.key() == Qt.Key_0:
-            self._reset_view()
-            self.zoom_changed.emit(self._zoom)
-            self.update()
+            self.category_hotkey.emit(9)
+        elif event.key() in (Qt.Key_Plus, Qt.Key_Equal):
+            self.zoom_by(1.2)
+        elif event.key() == Qt.Key_Minus:
+            self.zoom_by(1 / 1.2)
         else:
             super().keyPressEvent(event)
 
@@ -783,14 +1487,42 @@ class AnnotationPreviewWidget(QWidget):
             self.annotation_accepted.emit()
             self.drawing_mode = "navigate"
             self.mode_changed.emit("Navigate")
-        elif self.drawing_mode == "ai" and self._drawing_active and self._ai_mask_contour_pts:
-            self._pending_annotation = list(self._ai_mask_contour_pts)
-            self._pending_is_ai = True
-            self._drawing_accepted = True
-            self.update()
-            self.annotation_accepted.emit()
+        elif self.drawing_mode in self.OBJECT_TOOLS and self._drawing_active and self.has_ai_pending():
+            # One annotation per connected pending object, as MAD does.
+            for comp in self.pending_components():
+                outline = self._mask_outline(comp)
+                if len(outline) < 3:
+                    continue
+                self._pending_annotation = outline
+                self._pending_extra = self._mask_pieces(comp)[1:]
+                self._pending_is_ai = True
+                self._ai_mask = comp
+                self._drawing_accepted = True
+                self.annotation_accepted.emit()       # the window saves it
             self._clear_drawing()
-            self.mode_changed.emit("AI-Assisted Mask")
+            if not self.keep_tool_after_save:
+                self.drawing_mode = "navigate"        # Enter turns the tool off
+                self.mode_changed.emit("Navigate")
+
+    def set_show_masks(self, on: bool):
+        """V: masks over the frame, or the bare frame."""
+        self.show_masks = bool(on)
+        self.update()
+        self.masks_view_changed.emit(self.show_masks)
+
+    def current_prediction(self) -> Optional[int]:
+        """Index of the prediction under review: the one clicked, else the
+        first of the frame's model masks; None if the frame has none."""
+        i = self.review_idx
+        if (i is not None and 0 <= i < len(self.annotations)
+                and self.annotations[i].inferred and not self.annotations[i].rejected):
+            return i
+        return next((k for k, a in enumerate(self.annotations)
+                     if a.inferred and not a.rejected), None)
+
+    def mode_name(self) -> str:
+        return {"ai": "AI-Assisted Mask", "paint": "Paint", "erase": "Eraser"}.get(
+            self.drawing_mode, "Navigate")
 
     def accept_annotation(self, category: str, ann_id: int = -1):
         if self._pending_annotation is None:
@@ -799,6 +1531,8 @@ class AnnotationPreviewWidget(QWidget):
             self._pending_annotation, category, ann_id=ann_id,
             is_ai=self._pending_is_ai,
         )
+        ann.extra = list(getattr(self, "_pending_extra", None) or [])
+        self._pending_extra = []
         self.annotations.append(ann)
         self._clear_drawing()
 
@@ -854,12 +1588,19 @@ class AnnotationPreviewWidget(QWidget):
             int(self._img_w * s), int(self._img_h * s),
             self._pixmap,
         )
+        if self.roi is not None and self.show_masks:
+            from .mtt_roi_editor import paint_roi
+            paint_roi(painter, self.roi, self._img_w, self._img_h, self._img_to_widget)
 
         pr = self._point_radius()
         cat_counters: Dict[str, int] = {}
+        under_review = self.current_prediction()
+        self._label_rects = {}
 
-        for ai, ann in enumerate(self.annotations):
-            if ann.inferred:
+        for ai, ann in enumerate(self.annotations if self.show_masks else []):
+            if ann.rejected:
+                r, g, b = (230, 70, 70)
+            elif ann.inferred:
                 r, g, b = (255, 200, 0)
             else:
                 ci = ai % len(CLASS_COLORS)
@@ -875,9 +1616,20 @@ class AnnotationPreviewWidget(QWidget):
                 painter.setBrush(Qt.NoBrush)
                 if is_editing:
                     painter.setPen(QPen(color, 2.0, Qt.DashLine))
+                elif ann.rejected:
+                    painter.setPen(QPen(color, 1.5, Qt.DashLine))
+                elif ai == under_review:
+                    # The prediction A / R act on: white, as MAD marks the
+                    # selected detection.
+                    painter.setPen(QPen(QColor(255, 255, 255), 2.5))
+                    painter.setBrush(QBrush(QColor(255, 255, 255, 40)))
                 else:
                     painter.setPen(QPen(color, 1.5))
                 painter.drawPolygon(poly)
+                for piece in ann.extra:
+                    if len(piece) >= 3:
+                        painter.drawPolygon(QPolygonF([QPointF(*self._img_to_widget(px, py))
+                                                       for px, py in piece]))
 
             if is_editing:
                 painter.setPen(QPen(QColor(0, 0, 0), 1))
@@ -889,30 +1641,50 @@ class AnnotationPreviewWidget(QWidget):
             if ann.category and len(ann.points) >= 3:
                 cat_counters[ann.category] = cat_counters.get(ann.category, 0) + 1
                 instance_num = cat_counters[ann.category]
-                cx = sum(p[0] for p in ann.points) / len(ann.points)
-                cy = sum(p[1] for p in ann.points) / len(ann.points)
+                cx, cy = ann.label_anchor()
                 wcx, wcy = self._img_to_widget(cx, cy)
                 painter.setPen(Qt.NoPen)
                 painter.setBrush(QBrush(QColor(255, 255, 255)))
                 painter.drawEllipse(QPointF(wcx, wcy), 3, 3)
+                # As in MAD: a prediction still to review is named in
+                # parentheses with its own confidence, "(mouse_1 0.42)", in
+                # yellow (white while selected); an accepted mask is plain.
                 label = f"{ann.category}_{instance_num}"
-                if ann.inferred:
-                    label += " [inferred]"
+                if ann.rejected:
+                    label = "(rejected)"
+                elif ann.inferred:
+                    label = (f"({label} {ann.score:.2f})" if ann.score is not None
+                             else f"({label})")
                 font = painter.font()
                 font.setPixelSize(max(10, min(14, int(12 * self._zoom ** 0.3))))
                 font.setBold(True)
                 painter.setFont(font)
                 painter.setPen(QPen(QColor(0, 0, 0), 3))
                 painter.drawText(QPointF(wcx + 5, wcy - 5), label)
-                lbl_color = QColor(255, 200, 0) if ann.inferred else QColor(255, 255, 255)
+                if ann.rejected:
+                    lbl_color = QColor(240, 110, 110)
+                elif ann.inferred:
+                    lbl_color = (QColor(255, 255, 255) if ai == under_review
+                                 else QColor(255, 200, 0))
+                else:
+                    lbl_color = QColor(r, g, b).lighter(140)
                 painter.setPen(QPen(lbl_color))
                 painter.drawText(QPointF(wcx + 5, wcy - 5), label)
+                fm = QFontMetrics(font)
+                self._label_rects[ai] = QRectF(wcx - 6, wcy - 5 - fm.ascent() - 2,
+                                               fm.horizontalAdvance(label) + 14, fm.height() + 9)
 
-        if self._drawing_active:
+        if self._drawing_active and self.show_masks:
             if self.drawing_mode == "manual":
                 self._paint_manual_drawing(painter, pr)
-            elif self.drawing_mode == "ai":
+            elif self.drawing_mode in self.OBJECT_TOOLS:
                 self._paint_ai_drawing(painter, pr)
+        if self.drawing_mode in ("paint", "erase") and self._cursor_widget_pos is not None:
+            r = self.brush_radius * self._effective_scale()
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(255, 80, 80) if self.drawing_mode == "erase"
+                                else QColor(255, 220, 50), 1, Qt.DashLine))
+            painter.drawEllipse(QPointF(*self._cursor_widget_pos), r, r)
 
         if self._drawing_accepted and self._pending_annotation:
             pen = QPen(QColor(0, 220, 0), 2)
@@ -925,7 +1697,25 @@ class AnnotationPreviewWidget(QWidget):
             if len(self._pending_annotation) >= 3:
                 painter.drawPolygon(poly)
 
+        if self.busy_text:
+            # Dim the frame and say why clicks are ignored (see set_busy).
+            painter.fillRect(self.rect(), QColor(0, 0, 0, 150))
+            f = painter.font()
+            f.setPointSize(max(16, f.pointSize() + 8))
+            f.setBold(True)
+            painter.setFont(f)
+            painter.setPen(QColor(255, 255, 255))
+            painter.drawText(self.rect(), Qt.AlignCenter, self.busy_text)
+
         painter.end()
+
+    def set_busy(self, text: Optional[str]):
+        """Cover the frame with a message and ignore clicks until cleared
+        (None). Used while SAM2 loads: clicks made before the model is ready
+        cannot be served, and a burst of them is what crashed a session."""
+        self.busy_text = text or None
+        self.setCursor(Qt.WaitCursor if self.busy_text else Qt.ArrowCursor)
+        self.update()
 
     def _paint_manual_drawing(self, painter: QPainter, pr: float):
         if not self._current_points:
@@ -942,15 +1732,20 @@ class AnnotationPreviewWidget(QWidget):
             painter.drawEllipse(QPointF(wx, wy), pr, pr)
 
     def _paint_ai_drawing(self, painter: QPainter, pr: float):
-        if self._ai_mask_contour_pts and len(self._ai_mask_contour_pts) >= 3:
-            painter.setPen(QPen(QColor(255, 220, 50), 2))
-            painter.setBrush(Qt.NoBrush)
-            poly = QPolygonF()
-            for px, py in self._ai_mask_contour_pts:
-                wx, wy = self._img_to_widget(px, py)
-                poly.append(QPointF(wx, wy))
-            painter.drawPolygon(poly)
-
+        """Pending objects: outline + light fill in each object's colour."""
+        focus = self.focus_object()
+        for i, obj in enumerate(self._ai_objects):
+            r, g, b = self._OBJECT_COLORS[i % len(self._OBJECT_COLORS)]
+            if len(obj["outline"]) >= 3:
+                width = 3.5 if (obj is focus and len(self._ai_objects) > 1) else 2
+                painter.setPen(QPen(QColor(r, g, b), width, Qt.DashLine))
+                painter.setBrush(QBrush(QColor(r, g, b, 22)))
+                for piece in [obj["outline"]] + list(obj.get("extra") or []):
+                    poly = QPolygonF()
+                    for px, py in piece:
+                        wx, wy = self._img_to_widget(px, py)
+                        poly.append(QPointF(wx, wy))
+                    painter.drawPolygon(poly)
 
 # ======================================================================
 # Worker threads
@@ -961,11 +1756,14 @@ class FrameScrubber(QWidget):
     One tick per Training Frames Queue entry cut from this video, coloured by
     its labeling state with the same palette as the queue list: grey = queued
     and unlabeled, yellow = model prediction awaiting review, green = has an
-    accepted mask. The white playhead is the frame on screen.
+    accepted mask. The playhead is the frame on screen, coloured by its state
+    (white queued, yellow predicted, green labeled; blue: a frame not in the
+    queue), drawn on a SLEAP-style track.
 
-    The widget only reports seeks; the window decides what a seek means
-    (video mode at that frame). Keyboard focus is refused so the arrow keys
-    keep scrubbing through the preview widget after a click here.
+    The widget only reports seeks; the window decides what a seek means (a
+    queue frame opens with its masks, any other frame in video mode).
+    Keyboard focus is refused so the arrow keys keep scrubbing through the
+    preview widget after a click here.
     """
 
     seek_requested = pyqtSignal(int)
@@ -978,6 +1776,10 @@ class FrameScrubber(QWidget):
     # Draw order when several ticks share a pixel: the most advanced state is
     # painted last, so a labeled frame is never hidden behind a queued one.
     STATE_RANK = {"queued": 0, "predicted": 1, "labeled": 2}
+    #: Playhead on a frame that is not in the queue (plain video). On a queue
+    #: frame it takes the frame's state: white = queued, yellow = predicted,
+    #: green = labeled.
+    PLAYHEAD_COLOR = QColor("#4d8fe0")
 
     _PAD = 6             # groove inset from each edge, px
     _SNAP_PX = 4         # a click this close to a tick lands on the tick
@@ -1040,6 +1842,14 @@ class FrameScrubber(QWidget):
 
     def has_marks(self) -> bool:
         return bool(self._sorted_marks)
+
+    def playhead_color(self) -> QColor:
+        """The playhead's colour: the state of the frame on screen (white
+        queued, yellow predicted, green labeled), or blue off the queue."""
+        here = self._marks.get(self._position)
+        if here == "queued":
+            return QColor("#ffffff")
+        return self.STATE_COLORS.get(here, self.PLAYHEAD_COLOR)
 
     def next_mark(self, after: int) -> Optional[int]:
         """First tick strictly after ``after``, wrapping to the first tick."""
@@ -1162,25 +1972,29 @@ class FrameScrubber(QWidget):
                 p.drawText(self.rect(), Qt.AlignCenter, self._empty_text)
             return
 
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor("#3c3c3c"))
-        p.drawRoundedRect(groove, 3, 3)
+        # The track, as in SLEAP's seekbar: a framed box with a line through
+        # the middle; ticks for the queue frames cut from this video, coloured
+        # by state; the playhead takes the state of the frame on screen.
+        track = QRectF(x0, 3.0, x1 - x0, h - 6.0)
+        p.setPen(QPen(QColor("#5a5a5a"), 1.0))
+        p.setBrush(QColor("#262626"))
+        p.drawRect(track)
+        p.setPen(QPen(QColor("#6e6e6e"), 1.0))
+        p.drawLine(QPointF(x0, h / 2), QPointF(x1, h / 2))
         px = self._frame_to_x(self._position)
-        if px > x0:
-            p.setBrush(QColor("#25497a"))
-            p.drawRoundedRect(QRectF(x0, gy, px - x0, gh), 3, 3)
 
         for state in sorted(self.STATE_COLORS, key=self.STATE_RANK.get):
             color = self.STATE_COLORS[state]
             for f in self._by_state.get(state, ()):
                 x = self._frame_to_x(f)
-                p.fillRect(QRectF(x - 1.0, 2.0, 2.0, h - 4.0), color)
+                p.fillRect(QRectF(x - 1.0, 4.0, 2.0, h - 8.0), color)
 
-        pen = QPen(QColor("#1e1e1e"))
+        head = self.playhead_color()
+        pen = QPen(QColor("#111111"))
         pen.setWidthF(1.0)
         p.setPen(pen)
-        p.setBrush(QColor("#ffffff"))
-        p.drawRoundedRect(QRectF(px - 1.5, 1.0, 3.0, h - 2.0), 1.5, 1.5)
+        p.setBrush(head)
+        p.drawRoundedRect(QRectF(px - 3.0, 0.5, 6.0, h - 1.0), 2.0, 2.0)
 
 
 class SAM2LoadWorker(QThread):
@@ -1200,7 +2014,9 @@ class SAM2LoadWorker(QThread):
 
 
 class SAM2PredictWorker(QThread):
-    finished = pyqtSignal(np.ndarray, float)
+    # Not "finished": that would hide QThread.finished, which is what tells
+    # the window the thread has really stopped (see _request_ai_prediction).
+    predicted = pyqtSignal(object, object)     # candidate masks (k, H, W), their scores
     error = pyqtSignal(str)
 
     def __init__(self, segmenter, pos_points, neg_points):
@@ -1211,8 +2027,12 @@ class SAM2PredictWorker(QThread):
 
     def run(self):
         try:
-            mask, score = self.segmenter.predict_mask(self.pos_points, self.neg_points)
-            self.finished.emit(mask, score)
+            if hasattr(self.segmenter, "predict_candidates"):
+                masks, scores = self.segmenter.predict_candidates(self.pos_points, self.neg_points)
+            else:
+                mask, score = self.segmenter.predict_mask(self.pos_points, self.neg_points)
+                masks, scores = np.asarray(mask)[None], np.array([score], float)
+            self.predicted.emit(masks, scores)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -1240,6 +2060,185 @@ class AugmentWorker(QThread):
             self.finished.emit(out_path)
         except Exception as e:
             self.error.emit(str(e))
+
+
+class SegPreviewPanel(QWidget):
+    """Per-epoch prediction previews, as in MAD's training window: each epoch
+    adds a page of tiles (a fixed set of validation frames, so a tile can be
+    compared epoch to epoch) with the ground-truth outline, the predicted mask
+    and that frame's Dice. Scrub back through earlier epochs; follows the
+    latest unless you scroll back or untick Follow latest."""
+
+    MAX_HISTORY = 150
+    COLUMNS = 3
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pages: List[Tuple[int, Optional[float], list]] = []
+        self._view = 0
+        v = QVBoxLayout(self)
+        v.setContentsMargins(6, 6, 6, 6)
+        nav = QHBoxLayout()
+        self.btn_prev = QPushButton("◀ Prev")
+        self.btn_next = QPushButton("Next ▶")
+        self.btn_latest = QPushButton("Latest")
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(0, 0)
+        self.chk_follow = QCheckBox("Follow latest")
+        self.chk_follow.setChecked(True)
+        self.btn_prev.clicked.connect(lambda: self._go(self._view - 1))
+        self.btn_next.clicked.connect(lambda: self._go(self._view + 1))
+        self.btn_latest.clicked.connect(lambda: self._go(len(self._pages) - 1))
+        self.slider.valueChanged.connect(self._go)
+        for wdg in (self.btn_prev, self.slider, self.btn_next, self.btn_latest, self.chk_follow):
+            nav.addWidget(wdg, 1 if wdg is self.slider else 0)
+        v.addLayout(nav)
+        self.lbl = QLabel("Waiting for the first epoch…")
+        self.lbl.setStyleSheet("color: #cccccc; font-size: 11px;")
+        v.addWidget(self.lbl)
+        legend = QLabel("<span style='color:#39ff88'>▢ outline = your mask</span>"
+                        "&nbsp;&nbsp;&nbsp;<span style='color:#ff6666'>■ fill = predicted</span>")
+        legend.setStyleSheet("font-size: 10px;")
+        legend.setToolTip(
+            "Each tile is a held-out validation frame (never trained on), the\n"
+            "same frames every epoch. Green outline: the mask you drew. Red fill:\n"
+            "what the model predicts (confidence >= 0.25). Red inside green is\n"
+            "right; red outside green is a false detection; green without red is\n"
+            "a miss. dice = 2 x overlap / (predicted + labeled pixels), over the\n"
+            "whole frame. A frame with no animal shows 'empty': any red there is\n"
+            "a false detection.")
+        v.addWidget(legend)
+        self._grid_host = QWidget()
+        self._grid = QGridLayout(self._grid_host)
+        self._grid.setSpacing(6)
+        self._grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self._grid_host)
+        v.addWidget(scroll, 1)
+
+    def clear(self):
+        self._pages.clear()
+        self._view = 0
+        self.slider.setRange(0, 0)
+        self.lbl.setText("Waiting for the first epoch…")
+        self._render()
+
+    def add_page(self, epoch: int, val_dice: Optional[float], tiles: list):
+        self._pages.append((epoch, val_dice, tiles))
+        if len(self._pages) > self.MAX_HISTORY:
+            self._pages.pop(0)
+        self.slider.blockSignals(True)
+        self.slider.setRange(0, len(self._pages) - 1)
+        self.slider.blockSignals(False)
+        if self.chk_follow.isChecked():
+            self._go(len(self._pages) - 1)
+        else:
+            self._update_label()
+
+    def _go(self, i: int):
+        if not self._pages:
+            return
+        i = max(0, min(int(i), len(self._pages) - 1))
+        self._view = i
+        self.chk_follow.setChecked(i == len(self._pages) - 1)
+        self.slider.blockSignals(True)
+        self.slider.setValue(i)
+        self.slider.blockSignals(False)
+        self._update_label()
+        self._render()
+
+    def _update_label(self):
+        if not self._pages:
+            return
+        epoch, d, tiles = self._pages[self._view]
+        self.lbl.setText(
+            f"Epoch {epoch}  ·  mean Dice {d:.3f} over the frames with animals"
+            if d is not None else f"Epoch {epoch}")
+
+    @staticmethod
+    def tile_pixmap(t: dict) -> QPixmap:
+        rgb = cv2.cvtColor(t["img"], cv2.COLOR_GRAY2RGB)
+        if t["pred"].any():
+            over = rgb.copy()
+            over[t["pred"]] = (255, 80, 80)
+            rgb = cv2.addWeighted(over, 0.45, rgb, 0.55, 0)
+        if t["gt"].any():
+            cs, _ = cv2.findContours(t["gt"].astype(np.uint8), cv2.RETR_EXTERNAL,
+                                     cv2.CHAIN_APPROX_NONE)
+            cv2.drawContours(rgb, cs, -1, (57, 255, 136), 1)
+        rgb = np.ascontiguousarray(rgb)
+        h, w = rgb.shape[:2]
+        return QPixmap.fromImage(QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy())
+
+    @staticmethod
+    def tile_title(t: dict) -> str:
+        found = f"{t['n_pred']} found"
+        if t["n_gt"] == 0:
+            return "empty · " + ("clean" if t["dice"] is None else f"{found} (false)")
+        return f"dice {t['dice']:.2f} · {t['n_gt']} labeled, {found}"
+
+    def _render(self):
+        while self._grid.count():
+            item = self._grid.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        if not self._pages:
+            return
+        for k, t in enumerate(self._pages[self._view][2]):
+            cell = QWidget()
+            cv = QVBoxLayout(cell)
+            cv.setContentsMargins(0, 0, 0, 0)
+            cv.setSpacing(2)
+            title = QLabel(self.tile_title(t))
+            ok = t["dice"] is None or (t["n_gt"] and t["dice"] >= 0.7)
+            title.setStyleSheet(f"color: {'#cccccc' if ok else '#ff9e80'}; font-size: 10px;")
+            title.setToolTip(t["name"])
+            img = QLabel()
+            img.setPixmap(self.tile_pixmap(t))
+            img.setToolTip(t["name"])
+            cv.addWidget(title)
+            cv.addWidget(img)
+            self._grid.addWidget(cell, k // self.COLUMNS, k % self.COLUMNS)
+
+
+class SegTrainingWindow(QDialog):
+    """The segmentation training window, popped out like MAD's: the loss/mAP
+    graph and the log on the left, the per-epoch prediction previews on the
+    right. Closing it hides it; training goes on, and Show Training Window
+    (Train panel) brings it back."""
+
+    def __init__(self, main, graph_panel: QWidget, preview_panel: QWidget):
+        # Unowned (no parent): Windows keeps an owned window stacked above its
+        # owner, so the main window could not be brought in front of it.
+        super().__init__(None)
+        self._main = main
+        # Unowned, it no longer inherits the main window's stylesheet either.
+        self.setStyleSheet(DARK_STYLESHEET)
+        self.setModal(False)
+        self.setWindowTitle("Segmentation Training")
+        self.setWindowFlags(Qt.Window | Qt.WindowMinimizeButtonHint
+                            | Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint)
+        split = QSplitter(Qt.Horizontal, self)
+        split.addWidget(graph_panel)
+        split.addWidget(preview_panel)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lay.addWidget(split)
+        self.resize(1500, 860)
+        split.setSizes([800, 700])      # previews get room for three columns
+
+    def closeEvent(self, event):
+        """Launched with --training-window-only this window is all of Mask
+        Tracker: closing it quits, after asking if a run is still going."""
+        if getattr(self._main, "_window_only", False):
+            if not self._main._window_only_may_close():
+                event.ignore()
+                return
+            event.accept()
+            QTimer.singleShot(0, QApplication.instance().quit)
+            return
+        super().closeEvent(event)
 
 
 class TrainWorker(QThread):
@@ -1320,6 +2319,13 @@ class TrainWorker(QThread):
                 os.close(_null_fd)
 
 
+# Specks off a predicted mask, and one mask per animal: shared with the
+# headless prediction (mask_tracker_cli predict-frames).
+from .mask_tracker_batch import drop_fragments  # noqa: E402
+from .mask_tracker_parallel_view import InferenceGrid, ParallelInferenceWorker  # noqa: E402
+from .mtt_predict import drop_overlapping as _drop_overlapping  # noqa: E402
+
+
 class PostTrainInferenceWorker(QThread):
     """Run the trained model on unlabeled frames and emit inferred annotations."""
     progress = pyqtSignal(int, int)  # current_frame, total_frames
@@ -1342,30 +2348,23 @@ class PostTrainInferenceWorker(QThread):
 
     def run(self):
         try:
-            import json as _json
-
-            config_path = os.path.join(self.model_dir, "training_config.json")
-            arch = "maskrcnn"
-            if os.path.exists(config_path):
-                with open(config_path) as f:
-                    cfg = _json.load(f)
-                arch = cfg.get("architecture", "maskrcnn")
-
-            if arch == "yolov11-seg":
-                from .yolo_inference import YOLOInference
-                engine = YOLOInference(self.model_dir, device="auto", use_masks=True)
-            else:
-                from .mask_tracker_inference import MaskRCNNInference
-                engine = MaskRCNNInference(self.model_dir, device="auto")
-
-            engine.load_model()
+            from .mtt_predict import frame_detections, load_engine
+            engine = load_engine(self.model_dir, device="auto")
 
             total = len(self.frame_paths)
             inferred_count = 0
+            # Per-trial ROIs: each frame prepared with its source video's trial's
+            # (frames live in <project>/training_frames/).
+            from .mtt_roi import frame_source, frame_sources
+            sources = {}
+            if hasattr(engine, "use_source") and self.frame_paths:
+                sources = frame_sources(os.path.dirname(os.path.dirname(self.frame_paths[0])))
 
             for i, path in enumerate(self.frame_paths):
                 if self._stop_flag:
                     break
+                if sources:
+                    engine.use_source(frame_source(path, sources) or "")
 
                 img = cv2.imread(path)
                 if img is None:
@@ -1373,58 +2372,7 @@ class PostTrainInferenceWorker(QThread):
                     continue
 
                 img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                result = engine.predict(
-                    img_rgb,
-                    confidence_threshold=self.confidence,
-                    max_detections=self.max_det,
-                )
-
-                detections = []
-                n_det = len(result.get("scores", []))
-                for j in range(n_det):
-                    mask = None
-                    if result.get("masks") is not None and j < len(result["masks"]):
-                        mask = result["masks"][j]
-
-                    from .mask_tracker_annotator import (
-                        mask_to_coco_polygons, mask_bbox, mask_to_rle,
-                    )
-                    if mask is not None:
-                        # Store the predicted mask itself — approving one of
-                        # these promotes it to ground truth, so it must not
-                        # arrive already coarsened into a polygon.
-                        if not mask_to_coco_polygons(mask):
-                            continue
-                        mask_bool = np.asarray(mask).astype(bool)
-                        segmentation = mask_to_rle(mask_bool)
-                        bbox = list(mask_bbox(mask_bool))
-                        area = int(mask_bool.sum())
-                    else:
-                        # Box-only model: rectangle mask covering the box.
-                        box = result["boxes"][j]
-                        x1, y1, x2, y2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
-                        h_img, w_img = img_rgb.shape[:2]
-                        rect = np.zeros((h_img, w_img), dtype=bool)
-                        rect[
-                            max(0, int(round(y1))):max(0, int(round(y2))),
-                            max(0, int(round(x1))):max(0, int(round(x2))),
-                        ] = True
-                        if not rect.any():
-                            continue
-                        segmentation = mask_to_rle(rect)
-                        bbox = [x1, y1, x2 - x1, y2 - y1]
-                        area = int(rect.sum())
-
-                    label = int(result["labels"][j])
-                    score = float(result["scores"][j])
-                    detections.append({
-                        "segmentation": segmentation,
-                        "bbox": bbox,
-                        "area": area,
-                        "category_id": label,
-                        "score": score,
-                    })
-
+                detections = frame_detections(engine, img_rgb, self.confidence, self.max_det)
                 if detections:
                     filename = os.path.basename(path)
                     self.frame_result.emit(filename, detections)
@@ -1477,89 +2425,15 @@ class InferenceWorker(QThread):
         self._pause_flag = False
 
     def _load_classifier(self):
-        """Load the behavior classifier.
-
-        Returns ``(model, class_names, device, scene_cfg)``, where scene_cfg is
-        the stored configuration for a scene-aware checkpoint and None for a
-        legacy single-silhouette one. Returns None outright when nothing
-        loadable is there.
-        """
-        if not self.classifier_dir:
-            return None
-
-        from .behavior_classifier import load_scene_classifier
-        scene = load_scene_classifier(self.classifier_dir)
-        if scene is not None:
-            model, class_names, device, cfg = scene
-            n_soc = cfg.get("n_social_samples")
-            print(f"[Classifier Inference] Loaded scene-aware "
-                  f"{cfg.get('backbone', '?')} ({len(class_names)} classes: "
-                  f"{', '.join(class_names)}) on {device.upper()}"
-                  + (f"; trained with {n_soc} multi-animal samples"
-                     if n_soc is not None else ""))
-            return model, class_names, device, cfg
-
-        import torch
-        from torchvision import models
-        cfg_path = os.path.join(self.classifier_dir, "classifier_config.json")
-        weights_path = os.path.join(self.classifier_dir, "best_classifier.pth")
-        if not os.path.isfile(cfg_path) or not os.path.isfile(weights_path):
-            print(f"[Classifier Inference] Missing config or weights in {self.classifier_dir}")
-            return None
-
-        with open(cfg_path) as f:
-            cfg = json.load(f)
-        class_names = cfg.get("class_names", [])
-        n_classes = cfg.get("n_classes", len(class_names))
-        backbone = cfg.get("backbone", "ResNet-18")
-
-        from torch import nn
-        if backbone == "ResNet-34":
-            model = models.resnet34(weights=None)
-            model.fc = nn.Linear(model.fc.in_features, n_classes)
-        elif backbone == "MobileNetV3":
-            model = models.mobilenet_v3_small(weights=None)
-            model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, n_classes)
-        else:
-            model = models.resnet18(weights=None)
-            model.fc = nn.Linear(model.fc.in_features, n_classes)
-
-        device = "cpu"
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            device = "mps"
-
-        model.load_state_dict(torch.load(weights_path, map_location=device))
-        model = model.to(device)
-        model.eval()
-
-        print(f"[Classifier Inference] Loaded legacy single-silhouette {backbone} "
-              f"({n_classes} classes: {', '.join(class_names)}) on {device.upper()}. "
-              f"Social categories cannot be represented by this checkpoint — "
-              f"retrain to get a scene-aware model.")
-        return model, class_names, device, None
+        """Load the behavior classifier (see mask_tracker_parallel.load_classifier)."""
+        from .mask_tracker_parallel import load_classifier
+        return load_classifier(self.classifier_dir)
 
     @staticmethod
     def _apply_min_bout_filter(rows, min_bout):
-        """Replace behavior bouts shorter than min_bout frames with NC.
-
-        Groups consecutive same-behavior predictions per object. Bouts
-        shorter than min_bout are relabeled NC to suppress flickering.
-        """
-        from itertools import groupby
-
-        per_obj = {}
-        for i, r in enumerate(rows):
-            per_obj.setdefault(r["object_id"], []).append(i)
-
-        for obj_id, indices in per_obj.items():
-            labels = [rows[i]["behavior"] for i in indices]
-            for _, grp in groupby(enumerate(labels), key=lambda x: x[1]):
-                grp_list = list(grp)
-                if len(grp_list) < min_bout and grp_list[0][1] != "NC":
-                    for local_pos, _ in grp_list:
-                        rows[indices[local_pos]]["behavior"] = "NC"
+        """Replace behavior bouts shorter than min_bout frames with NC."""
+        from .mask_tracker_parallel import apply_min_bout_filter
+        apply_min_bout_filter(rows, min_bout)
 
     def run(self):
         import io, sys
@@ -1578,22 +2452,12 @@ class InferenceWorker(QThread):
 
         sys.stdout = _LogCapture(self, _real_stdout)
         try:
-            from .mask_tracker_inference import MaskInferenceConfig, run_inference_on_video
-            from .behavior_classifier import predict_scene
-            from .silhouette_extractor import (
-                generate_composite, generate_scene_composite, pairwise_features,
-                pairwise_vector,
-            )
+            from .mask_tracker_inference import MaskInferenceConfig
+            from .mask_tracker_parallel import infer_one_video
             import time as _pause_time
 
             config = MaskInferenceConfig(**self.config_dict)
-
             cls_info = self._load_classifier()
-            cls_model = cls_class_names = cls_device = cls_scene_cfg = None
-            torch = None
-            if cls_info:
-                cls_model, cls_class_names, cls_device, cls_scene_cfg = cls_info
-                import torch
 
             def _check_stop():
                 while self._pause_flag and not self._stop_flag:
@@ -1607,165 +2471,19 @@ class InferenceWorker(QThread):
             for video_path in self.video_paths:
                 if self._stop_flag:
                     break
-
-                from collections import deque
-                mask_buffers: dict = {}
-                current_labels: dict = {}
-                behavior_rows: list = []
-
-                def _track_cb(matched, frame_idx, fps):
-                    if cls_model is None:
-                        return None
-
-                    # Every known object gets an entry every frame, present or
-                    # not, so the per-object buffers stay aligned in time and a
-                    # neighbour's position can be read at the same index as the
-                    # focal animal's. Appending only for detected objects would
-                    # silently shear the windows apart whenever one is missed.
-                    for obj_id in set(mask_buffers) | set(matched):
-                        if obj_id not in mask_buffers:
-                            mask_buffers[obj_id] = deque(maxlen=self.cls_window)
-                        det = matched.get(obj_id)
-                        entry = None
-                        mask = det.get("mask") if det is not None else None
-                        if mask is not None:
-                            bbox = det["bbox"]
-                            h_f, w_f = mask.shape[:2]
-                            x1 = max(0, int(round(float(bbox[0]))))
-                            y1 = max(0, int(round(float(bbox[1]))))
-                            x2 = min(w_f, int(round(float(bbox[2]))))
-                            y2 = min(h_f, int(round(float(bbox[3]))))
-                            if x2 > x1 and y2 > y1:
-                                entry = {
-                                    "crop": mask[y1:y2, x1:x2],
-                                    "bbox": (x1, y1, x2, y2),
-                                }
-                        mask_buffers[obj_id].append(entry)
-
-                    # Snapshot once rather than per focal animal: the inner
-                    # loop below is quadratic in object count otherwise.
-                    windows = {oid: list(buf) for oid, buf in mask_buffers.items()}
-                    for obj_id, window in windows.items():
-                        if all(e is None for e in window):
-                            # Gone for a whole window. Drop it so a long video
-                            # does not accumulate dead buffers, and so it stops
-                            # counting as a neighbour of anyone.
-                            mask_buffers.pop(obj_id, None)
-                            current_labels.pop(obj_id, None)
-
-                    for obj_id in list(mask_buffers.keys()):
-                        window = windows.get(obj_id) or []
-                        if len(window) < self.cls_window:
-                            continue
-
-                        if cls_scene_cfg is not None:
-                            neighbors = []
-                            for i in range(len(window)):
-                                neighbors.append([
-                                    other[i] for oid, other in windows.items()
-                                    if oid != obj_id and oid in mask_buffers
-                                    and len(other) == len(window)
-                                    and other[i] is not None
-                                ])
-                            scene = generate_scene_composite(
-                                window, neighbors, output_size=(128, 128),
-                            )
-                            vec = pairwise_vector(
-                                pairwise_features(window, neighbors, fps=fps)
-                            )
-                            probs_np = predict_scene(
-                                cls_model, cls_scene_cfg, scene, vec, cls_device,
-                            )
-                            probs = torch.from_numpy(probs_np)
-                        else:
-                            crops = [w["crop"] if w is not None else None for w in window]
-                            boxes = [w["bbox"] if w is not None else None for w in window]
-                            composite = generate_composite(
-                                crops, output_size=(128, 128), bboxes=boxes)
-                            img = composite.astype(np.float32) / 255.0
-                            inp = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(cls_device)
-                            with torch.no_grad():
-                                probs = torch.softmax(cls_model(inp), dim=1)[0].cpu()
-
-                        sorted_probs, sorted_idx = probs.sort(descending=True)
-                        conf = sorted_probs[0].item()
-                        pred_idx = sorted_idx[0].item()
-                        gap = (sorted_probs[0] - sorted_probs[1]).item() if len(sorted_probs) > 1 else conf
-
-                        if conf < self.nc_threshold or gap < self.uncertain_gap:
-                            beh_name = "NC"
-                        else:
-                            beh_name = cls_class_names[pred_idx]
-                        current_labels[obj_id] = (beh_name, conf)
-
-                        behavior_rows.append({
-                            "frame": frame_idx,
-                            "object_id": obj_id,
-                            "behavior": beh_name,
-                            "confidence": round(conf, 4),
-                            "gap": round(gap, 4),
-                        })
-
-                    return current_labels if current_labels else None
-
-                result = run_inference_on_video(
-                    video_path,
-                    self.model_dir,
-                    config,
+                result = infer_one_video(
+                    video_path, self.model_dir, config, cls_info,
+                    cls_window=self.cls_window, nc_threshold=self.nc_threshold,
+                    uncertain_gap=self.uncertain_gap, min_bout=self.min_bout,
+                    create_tracked_video=self.create_tracked_video,
                     progress=lambda f, t: self.progress.emit(f, t),
                     should_stop=_check_stop,
+                    stop_requested=lambda: self._stop_flag,
                     frame_callback=_on_frame,
-                    track_callback=_track_cb if cls_model else None,
-                    create_tracked_video=self.create_tracked_video,
+                    run_info={"classifier": self.classifier_dir},
                 )
-                result["video_path"] = video_path
-
-                if self._stop_flag:
-                    out_dir = result.get("output_dir", "")
-                    if out_dir and os.path.isdir(out_dir):
-                        import shutil
-                        shutil.rmtree(out_dir, ignore_errors=True)
-                        print(f"[MTT Inference] Removed incomplete output: {out_dir}")
+                if result.get("stopped"):
                     break
-
-                if behavior_rows:
-                    per_obj_first = {}
-                    for row in behavior_rows:
-                        oid = row["object_id"]
-                        if oid not in per_obj_first:
-                            per_obj_first[oid] = row
-                    backfill = []
-                    for oid, first_row in per_obj_first.items():
-                        first_frame = first_row["frame"]
-                        for fi in range(first_frame):
-                            backfill.append({
-                                "frame": fi,
-                                "object_id": oid,
-                                "behavior": first_row["behavior"],
-                                "confidence": first_row["confidence"],
-                                "gap": first_row["gap"],
-                            })
-                    if backfill:
-                        behavior_rows = backfill + behavior_rows
-
-                    self._apply_min_bout_filter(behavior_rows, self.min_bout)
-
-                    import csv
-                    out_dir = result.get("output_dir", "")
-                    beh_csv = os.path.join(out_dir, "behavior_predictions.csv")
-                    fieldnames = ["frame", "object_id", "behavior", "confidence", "gap"]
-                    behavior_rows.sort(key=lambda r: (r["object_id"], r["frame"]))
-                    with open(beh_csv, "w", newline="") as f:
-                        w = csv.DictWriter(f, fieldnames=fieldnames)
-                        w.writeheader()
-                        w.writerows(behavior_rows)
-                    result["behavior_csv"] = beh_csv
-                    n_pred = len(behavior_rows)
-                    n_nc = sum(1 for r in behavior_rows if r["behavior"] == "NC")
-                    n_objs = len(set(r["object_id"] for r in behavior_rows))
-                    print(f"[Classifier Inference] Saved {n_pred} predictions "
-                          f"({n_nc} NC) for {n_objs} objects → {beh_csv}")
-
                 self.video_finished.emit(result)
 
             self.all_done.emit()
@@ -2057,8 +2775,8 @@ class _ClassifierTrainWorker(QThread):
         from torchvision import transforms, models
 
         from .behavior_classifier import (
-            INPUT_KIND_SCENE, build_scene_model, feature_stats,
-            normalize_features,
+            INPUT_KIND_SCENE, build_scene_model, classification_report,
+            feature_stats, grouped_split, normalize_features,
         )
         from .silhouette_extractor import (
             PAIRWISE_FIELDS, load_clip_masks_npz, scene_sample_from_clip,
@@ -2097,6 +2815,8 @@ class _ClassifierTrainWorker(QThread):
         images: list = []
         vectors: list = []
         kept_labels: list = []
+        kept_videos: list = []
+        kept_clips: list = []
         n_social = 0
         cache: Dict[str, Dict] = {}
         for sample, label in zip(samples, labels):
@@ -2117,6 +2837,8 @@ class _ClassifierTrainWorker(QThread):
             images.append(scene)
             vectors.append(vec)
             kept_labels.append(label)
+            kept_videos.append(sample.get("video") or "")
+            kept_clips.append(clip_dir)
             if len(masks_dict) > 1:
                 n_social += 1
         cache.clear()
@@ -2181,28 +2903,53 @@ class _ClassifierTrainWorker(QThread):
             if aug_list:
                 aug_transform = transforms.Compose(aug_list)
 
-        n_total = len(images)
-        n_val = max(1, int(n_total * val_split)) if val_split > 0 else 0
-
-        if n_val > 0:
-            import random as _rnd
-            from collections import defaultdict as _ddict
-            per_class: dict[int, list[int]] = _ddict(list)
-            for i, lbl in enumerate(labels):
-                per_class[lbl].append(i)
-
-            train_idx, val_idx = [], []
-            for cls_id, idxs in per_class.items():
-                _rnd.shuffle(idxs)
-                n_cls_val = max(1, int(len(idxs) * val_split))
-                val_idx.extend(idxs[:n_cls_val])
-                train_idx.extend(idxs[n_cls_val:])
-
-            if not train_idx:
-                train_idx = val_idx[:]
-        else:
-            train_idx = list(range(n_total))
+        # Whole source videos are held out, never individual samples: the same
+        # huddle seen from each of its two mice, or the next clip of the same
+        # session, would otherwise sit on both sides of the split and score
+        # memory of the session instead of recognition of the behaviour.
+        train_idx, val_idx, split_info = grouped_split(
+            labels, kept_videos, kept_clips, val_split,
+            seed=int(self.config.get("split_seed", 0)),
+        )
+        if not train_idx:
+            train_idx = val_idx[:]
             val_idx = []
+        if val_idx:
+            held = split_info["val_units"]
+            if split_info["unit"] == "video":
+                self.log_message.emit(
+                    f"[Classifier] Validation: {len(held)} of "
+                    f"{split_info['n_units']} source videos held out whole"
+                )
+                for v in held:
+                    self.log_message.emit(f"[Classifier]   val video: {v}")
+            else:
+                self.log_message.emit(
+                    f"[Classifier] ⚠ All clips come from one video, so validation "
+                    f"holds out {len(held)} whole clips of that video. The score is "
+                    f"optimistic: label clips from more videos for an honest one."
+                )
+        for c in split_info["train_only_classes"]:
+            self.log_message.emit(
+                f"[Classifier] ⚠ '{class_names[c]}' comes from a single "
+                f"{split_info['unit']}, so it stays in training and is not validated."
+            )
+        for c in split_info["classes_without_val"]:
+            if c not in split_info["train_only_classes"] and val_idx:
+                self.log_message.emit(
+                    f"[Classifier] ⚠ '{class_names[c]}' has no validation examples."
+                )
+        with open(os.path.join(output_dir, "split.json"), "w") as f:
+            json.dump({
+                "unit": split_info["unit"],
+                "seed": split_info["seed"],
+                "val_fraction": val_split,
+                "val_units": split_info["val_units"],
+                "per_class": {class_names[c]: v
+                              for c, v in split_info["per_class"].items()},
+                "train_only_classes": [class_names[c]
+                                       for c in split_info["train_only_classes"]],
+            }, f, indent=2)
 
         # Whitening statistics come from the training split alone, so the
         # validation score is not quietly inflated by having seen the
@@ -2218,16 +2965,16 @@ class _ClassifierTrainWorker(QThread):
         n_val = len(val_idx)
 
         self.log_message.emit(
-            f"[Classifier] Split: {n_train} train, {n_val} val (stratified per class)"
+            f"[Classifier] Split: {n_train} train, {n_val} val "
+            f"(held out by {split_info['unit']})"
         )
 
         n_classes = len(class_names)
 
-        from collections import Counter as _Counter
-        train_counts = _Counter(train_ds.targets if hasattr(train_ds, "targets") else train_labels)
         for cls_idx, cls_name in enumerate(class_names):
-            cnt = train_counts.get(cls_idx, 0)
-            self.log_message.emit(f"[Classifier]   {cls_name}: {cnt} train")
+            c = split_info["per_class"].get(cls_idx, {"train": 0, "val": 0})
+            self.log_message.emit(
+                f"[Classifier]   {cls_name}: {c['train']} train, {c['val']} val")
 
         if n_train < 10 * n_classes:
             self.log_message.emit(
@@ -2291,6 +3038,8 @@ class _ClassifierTrainWorker(QThread):
         all_train_losses = []
         all_val_losses = []
         best_val_acc = 0.0
+        best_report = None
+        epoch_metrics: list = []
 
         for epoch in range(1, epochs + 1):
             if self._stop_flag:
@@ -2319,8 +3068,8 @@ class _ClassifierTrainWorker(QThread):
             if val_loader is not None:
                 model.eval()
                 v_loss = 0.0
-                correct = 0
-                total = 0
+                y_true: list = []
+                y_pred: list = []
                 with torch.no_grad():
                     for imgs, feats, targets in val_loader:
                         imgs = imgs.to(device)
@@ -2328,29 +3077,36 @@ class _ClassifierTrainWorker(QThread):
                         targets = targets.to(device)
                         outputs = model(imgs, feats)
                         v_loss += criterion(outputs, targets).item()
-                        preds = outputs.argmax(dim=1)
-                        correct += (preds == targets).sum().item()
-                        total += targets.size(0)
+                        y_pred.extend(outputs.argmax(dim=1).cpu().tolist())
+                        y_true.extend(targets.cpu().tolist())
                 val_loss = v_loss / max(len(val_loader), 1)
-                val_acc = correct / max(total, 1)
+                report = classification_report(y_true, y_pred, n_classes)
+                val_acc = report["accuracy"]
+                epoch_metrics.append(report)
+                # Plain accuracy is mostly the commonest behaviour; balanced
+                # accuracy and macro F1 weight every behaviour equally.
+                scores = (f"val_acc={val_acc:.1%}  "
+                          f"bal_acc={report['balanced_accuracy']:.1%}  "
+                          f"macro_F1={report['macro_f1']:.2f}")
 
                 all_val_losses.append(val_loss)
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     best_epoch = epoch
                     best_val_acc = val_acc
+                    best_report = report
                     patience_counter = 0
                     torch.save(model.state_dict(),
                                os.path.join(output_dir, "best_classifier.pth"))
                     self.log_message.emit(
                         f"[Classifier] Epoch {epoch}/{epochs}  train_loss={train_loss:.4f}  "
-                        f"val_loss={val_loss:.4f}  val_acc={val_acc:.1%}  ★ best"
+                        f"val_loss={val_loss:.4f}  {scores}  ★ best"
                     )
                 else:
                     patience_counter += 1
                     self.log_message.emit(
                         f"[Classifier] Epoch {epoch}/{epochs}  train_loss={train_loss:.4f}  "
-                        f"val_loss={val_loss:.4f}  val_acc={val_acc:.1%}  "
+                        f"val_loss={val_loss:.4f}  {scores}  "
                         f"(patience {patience_counter}/{patience})"
                     )
             else:
@@ -2398,12 +3154,43 @@ class _ClassifierTrainWorker(QThread):
         log_path = os.path.join(output_dir, "training_log.csv")
         with open(log_path, "w", newline="") as lf:
             writer = _csv.writer(lf)
-            writer.writerow(["epoch", "train_loss", "val_loss", "val_acc"])
+            writer.writerow(["epoch", "train_loss", "val_loss", "val_acc",
+                             "val_balanced_acc", "val_macro_f1"])
             for ei in range(len(all_train_losses)):
-                t_loss = all_train_losses[ei]
-                v_loss = all_val_losses[ei] if ei < len(all_val_losses) else ""
-                v_acc = ""
-                writer.writerow([ei + 1, f"{t_loss:.6f}", v_loss if v_loss == "" else f"{v_loss:.6f}", v_acc])
+                row = [ei + 1, f"{all_train_losses[ei]:.6f}"]
+                if ei < len(all_val_losses) and ei < len(epoch_metrics):
+                    m = epoch_metrics[ei]
+                    row += [f"{all_val_losses[ei]:.6f}", f"{m['accuracy']:.4f}",
+                            f"{m['balanced_accuracy']:.4f}", f"{m['macro_f1']:.4f}"]
+                else:
+                    row += ["", "", "", ""]
+                writer.writerow(row)
+
+        # Per-behaviour scores at the best epoch: the confusion matrix (rows
+        # are the labelled behaviour, columns what the model said) shows which
+        # behaviours it mixes up, which one accuracy figure cannot.
+        per_class_out = None
+        if best_report is not None:
+            cm = best_report["confusion"]
+            with open(os.path.join(output_dir, "val_confusion.csv"), "w",
+                      newline="") as cf:
+                cw = _csv.writer(cf)
+                cw.writerow(["labelled / predicted"] + list(class_names))
+                for ci, cname in enumerate(class_names):
+                    cw.writerow([cname] + [int(x) for x in cm[ci]])
+
+            def _num(x):
+                return None if x != x else round(float(x), 4)  # NaN -> null
+
+            per_class_out = {
+                cname: {
+                    "n_val": int(best_report["support"][ci]),
+                    "precision": _num(best_report["precision"][ci]),
+                    "recall": _num(best_report["recall"][ci]),
+                    "f1": _num(best_report["f1"][ci]),
+                }
+                for ci, cname in enumerate(class_names)
+            }
 
         # Save training summary
         summary_out = {
@@ -2422,6 +3209,11 @@ class _ClassifierTrainWorker(QThread):
             "batch_size": batch_size,
             "n_train": n_train,
             "n_val": n_val,
+            "val_held_out_by": split_info["unit"],
+            "best_val_balanced_acc": (best_report["balanced_accuracy"]
+                                      if best_report else None),
+            "best_val_macro_f1": best_report["macro_f1"] if best_report else None,
+            "val_per_class": per_class_out,
             "early_stopping": early_stopping,
         }
         with open(os.path.join(output_dir, "training_summary.json"), "w") as sf:
@@ -2437,6 +3229,23 @@ class _ClassifierTrainWorker(QThread):
                 f"[Classifier] Best model: epoch {best_epoch}  "
                 f"val_loss={best_val_loss:.4f}  val_acc={best_val_acc:.1%}"
             )
+        if per_class_out:
+            self.log_message.emit(
+                f"[Classifier] Per behaviour at the best epoch "
+                f"(balanced acc {best_report['balanced_accuracy']:.1%}, "
+                f"macro F1 {best_report['macro_f1']:.2f}):"
+            )
+            for cname, m in per_class_out.items():
+                if m["n_val"] == 0:
+                    self.log_message.emit(f"[Classifier]   {cname}: not validated")
+                    continue
+                prec = "-" if m["precision"] is None else f"{m['precision']:.2f}"
+                self.log_message.emit(
+                    f"[Classifier]   {cname}: recall {m['recall']:.2f}  "
+                    f"precision {prec}  F1 {m['f1']:.2f}  (n={m['n_val']})"
+                )
+            self.log_message.emit(
+                "[Classifier] Confusion matrix: val_confusion.csv")
 
         if all_train_losses and all_val_losses:
             final_train = all_train_losses[-1]
@@ -3042,13 +3851,15 @@ class SystemProfileWorker(QThread):
 # Main window
 # ======================================================================
 class MaskTrackerWindow(QMainWindow):
-    BASE_TITLE = "FNT Mask Tracker Tool"
+    BASE_TITLE = "Mask Tracker"
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle(self.BASE_TITLE)
-        self.setMinimumSize(1100, 750)
-        self.resize(1400, 900)
+        self._fit_to_screen()
+        # Labeling keys reach the frame whatever was clicked last (see
+        # eventFilter).
+        QApplication.instance().installEventFilter(self)
         self.setStyleSheet(DARK_STYLESHEET)
 
         self._project_dir: Optional[str] = None
@@ -3076,6 +3887,9 @@ class MaskTrackerWindow(QMainWindow):
         # (-1 = unknown), so sequential stepping can skip the seek.
         self._video_cap_path: Optional[str] = None
         self._video_cap_pos: int = -1
+        # Recently decoded frames of that file (index -> BGR), so stepping
+        # back is not a keyframe seek per press; see _read_video_frame.
+        self._video_frame_cache: "OrderedDict[int, np.ndarray]" = OrderedDict()
 
         # Timeline under the preview: the video its ticks belong to, and the
         # queue row behind each tick so Space can open that frame.
@@ -3087,6 +3901,16 @@ class MaskTrackerWindow(QMainWindow):
         self.current_frame_idx: int = -1
         self._output_dir: Optional[str] = None
         self._skip_delete_frame_warning: bool = False
+        # Frame filenames the queue is limited to (--focus), None = every frame
+        # in training_frames/.
+        self._focus_names: Optional[set] = None
+        # Started from the command line: opening a project must not stop at a
+        # question nobody is there to answer.
+        self._launched: bool = False
+        # YOLO input size for the next run; None = the 640 default.
+        self._imgsz_override: Optional[int] = None
+        self._mosaic_override: Optional[float] = None
+        self._copy_paste_override: Optional[float] = None
 
         self._segmenter = None
         self._sam2_worker: Optional[SAM2LoadWorker] = None
@@ -3119,6 +3943,69 @@ class MaskTrackerWindow(QMainWindow):
         self._tab_anim_timer = QTimer(self)
         self._tab_anim_timer.timeout.connect(self._update_tab_animations)
         self._tab_anim_timer.start(150)
+
+    #: Keys that act on the frame being labeled, whichever widget has focus.
+    _LABELING_KEYS = (Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter, Qt.Key_N,
+                      Qt.Key_B, Qt.Key_E, Qt.Key_M, Qt.Key_U, Qt.Key_S, Qt.Key_A,
+                      Qt.Key_P, Qt.Key_X, Qt.Key_R, Qt.Key_D, Qt.Key_Delete,
+                      Qt.Key_V, Qt.Key_Escape)
+
+    def eventFilter(self, obj, event):
+        """Send the labeling keys to the preview from anywhere in this window.
+
+        Keys only reach the widget with keyboard focus. After a click on the
+        Mark as Empty Frame button, the frame list or any other control, Space
+        pressed that control (unmarking the frame it had just marked) or did
+        nothing, instead of moving to the next frame. Text entry -- spin boxes,
+        line edits, editable combos -- keeps its keys.
+        """
+        if (event.type() == event.KeyPress and isinstance(obj, QWidget)
+                and obj is not self.preview and obj.window() is self
+                and event.key() in self._LABELING_KEYS
+                and self.tab_widget.currentIndex() == 0
+                and self.preview.annotation_keys_enabled
+                and not isinstance(obj, (QLineEdit, QAbstractSpinBox, QTextEdit))
+                and not (isinstance(obj, QComboBox) and obj.isEditable())):
+            self.preview.setFocus(Qt.OtherFocusReason)
+            self.preview.keyPressEvent(event)
+            return True
+        # Left/Right scrub the source video from anywhere on the Mask tab: the frame
+        # list (focused after a click or at startup) used to swallow them.
+        if (event.type() == event.KeyPress and isinstance(obj, QWidget)
+                and obj is not self and obj.window() is self
+                and event.key() in (Qt.Key_Left, Qt.Key_Right)
+                and self.tab_widget.currentIndex() == 0
+                and not isinstance(obj, (QLineEdit, QAbstractSpinBox, QTextEdit,
+                                         QAbstractSlider))
+                and not (isinstance(obj, QComboBox) and obj.isEditable())):
+            self.keyPressEvent(event)
+            return True
+        return super().eventFilter(obj, event)
+
+    def _on_e_key(self):
+        """E: mark the queue frame empty; in a source video, extract the frame."""
+        if self._annot_in_video_mode and self._video_cap is not None:
+            self._extract_frame_from_video()
+        else:
+            self._toggle_empty_frame()
+
+    def _fit_to_screen(self):
+        """Open at 90% of the screen's free area (at least 1400 x 900 where it
+        fits) and never larger than the screen: the fixed 1400 x 900 with a
+        1100 x 750 minimum hung off the bottom of a 768-px laptop screen and
+        left most of a 1920 x 1080 one unused."""
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            self.setMinimumSize(1100, 750)
+            self.resize(1400, 900)
+            return
+        avail = screen.availableGeometry()
+        self.setMinimumSize(min(1100, avail.width()), min(750, avail.height()))
+        w = min(avail.width(), max(1400, int(avail.width() * 0.9)))
+        h = min(avail.height(), max(900, int(avail.height() * 0.9)))
+        self.resize(w, h)
+        self.move(avail.x() + (avail.width() - w) // 2,
+                  avail.y() + (avail.height() - h) // 2)
 
     @staticmethod
     def _build_mouse_sprites() -> list:
@@ -3273,6 +4160,24 @@ class MaskTrackerWindow(QMainWindow):
         act_rebuild.triggered.connect(self._rebuild_source_links)
         file_menu.addAction(act_rebuild)
 
+        file_menu.addSeparator()
+        self.act_show_all_frames = QAction("Show All Frames", self)
+        self.act_show_all_frames.setToolTip(
+            "Leave the focus list (--focus) and show every frame in "
+            "training_frames/ again."
+        )
+        self.act_show_all_frames.setEnabled(False)
+        self.act_show_all_frames.triggered.connect(self.show_all_frames)
+        file_menu.addAction(self.act_show_all_frames)
+
+        act_predict = QAction("Predict Unreviewed Frames with a Model…", self)
+        act_predict.setToolTip(
+            "Run a trained model (a folder in models/) on the queue's frames that\n"
+            "have no accepted mask and are not marked empty; its masks replace\n"
+            "any earlier predictions there, for review.")
+        act_predict.triggered.connect(lambda _=False: self._predict_queue_with_model())
+        file_menu.addAction(act_predict)
+
         edit_menu = menu_bar.addMenu("Edit")
         self.act_undo = QAction("Undo", self)
         self.act_undo.setShortcut("Ctrl+Z")
@@ -3302,6 +4207,10 @@ class MaskTrackerWindow(QMainWindow):
 
         # Left panel: tabs
         self.tab_widget = QTabWidget()
+        # The tab strip never takes keyboard focus: with it focused, Left/Right switch tabs
+        # instead of scrubbing frames (it is the first widget to get focus at startup).
+        self.tab_widget.setFocusPolicy(Qt.NoFocus)
+        self.tab_widget.tabBar().setFocusPolicy(Qt.NoFocus)
         fm = self.fontMetrics()
         min_w = max(300, fm.averageCharWidth() * 44 + 30)
         self.tab_widget.setMinimumWidth(min_w)
@@ -3341,6 +4250,7 @@ class MaskTrackerWindow(QMainWindow):
         right_layout.addWidget(self._preview_title_row)
 
         self.preview = AnnotationPreviewWidget()
+        self.preview.before_finish = self._pick_class_for_pending
         self.preview.annotation_accepted.connect(self._on_annotation_accepted)
         self.preview.ai_prediction_requested.connect(self._request_ai_prediction)
         self.preview.zoom_changed.connect(
@@ -3349,6 +4259,23 @@ class MaskTrackerWindow(QMainWindow):
         self.preview.mode_changed.connect(self._on_mode_changed)
         self.preview.advance_frame_requested.connect(self._on_advance_frame)
         self.preview.timeline_advance_requested.connect(self._on_timeline_advance)
+        self.preview.empty_frame_requested.connect(self._toggle_empty_frame)
+        self.preview.sam_toggle_requested.connect(lambda: self.btn_sam_toggle.toggle())
+        self.preview.e_key_requested.connect(self._on_e_key)
+        self.preview.queue_step_requested.connect(self._step_queue)
+        self.preview.skip_requested.connect(self._skip_frame)
+        self.preview.tool_requested.connect(self._on_tool_key)
+        self.preview.brush_radius_changed.connect(self._on_brush_radius_changed)
+        self.preview.edit_as_pending_requested.connect(self._edit_as_pending)
+        self.preview.review_requested.connect(self._on_review)
+        self.preview.prediction_selected.connect(self._update_review_label)
+        self.preview.replace_prediction_requested.connect(self._replace_prediction)
+        self.preview.edit_cancelled_restore.connect(self._restore_edited)
+        self.btn_view_masks.clicked.connect(
+            lambda _=False: self.preview.set_show_masks(not self.preview.show_masks))
+        self.preview.masks_view_changed.connect(
+            lambda on: self.btn_view_masks.setText("Frame + Masks (V)" if on else "Frame Only (V)"))
+        self.preview.sam_pending_changed.connect(lambda: self._show_sam_pending_status())
         self.preview.annotation_edited.connect(self._on_annotation_edited)
         self.preview.delete_annotation_requested.connect(self._on_delete_annotation_by_index)
         self.preview.approve_annotation_requested.connect(self._on_approve_annotation_by_index)
@@ -3358,11 +4285,23 @@ class MaskTrackerWindow(QMainWindow):
         self.preview.reassign_annotation_requested.connect(self._on_reassign_annotation)
         right_layout.addWidget(self.preview, 1)
 
+        # Tiles for "Several videos at once": in the preview's place while it runs.
+        self._infer_grid = InferenceGrid()
+        self._infer_grid.setVisible(False)
+        self._infer_grid_on = False
+        right_layout.addWidget(self._infer_grid, 1)
+
         # Source-video timeline directly under the preview (Mask tab only).
         self._scrubber_row = QWidget()
         scrub_layout = QHBoxLayout(self._scrubber_row)
         scrub_layout.setContentsMargins(5, 0, 5, 0)
         scrub_layout.setSpacing(8)
+        # Which video the timeline is: a focus session's queue jumps between
+        # clips (each frame was cut from its own), so the clip is named here.
+        self._lbl_scrub_video = QLabel("")
+        self._lbl_scrub_video.setStyleSheet("color: #bbbbbb; font-size: 10px;")
+        self._lbl_scrub_video.setMaximumWidth(330)
+        scrub_layout.addWidget(self._lbl_scrub_video)
         self._scrubber = FrameScrubber()
         self._scrubber.seek_requested.connect(self._on_scrubber_seek)
         scrub_layout.addWidget(self._scrubber, 1)
@@ -3433,27 +4372,30 @@ class MaskTrackerWindow(QMainWindow):
 
         self.lbl_active_class = QLabel("Class:")
         _tip_active_class = (
-            "Class assigned to each new mask you accept — no dialog per mask.\n"
-            "Press 1–9 to switch class while annotating; right-click a mask\n"
-            "for Change Class if you picked the wrong one."
+            "Class assigned to each new mask you accept with Enter — no dialog per mask.\n"
+            "A number key (1–9, 0) saves the pending mask as that class instead;\n"
+            "right-click a mask for Change Class if you picked the wrong one."
         )
         self.lbl_active_class.setToolTip(_tip_active_class)
-        info_layout.addWidget(self.lbl_active_class)
+        self._tools_class_row.addWidget(self.lbl_active_class)
         self.combo_active_class = QComboBox()
         self.combo_active_class.setToolTip(_tip_active_class)
         self.combo_active_class.setMinimumWidth(90)
-        info_layout.addWidget(self.combo_active_class)
+        self._tools_class_row.addWidget(self.combo_active_class, 1)
 
-        self.btn_sam_toggle = QPushButton("SAM Labeling")
+        self.btn_sam_toggle = QPushButton("SAM (M)")
         self.btn_sam_toggle.setCheckable(True)
         self.btn_sam_toggle.setChecked(False)
         self.btn_sam_toggle.setToolTip(
-            "Toggle SAM2 AI-assisted labeling mode.\n\n"
-            "When active, double-click on an object to place a\n"
-            "positive point. SAM2 will predict a segmentation mask.\n"
-            "Right-click to add negative (exclude) points.\n"
-            "Enter to accept the mask, or toggle off to cancel.\n\n"
-            "Single-click drag still pans the view while in SAM mode."
+            "SAM2-assisted labeling, as in MAD (shortcut M).\n\n"
+            "Click each mouse. A click on or near a pending mouse adds to it\n"
+            "(a foot or tail SAM missed); elsewhere it starts a new mouse.\n"
+            "Shift+click starts a new mouse even where two touch. Right-click\n"
+            "inside a mouse excludes that spot (e.g. the other of two mice);\n"
+            "Shift+right-click drops the mouse. Enter saves each mouse as its\n"
+            "own mask (mouse_1, mouse_2, ...).\n"
+            "U undoes, Esc clears; Enter saves and turns SAM off. Drag pans;\n"
+            "right-click a saved mask to edit it."
         )
         self._sam_toggle_off_style = (
             "QPushButton { background-color: #424242; color: #cccccc; font-weight: bold; "
@@ -3467,16 +4409,95 @@ class MaskTrackerWindow(QMainWindow):
         )
         self.btn_sam_toggle.setStyleSheet(self._sam_toggle_off_style)
         self.btn_sam_toggle.toggled.connect(self._on_sam_toggle)
-        info_layout.addWidget(self.btn_sam_toggle)
+        self._tools_row.addWidget(self.btn_sam_toggle)
 
         self.btn_sam_model = QPushButton("...")
         self.btn_sam_model.setFixedWidth(28)
         self.btn_sam_model.setToolTip("Change the SAM2 model used for AI labeling.")
         self.btn_sam_model.setStyleSheet(self._sam_toggle_off_style)
         self.btn_sam_model.clicked.connect(self._choose_sam2_model)
-        info_layout.addWidget(self.btn_sam_model)
+        self._tools_row.addWidget(self.btn_sam_model)
 
-        self.btn_edit_classes = QPushButton("Edit Object Classes")
+        self.btn_paint = QPushButton("Paint (P)")
+        self.btn_paint.setCheckable(True)
+        self.btn_paint.setToolTip(
+            "Paint pixels into a pending object (left-drag; starts a new object\n"
+            "off any object). Right-drag erases. Wheel = brush size, Ctrl+wheel\n"
+            "zooms. Enter saves each object as its own mask. Shortcut: P")
+        self.btn_paint.setStyleSheet(self._sam_toggle_off_style)
+        self.btn_paint.clicked.connect(
+            lambda checked: self._set_object_tool("paint" if checked else None))
+        self._tools_row.addWidget(self.btn_paint)
+
+        self.btn_erase = QPushButton("Eraser (X)")
+        self.btn_erase.setCheckable(True)
+        self.btn_erase.setToolTip(
+            "Erase pixels from pending objects (left-drag). Wheel = brush\n"
+            "size, Ctrl+wheel zooms. Shortcut: X")
+        self.btn_erase.setStyleSheet(self._sam_toggle_off_style)
+        self.btn_erase.clicked.connect(
+            lambda checked: self._set_object_tool("erase" if checked else None))
+        self._tools_row.addWidget(self.btn_erase)
+        for btn in (self.btn_sam_toggle, self.btn_paint, self.btn_erase):
+            btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        self.btn_clear_objects = QPushButton("Clear (Esc)")
+        self.btn_clear_objects.setToolTip(
+            "Drop the pending (unsaved) objects on this frame; the tool stays on.")
+        self.btn_clear_objects.clicked.connect(self._clear_pending_objects)
+        self._tools_edit_row.addWidget(self.btn_clear_objects)
+        self.btn_undo_tool = QPushButton("Undo (U)")
+        self.btn_undo_tool.setToolTip(
+            "Undo the last SAM click or Paint / Eraser stroke. Shortcut: U\n"
+            "(Ctrl+Z undoes saved masks.)")
+        self.btn_undo_tool.clicked.connect(self._undo_tool_step)
+        self._tools_edit_row.addWidget(self.btn_undo_tool)
+        for btn in (self.btn_clear_objects, self.btn_undo_tool):
+            btn.setStyleSheet(self._sam_toggle_off_style)
+            btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        self.btn_skip_frame = QPushButton("Skip (S)")
+        self.btn_skip_frame.setToolTip(
+            "Leave this frame as it is and go to the next frame still to\n"
+            "label (no decision recorded; unsaved SAM objects are dropped).\n"
+            "Past the last one it starts again at the first. Shortcut: S"
+        )
+        self.btn_skip_frame.setStyleSheet(
+            "QPushButton { background-color: #5a5a5a; color: white; font-weight: bold; "
+            "padding: 3px 6px; border-radius: 3px; }"
+            "QPushButton:hover { background-color: #6a6a6a; }"
+        )
+        self.btn_skip_frame.clicked.connect(lambda _=False: self._skip_frame())
+        self._queue_review_row.addWidget(self.btn_skip_frame)
+
+        self.btn_empty_frame = QPushButton("Mark as Empty Frame (E)")
+        self.btn_empty_frame.setCheckable(True)
+        self.btn_empty_frame.setToolTip(
+            "Mark this frame as holding no object (E).\n\n"
+            "An empty frame counts as reviewed: it trains as a background\n"
+            "image (negative example), Enter skips it, and post-training\n"
+            "inference leaves it alone. Marking drops the frame's pending\n"
+            "masks; a frame with an accepted mask cannot be marked. Click\n"
+            "again (or N) to unmark."
+        )
+        # Yellow to mark; red once the frame is marked empty.
+        self._empty_off_style = (
+            "QPushButton { background-color: #fbc02d; color: #1a1a1a; font-weight: bold; "
+            "padding: 3px 6px; border-radius: 3px; }"
+            "QPushButton:hover { background-color: #fdd835; }"
+        )
+        self._empty_on_style = (
+            "QPushButton { background-color: #c62828; color: white; font-weight: bold; "
+            "padding: 3px 6px; border-radius: 3px; border: 2px solid #ef5350; }"
+            "QPushButton:hover { background-color: #d32f2f; }"
+        )
+        self.btn_empty_frame.setStyleSheet(self._empty_off_style)
+        self.btn_empty_frame.clicked.connect(lambda _=False: self._toggle_empty_frame())
+        self._queue_review_row.addWidget(self.btn_empty_frame)
+        for btn in (self.btn_skip_frame, self.btn_empty_frame):
+            btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        self.btn_edit_classes = QPushButton("Edit Classes")
         self.btn_edit_classes.setStyleSheet(
             "QPushButton { background-color: #2979ff; color: white; font-weight: bold; "
             "padding: 3px 6px; border-radius: 3px; }"
@@ -3487,20 +4508,41 @@ class MaskTrackerWindow(QMainWindow):
             "(e.g. 'mouse'). These become the segmentation model's classes."
         )
         self.btn_edit_classes.clicked.connect(self._edit_classes)
-        info_layout.addWidget(self.btn_edit_classes)
+        self._tools_class_row.addWidget(self.btn_edit_classes)
 
+        # Zoom by click: - 100% + Fit (a trackpad pinch or the wheel is fiddly).
+        self.btn_zoom_out = QPushButton("−")
+        self.btn_zoom_in = QPushButton("+")
+        self.btn_zoom_fit = QPushButton("Fit")
+        for b, tip, slot, width in (
+                (self.btn_zoom_out, "Zoom out (also - key, scroll)",
+                 lambda _=False: self.preview.zoom_by(1 / 1.25), 26),
+                (self.btn_zoom_in, "Zoom in on the middle of the view (also + key, scroll)",
+                 lambda _=False: self.preview.zoom_by(1.25), 26),
+                (self.btn_zoom_fit, "Fit the whole frame to the view (100%)",
+                 lambda _=False: self.preview.fit_view(), 40)):
+            b.setFocusPolicy(Qt.NoFocus)        # the preview keeps the keys
+            b.setFixedSize(width, 22)
+            if b is not self.btn_zoom_fit:      # the app's button font makes +/- specks
+                b.setStyleSheet("QPushButton { font-size: 16px; font-weight: bold; padding: 0px; }")
+            b.setToolTip(tip)
+            b.clicked.connect(slot)
         self.lbl_zoom_info = QLabel("100%")
         self.lbl_zoom_info.setStyleSheet("color: #999999;")
-        self.lbl_zoom_info.setToolTip("Current zoom. Scroll to zoom, 0 resets, +/- step.")
+        self.lbl_zoom_info.setMinimumWidth(38)
+        self.lbl_zoom_info.setAlignment(Qt.AlignCenter)
+        self.lbl_zoom_info.setToolTip("Current zoom (100% = the whole frame fitted). "
+                                      "Scroll, +/- or the buttons zoom; Fit returns to 100%.")
+        info_layout.addWidget(self.btn_zoom_out)
         info_layout.addWidget(self.lbl_zoom_info)
+        info_layout.addWidget(self.btn_zoom_in)
+        info_layout.addWidget(self.btn_zoom_fit)
         right_layout.addWidget(info_row)
 
         # Store annotation-specific widgets for show/hide on tab switch
         self._annotation_bar_widgets = [
-            self.lbl_mode, self.lbl_frame_info, self.lbl_ann_stats,
-            self.lbl_active_class, self.combo_active_class,
-            self.btn_sam_toggle, self.btn_sam_model, self.btn_edit_classes,
-            self.lbl_zoom_info,
+            self.lbl_mode, self.lbl_frame_info, self.lbl_ann_stats, self.lbl_zoom_info,
+            self.btn_zoom_out, self.btn_zoom_in, self.btn_zoom_fit,
         ]
         # Classifier info label (hidden by default, shown on Classifier tab)
         self.lbl_classifier_info = QLabel("")
@@ -3613,8 +4655,9 @@ class MaskTrackerWindow(QMainWindow):
         btn_copy_seg_log.clicked.connect(self._copy_seg_train_log)
         training_viz_layout.addWidget(btn_copy_seg_log)
 
-        self._training_viz_panel.setVisible(False)
-        right_layout.addWidget(self._training_viz_panel, 1)
+        self._seg_preview_panel = SegPreviewPanel()
+        self._seg_train_window = SegTrainingWindow(
+            self, self._training_viz_panel, self._seg_preview_panel)
 
         # Classifier training visualization panel (hidden by default)
         self._cls_training_viz_panel = QWidget()
@@ -3684,7 +4727,10 @@ class MaskTrackerWindow(QMainWindow):
         # Frame column truncates every long video stem. An offset above
         # min_w (not a second character count) so it still widens when the
         # 300 px floor is what set min_w.
-        init_left = min(max_left, min_w + max(70, fm.averageCharWidth() * 10))
+        # On a wide window give the panel about a quarter of it, so the queue
+        # shows whole frame names (camera, date and frame number).
+        init_left = min(max_left, max(min_w + max(70, fm.averageCharWidth() * 10),
+                                      int(self.width() * 0.27)))
         splitter.setSizes([init_left, 800])
         right_panel.setMinimumWidth(300)
         self.tab_widget.setMaximumWidth(max_left)
@@ -3767,21 +4813,34 @@ class MaskTrackerWindow(QMainWindow):
         self._create_videos_section(layout)
         self._create_extraction_section(layout)
         self._create_frames_section(layout)
+        self._create_review_section(layout)
+        self._create_labeling_tools_section(layout)
 
         # Help text
         info = QLabel(
             "Right-click preview to add Manual Mask or Edit/Delete masks.\n"
             "Manual: click to place vertices, Enter to accept.\n"
-            "SAM: toggle SAM Labeling button, double-click to place points,\n"
-            "  right-click to exclude, Enter to accept.\n"
-            "Editing: drag vertices, right-click to insert one.\n"
-            "  Enter commits, Esc cancels; new masks are locked out until then.\n"
-            "Left-click + drag to pan. Scroll to zoom. Enter = next unlabeled frame.\n"
-            "Space = next queued frame on this video's timeline (Shift+Space = previous).\n"
+            "SAM (M): click each mouse; a click on or near a pending one adds to\n"
+            "  it (Shift+click = new one), right-click excludes; Enter saves each as\n"
+            "  its own mask. Paint (P) / Eraser (X): drag, wheel = brush size; a\n"
+            "  stroke away from the mask being edited starts a new one (Shift: always).\n"
+            "  U undoes a click or stroke; Shift+right-click drops an object.\n"
+            "Edit Mask (right-click a saved mask), or Paint / Eraser on it, brings\n"
+            "  it back (dashed) to reshape; Enter saves and turns the tool off.\n"
+            "Left-click + drag to pan. Scroll (or − / + / Fit, bottom right) to zoom. "
+            "Enter = next unlabeled frame.\n"
+            "Space = next frame in the queue, via this video's timeline (Shift+Space = back).\n"
+            "N / B = next / back in the queue. E = mark the frame empty (trains as a background).\n"
+            "Review: A accepts the bold prediction (click one to pick it), R rejects\n"
+            "  it, Shift+A accepts all on the frame. A SAM click on a prediction\n"
+            "  replaces it with SAM's mask.\n"
+            "S = skip: leave this frame and go to the next one still to label.\n"
             "Arrow keys scrub the source video (Shift ±10, Ctrl ±100); click the\n"
             "  timeline under the preview to seek.\n"
-            "1-9 = switch active class. Ctrl+Z / Ctrl+Shift+Z = undo / redo.\n"
-            "E = extract current video frame to Training Frames Queue."
+            "1-9, 0 = class: with a mask pending, save it as that class; else switch the active class.\n"
+            "Ctrl+Z / Ctrl+Shift+Z = undo / redo.\n"
+            "V = show / hide the masks.\n"
+            "In a source video (arrow keys), E extracts the frame to the queue."
         )
         info.setStyleSheet("color: #888888; font-size: 9px;")
         info.setWordWrap(True)
@@ -3806,6 +4865,8 @@ class MaskTrackerWindow(QMainWindow):
         # Training data summary (inline at top)
         self.lbl_train_annotations = QLabel("Total annotations: —")
         self.lbl_train_classes = QLabel("Classes: —")
+        # Wraps: with ten object classes one line was ~1,900 px and widened the panel.
+        self.lbl_train_classes.setWordWrap(True)
         for lbl in (self.lbl_train_annotations, self.lbl_train_classes):
             lbl.setStyleSheet("color: #cccccc; font-size: 11px;")
             train_vbox.addWidget(lbl)
@@ -3919,7 +4980,9 @@ class MaskTrackerWindow(QMainWindow):
             "  infrared or unusual imaging modalities)."
         )
         self.chk_freeze_backbone = QCheckBox("Freeze backbone (train heads only)")
-        self.chk_freeze_backbone.setChecked(True)
+        # Off: with the backbone frozen, the 8x8 zone model (37 frames) found
+        # a mouse in a third of the frames; trained whole, nearly all.
+        self.chk_freeze_backbone.setChecked(False)
         self.chk_freeze_backbone.setToolTip(tip_freeze)
         train_vbox.addWidget(self.chk_freeze_backbone)
 
@@ -3941,6 +5004,9 @@ class MaskTrackerWindow(QMainWindow):
         self.combo_optimizer = QComboBox()
         self.combo_optimizer.addItems(["AdamW", "SGD"])
         self.combo_optimizer.setToolTip(tip_optimizer)
+        self.combo_optimizer.currentTextChanged.connect(
+            lambda name: self.spin_lr.setValue(0.002 if name == "AdamW" else 0.01)
+            if hasattr(self, "spin_lr") else None)
         row.addWidget(self.combo_optimizer)
         train_vbox.addLayout(row)
 
@@ -4376,6 +5442,14 @@ class MaskTrackerWindow(QMainWindow):
         )
         self.btn_train.clicked.connect(self._start_training)
         train_vbox.addWidget(self.btn_train)
+
+        self.btn_show_train_window = QPushButton("Show Training Window")
+        self.btn_show_train_window.setToolTip(
+            "Bring back the training window: loss and mAP graph, log, and the\n"
+            "per-epoch prediction previews with Dice.")
+        self.btn_show_train_window.setEnabled(False)
+        self.btn_show_train_window.clicked.connect(lambda _=False: self._show_seg_train_window())
+        train_vbox.addWidget(self.btn_show_train_window)
 
         self.train_progress = QProgressBar()
         self.train_progress.setToolTip("Training progress across the configured iterations.")
@@ -4995,6 +6069,14 @@ class MaskTrackerWindow(QMainWindow):
         btn_clear_vids.setToolTip("Remove all videos from the queue.")
         btn_clear_vids.clicked.connect(self._clear_tracking_videos)
         vid_btn_row.addWidget(btn_clear_vids)
+        btn_exits = QPushButton("Exits...")
+        btn_exits.setToolTip(
+            "Draw each camera's exits (the openings in the wall where animals come\n"
+            "and go) for the queued videos' folders; saved as exits.json beside the\n"
+            "videos. Animal counts use them: an animal that vanishes at an exit has\n"
+            "left, one that vanishes anywhere else is hiding and stays counted.")
+        btn_exits.clicked.connect(self._open_exits)
+        vid_btn_row.addWidget(btn_exits)
         video_vbox.addLayout(vid_btn_row)
 
         self.list_track_videos = QListWidget()
@@ -5029,7 +6111,7 @@ class MaskTrackerWindow(QMainWindow):
         model_row.addWidget(btn_refresh_models)
         settings_vbox.addLayout(model_row)
 
-        self.lbl_track_model_info = QLabel("No model selected")
+        self.lbl_track_model_info = PathLabel("No model selected")
         self.lbl_track_model_info.setStyleSheet("color: #999999; font-size: 10px;")
         self.lbl_track_model_info.setWordWrap(True)
         settings_vbox.addWidget(self.lbl_track_model_info)
@@ -5084,6 +6166,23 @@ class MaskTrackerWindow(QMainWindow):
         row2.addWidget(self.combo_track_disappear)
         row2.addWidget(QLabel("frames"))
         settings_vbox.addLayout(row2)
+
+        row_step = QHBoxLayout()
+        row_step.addWidget(QLabel("Analyse every:"))
+        self.spin_track_step = QSpinBox()
+        self.spin_track_step.setRange(1, 300)
+        self.spin_track_step.setValue(1)
+        self.spin_track_step.setStyleSheet(self._spin_style)
+        self.spin_track_step.setToolTip(
+            "Detect and track every Nth frame only (1 = every frame).\n"
+            "3 on a 30 fps video = 10 positions per second, about 3x faster.\n"
+            "Frame numbers and times in the trajectories stay the video's;\n"
+            "the tracked video shows the analysed frames at fps / N.\n"
+            "Max disappear then counts analysed frames."
+        )
+        row_step.addWidget(self.spin_track_step)
+        row_step.addWidget(QLabel("frame(s)"))
+        settings_vbox.addLayout(row_step)
 
         row3 = QHBoxLayout()
         row3.addWidget(QLabel("IoU threshold:"))
@@ -5176,7 +6275,7 @@ class MaskTrackerWindow(QMainWindow):
         row_bcm.addWidget(btn_refresh_cls)
         cls_opts.addLayout(row_bcm)
 
-        self.lbl_behavior_model_info = QLabel("No classifier model found")
+        self.lbl_behavior_model_info = PathLabel("No classifier model found")
         self.lbl_behavior_model_info.setStyleSheet("color: #999999; font-size: 10px;")
         self.lbl_behavior_model_info.setWordWrap(True)
         cls_opts.addWidget(self.lbl_behavior_model_info)
@@ -5346,6 +6445,37 @@ class MaskTrackerWindow(QMainWindow):
         )
         ctrl_vbox.addWidget(self.chk_inference_preview)
 
+        row_par = QHBoxLayout()
+        self.chk_parallel_videos = QCheckBox("Several videos at once")
+        self.chk_parallel_videos.setChecked(False)
+        self.chk_parallel_videos.setToolTip(
+            "Track several queued videos at the same time, one worker process\n"
+            "per video. One video at a time leaves the GPU mostly idle: the\n"
+            "work around the model (reading, tracking, drawing, writing) runs\n"
+            "on the CPU one step after another, and separate workers overlap it.\n\n"
+            "The preview pane shows a small tile per running video. Each video's\n"
+            "outputs are the same as when it runs alone."
+        )
+        row_par.addWidget(self.chk_parallel_videos)
+        row_par.addStretch()
+        lbl_par = QLabel("At once:")
+        row_par.addWidget(lbl_par)
+        self.spin_parallel_videos = QSpinBox()
+        self.spin_parallel_videos.setRange(0, 16)
+        self.spin_parallel_videos.setSpecialValueText("Auto")
+        self.spin_parallel_videos.setValue(0)
+        self.spin_parallel_videos.setStyleSheet(self._spin_style)
+        self.spin_parallel_videos.setToolTip(
+            "How many videos run at once.\n\n"
+            "Auto: as many as this machine can take, the smallest of physical\n"
+            "CPU cores / 3, free GPU memory / 1.5 GB, available RAM / 3 GB,\n"
+            "8, and the number of queued videos.\n"
+            "A number: that many (never more than the queue)."
+        )
+        lbl_par.setToolTip(self.spin_parallel_videos.toolTip())
+        row_par.addWidget(self.spin_parallel_videos)
+        ctrl_vbox.addLayout(row_par)
+
         btn_row = QHBoxLayout()
         self.btn_start_tracking = QPushButton("Run Inference")
         self.btn_start_tracking.setStyleSheet(
@@ -5478,6 +6608,7 @@ class MaskTrackerWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _create_videos_section(self, layout):
         group = QGroupBox("Source Videos")
+        self._grp_videos = group
         vbox = QVBoxLayout()
         vbox.setSpacing(4)
 
@@ -5534,6 +6665,7 @@ class MaskTrackerWindow(QMainWindow):
 
     def _create_extraction_section(self, layout):
         group = QGroupBox("Frame Extraction")
+        self._grp_extraction = group
         vbox = QVBoxLayout()
         vbox.setSpacing(4)
 
@@ -5601,7 +6733,7 @@ class MaskTrackerWindow(QMainWindow):
         )
         row = QHBoxLayout()
         row.addWidget(_tipped_label("Output:", tip_output))
-        self.lbl_output_dir = QLabel("(auto)")
+        self.lbl_output_dir = PathLabel("(auto)")
         self.lbl_output_dir.setStyleSheet("color: #999999; font-size: 10px;")
         self.lbl_output_dir.setWordWrap(True)
         self.lbl_output_dir.setToolTip(tip_output)
@@ -5634,6 +6766,121 @@ class MaskTrackerWindow(QMainWindow):
         group.setLayout(vbox)
         layout.addWidget(group)
 
+    @staticmethod
+    def _review_btn_qss(bg: str, hover: str) -> str:
+        return (f"QPushButton {{ background-color: {bg}; color: white; font-weight: bold; "
+                f"padding: 3px 6px; border-radius: 3px; }}"
+                f"QPushButton:hover {{ background-color: {hover}; }}"
+                "QPushButton:disabled { background-color: #3a3a3a; color: #777777; }")
+
+    def _create_review_section(self, layout):
+        """Reviewing the model's masks, as MAD reviews its detections: the
+        prediction under review is drawn bold (click another to pick it); A
+        accepts it, R rejects it (deletes it; Ctrl+Z restores), Shift+A
+        accepts every prediction on the frame. Once a frame has none left the
+        next frame with predictions opens (Auto-advance)."""
+        group = QGroupBox("Review Predictions")
+        vbox = QVBoxLayout()
+        vbox.setSpacing(4)
+        self.lbl_review = QLabel("No predictions to review")
+        self.lbl_review.setStyleSheet("color: #999999; font-size: 10px;")
+        self.lbl_review.setWordWrap(True)
+        vbox.addWidget(self.lbl_review)
+
+        row1 = QHBoxLayout()
+        row1.setSpacing(2)
+        self.btn_accept_pred = QPushButton("Accept (A)")
+        self.btn_accept_pred.setToolTip(
+            "Accept the prediction under review (bold): it becomes a labeled\n"
+            "mask and trains the next model. Shortcut: A")
+        self.btn_accept_pred.setStyleSheet(self._review_btn_qss("#2d7a3a", "#379247"))
+        self.btn_accept_pred.clicked.connect(lambda _=False: self._on_review("accept"))
+        row1.addWidget(self.btn_accept_pred)
+        self.btn_reject_pred = QPushButton("Reject (R)")
+        self.btn_reject_pred.setToolTip(
+            "Reject the prediction under review: it is deleted (Ctrl+Z\n"
+            "restores it). To fix a nearly right mask instead, use Paint /\n"
+            "Eraser on it or right-click > Edit Mask. Shortcut: R (or D, Delete)")
+        self.btn_reject_pred.setStyleSheet(self._review_btn_qss("#8a2c2c", "#a83636"))
+        self.btn_reject_pred.clicked.connect(lambda _=False: self._on_review("reject"))
+        row1.addWidget(self.btn_reject_pred)
+        vbox.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.setSpacing(2)
+        self.btn_accept_all_pred = QPushButton("Accept All on Frame")
+        self.btn_accept_all_pred.setToolTip(
+            "Accept every prediction on this frame. Shortcut: Shift+A")
+        self.btn_accept_all_pred.clicked.connect(lambda _=False: self._on_review("accept_all"))
+        row2.addWidget(self.btn_accept_all_pred)
+        self.btn_next_review = QPushButton("Next to Review")
+        self.btn_next_review.setToolTip("Open the next frame that still has predictions.")
+        self.btn_next_review.clicked.connect(lambda _=False: self._next_review_frame())
+        row2.addWidget(self.btn_next_review)
+        vbox.addLayout(row2)
+
+        self.chk_review_auto = QCheckBox("Auto-advance after Accept/Reject")
+        self.chk_review_auto.setChecked(True)
+        self.chk_review_auto.setToolTip(
+            "On: once a frame has no predictions left (and keeps at least one\n"
+            "mask), the next frame with predictions opens.")
+        vbox.addWidget(self.chk_review_auto)
+        for w in (self.btn_accept_pred, self.btn_reject_pred, self.btn_accept_all_pred,
+                  self.btn_next_review, self.chk_review_auto):
+            w.setFocusPolicy(Qt.NoFocus)
+            if isinstance(w, QPushButton):
+                w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        group.setLayout(vbox)
+        layout.addWidget(group)
+
+    def _create_labeling_tools_section(self, layout):
+        """The labeling tools, in the left column as in MAD: SAM, Paint and
+        Eraser; Clear and Undo; the class new masks get. The bar under the
+        preview kept only the mode, frame and zoom. _build_ui makes the
+        buttons with the preview's other controls and places them here."""
+        group = QGroupBox("Labeling Tools")
+        vbox = QVBoxLayout()
+        vbox.setSpacing(4)
+        self._tools_row = QHBoxLayout()
+        self._tools_row.setSpacing(2)
+        self._tools_edit_row = QHBoxLayout()
+        self._tools_edit_row.setSpacing(2)
+        self._tools_class_row = QHBoxLayout()
+        self._tools_class_row.setSpacing(4)
+        self._tools_view_row = QHBoxLayout()
+        self._tools_view_row.setSpacing(4)
+        self._tools_view_row.addWidget(QLabel("View:"))
+        self.btn_view_masks = QPushButton("Frame + Masks (V)")
+        self.btn_view_masks.setToolTip(
+            "Show or hide the masks over the frame, to see the animal underneath\n"
+            "(as MAD's Spec + Mask / Spec only). Shortcut: V")
+        self.btn_view_masks.setFocusPolicy(Qt.NoFocus)
+        self._tools_view_row.addWidget(self.btn_view_masks)
+        self._tools_view_row.addStretch()
+        # The project's labelling rules (LABELING_GUIDE.md): hover to read,
+        # click to open or edit.
+        from fnt.labeling_guide import GuideButton
+        self.btn_guide = GuideButton()
+        self._tools_view_row.addWidget(self.btn_guide)
+        # The camera's region of interest: drawn once per project, applied
+        # to training frames and to every prediction of models trained here.
+        self.btn_roi = QPushButton("ROI")
+        self.btn_roi.setFocusPolicy(Qt.NoFocus)
+        self.btn_roi.clicked.connect(self._edit_roi)
+        self._tools_view_row.addWidget(self.btn_roi)
+        self.lbl_class_keys = QLabel("")
+        self.lbl_class_keys.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.lbl_class_keys.setStyleSheet("color: #aaaaaa; font-size: 10px;")
+        self.lbl_class_keys.setToolTip(
+            "Number keys: with a mask pending (SAM or Paint), save it as that class;\n"
+            "otherwise make that class the active one. 0 is the tenth class.")
+        for row in (self._tools_row, self._tools_edit_row, self._tools_class_row):
+            vbox.addLayout(row)
+        vbox.addWidget(self.lbl_class_keys)
+        vbox.addLayout(self._tools_view_row)
+        group.setLayout(vbox)
+        layout.addWidget(group)
+
     def _create_frames_section(self, layout):
         group = QGroupBox("Training Frames Queue")
         vbox = QVBoxLayout()
@@ -5644,6 +6891,9 @@ class MaskTrackerWindow(QMainWindow):
 
         self.frame_list = QTreeWidget()
         self.frame_list.setMaximumHeight(320)
+        # Shorten names in the middle: the frame number at the end is what
+        # tells neighbouring rows apart, the shared video-stem prefix is not.
+        self.frame_list.setTextElideMode(Qt.ElideMiddle)
         self.frame_list.setColumnCount(3)
         self.frame_list.setHeaderLabels(["Frame", "Annotations", "Conf"])
         self.frame_list.setToolTip(
@@ -5706,6 +6956,13 @@ class MaskTrackerWindow(QMainWindow):
         self.btn_shuffle.toggled.connect(self._on_shuffle_toggled)
         nav_row.addWidget(self.btn_shuffle)
         vbox.addLayout(nav_row)
+
+        # Skip (S) and Mark as Empty Frame (E) sit under the queue, as Skip
+        # sits under MAD's detections list. _build_ui makes the buttons.
+        self._queue_review_row = QHBoxLayout()
+        self._queue_review_row.setSpacing(4)
+        vbox.addLayout(self._queue_review_row)
+        vbox.addSpacing(10)       # keep the delete buttons apart from Skip / Empty
 
         delete_row = QHBoxLayout()
         delete_row.setSpacing(4)
@@ -5779,6 +7036,11 @@ class MaskTrackerWindow(QMainWindow):
             return
         os.makedirs(d, exist_ok=True)
         self._project_dir = d
+        if hasattr(self, "btn_guide"):
+            self.btn_guide.set_project(d)
+        self._project_config = {}
+        self._project_config_saved = None
+        self._refresh_roi()
         self._cls_data_loaded = False
         os.makedirs(os.path.join(d, "training_frames"), exist_ok=True)
         os.makedirs(os.path.join(d, "annotations"), exist_ok=True)
@@ -6015,6 +7277,12 @@ class MaskTrackerWindow(QMainWindow):
 
         if not to_rename:
             return
+        if self._launched:
+            # Renaming is optional housekeeping; never ask (or rename) on a
+            # command-line open. The next interactive open still offers it.
+            print(f"[MTT] {len(to_rename)} model folder(s) use the old naming "
+                  f"scheme; open the project interactively to rename them.")
+            return
 
         names = "\n".join(f"  • {old} → {new}" for _, _, old, new in to_rename)
         reply = QMessageBox.question(
@@ -6038,10 +7306,14 @@ class MaskTrackerWindow(QMainWindow):
         with open(config_path) as f:
             cfg = json.load(f)
         self._project_dir = os.path.dirname(config_path)
+        if hasattr(self, "btn_guide"):
+            self.btn_guide.set_project(self._project_dir)
         self._migrate_classifier_dir()
         self._migrate_model_folder_names()
         self._cls_data_loaded = False
         self._project_config = cfg
+        self._project_config_saved = copy.deepcopy(cfg)     # what is on disk (see _save_project_config)
+        self._refresh_roi()
 
         # Keep missing videos in the list (shown in red) instead of silently
         # dropping them — the user can relink after moving data or drives.
@@ -6095,11 +7367,15 @@ class MaskTrackerWindow(QMainWindow):
         self._rebuild_frame_confidence()
         self._refresh_frame_list()
 
-        self.setWindowTitle(f"{self.BASE_TITLE} — {os.path.basename(self._project_dir)}")
+        self._set_project_title()
         self.status_bar.showMessage(f"Opened project: {self._project_dir}")
         self._update_ann_stats()
         self._add_recent_project(config_path)
-        if missing:
+        if missing and self._launched:
+            self.status_bar.showMessage(
+                f"{len(missing)} project video(s) not found on disk — "
+                f"File > Locate Missing Videos... relinks them.", 10000)
+        elif missing:
             self._prompt_missing_videos(missing)
 
         # Refresh whichever tab is currently visible
@@ -6129,12 +7405,99 @@ class MaskTrackerWindow(QMainWindow):
             self._coco.export(ann_path)
         self.status_bar.showMessage(f"Project saved: {self._project_dir}")
 
+    def _refresh_roi(self):
+        """Show the project's ROI on the preview (the current frame's trial's own,
+        when it has one) and the ROI button."""
+        from .mtt_roi import ROI
+        roi = ROI.from_dict(self._project_config.get("roi"))
+        shown = roi.for_source(self._roi_source()) if roi is not None else None
+        self.preview.roi = shown
+        self.preview.update()
+        if hasattr(self, "btn_roi"):
+            self.btn_roi.setText("ROI" if roi is not None else "ROI (none)")
+            self.btn_roi.setToolTip(
+                "Region of interest: the area the model sees, and holes in it it ignores.\n"
+                + (f"This project: {roi.describe()}" + (
+                    f" (drawn on {roi.frame_size[0]}x{roi.frame_size[1]} frames)"
+                    if roi.frame_size else "") if roi is not None else "This project has none.")
+                + "\nApplied to training frames and to every prediction of models trained\n"
+                "with it; models trained before it was drawn are unaffected.\n"
+                "Click to draw it on the frame on screen.")
+
+    def _roi_source(self) -> Optional[str]:
+        """The source video of the frame on screen, for per-trial ROIs."""
+        try:
+            src = self._scrubber_source()
+        except Exception:
+            src = None
+        return src[0] if src else None
+
+    def _edit_roi(self):
+        if self._project_dir is None:
+            QMessageBox.information(self, "Region of interest", "Open a project first.")
+            return
+        frame = self.preview._image_rgb
+        if frame is None:
+            QMessageBox.information(self, "Region of interest",
+                                    "Show a frame first: the ROI is drawn on it.")
+            return
+        from .mtt_roi import ROI, trial_key
+        from .mtt_roi_editor import ROIEditorDialog
+        whole = ROI.from_dict(self._project_config.get("roi"))
+        src = self._roi_source()
+        trial = trial_key(src) if src else None
+        own = bool(whole is not None and trial and trial in whole.by_folder)
+        start = whole.for_source(src) if whole is not None else None
+        dlg = ROIEditorDialog(frame, start, self, trial=trial, own=own)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        roi = dlg.roi()
+        by = dict(whole.by_folder) if whole is not None else {}
+        if dlg.for_trial():
+            if roi is None:
+                by.pop(trial, None)
+            else:
+                by[trial] = roi
+            base = whole.base() if whole is not None and not whole.is_empty() else ROI()
+            base.by_folder = by
+            roi = None if base.is_empty() and not by else base
+        elif roi is not None:
+            roi.by_folder = by
+        elif by:
+            roi = ROI(by_folder=by)
+        if roi is None:
+            self._project_config.pop("roi", None)
+        else:
+            self._project_config["roi"] = roi.to_dict()
+        self._save_project_config()
+        self._refresh_roi()
+        self.status_bar.showMessage(
+            f"ROI saved: {roi.describe()}. Models trained from now on use it."
+            if roi is not None else "ROI removed: models trained from now on see whole frames.")
+
     def _save_project_config(self):
         if self._project_dir is None:
             return
         path = os.path.join(self._project_dir, "project_config.json")
+        # Another window or a script may have changed the file since this one
+        # read it (an ROI drawn elsewhere, per-trial outlines): keep their
+        # value of every setting this window has not changed itself.
+        base = getattr(self, "_project_config_saved", None)
+        if base is not None and os.path.exists(path):
+            try:
+                with open(path) as f:
+                    disk = json.load(f)
+            except (OSError, ValueError):
+                disk = None
+            if isinstance(disk, dict):
+                missing = object()
+                for k, v in disk.items():
+                    if (base.get(k, missing) != v
+                            and self._project_config.get(k, missing) == base.get(k, missing)):
+                        self._project_config[k] = v
         with open(path, "w") as f:
             json.dump(self._project_config, f, indent=2)
+        self._project_config_saved = copy.deepcopy(self._project_config)
 
     def _autosave_project_config(self):
         """Persist video list + classes immediately, like annotations already do.
@@ -6474,6 +7837,7 @@ class MaskTrackerWindow(QMainWindow):
         self._video_cap = cap
         self._video_cap_path = path
         self._video_cap_pos = 0
+        self._video_frame_cache.clear()
         self._video_frame_idx = 0
         self._video_frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self._video_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -6500,21 +7864,56 @@ class MaskTrackerWindow(QMainWindow):
             self._video_cap = None
         self._video_cap_path = None
         self._video_cap_pos = -1
+        self._video_frame_cache.clear()
         self._video_frame_count = 0
         self._video_frame_idx = 0
+
+    VIDEO_CACHE_BYTES = 512 * 1024 * 1024
+
+    def _read_video_frame(self, frame_idx: int) -> Optional[np.ndarray]:
+        """Frame ``frame_idx`` of the open video (BGR), or None.
+
+        Stepping to the very next frame skips the seek: one decode per arrow
+        press. Stepping back used to seek every press, and a seek decodes
+        forward from the previous keyframe (~1 s per press over the network),
+        so holding Left crawled while Right flew. Decoded frames are now kept
+        (up to VIDEO_CACHE_BYTES), and stepping back past them fetches the
+        block that ends at the target with one seek.
+        """
+        cache = self._video_frame_cache
+        if frame_idx in cache:
+            cache.move_to_end(frame_idx)
+            return cache[frame_idx]
+        cap = self._video_cap
+        start = frame_idx
+        if self._video_cap_pos != frame_idx:
+            if cache:
+                max_frames = max(1, self.VIDEO_CACHE_BYTES // next(iter(cache.values())).nbytes)
+                block = max(1, max_frames // 2)
+                if any(frame_idx < k <= frame_idx + block for k in cache):  # stepping back
+                    start = max(0, frame_idx - block + 1)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+        frame = None
+        for i in range(start, frame_idx + 1):
+            ret, frame = cap.read()
+            if not ret:
+                self._video_cap_pos = -1
+                return None
+            cache[i] = frame
+            cache.move_to_end(i)
+        self._video_cap_pos = frame_idx + 1
+        max_frames = max(1, self.VIDEO_CACHE_BYTES // frame.nbytes)
+        while len(cache) > max_frames:
+            cache.popitem(last=False)
+        return frame
 
     def _show_video_frame(self, frame_idx: int):
         if self._video_cap is None:
             return
         frame_idx = max(0, min(frame_idx, self._video_frame_count - 1))
         self._video_frame_idx = frame_idx
-        # Stepping to the very next frame skips the seek: one decode per
-        # arrow press instead of a keyframe seek plus decode-forward.
-        if self._video_cap_pos != frame_idx:
-            self._video_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        ret, frame = self._video_cap.read()
-        self._video_cap_pos = frame_idx + 1 if ret else -1
-        if ret:
+        frame = self._read_video_frame(frame_idx)
+        if frame is not None:
             if self.preview.annotations:
                 self.preview.annotations.clear()
             self.preview.set_frame(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
@@ -6591,8 +7990,12 @@ class MaskTrackerWindow(QMainWindow):
                 "No source video linked to this frame" if showing_frame else ""
             )
             self._lbl_scrub_time.setText("")
+            self._lbl_scrub_video.setText("")
+            self._lbl_scrub_video.setToolTip("")
             return
         vpath, pos = src
+        if getattr(self, "_project_config", None) and self._project_config.get("roi", {}).get("by_folder"):
+            self._refresh_roi()             # per-trial ROI: this frame's trial's
         # Keep the video playhead on the frame being labeled, so selecting
         # this video in the list opens here rather than at frame 0.
         self._video_frame_idx = pos
@@ -6604,6 +8007,15 @@ class MaskTrackerWindow(QMainWindow):
         self._lbl_scrub_time.setText(
             f"frame {pos:,} · {FrameScrubber.format_timecode(pos, self._video_fps)}"
         )
+        n_here = len(self._scrubber_rows)
+        name = f"{os.path.basename(os.path.dirname(vpath))}/{os.path.splitext(os.path.basename(vpath))[0]}"
+        text = f"{name} · {n_here} in queue"
+        fm = QFontMetrics(self._lbl_scrub_video.font())
+        self._lbl_scrub_video.setText(fm.elidedText(text, Qt.ElideMiddle, 330))
+        self._lbl_scrub_video.setToolTip(
+            f"Timeline: {vpath}\n{n_here} frame(s) of the queue were cut from this video "
+            f"(the ticks). A focus session's queue moves between videos, so the timeline "
+            f"follows the frame on screen.")
 
     def _rebuild_scrubber_marks(self):
         """Recompute the tick for every queue frame cut from the timeline's video."""
@@ -6652,11 +8064,42 @@ class MaskTrackerWindow(QMainWindow):
         self._scrubber_vpath = None  # force the ticks to be recomputed
         self._sync_scrubber()
 
+    def _queue_row_at(self, vpath: str, fidx: int) -> Optional[int]:
+        """The queue row of frame ``fidx`` of ``vpath``, if that frame is in
+        the Training Frames Queue."""
+        if vpath == self._scrubber_vpath and fidx in self._scrubber_rows:
+            return self._scrubber_rows[fidx]
+        for row, (v, f, _) in enumerate(self._extracted_frames):
+            if v == vpath and f == fidx:
+                return row
+        return None
+
+    def _go_to_source_frame(self, vpath: str, fidx: int):
+        """Show frame ``fidx`` of the source video: a frame that is in the queue
+        opens as the queue frame, with its masks and predictions (stepping onto
+        a labeled frame with the arrows used to show it bare); any other frame
+        opens in video mode."""
+        row = self._queue_row_at(vpath, fidx)
+        if row is not None:
+            cur = self.frame_list.currentItem()
+            if cur is not None and cur.data(0, Qt.UserRole) == row:
+                # Still the list's current item after a trip into the video:
+                # selecting it again would not signal, so load it directly.
+                self._on_frame_item_changed(cur, None)
+            else:
+                self._select_frame_row(row)
+        elif self._annot_in_video_mode and vpath == self._video_cap_path:
+            self._show_video_frame(fidx)
+        else:
+            # From a queue frame, the arrows step out into the video it was
+            # cut from.
+            self._enter_video_mode_at(vpath, fidx)
+
     def _on_scrubber_seek(self, frame_idx: int):
         src = self._scrubber_source()
         if src is None:
             return
-        self._enter_video_mode_at(src[0], frame_idx)
+        self._go_to_source_frame(src[0], frame_idx)
         self.preview.setFocus()
 
     def _on_timeline_advance(self, direction: int):
@@ -6679,14 +8122,111 @@ class MaskTrackerWindow(QMainWindow):
             self._enter_video_mode_at(src[0], target)
             return
         wrapped = (target <= pos) if direction >= 0 else (target >= pos)
-        if wrapped and len(self._scrubber_rows) > 1:
-            self.status_bar.showMessage(
-                "Wrapped to the first queued frame of this video"
-                if direction >= 0 else
-                "Wrapped to the last queued frame of this video",
-                2500,
-            )
+        if wrapped:
+            # Past this video's last (first) queued frame: carry on through the
+            # queue instead of wrapping back within the video, which made Space
+            # bounce between the two frames of a two-frame clip.
+            self._step_queue(direction)
+            return
         self._select_frame_row(row)
+
+    def _step_queue(self, direction: int):
+        """Select the next (direction > 0) or previous queue row, in the order
+        the list shows; wraps at the ends with a status message."""
+        n = self.frame_list.topLevelItemCount()
+        if n == 0:
+            return
+        pos = next((i for i in range(n)
+                    if self.frame_list.topLevelItem(i).data(0, Qt.UserRole)
+                    == self.current_frame_idx), -1)
+        nxt = pos + (1 if direction >= 0 else -1)
+        if nxt >= n or nxt < 0:
+            nxt = 0 if direction >= 0 else n - 1
+            self.status_bar.showMessage(
+                "Wrapped to the start of the queue" if direction >= 0
+                else "Wrapped to the end of the queue", 2500)
+        row = self.frame_list.topLevelItem(nxt).data(0, Qt.UserRole)
+        if row is not None:
+            self._select_frame_row(row)
+
+    def _skip_frame(self):
+        """S / Skip: leave this frame undecided and go to the next frame still
+        to label, as Skip does in MAD. Unsaved SAM objects are dropped. The skip
+        is recorded on the frame (shown in the queue): skipped frames are the
+        ones the model got too wrong to fix by hand."""
+        self.preview._clear_drawing()
+        before = self.current_frame_idx
+        done = ""
+        if not self._annot_in_video_mode and 0 <= before < len(self._extracted_frames):
+            fp = self._extracted_frames[before][2]
+            filename = os.path.basename(fp)
+            n_total, n_inferred = self._count_annotations_for_file(filename)
+            if self._coco.is_image_empty(filename):
+                done = "empty"          # e.g. every prediction rejected: finished, not skipped
+            elif n_total > n_inferred:
+                done = "labelled"
+            else:
+                w = h = 0
+                if filename not in self._coco._image_id_map:
+                    img = cv2.imread(fp, cv2.IMREAD_UNCHANGED)
+                    h, w = (img.shape[:2] if img is not None else (0, 0))
+                self._coco.mark_skipped(filename, w, h)
+            self._update_frame_list_item(before)
+        self._next_frame()
+        if self.current_frame_idx == before:
+            self.status_bar.showMessage("Nothing else left to label in the queue", 4000)
+        elif done:
+            self.status_bar.showMessage(f"That frame is done ({done}), not skipped", 2500)
+        else:
+            self.status_bar.showMessage("Skipped: nothing changed on that frame", 2500)
+
+    def _toggle_empty_frame(self):
+        """Mark (or unmark) the current queue frame as empty: reviewed, holding
+        no object, so it trains as a background image."""
+        if self._annot_in_video_mode or not (
+                0 <= self.current_frame_idx < len(self._extracted_frames)):
+            self.status_bar.showMessage(
+                "Empty Frame applies to a frame in the Training Frames Queue.", 4000)
+            self._sync_empty_button()
+            return
+        _, _, fp = self._extracted_frames[self.current_frame_idx]
+        filename = os.path.basename(fp)
+        advance = False
+        if self._coco.is_image_empty(filename):
+            self._coco.set_image_empty(filename, 0, 0, empty=False)
+            self.status_bar.showMessage(f"{filename}: no longer marked empty", 4000)
+        else:
+            img = cv2.imread(fp, cv2.IMREAD_UNCHANGED)
+            h, w = (img.shape[:2] if img is not None else (0, 0))
+            if self._coco.set_image_empty(filename, w, h, empty=True) < 0:
+                self.status_bar.showMessage(
+                    "This frame has accepted masks; delete them to mark it empty.", 5000)
+                self._sync_empty_button()
+                return
+            self.status_bar.showMessage(f"{filename}: marked empty", 3000)
+            advance = True
+        self._frame_confidence.pop(filename, None)
+        self._load_frame_annotations(fp)
+        self._update_frame_list_item(self.current_frame_idx)
+        self._update_ann_stats()
+        self._sync_empty_button()
+        if advance:
+            self._next_frame()
+
+    def _sync_empty_button(self):
+        """The Empty Frame button shows the current frame's state."""
+        btn = getattr(self, "btn_empty_frame", None)
+        if btn is None:
+            return
+        empty = False
+        if not self._annot_in_video_mode and 0 <= self.current_frame_idx < len(self._extracted_frames):
+            empty = self._coco.is_image_empty(
+                os.path.basename(self._extracted_frames[self.current_frame_idx][2]))
+        btn.blockSignals(True)
+        btn.setChecked(empty)
+        btn.blockSignals(False)
+        btn.setStyleSheet(self._empty_on_style if empty else self._empty_off_style)
+        btn.setText("Marked Empty ✓ (E)" if empty else "Mark as Empty Frame (E)")
 
     def _extract_frame_from_video(self):
         if self._video_cap is None or self.current_video_idx < 0:
@@ -6714,10 +8254,8 @@ class MaskTrackerWindow(QMainWindow):
         if os.path.exists(out_path):
             self.status_bar.showMessage(f"Frame already extracted: {fname}", 3000)
         else:
-            self._video_cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
-            ret, frame = self._video_cap.read()
-            self._video_cap_pos = fidx + 1 if ret else -1
-            if not ret:
+            frame = self._read_video_frame(fidx)
+            if frame is None:
                 self.status_bar.showMessage("Failed to read frame from video", 3000)
                 return
             cv2.imwrite(out_path, frame)
@@ -6878,8 +8416,11 @@ class MaskTrackerWindow(QMainWindow):
         has_source = self._frame_source_available(vpath)
         n_total, n_inferred = self._count_annotations_for_file(filename)
         n_approved = n_total - n_inferred
+        is_empty = self._coco.is_image_empty(filename)
+        n_skipped = self._coco.skip_count(filename)
+        n_rejected = self._coco.rejected_count(filename)
 
-        if n_approved > 0:
+        if n_approved > 0 or is_empty:
             name_color = QColor("#4fc456")   # green: has accepted mask(s)
         elif n_total > 0:
             name_color = QColor("#e6c830")   # yellow: pending only
@@ -6911,7 +8452,9 @@ class MaskTrackerWindow(QMainWindow):
             )
 
         # Annotations column: number of masks, broken down by state.
-        if n_approved and n_inferred:
+        if is_empty:
+            ann_text = "empty ✓"
+        elif n_approved and n_inferred:
             ann_text = f"{n_approved} ✓ · {n_inferred} pending"
         elif n_approved:
             ann_text = f"{n_approved} ✓"
@@ -6919,14 +8462,23 @@ class MaskTrackerWindow(QMainWindow):
             ann_text = f"{n_inferred} pending"
         else:
             ann_text = ""
+        if n_rejected:
+            ann_text = f"{ann_text} · {n_rejected} ✗" if ann_text else f"{n_rejected} ✗"
+        if n_skipped:
+            ann_text = f"{ann_text} · skipped" if ann_text else "skipped"
         item.setText(1, ann_text)
         item.setData(1, Qt.UserRole, float(n_total))  # numeric sort key
         item.setForeground(1, name_color)
-        item.setToolTip(
-            1,
-            f"{n_approved} accepted, {n_inferred} pending ({n_total} total)"
-            if n_total else "No annotations yet",
-        )
+        tip = ("Empty: no object; trains as a background image" if is_empty
+               else f"{n_approved} accepted, {n_inferred} pending ({n_total} total)"
+               if n_total else "No annotations yet")
+        if n_rejected:
+            tip += f"\n{n_rejected} prediction(s) rejected"
+            if is_empty and not n_total:
+                tip += " and nothing labelled, so the frame counts as empty (E unmarks it)"
+        if n_skipped:
+            tip += f"\nSkipped {n_skipped} time(s) (S)"
+        item.setToolTip(1, tip)
 
         # Confidence column.
         conf = self._frame_confidence.get(filename)
@@ -6950,7 +8502,8 @@ class MaskTrackerWindow(QMainWindow):
             item = self._NumericTreeItem(["", "", ""])
             self._render_frame_item(item, idx)
             self.frame_list.addTopLevelItem(item)
-        self.frame_list.setSortingEnabled(True)
+        # A focus session shows its list's order (the queue's), not the names'.
+        self.frame_list.setSortingEnabled(self._focus_names is None)
         self.frame_list.blockSignals(False)
         self._update_nav_state()
         self._schedule_scrubber_refresh()
@@ -6969,7 +8522,7 @@ class MaskTrackerWindow(QMainWindow):
         max_score = 0.0
         has_inferred = False
         for ann in self._coco.get_annotations_for_image(img_id):
-            if ann.get("inferred", False):
+            if ann.get("inferred", False) and not ann.get("rejected"):
                 s = ann.get("score", 0.0)
                 if s > max_score:
                     max_score = s
@@ -7001,7 +8554,8 @@ class MaskTrackerWindow(QMainWindow):
         if filename not in self._coco._image_id_map:
             return (0, 0)
         img_id = self._coco._image_id_map[filename]
-        anns = self._coco.get_annotations_for_image(img_id)
+        # Rejected predictions are a record, not a mask: they count as nothing.
+        anns = [a for a in self._coco.get_annotations_for_image(img_id) if not a.get("rejected")]
         total = len(anns)
         n_inferred = sum(1 for a in anns if a.get("inferred", False))
         return (total, n_inferred)
@@ -7021,14 +8575,78 @@ class MaskTrackerWindow(QMainWindow):
                 continue
             full = os.path.join(folder, f)
             m = pat.match(Path(f).stem)
+            if self._focus_names is not None and f not in self._focus_names:
+                continue
             if m and m.group("stem") in stem_map:
                 frames.append(
                     (stem_map[m.group("stem")], int(m.group("idx")), full)
                 )
             else:
                 frames.append(("", 0, full))
+        if self._focus_names is not None:
+            # The list's own order: it is chosen (hard frames between easy
+            # ones, not one clip's frames in a block); the name sort is not.
+            rank = getattr(self, "_focus_rank", {})
+            frames.sort(key=lambda fr: rank.get(os.path.basename(fr[2]), len(rank)))
         self._extracted_frames = frames
         self._refresh_frame_list()
+
+    def focus_frames(self, items) -> Tuple[int, List[str]]:
+        """Limit the frame queue to these frames (``--focus``).
+
+        ``items`` are frame filenames or paths and/or .txt files listing them
+        one per line. The rest of training_frames/ is untouched and File >
+        Show All Frames brings it back. Post-training inference runs on the
+        queue, so it covers only the focused frames too. Returns
+        (frames shown, names not found in training_frames/).
+        """
+        names = expand_focus_items(items)
+        self._focus_names = set(names)
+        self._focus_rank = {n: i for i, n in enumerate(names)}
+        # The session's name in the title: the list file's (focus_zone_round6), so
+        # which round is open is never a guess.
+        lists = [Path(str(i)).stem for i in items or ()
+                 if str(i).lower().endswith(".txt")]
+        self._focus_label = ", ".join(lists) or "focus"
+        self.current_frame_idx = -1
+        if self._output_dir and os.path.isdir(self._output_dir):
+            self._scan_frames_dir(self._output_dir)
+        shown = {os.path.basename(fp) for _, _, fp in self._extracted_frames}
+        missing = [n for n in names if n not in shown]
+        self.act_show_all_frames.setEnabled(True)
+        # A focus session labels a fixed list: the sections that add videos
+        # and extract frames make room for the queue and the labeling tools.
+        self._grp_videos.setVisible(False)
+        self._grp_extraction.setVisible(False)
+        self._set_project_title()
+        if self._extracted_frames:
+            self._select_frame_row(0)
+        self.status_bar.showMessage(
+            f"Focus: {len(shown)} frame(s)"
+            + (f", {len(missing)} not found" if missing else ""), 8000)
+        return len(shown), missing
+
+    def show_all_frames(self):
+        """Leave the focus list: every frame in training_frames/ again."""
+        self._focus_names = None
+        self.current_frame_idx = -1
+        if self._output_dir and os.path.isdir(self._output_dir):
+            self._scan_frames_dir(self._output_dir)
+            if self._extracted_frames:
+                self._select_frame_row(0)
+        self.act_show_all_frames.setEnabled(False)
+        self._grp_videos.setVisible(True)
+        self._grp_extraction.setVisible(True)
+        self._set_project_title()
+
+    def _set_project_title(self):
+        title = self.BASE_TITLE
+        if self._project_dir:
+            title += f" — {os.path.basename(self._project_dir)}"
+        if self._focus_names is not None:
+            label = getattr(self, "_focus_label", "focus")
+            title += f" ({label}: {len(self._extracted_frames)} frames)"
+        self.setWindowTitle(title)
 
     def _load_existing_frames(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Frames Folder")
@@ -7150,8 +8768,10 @@ class MaskTrackerWindow(QMainWindow):
                 continue
             _, _, fp = self._extracted_frames[i]
             filename = os.path.basename(fp)
+            if self._coco.is_image_empty(filename):
+                continue          # reviewed: holds no object
             total, n_inferred = self._count_annotations_for_file(filename)
-            if total == 0 or total == n_inferred:
+            if total == 0 or n_inferred > 0:      # unlabeled, or predictions to review
                 candidates.append(i)
 
         if not candidates:
@@ -7291,7 +8911,9 @@ class MaskTrackerWindow(QMainWindow):
 
     def _clear_all_inferences(self):
         """Remove all inferred annotations across all frames."""
-        inferred_anns = [a for a in self._coco.annotations if a.get("inferred", False)]
+        # Rejected masks are the reviewer's decisions, not predictions: they stay.
+        inferred_anns = [a for a in self._coco.annotations
+                         if a.get("inferred", False) and not a.get("rejected")]
         if not inferred_anns:
             QMessageBox.information(
                 self, "No Inferences",
@@ -7333,6 +8955,7 @@ class MaskTrackerWindow(QMainWindow):
             QMessageBox.warning(self, "Error", f"Could not read image:\n{path}")
             return
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        self._wait_for_prediction()
         self.preview.clear()
         self.preview.set_frame(img_rgb)
         self._image_set = False
@@ -7348,6 +8971,8 @@ class MaskTrackerWindow(QMainWindow):
 
         if filename not in self._coco._image_id_map:
             self._update_ann_stats()
+            self._sync_empty_button()
+            self._update_review_label()
             return
 
         img_id = self._coco._image_id_map[filename]
@@ -7366,18 +8991,31 @@ class MaskTrackerWindow(QMainWindow):
             polys = segmentation_to_polygons(
                 ann["segmentation"], dims[0], dims[1]
             )
+            extra = []
             if polys:
+                # The largest piece carries the vertices and the label; the
+                # others (a tail coming out past another mouse) are drawn too.
+                polys = sorted(polys, key=lambda q: cv2.contourArea(
+                    np.asarray(q, np.float32).reshape(-1, 2)), reverse=True)
                 seg = polys[0]
                 for i in range(0, len(seg), 2):
                     points.append((float(seg[i]), float(seg[i + 1])))
+                extra = [[(float(q[i]), float(q[i + 1])) for i in range(0, len(q), 2)]
+                         for q in polys[1:] if len(q) >= 6]
             is_inferred = ann.get("inferred", False)
             ann_obj = AnnotationObject(
                 points, cat_name, ann_id=ann["id"], inferred=is_inferred,
+                score=ann.get("score") if is_inferred else None,
+                rejected=bool(ann.get("rejected")),
             )
+            ann_obj.extra = extra
             self.preview.annotations.append(ann_obj)
 
+        self.preview.review_idx = None
         self.preview.update()
         self._update_ann_stats()
+        self._sync_empty_button()
+        self._update_review_label()
 
     # ==================================================================
     # Mode changes
@@ -7401,22 +9039,15 @@ class MaskTrackerWindow(QMainWindow):
             self.btn_sam_toggle.setChecked(False)
             self.btn_sam_toggle.setStyleSheet(self._sam_toggle_off_style)
             self.btn_sam_toggle.blockSignals(False)
+        self._sync_tool_buttons()       # Paint / Eraser too (Esc, Enter)
 
     def _on_sam_toggle(self, checked: bool):
         """Toggle SAM2 AI labeling mode on/off via the button."""
         if checked:
-            if not getattr(self, '_sam_instructions_shown', False):
-                self._sam_instructions_shown = True
-                QMessageBox.information(
-                    self, "SAM Labeling Instructions",
-                    "Double-click on an object to add a mask point.\n"
-                    "Right-click to mark areas to exclude from the mask.\n"
-                    "Press Enter to accept the predicted mask.\n"
-                    "Press Escape or toggle the button off to cancel.\n\n"
-                    "You can add multiple positive/negative points\n"
-                    "before accepting to refine the prediction."
-                )
+            # Straight to the model picker on first use (no instructions box;
+            # the button's tooltip and the help text hold them).
             self.preview.drawing_mode = "ai"
+            self._sync_tool_buttons()
             self.preview.mode_changed.emit("AI-Assisted Mask")
         else:
             # Cancel any in-progress AI drawing
@@ -7542,11 +9173,19 @@ class MaskTrackerWindow(QMainWindow):
             self.lbl_mode.setText("Navigate")
             self._ai_enabled = False
             return
+        if self._sam2_worker is not None and self._sam2_worker.isRunning():
+            # Replacing a loader that is still running would destroy a running
+            # QThread, which aborts the process.
+            self.status_bar.showMessage("A SAM2 model is still loading; try again when it is ready.", 5000)
+            return
+        self._wait_for_prediction()
         self._segmenter = SAM2ImageSegmenter(checkpoint_path, config_name)
         # Force the (possibly new) segmenter to receive the current frame once
         # loaded — important when swapping models mid-session.
         self._image_set = False
-        self.status_bar.showMessage(f"Loading SAM2 ({os.path.basename(checkpoint_path)})...")
+        name = os.path.basename(checkpoint_path)
+        self.status_bar.showMessage(f"Loading SAM2 ({name})...")
+        self.preview.set_busy(f"Loading SAM model ({name})…\nclicks resume when it is ready")
         self._sam2_worker = SAM2LoadWorker(self._segmenter)
         self._sam2_worker.finished.connect(self._on_sam2_loaded)
         self._sam2_worker.error.connect(self._on_sam2_error)
@@ -7555,15 +9194,20 @@ class MaskTrackerWindow(QMainWindow):
 
     def _on_sam2_loaded(self):
         self.status_bar.showMessage(f"SAM2 loaded ({self._segmenter.device})")
+        self.preview.set_busy(None)
         if self.current_frame_idx >= 0 and not self._image_set:
             _, _, path = self._extracted_frames[self.current_frame_idx]
             img = cv2.imread(path)
             if img is not None:
                 self._segmenter.set_image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
                 self._image_set = True
+        # Points clicked while the model was loading get their mask now.
+        if self.preview.has_ai_jobs():
+            self._request_ai_prediction()
 
     def _on_sam2_error(self, msg: str):
         self.status_bar.showMessage(f"SAM2 error: {msg}")
+        self.preview.set_busy(None)
         QMessageBox.critical(self, "SAM2 Error", msg)
         self.preview.drawing_mode = "navigate"
         self.lbl_mode.setText("Navigate")
@@ -7573,27 +9217,162 @@ class MaskTrackerWindow(QMainWindow):
     # AI prediction
     # ==================================================================
     def _request_ai_prediction(self):
+        """Predict the next pending object that needs it, one run at a time.
+
+        Every click used to start a new worker and drop the reference to the
+        one still running; Qt aborts the whole process when a running QThread
+        is destroyed ("QThread: Destroyed while thread is still running",
+        0xC0000409 in Qt5Core.dll) -- quick clicks crashed the window. Objects
+        whose points changed wait in the preview's queue; each is predicted from
+        all of its own points when the thread is free.
+        """
         if self._segmenter is None or self._segmenter.predictor is None:
+            if self.preview.has_ai_jobs():
+                self.status_bar.showMessage(
+                    "SAM2 is still loading; the mask follows when it is ready.", 4000)
             return
         if not self._image_set:
             return
-        pos = list(self.preview._ai_positive_points)
-        neg = list(self.preview._ai_negative_points) or None
-        if not pos:
+        if self._predict_worker is not None and self._predict_worker.isRunning():
+            return        # the next object runs when this thread stops
+        job = self.preview.next_ai_job()
+        if job is None:
             return
-        self._predict_worker = SAM2PredictWorker(self._segmenter, pos, neg)
-        self._predict_worker.finished.connect(self._on_prediction_done)
-        self._predict_worker.error.connect(self._on_prediction_error)
-        self._predict_worker.start()
+        obj_id, version, pos, neg = job
+        worker = SAM2PredictWorker(self._segmenter, pos, neg or None)
+        worker.job = (obj_id, version)
+        worker.predicted.connect(self._on_prediction_done)
+        worker.error.connect(self._on_prediction_error)
+        worker.finished.connect(self._on_predict_thread_finished)
+        self._predict_worker = worker
+        worker.start()
 
-    def _on_prediction_done(self, mask: np.ndarray, score: float):
-        self.preview.set_ai_mask(mask, score)
-        self.status_bar.showMessage(
-            f"SAM2 prediction (score={score:.3f}) — Enter to accept, Escape to reject"
-        )
+    def _on_predict_thread_finished(self):
+        """The prediction thread has stopped: predict the next waiting object."""
+        if self.preview.has_ai_jobs():
+            self._request_ai_prediction()
+
+    def _wait_for_prediction(self):
+        """Let a running prediction finish before the predictor's image changes
+        (or the window closes): SAM2 must not be fed a new image mid-predict."""
+        w = self._predict_worker
+        if w is not None and w.isRunning():
+            w.wait(10000)
+
+    def _on_prediction_done(self, masks: np.ndarray, scores: np.ndarray):
+        job = getattr(self._predict_worker, "job", None)
+        score = None
+        if job is not None and self.preview.set_object_mask(job[0], job[1], masks, scores):
+            obj = self.preview._object(job[0])
+            score = None if obj is None else obj.get("score")
+        self._show_sam_pending_status(score)
 
     def _on_prediction_error(self, msg: str):
         self.status_bar.showMessage(f"Prediction error: {msg}")
+
+    def _show_sam_pending_status(self, score: Optional[float] = None):
+        n = len(self.preview.pending_components())
+        waiting = len(self.preview._ai_queue)
+        msg = f"{n} object(s) pending"
+        if score is not None:
+            msg += f" (SAM score {score:.2f})"
+        if waiting:
+            msg += f", {waiting} waiting for SAM"
+        msg += (" — Enter saves each as its own mask; a click on or near a mouse adds to it, "
+                "Shift+click = new mouse, right-click excludes, U undoes, Esc clears")
+        self.status_bar.showMessage(msg)
+
+    # -- Paint / Eraser tools -------------------------------------------
+    def _set_object_tool(self, tool: Optional[str]):
+        """Switch between SAM ("ai"), Paint ("paint"), Eraser ("erase") or none.
+        Pending objects stay; the buttons show which tool is on."""
+        if tool == "ai":
+            if not self.btn_sam_toggle.isChecked():
+                self.btn_sam_toggle.setChecked(True)      # runs _on_sam_toggle
+            return
+        if tool in ("paint", "erase"):
+            if self.btn_sam_toggle.isChecked():
+                self.btn_sam_toggle.blockSignals(True)
+                self.btn_sam_toggle.setChecked(False)
+                self.btn_sam_toggle.setStyleSheet(self._sam_toggle_off_style)
+                self.btn_sam_toggle.blockSignals(False)
+            self.preview.drawing_mode = tool
+            self.lbl_mode.setText(self.preview.mode_name()
+                                  + f" — brush {self.preview.brush_radius}px (wheel resizes)")
+        else:
+            self.preview.drawing_mode = "navigate"
+            self.lbl_mode.setText("Navigate")
+        self._sync_tool_buttons()
+        self.preview.update()
+
+    def _sync_tool_buttons(self):
+        if not hasattr(self, "btn_erase"):
+            return                      # mode changes while the window is built
+        mode = self.preview.drawing_mode
+        for btn, name in ((self.btn_paint, "paint"), (self.btn_erase, "erase")):
+            btn.blockSignals(True)
+            btn.setChecked(mode == name)
+            btn.setStyleSheet(self._sam_toggle_on_style if mode == name else self._sam_toggle_off_style)
+            btn.blockSignals(False)
+
+    def _clear_pending_objects(self):
+        """Clear: drop the pending objects (Esc with a tool on); an edited
+        saved mask goes back as it was."""
+        self.preview.cancel_pending()
+
+    def _restore_edited(self, restore: list):
+        """Esc on an Edit Mask: the saved mask goes back minus what was erased
+        (paint not yet accepted with Enter is dropped)."""
+        from .mask_tracker_annotator import mask_bbox, mask_to_rle, segmentation_to_mask
+        h, w = self.preview._img_h, self.preview._img_w
+        for ann, erased in restore:
+            ann = copy.deepcopy(ann)
+            if erased is not None and erased.any():
+                m = segmentation_to_mask(ann["segmentation"], h, w).astype(bool) & ~erased
+                if not m.any():
+                    continue                       # erased away entirely
+                ann["segmentation"] = mask_to_rle(m)
+                ann["bbox"] = list(mask_bbox(m))
+                ann["area"] = int(m.sum())
+            self._coco.restore_annotation(ann)
+        path = self._current_frame_path()
+        if path:
+            self._load_frame_annotations(path)
+        self._recalc_current_frame_confidence()
+        self.status_bar.showMessage(
+            "Edit ended: the mask is saved with your erasures; unaccepted paint dropped.", 4000)
+
+    def _undo_tool_step(self):
+        """Undo: the last SAM click or Paint / Eraser stroke (U)."""
+        if self.preview.undo_ai_click():
+            self._show_sam_pending_status()
+
+    def _on_tool_key(self, tool: str):
+        """P / X: Paint / Eraser on; the same key again turns it off."""
+        self._set_object_tool(None if self.preview.drawing_mode == tool else tool)
+
+    def _on_brush_radius_changed(self, r: int):
+        self.lbl_mode.setText(self.preview.mode_name() + f" — brush {r}px (wheel resizes)")
+
+    def _edit_as_pending(self, obj_idx: int):
+        """Bring a saved mask back as a pending object (deleted from the
+        project, Ctrl+Z restores it) to reshape it with SAM, Paint or Eraser;
+        Enter saves it again."""
+        if not (0 <= obj_idx < len(self.preview.annotations)):
+            return
+        ann = self.preview.annotations[obj_idx]
+        stored = self._coco.get_annotation(ann.ann_id) if ann.ann_id >= 0 else None
+        if stored is None:
+            return
+        from .mask_tracker_annotator import segmentation_to_mask
+        h, w = self.preview._img_h, self.preview._img_w
+        mask = segmentation_to_mask(stored["segmentation"], h, w)
+        origin = copy.deepcopy(stored)
+        self._on_delete_annotation_by_index(obj_idx)
+        if self.preview.drawing_mode not in self.preview.OBJECT_TOOLS:
+            self._set_object_tool("paint")
+        self.preview.add_pending_mask(mask, origin=origin)
+        self._show_sam_pending_status()
 
     # ==================================================================
     # Class management, active class, undo/redo
@@ -7610,14 +9389,42 @@ class MaskTrackerWindow(QMainWindow):
             self.combo_active_class.setCurrentText(self._last_used_category)
         self.combo_active_class.blockSignals(False)
         self.preview.available_categories = list(self._categories)
+        # Several classes: the tool stays on between masks (labelling a frame's objects
+        # one after another), and Enter asks the class.
+        self.preview.keep_tool_after_save = len(self._categories) > 1
+        if hasattr(self, "lbl_class_keys"):
+            keys = [str((i + 1) % 10) for i in range(min(10, len(self._categories)))]
+            items = [f"{k}  {c}" for k, c in zip(keys, self._categories)]
+            # Two per line: one long line widened the whole left panel.
+            self.lbl_class_keys.setText("\n".join("      ".join(items[i:i + 2]) for i in range(0, len(items), 2)))
+
+    def _pick_class_for_pending(self) -> bool:
+        """Before Enter saves pending masks: with several classes, ask which (the keypad;
+        Enter keeps the active class). False leaves the masks pending."""
+        if len(self._categories) <= 1:
+            return True
+        dlg = ClassPickerDialog(self._categories, self._active_category() or "", parent=self)
+        if dlg.exec_() != QDialog.Accepted or not dlg.selected:
+            return False
+        self.combo_active_class.setCurrentText(dlg.selected)
+        return True
 
     def _active_category(self) -> Optional[str]:
         cat = self.combo_active_class.currentText().strip()
         return cat if cat else None
 
     def _on_category_hotkey(self, idx: int):
-        if 0 <= idx < self.combo_active_class.count():
-            self.combo_active_class.setCurrentIndex(idx)
+        """1-9, 0: with a mask pending, save it as that class (click an object, press
+        its number); otherwise make that class the active one."""
+        if not 0 <= idx < self.combo_active_class.count():
+            return
+        self.combo_active_class.setCurrentIndex(idx)
+        pv = self.preview
+        if (pv.drawing_mode in pv.OBJECT_TOOLS and pv._drawing_active and pv.has_ai_pending()
+                and pv._editing_obj_idx is None):
+            pv._finish_annotation()
+            self.status_bar.showMessage(f"Saved as {self.combo_active_class.currentText()}", 2500)
+        else:
             self.status_bar.showMessage(
                 f"Active class: {self.combo_active_class.currentText()}", 2000
             )
@@ -7671,7 +9478,10 @@ class MaskTrackerWindow(QMainWindow):
                 self._coco.remove_annotation(op["ann"]["id"])
         elif t == "edit":
             fields = op["before"] if reverse else op["after"]
-            self._coco.apply_annotation_fields(op["ann_id"], copy.deepcopy(fields))
+            if set(fields) == {"rejected"}:
+                self._coco.reject_annotation(op["ann_id"], bool(fields["rejected"]))
+            else:
+                self._coco.apply_annotation_fields(op["ann_id"], copy.deepcopy(fields))
         elif t == "approve":
             if reverse:
                 self._coco.set_inferred(op["ann_id"], True, op.get("score"))
@@ -7847,7 +9657,7 @@ class MaskTrackerWindow(QMainWindow):
             before = {k: copy.deepcopy(before_dict[k])
                       for k in ("segmentation", "bbox", "area")
                       if k in before_dict}
-            self._coco.update_annotation_polygon(ann.ann_id, ann.points)
+            self._coco.update_annotation_polygon(ann.ann_id, ann.points, ann.extra)
             after_dict = self._coco.get_annotation(ann.ann_id)
             if after_dict is not None:
                 after = {k: copy.deepcopy(after_dict[k])
@@ -7890,6 +9700,118 @@ class MaskTrackerWindow(QMainWindow):
         if path:
             self._load_frame_annotations(path)
             self.preview.update()
+
+    # -- review of the model's masks (as in MAD) --------------------------
+    def _on_review(self, action: str):
+        """A / R / Shift+A (and the Review buttons): accept or reject the
+        prediction under review, or accept every prediction on the frame."""
+        pv = self.preview
+        if action == "accept_all":
+            idxs = [i for i, a in enumerate(pv.annotations) if a.inferred and not a.rejected]
+            if not idxs:
+                self.status_bar.showMessage("No predictions on this frame.", 3000)
+                return
+            for i in reversed(idxs):
+                self._on_approve_annotation_by_index(i)
+        else:
+            i = pv.current_prediction()
+            if i is None:
+                self.status_bar.showMessage("No predictions on this frame.", 3000)
+                return
+            if action == "accept":
+                self._on_approve_annotation_by_index(i)
+            else:
+                self._reject_prediction(i)
+        pv.review_idx = None
+        self._after_review_step()
+
+    def _replace_prediction(self, idx: int):
+        """A SAM click landed on a prediction: drop it (Ctrl+Z restores it);
+        the SAM mask from the click takes its place when Enter saves it."""
+        self._on_delete_annotation_by_index(idx)
+        self.preview.review_idx = None
+        self._recalc_current_frame_confidence()
+        self._update_review_label()
+        self.status_bar.showMessage(
+            "Prediction replaced by a SAM mask: Enter saves it (Ctrl+Z brings the prediction back).",
+            6000)
+
+    def _reject_prediction(self, idx: int):
+        """R / D / Delete: keep the prediction, marked rejected (Ctrl+Z
+        restores it to pending)."""
+        ann = self.preview.annotations[idx]
+        if ann.ann_id < 0:
+            return
+        self._coco.reject_annotation(ann.ann_id)
+        self._push_undo({
+            "type": "edit", "path": self._current_frame_path(), "ann_id": ann.ann_id,
+            "before": {"rejected": False}, "after": {"rejected": True},
+            "label": "rejection",
+        })
+        ann.rejected = True
+        self.status_bar.showMessage("Prediction rejected (kept, red) — Ctrl+Z to undo", 3000)
+
+    def _after_review_step(self):
+        pv = self.preview
+        self._recalc_current_frame_confidence()
+        pv.update()
+        if pv.current_prediction() is None:
+            path = self._current_frame_path()
+            if not any(not a.inferred for a in pv.annotations):
+                if path and self._coco.is_image_empty(os.path.basename(path)):
+                    self._update_ann_stats()
+                    self.status_bar.showMessage(
+                        "Every prediction rejected: the frame counts as empty. Draw any mice it "
+                        "does hold, or press E to unmark it.", 6000)
+                    if self.chk_review_auto.isChecked():
+                        self._next_review_frame()
+                else:
+                    self.status_bar.showMessage(
+                        "No accepted masks on this frame: draw the mice, or press E if it holds "
+                        "none (rejected masks are kept as a record).")
+            elif self.chk_review_auto.isChecked():
+                self._next_review_frame()
+        self._update_review_label()
+
+    def _frames_to_review(self) -> List[int]:
+        """Queue rows whose frame still has predictions."""
+        ids = {a["image_id"] for a in self._coco.annotations
+               if a.get("inferred", False) and not a.get("rejected")}
+        names = {img["file_name"] for img in self._coco.images if img["id"] in ids}
+        return [i for i, (_, _, fp) in enumerate(self._extracted_frames)
+                if os.path.basename(fp) in names]
+
+    def _next_review_frame(self):
+        rows = [r for r in self._frames_to_review() if r != self.current_frame_idx]
+        if not rows:
+            self.status_bar.showMessage("All predictions reviewed.", 5000)
+            self._update_review_label()
+            return
+        later = [r for r in rows if r > self.current_frame_idx]
+        self._select_frame_row(later[0] if later else rows[0])
+
+    def _update_review_label(self):
+        if not hasattr(self, "lbl_review"):
+            return
+        pv = self.preview
+        preds = [i for i, a in enumerate(pv.annotations) if a.inferred and not a.rejected]
+        n_frames = len(self._frames_to_review())
+        if preds:
+            cur = pv.current_prediction()
+            stored = self._coco.get_annotation(pv.annotations[cur].ann_id) or {}
+            score = stored.get("score")
+            text = (f"Prediction {preds.index(cur) + 1} of {len(preds)} on this frame"
+                    + (f" (score {score:.2f})" if score is not None else "")
+                    + f" · {n_frames} frame(s) to review")
+            self.lbl_review.setStyleSheet("color: #e6c830; font-size: 10px;")
+        else:
+            text = (f"No predictions on this frame · {n_frames} frame(s) to review"
+                    if n_frames else "No predictions to review")
+            self.lbl_review.setStyleSheet("color: #999999; font-size: 10px;")
+        self.lbl_review.setText(text)
+        for b in (self.btn_accept_pred, self.btn_reject_pred, self.btn_accept_all_pred):
+            b.setEnabled(bool(preds))
+        self.btn_next_review.setEnabled(bool(n_frames))
 
     def _on_approve_annotation_by_index(self, obj_idx: int):
         if obj_idx < 0 or obj_idx >= len(self.preview.annotations):
@@ -8035,7 +9957,9 @@ class MaskTrackerWindow(QMainWindow):
         if not is_maskrcnn:
             is_small = "small" in arch_text.lower()
             self.spin_batch.setValue(2 if is_small else 8)
-            self.spin_lr.setValue(0.01)
+            # AdamW wants ~0.002; 0.01 (SGD's rate) trained the first 8x8 zone
+            # model badly.
+            self.spin_lr.setValue(0.002 if self.combo_optimizer.currentText() == "AdamW" else 0.01)
         else:
             self.spin_batch.setValue(2)
             self.spin_lr.setValue(0.005)
@@ -8120,7 +10044,10 @@ class MaskTrackerWindow(QMainWindow):
 
         # Export training annotations, excluding inferred (unapproved) masks
         ann_path = os.path.join(self._project_dir, "annotations", "annotations_train.json")
-        self._coco.export(ann_path, exclude_inferred=True)
+        only = getattr(self, "_train_only", None)
+        self._coco.export(ann_path, exclude_inferred=True, only=only)
+        if only is not None:
+            print(f"[MTT] training on the {len(only)} frame(s) of --train-only", flush=True)
 
         # Check that we have actual training data after excluding inferred
         n_approved = sum(
@@ -8139,7 +10066,7 @@ class MaskTrackerWindow(QMainWindow):
         n_train_images = len(set(
             a["image_id"] for a in self._coco.annotations
             if not a.get("inferred", False)
-        ))
+        )) + self._coco.count_empty_images()
 
         arch_text = self.combo_architecture.currentText()
         is_yolo = arch_text.startswith("YOLO")
@@ -8255,7 +10182,13 @@ class MaskTrackerWindow(QMainWindow):
                 "val_fraction": self.spin_val_frac.value(),
                 "device": device_choice,
                 "model_variant": model_variant,
-                "imgsz": 640,
+                "imgsz": self._imgsz_override or 640,
+                # Mosaic and copy-paste on by default: with few labeled frames
+                # they made the difference (8x8 zone model, 2026-10-15).
+                "aug_mosaic": (1.0 if self._mosaic_override is None
+                               else self._mosaic_override),
+                "aug_copy_paste": (0.3 if self._copy_paste_override is None
+                                   else self._copy_paste_override),
                 "early_stop_patience": self.spin_patience.value(),
                 "freeze_backbone": self.chk_freeze_backbone.isChecked(),
                 "optimizer": optimizer,
@@ -8265,6 +10198,8 @@ class MaskTrackerWindow(QMainWindow):
                 "aug_scale": aug_scale,
                 "aug_hsv_v": aug_hsv_v,
                 "aug_hsv_s": aug_hsv_s,
+                # The project's ROI travels with the model (mtt_roi).
+                "roi": self._project_config.get("roi") or None,
                 "_architecture": "yolo",
             }
         else:
@@ -8393,6 +10328,10 @@ class MaskTrackerWindow(QMainWindow):
                 )
             else:
                 self._seg_log_text.append("[Segmentation] Augmentation: disabled")
+            from .mtt_roi import ROI
+            roi = ROI.from_dict(config_dict.get("roi"))
+            self._seg_log_text.append(
+                f"[Segmentation] ROI: {roi.describe() if roi is not None else 'none (whole frames)'}")
 
         self._seg_log_text.append("")
 
@@ -8402,10 +10341,18 @@ class MaskTrackerWindow(QMainWindow):
         self._train_worker.error.connect(self._on_train_error)
         self._train_worker.start()
 
-        self._training_viz_panel.setVisible(True)
-        self.preview.setVisible(False)
-        self._scrubber_row.setVisible(False)
-        self._info_row.setVisible(False)
+        self._seg_preview_panel.clear()
+        title = "Segmentation Training"
+        if self._project_dir:
+            title += f" — {os.path.basename(self._project_dir)}"
+        self._seg_train_window.setWindowTitle(title)
+        self._show_seg_train_window()
+        self.btn_show_train_window.setEnabled(True)
+
+    def _show_seg_train_window(self):
+        self._seg_train_window.show()
+        self._seg_train_window.raise_()
+        self._seg_train_window.activateWindow()
 
     def _toggle_pause(self):
         if not hasattr(self, "_train_worker") or not self._train_worker.isRunning():
@@ -8427,12 +10374,47 @@ class MaskTrackerWindow(QMainWindow):
             )
             self.lbl_train_status.setText("Training paused")
 
+    def _run_active(self) -> bool:
+        """A training run or its post-training inference is still going."""
+        return any(getattr(self, w, None) is not None and getattr(self, w).isRunning()
+                   for w in ("_train_worker", "_post_infer_worker"))
+
+    def _window_only_may_close(self) -> bool:
+        """Closing the only window (--training-window-only): fine once the run is
+        over; mid-run, only after the user agrees to stop it (Mask Tracker then
+        quits once the run has wound down and saved)."""
+        if not self._run_active():
+            return True
+        ans = QMessageBox.question(
+            self._seg_train_window, "Training in progress",
+            "Training is still running.\nStop it and close Mask Tracker?",
+            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
+        if ans != QMessageBox.Yes:
+            return False
+        self._quit_when_idle = True
+        self._stop_training()
+        w = getattr(self, "_post_infer_worker", None)
+        if w is not None and w.isRunning():
+            w.request_stop()
+        return False            # stays open until the run has stopped, then quits
+
+    def _quit_if_asked(self) -> bool:
+        """After a run: quit if the user stopped it to close the window."""
+        if getattr(self, "_quit_when_idle", False):
+            QTimer.singleShot(0, QApplication.instance().quit)
+            return True
+        return False
+
     def _stop_training(self):
         if hasattr(self, "_train_worker") and self._train_worker.isRunning():
             self._train_worker.request_stop()
             self.lbl_train_status.setText("Stopping training...")
 
     def _on_train_progress(self, iteration: int, total: int, metrics: dict):
+        if metrics.get("status") == "epoch_preview":
+            self._seg_preview_panel.add_page(
+                metrics.get("epoch", iteration), metrics.get("val_dice"), metrics["tiles"])
+            return
         self.train_progress.setValue(iteration)
         loss = metrics.get("loss", 0.0)
         self.lbl_train_status.setText(f"Iteration {iteration}/{total}  —  loss: {loss:.4f}")
@@ -8455,11 +10437,8 @@ class MaskTrackerWindow(QMainWindow):
         self._seg_log_text.append("  ".join(parts))
 
     def _dismiss_training_viz(self):
-        if self._training_viz_panel.isVisible():
-            self._training_viz_panel.setVisible(False)
-            self.preview.setVisible(True)
-            self._scrubber_row.setVisible(True)
-            self._info_row.setVisible(True)
+        """The training graph lives in its own window now; the main window's
+        preview stays up throughout, so there is nothing to swap back."""
 
     def _on_train_finished(self, summary: dict):
         self.btn_pause.setVisible(False)
@@ -8495,6 +10474,8 @@ class MaskTrackerWindow(QMainWindow):
             "best_str": best_str,
         }
 
+        if self._quit_if_asked():
+            return
         # Trigger post-training inference if enabled, otherwise show dialog now
         if self.chk_post_infer.isChecked() and run_dir:
             self.lbl_train_status.setText("Training done — running inference on unlabeled frames...")
@@ -8507,41 +10488,40 @@ class MaskTrackerWindow(QMainWindow):
             self.status_bar.showMessage(f"Training complete: {model_path}")
             self._show_train_complete_dialog()
 
+    def _predict_queue_with_model(self, model_dir: Optional[str] = None):
+        """Predict the unreviewed queue frames with a trained model (File menu,
+        or --predict): the post-training inference, for any model."""
+        if model_dir is None:
+            start = os.path.join(self._project_dir, "models") if self._project_dir else ""
+            model_dir = QFileDialog.getExistingDirectory(self, "Model folder", start)
+            if not model_dir:
+                return
+        if not any(os.path.exists(os.path.join(model_dir, n))
+                   for n in ("weights_best.pt", "weights.pt", "model_final.pth")):
+            QMessageBox.warning(self, "No model", f"No trained weights in\n{model_dir}")
+            return
+        self.lbl_train_status.setText(f"Predicting with {os.path.basename(model_dir)}…")
+        self._run_post_train_inference(model_dir)
+
     def _run_post_train_inference(self, model_dir: str):
         """Run the trained model on unlabeled extracted frames."""
         if not self._extracted_frames:
             self.lbl_train_status.setText("No extracted frames for post-training inference.")
             return
 
-        # Collect frames without manual (non-inferred) annotations
-        unlabeled_paths = []
-        for _, _, fp in self._extracted_frames:
-            filename = os.path.basename(fp)
-            if filename in self._coco._image_id_map:
-                img_id = self._coco._image_id_map[filename]
-                n_manual = self._coco.count_annotations_for_image(
-                    img_id, exclude_inferred=True,
-                )
-                if n_manual > 0:
-                    continue  # has manual annotations — skip
-            unlabeled_paths.append(fp)
+        # Frames not yet reviewed (no accepted mask, not marked empty); their
+        # earlier predictions are replaced.
+        from .mtt_predict import clear_predictions, unreviewed_frames
+        paths = {os.path.basename(fp): fp for _, _, fp in self._extracted_frames}
+        todo = unreviewed_frames(self._coco, list(paths))
+        unlabeled_paths = [paths[n] for n in todo]
 
         if not unlabeled_paths:
             self.lbl_train_status.setText(
                 "All frames already have annotations — no inference needed."
             )
             return
-
-        # Remove any existing inferred annotations from these frames
-        # (in case of a previous inference run)
-        for fp in unlabeled_paths:
-            filename = os.path.basename(fp)
-            if filename in self._coco._image_id_map:
-                img_id = self._coco._image_id_map[filename]
-                existing = self._coco.get_annotations_for_image(img_id)
-                for ann in existing:
-                    if ann.get("inferred", False):
-                        self._coco.remove_annotation(ann["id"])
+        clear_predictions(self._coco, todo)
 
         max_det = self.spin_post_infer_max.value() or 100
 
@@ -8591,37 +10571,8 @@ class MaskTrackerWindow(QMainWindow):
         if img is None:
             return
         h, w = img.shape[:2]
-
-        img_id = self._coco.get_or_add_image(filename, w, h)
-
-        max_score = 0.0
-        for det in detections:
-            label = det["category_id"]
-            cat_id = None
-            coco_cats_by_idx = {}
-            for ci, cat in enumerate(self._coco.categories):
-                coco_cats_by_idx[ci + 1] = cat["id"]
-            cat_id = coco_cats_by_idx.get(label)
-            if cat_id is None and self._coco.categories:
-                cat_id = self._coco.categories[0]["id"]
-            if cat_id is None:
-                continue
-
-            score = det.get("score", 0.0)
-            if score > max_score:
-                max_score = score
-
-            self._coco.add_annotation_from_segmentation(
-                image_id=img_id,
-                category_id=cat_id,
-                segmentation=det["segmentation"],
-                bbox=det["bbox"],
-                area=det["area"],
-                inferred=True,
-                score=score,
-            )
-
-        self._frame_confidence[filename] = max_score
+        from .mtt_predict import add_predictions
+        self._frame_confidence[filename] = add_predictions(self._coco, filename, w, h, detections)
 
     def _on_post_infer_finished(self, count: int):
         self.train_progress.setVisible(False)
@@ -8644,6 +10595,7 @@ class MaskTrackerWindow(QMainWindow):
             f"across {n_inferred_frames}/{available} frames"
         )
         self.lbl_train_status.setText(f"{infer_status}. Review inferred masks.")
+        self._update_review_label()
 
         # Log inference results
         self._seg_log_text.append(f"[Inference] {infer_status}")
@@ -8660,6 +10612,8 @@ class MaskTrackerWindow(QMainWindow):
 
         model_path = getattr(self, "_last_train_summary", {}).get("model_path", "")
         self.status_bar.showMessage(f"Training + inference complete: {model_path}")
+        if self._quit_if_asked():
+            return
         self._show_train_complete_dialog(infer_status)
 
     def _on_post_infer_error(self, msg: str):
@@ -8689,6 +10643,13 @@ class MaskTrackerWindow(QMainWindow):
         lines.append("")
         lines.append(f"Model saved to:\n{run_dir}")
 
+        if getattr(self, "_window_only", False):
+            # No pop-up over the only window: the summary goes in its log and title.
+            self._seg_log_text.append("")
+            self._seg_log_text.append(f"[{title}] " + " ".join(l for l in lines if l))
+            self._seg_train_window.setWindowTitle(
+                f"{self._seg_train_window.windowTitle()} \u2014 {title.lower()}")
+            return
         QMessageBox.information(self, title, "\n".join(lines))
 
     def _on_train_error(self, msg: str):
@@ -8698,7 +10659,8 @@ class MaskTrackerWindow(QMainWindow):
         self.btn_stop.setVisible(False)
         self._dismiss_training_viz()
         self.lbl_train_status.setText(f"Error: {msg}")
-        QMessageBox.critical(self, "Training Error", msg)
+        QMessageBox.critical(self._seg_train_window if getattr(self, "_window_only", False) else self,
+                             "Training Error", msg)
 
     def _show_training_samples(self, model_dir: str):
         """Run the trained model on a few random frames and show predictions."""
@@ -9275,12 +11237,7 @@ class MaskTrackerWindow(QMainWindow):
                     if key == Qt.Key_Left:
                         step = -step
                     vpath, pos = src
-                    if self._annot_in_video_mode:
-                        self._show_video_frame(pos + step)
-                    else:
-                        # From a queue frame, the arrows step out into the
-                        # video it was cut from.
-                        self._enter_video_mode_at(vpath, pos + step)
+                    self._go_to_source_frame(vpath, pos + step)
                     return
             elif key == Qt.Key_E:
                 if self._annot_in_video_mode and self._video_cap is not None:
@@ -10888,6 +12845,8 @@ class MaskTrackerWindow(QMainWindow):
                     "clip_dir": clip["clip_dir"],
                     "obj_id": int(obj_id_str),
                     "fps": float(clip.get("fps", 30.0)),
+                    # The validation split holds out whole source videos.
+                    "video": clip.get("source_video") or "",
                 })
                 class_name_set.add(beh)
                 labels.append(beh)
@@ -11418,6 +13377,29 @@ class MaskTrackerWindow(QMainWindow):
         self.list_track_videos.clear()
         self._update_tracking_button_state()
 
+    def _open_exits(self):
+        """The Exits window on the cameras of the queued videos (or of a folder chosen now)."""
+        from .mtt_exits import cameras_in
+        from .mtt_exits_editor import ExitsWindow
+        videos = [self.list_track_videos.item(i).data(Qt.UserRole)
+                  for i in range(self.list_track_videos.count())]
+        videos = [v for v in videos if v]
+        if not videos:
+            folder = QFileDialog.getExistingDirectory(self, "Video folder(s) to draw exits for")
+            if not folder:
+                return
+            videos = [folder]
+        cams = cameras_in(videos)
+        if not cams:
+            QMessageBox.information(self, "Exits", "No videos found.")
+            return
+        w = getattr(self, "_exits_window", None)
+        if w is not None and w.isVisible():
+            w.close()
+        self._exits_window = ExitsWindow(cams)
+        self._exits_window.show()
+        self._exits_window.raise_()
+
     def _update_tracking_button_state(self):
         idx = self.combo_track_model.currentIndex()
         dirs = getattr(self, "_track_model_dirs", [])
@@ -11440,13 +13422,9 @@ class MaskTrackerWindow(QMainWindow):
         for i in range(self.list_track_videos.count()):
             video_paths.append(self.list_track_videos.item(i).data(Qt.UserRole))
 
-        existing = []
-        for vp in video_paths:
-            out_dir = os.path.join(
-                str(Path(vp).parent), f"{Path(vp).stem}_MaskTracker"
-            )
-            if os.path.isdir(out_dir):
-                existing.append(os.path.basename(vp))
+        # A folder holding only the ROI Tool's drawing is not a track: it is kept and tracked into without asking.
+        from .mtt_runs import has_tracking_output, move_tracking_aside
+        existing = [os.path.basename(vp) for vp in video_paths if has_tracking_output(vp)]
 
         if existing:
             names = "\n".join(f"  • {n}" for n in existing)
@@ -11455,18 +13433,16 @@ class MaskTrackerWindow(QMainWindow):
                 "Existing Results Found",
                 f"The following video(s) already have MaskTracker output:\n\n"
                 f"{names}\n\n"
-                f"Overwriting will clear all contents in the MaskTracker "
-                f"output folder(s), including any ROI analysis saved there.\n\n"
-                f"Overwrite existing results?",
+                f"Re-tracking moves the old tracking files to _TO_DELETE_tracking/ "
+                f"beside each video; the MaskTracker folder and its ROI drawing stay.\n\n"
+                f"Re-track these videos?",
                 QMessageBox.Yes | QMessageBox.Cancel,
             )
             if reply != QMessageBox.Yes:
                 return
 
             for vp in video_paths:
-                out_dir = Path(vp).parent / f"{Path(vp).stem}_MaskTracker"
-                if out_dir.is_dir():
-                    shutil.rmtree(out_dir)
+                move_tracking_aside(vp)
 
             roi_existing = []
             for vp in video_paths:
@@ -11489,14 +13465,20 @@ class MaskTrackerWindow(QMainWindow):
                     f"(It will be invalid after re-tracking.)",
                     QMessageBox.Yes | QMessageBox.No,
                 )
-                if roi_reply == QMessageBox.Yes:
+                if roi_reply == QMessageBox.Yes:  # moved aside, not deleted
                     for vp in video_paths:
                         stem = Path(vp).stem
                         parent = Path(vp).parent
                         for suffix in (f"{stem}_roiAnalysis", f"{stem}_roiAnalysis_SLEAP"):
                             roi_dir = parent / suffix
                             if roi_dir.is_dir():
-                                shutil.rmtree(roi_dir)
+                                from datetime import datetime
+                                aside = parent / "_TO_DELETE_tracking" / suffix
+                                if aside.exists():
+                                    aside = aside.with_name(
+                                        f"{suffix}_{datetime.now():%Y%m%d_%H%M%S}")
+                                aside.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.move(str(roi_dir), str(aside))
 
         combo_text = self.combo_track_device.currentText()
         if combo_text.startswith("Auto"):
@@ -11529,6 +13511,7 @@ class MaskTrackerWindow(QMainWindow):
             "use_masks": self.chk_track_masks.isChecked(),
             "device": device,
             "save_masks": self.chk_save_masks.isChecked(),
+            "frame_step": self.spin_track_step.value(),
         }
 
         if self.chk_behavior_cls.isChecked():
@@ -11570,6 +13553,12 @@ class MaskTrackerWindow(QMainWindow):
                 )
                 return
 
+        if self.chk_parallel_videos.isChecked() and len(video_paths) > 1:
+            self._start_parallel_tracking(video_paths, model_dir, config_dict,
+                                          classifier_dir)
+            return
+        self._track_parallel = False
+
         self._inference_worker = InferenceWorker(
             video_paths, model_dir, config_dict,
             classifier_dir=classifier_dir,
@@ -11590,6 +13579,241 @@ class MaskTrackerWindow(QMainWindow):
         self._infer_log_text.clear()
         self._infer_log_panel.setVisible(True)
         self._inference_worker.start()
+
+    def _launch_inference(self, args, _waited: float = 0.0):
+        """--infer: fill the Inference tab from the command line and run it.
+
+        Waits for the hardware probe first, since it sets the device and mask
+        defaults; never stops at a dialog (videos with output are left out).
+        """
+        probe = getattr(self, "_sysprofile_worker", None)
+        if probe is not None and probe.isRunning() and _waited < 30:
+            QTimer.singleShot(250, lambda: self._launch_inference(args, _waited + 0.25))
+            return
+        # The tab fills its model list when shown.
+        self.tab_widget.setCurrentIndex(self._inference_tab_idx)
+        self._refresh_model_list()
+        settings = inference_settings(args)
+        model = args.infer_model or settings.get("model_dir")
+        if model:
+            if not self._select_track_model(model):
+                print(f"[MTT] --infer-model is not a trained model folder: {model}", flush=True)
+                return
+        from .mtt_runs import find_track_videos
+        videos = []
+        for item in args.infer:
+            if os.path.exists(item):
+                videos += find_track_videos([item])
+            else:
+                print(f"[MTT] --infer: no such video or folder: {item}", flush=True)
+        from .mtt_runs import has_tracking_output
+        todo = [v for v in videos if not has_tracking_output(v)]
+        if len(todo) < len(videos):
+            print(f"[MTT] --infer: {len(videos) - len(todo)} video(s) already have "
+                  f"output, left out", flush=True)
+        if not todo:
+            print("[MTT] --infer: nothing to track", flush=True)
+            return
+        self.list_track_videos.clear()
+        for v in todo:
+            self.list_track_videos.addItem(os.path.basename(v))
+            self.list_track_videos.item(self.list_track_videos.count() - 1).setData(
+                Qt.UserRole, v)
+        applied = self._apply_inference_settings(settings)
+        if applied:
+            print(f"[MTT] inference settings: {', '.join(applied)}", flush=True)
+        self._quit_when_done = bool(getattr(args, "quit_when_done", False))
+        self.tab_widget.setCurrentIndex(self._inference_tab_idx)
+        self._update_tracking_button_state()
+        print(f"[MTT] --infer: {len(todo)} video(s)", flush=True)
+        self._start_tracking()
+
+    def _select_track_model(self, model_dir: str) -> bool:
+        """Pick this model in the Inference tab, adding it for this session if
+        it is not one of the project's (nothing is saved)."""
+        want = os.path.normcase(os.path.normpath(model_dir))
+        hits = [k for k, d in enumerate(self._track_model_dirs)
+                if d and os.path.normcase(os.path.normpath(d)) == want]
+        if not hits:
+            if not self._is_track_model_dir(model_dir):
+                return False
+            k = max(0, len(self._track_model_dirs) - 1)      # before the Browse entry
+            self.combo_track_model.insertItem(k, self._track_model_label(model_dir, external=True))
+            self._track_model_dirs.insert(k, model_dir)
+            hits = [k]
+        self.combo_track_model.setCurrentIndex(hits[0])
+        return True
+
+    def _apply_inference_settings(self, d: dict) -> List[str]:
+        """Put settings (mask_tracker_cli.inference_settings) into the Inference
+        tab, so the tab shows what the run uses. Returns what was set."""
+        applied = []
+
+        def note(k):
+            applied.append(f"{k}={d[k]}")
+
+        if "max_detections" in d:
+            self.spin_track_max_det.setValue(int(d["max_detections"]))
+            note("max_detections")
+        if "confidence_threshold" in d:
+            self.spin_track_confidence.setValue(float(d["confidence_threshold"]))
+            note("confidence_threshold")
+        if "max_disappeared_frames" in d:
+            text = "Never" if int(d["max_disappeared_frames"]) == 0 else str(int(d["max_disappeared_frames"]))
+            if self.combo_track_disappear.findText(text) < 0:
+                self.combo_track_disappear.addItem(text)
+            self.combo_track_disappear.setCurrentText(text)
+            note("max_disappeared_frames")
+        if "iou_match_threshold" in d:
+            self.spin_track_iou.setValue(float(d["iou_match_threshold"]))
+            note("iou_match_threshold")
+        if "frame_step" in d:
+            self.spin_track_step.setValue(max(1, int(d["frame_step"] or 1)))
+            note("frame_step")
+        if "matching_algorithm" in d:
+            for i in range(self.combo_track_matching.count()):
+                if self.combo_track_matching.itemText(i).lower().startswith(d["matching_algorithm"]):
+                    self.combo_track_matching.setCurrentIndex(i)
+            note("matching_algorithm")
+        if "inference_size" in d:
+            size = int(d["inference_size"] or 0)
+            text = None
+            for i in range(self.combo_track_resolution.count()):
+                t = self.combo_track_resolution.itemText(i)
+                if (size == 0 and t.startswith("Trained")) or t == f"{size}px":
+                    text = t
+            if text is None:
+                text = f"{size}px"
+                self.combo_track_resolution.addItem(text)
+            self.combo_track_resolution.setCurrentText(text)
+            note("inference_size")
+        if "device" in d:
+            names = {"auto": "Auto", "cpu": "CPU", "cuda": "CUDA", "mps": "MPS"}
+            want = names.get(str(d["device"]).lower(), "Auto")
+            for i in range(self.combo_track_device.count()):
+                if self.combo_track_device.itemText(i).startswith(want):
+                    self.combo_track_device.setCurrentIndex(i)
+            note("device")
+        for key, box in (("use_masks", self.chk_track_masks),
+                         ("save_masks", self.chk_save_masks),
+                         ("create_tracked_video", self.chk_create_tracked_video),
+                         ("show_preview", self.chk_inference_preview)):
+            if key in d:
+                box.setChecked(bool(d[key]))
+                note(key)
+        if "classifier_dir" in d:
+            cdir = d["classifier_dir"]
+            if not cdir:
+                self.chk_behavior_cls.setChecked(False)
+            else:
+                self._refresh_classifier_model_list()
+                want = os.path.normcase(os.path.normpath(cdir))
+                hits = [k for k, x in enumerate(self._behavior_model_dirs)
+                        if x and os.path.normcase(os.path.normpath(x)) == want]
+                if not hits and self._is_behavior_model_dir(cdir):
+                    k = max(0, len(self._behavior_model_dirs) - 1)
+                    self.combo_behavior_model.insertItem(k, os.path.basename(os.path.normpath(cdir)))
+                    self._behavior_model_dirs.insert(k, cdir)
+                    hits = [k]
+                if hits:
+                    self.chk_behavior_cls.setChecked(True)
+                    self.combo_behavior_model.setCurrentIndex(hits[0])
+                else:
+                    print(f"[MTT] not a behavior classifier folder: {cdir}", flush=True)
+            note("classifier_dir")
+        for key, spin in (("nc_threshold", self.spin_nc_threshold),
+                          ("cls_window", self.spin_cls_window),
+                          ("min_bout", self.spin_min_bout),
+                          ("uncertain_gap", self.spin_uncertain_gap)):
+            if key in d:
+                spin.setValue(type(spin.value())(d[key]))
+                note(key)
+        if "parallel" in d:
+            self.chk_parallel_videos.setChecked(True)
+            self.spin_parallel_videos.setValue(0 if d["parallel"] == "auto" else int(d["parallel"]))
+            note("parallel")
+        return applied
+
+    def _start_parallel_tracking(self, video_paths, model_dir, config_dict,
+                                 classifier_dir):
+        """Track the queue several videos at a time (mask_tracker_parallel),
+        with a tile per running video in the preview pane."""
+        import time as _time
+        from .mask_tracker_parallel import auto_worker_count
+        n = self.spin_parallel_videos.value()
+        if n == 0:
+            n, why = auto_worker_count(len(video_paths), config_dict.get("device", "auto"))
+        else:
+            n = min(n, len(video_paths))
+            why = f"{n} at once (set by hand)"
+        opts = {
+            "classifier_dir": classifier_dir,
+            "nc_threshold": self.spin_nc_threshold.value(),
+            "cls_window": self.spin_cls_window.value(),
+            "min_bout": self.spin_min_bout.value(),
+            "uncertain_gap": self.spin_uncertain_gap.value(),
+            "create_tracked_video": self.chk_create_tracked_video.isChecked(),
+            "show_preview": self.chk_inference_preview.isChecked(),
+            "auto_reason": why,
+        }
+        self._track_parallel = True
+        self._track_parallel_t0 = _time.time()
+        self._track_parallel_frames = 0
+        self._track_parallel_failed = 0
+        w = ParallelInferenceWorker(video_paths, model_dir, config_dict, n, opts)
+        self._inference_worker = w
+        self._infer_grid.set_slots(w.n_workers)
+        self._infer_grid.lbl_summary.setText(f"Tracking {len(video_paths)} videos, {why}")
+        w.video_started.connect(self._infer_grid.video_started)
+        w.video_progress.connect(self._infer_grid.video_progress)
+        w.video_progress.connect(self._on_parallel_progress)
+        w.video_frame.connect(self._on_parallel_frame)
+        w.video_failed.connect(self._on_parallel_failed)
+        w.worker_exited.connect(self._infer_grid.worker_exited)
+        w.video_finished.connect(self._on_video_finished)
+        w.all_done.connect(self._on_all_tracking_done)
+        w.error.connect(self._on_tracking_error)
+        w.log.connect(self._on_infer_log)
+
+        self.track_progress.setVisible(False)
+        self.track_queue_progress.setVisible(True)
+        self.lbl_track_status.setText(f"Tracking {len(video_paths)} videos, {why}")
+        self._show_infer_grid(True)
+        self._infer_log_text.clear()
+        self._infer_log_panel.setVisible(True)
+        print(f"[MTT Parallel] {why}", flush=True)
+        w.start()
+
+    def _show_infer_grid(self, on: bool):
+        """The tile grid in the preview's place (on the Inference tab) or not."""
+        self._infer_grid_on = on
+        here = self.tab_widget.currentIndex() == self._inference_tab_idx
+        self._infer_grid.setVisible(on and here)
+        if here:
+            self.preview.setVisible(not on)
+
+    def _on_parallel_progress(self, slot: int, frame: int, total: int, fps: float):
+        w = self._inference_worker
+        running = len(w.fps) if hasattr(w, "fps") else 0
+        all_fps = w.total_fps() if hasattr(w, "total_fps") else 0.0
+        failed = getattr(self, "_track_parallel_failed", 0)
+        text = (f"{self._track_videos_done} of {self._track_total_videos} done · "
+                f"{running} running · {all_fps:.0f} fps in all")
+        if failed:
+            text += f" · {failed} failed"
+        self.lbl_track_status.setText(text)
+        self.lbl_tracking_info.setText(text)
+
+    def _on_parallel_frame(self, slot: int, rgb, frame: int):
+        if self.tab_widget.currentIndex() == self._inference_tab_idx:
+            self._infer_grid.video_frame(slot, rgb, frame)
+
+    def _on_parallel_failed(self, slot: int, msg: str):
+        self._track_parallel_failed = getattr(self, "_track_parallel_failed", 0) + 1
+        self._infer_grid.video_failed(slot, msg)
+        item = QListWidgetItem(f"FAILED {msg}")
+        item.setForeground(QColor("#ef5350"))
+        self.list_track_results.addItem(item)
 
     def _on_tracking_frame(self, frame_rgb, frame_idx: int):
         """Display an annotated frame in the preview during live inference."""
@@ -11658,7 +13882,11 @@ class MaskTrackerWindow(QMainWindow):
         item.setForeground(QColor("#4fc456"))
         self.list_track_results.addItem(item)
 
-        if self._track_videos_done < self._track_total_videos:
+        if getattr(self, "_track_parallel", False):
+            self._track_parallel_frames += total_frames
+            if "worker" in result:
+                self._infer_grid.video_done(result["worker"], f"finished: {n_tracks} tracks")
+        elif self._track_videos_done < self._track_total_videos:
             next_name = os.path.basename(
                 self._track_video_paths[self._track_videos_done]
             )
@@ -11678,12 +13906,27 @@ class MaskTrackerWindow(QMainWindow):
         self.lbl_track_status.setText(
             f"Done — {self._track_videos_done} video(s) processed"
         )
+        if getattr(self, "_track_parallel", False):
+            import time as _time
+            dt = max(1e-6, _time.time() - self._track_parallel_t0)
+            line = (f"[MTT Parallel] Done: {self._track_videos_done} video(s), "
+                    f"{self._track_parallel_frames} frames in {dt / 60:.1f} min "
+                    f"({self._track_parallel_frames / dt:.1f} fps in all)")
+            if self._track_parallel_failed:
+                line += f", {self._track_parallel_failed} failed"
+            self._on_infer_log(line)
+            print(line, flush=True)
+            self.lbl_track_status.setText(line.replace("[MTT Parallel] ", ""))
+            self._track_parallel = False
+            self._show_infer_grid(False)
         self.lbl_tracking_info.setText(
             f"Inference complete — {self._track_videos_done} video(s) processed"
         )
         self.status_bar.showMessage(
             f"Inference complete: {self._track_videos_done} video(s)"
         )
+        if getattr(self, "_quit_when_done", False):
+            QTimer.singleShot(1500, self.close)
 
     def _toggle_tracking_pause(self):
         if not hasattr(self, "_inference_worker") or not self._inference_worker.isRunning():
@@ -11713,6 +13956,9 @@ class MaskTrackerWindow(QMainWindow):
             self.lbl_track_status.setText("Stopping tracking...")
 
     def _on_tracking_error(self, msg: str):
+        if getattr(self, "_infer_grid_on", False):
+            self._track_parallel = False
+            self._show_infer_grid(False)
         self.track_progress.setVisible(False)
         self.track_queue_progress.setVisible(False)
         self.btn_start_tracking.setEnabled(True)
@@ -11720,6 +13966,10 @@ class MaskTrackerWindow(QMainWindow):
         self.btn_track_stop.setVisible(False)
         self.preview.setEnabled(True)
         self.lbl_track_status.setText(f"Error: {msg}")
+        print(f"[MTT] tracking error: {msg}", flush=True)
+        if getattr(self, "_quit_when_done", False):
+            QTimer.singleShot(1500, self.close)
+            return
         QMessageBox.critical(self, "Tracking Error", msg)
 
     def _on_result_double_clicked(self, item):
@@ -11870,20 +14120,15 @@ class MaskTrackerWindow(QMainWindow):
         )
         self._preview_title_row.setVisible(is_classifier)
         # Check if mask model training is in progress
-        mask_training_active = (
-            hasattr(self, "_train_worker")
-            and self._train_worker is not None
-            and self._train_worker.isRunning()
-        )
-        mask_show_viz = is_annotation and mask_training_active
-
         # Classifier training loss panel
         self._cls_training_viz_panel.setVisible(cls_show_loss or cls_graph_visible)
-        # Mask training visualization panel
-        self._training_viz_panel.setVisible(mask_show_viz)
-        # Preview + info row: hidden during any training viz
-        show_preview = not cls_show_loss and not cls_graph_visible and not mask_show_viz
-        self.preview.setVisible(show_preview)
+        # (Mask training has its own window.) Preview + info row: hidden while
+        # the classifier graph is up.
+        show_preview = not cls_show_loss and not cls_graph_visible
+        grid_on = is_tracking and getattr(self, "_infer_grid_on", False)
+        self.preview.setVisible(show_preview and not grid_on)
+        if hasattr(self, "_infer_grid"):
+            self._infer_grid.setVisible(grid_on)
         self._scrubber_row.setVisible(is_annotation and show_preview)
         self._info_row.setVisible(show_preview)
 
@@ -12009,24 +14254,32 @@ class MaskTrackerWindow(QMainWindow):
         stats = self._coco.get_stats()
         n_this_frame = len(self.preview.annotations)
         n_inferred_frame = sum(1 for a in self.preview.annotations if a.inferred)
-        if stats["num_annotations"] == 0:
+        n_empty = self._coco.count_empty_images()
+        frame_empty = (not self._annot_in_video_mode
+                       and 0 <= self.current_frame_idx < len(self._extracted_frames)
+                       and self._coco.is_image_empty(os.path.basename(
+                           self._extracted_frames[self.current_frame_idx][2])))
+        if stats["num_annotations"] == 0 and n_empty == 0:
             self.lbl_ann_stats.setText("")
         else:
             n_total_inferred = sum(
                 1 for a in self._coco.annotations if a.get("inferred", False)
             )
-            frame_str = f"{n_this_frame} on frame"
+            frame_str = "empty frame" if frame_empty else f"{n_this_frame} on frame"
             if n_inferred_frame > 0:
                 frame_str += f" ({n_inferred_frame} inferred)"
             total_str = f"{stats['num_annotations']} total across {stats['images_with_annotations']} images"
             if n_total_inferred > 0:
                 total_str += f" ({n_total_inferred} inferred)"
+            if n_empty:
+                total_str += f", {n_empty} empty"
             self.lbl_ann_stats.setText(f"{frame_str}  |  {total_str}")
             if n_inferred_frame > 0:
                 self.lbl_ann_stats.setStyleSheet("color: #e6c830; font-size: 10px;")
             else:
                 self.lbl_ann_stats.setStyleSheet("color: #4caf50; font-size: 10px;")
         self._update_frame_list_item(self.current_frame_idx)
+        self._sync_empty_button()
 
     def _update_frame_list_item(self, row: int):
         if row < 0 or row >= len(self._extracted_frames):
@@ -12045,6 +14298,9 @@ class MaskTrackerWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._close_video()
+        win = getattr(self, "_seg_train_window", None)
+        if win is not None and not getattr(self, "_window_only", False):
+            win.hide()          # unowned, so it would otherwise outlive the main window
         # Annotations and the project config are auto-saved on every action.
         self._autosave_project_config()
         self._tab_anim_timer.stop()
@@ -12053,4 +14309,327 @@ class MaskTrackerWindow(QMainWindow):
         worker = getattr(self, "_sysprofile_worker", None)
         if worker is not None and worker.isRunning():
             worker.wait(2000)
+        self._wait_for_prediction()
+        w = getattr(self, "_inference_worker", None)
+        if isinstance(w, ParallelInferenceWorker) and w.isRunning():
+            w.shutdown()
         event.accept()
+
+
+# ======================================================================
+# Command-line launch
+# ======================================================================
+#: --arch value -> Architecture combo text.
+ARCH_CHOICES = {
+    "yolo11n-seg": "YOLOv11-nano-seg",
+    "yolo11s-seg": "YOLOv11-small-seg",
+    "yolo11m-seg": "YOLOv11-medium-seg",
+    "yolo11l-seg": "YOLOv11-large-seg",
+    "maskrcnn": "Mask R-CNN",
+}
+#: --device value -> Device combo text.
+DEVICE_CHOICES = {
+    "auto": "Auto",
+    "cpu": "CPU",
+    "cuda": "CUDA (NVIDIA)",
+    "mps": "MPS (Apple Silicon)",
+}
+
+
+def expand_focus_items(items) -> List[str]:
+    """Frame filenames from --focus items, in order, without duplicates.
+
+    An item is a frame filename or path, or a .txt file listing them one per
+    line (blank lines and lines starting with # are skipped). Names without an
+    image extension are taken as .png, the extension extraction writes.
+    """
+    names: List[str] = []
+    seen = set()
+
+    def _add(raw: str):
+        raw = raw.strip()
+        if not raw or raw.startswith("#"):
+            return
+        name = re.split(r"[\\/]", raw)[-1]
+        if Path(name).suffix.lower() not in IMAGE_EXTENSIONS:
+            name += ".png"
+        if name not in seen:
+            seen.add(name)
+            names.append(name)
+
+    for item in items or ():
+        item = str(item)
+        if item.lower().endswith(".txt") and os.path.isfile(item):
+            with open(item, encoding="utf-8") as fh:
+                for line in fh:
+                    _add(line)
+        else:
+            _add(item)
+    return names
+
+
+from .mask_tracker_cli import (  # noqa: E402
+    add_inference_settings, inference_settings, project_of_model, resolve_project_config,
+)
+
+
+def apply_training_args(win: "MaskTrackerWindow", args) -> List[str]:
+    """Put the training flags that were given into the Train panel.
+
+    Flags left out keep the panel's value, so the window always shows what the
+    run trains with and the next press of Train uses the panel alone. Returns
+    the settings applied, for the log.
+    """
+    applied = []
+    if getattr(args, "arch", None):
+        win.combo_architecture.setCurrentText(ARCH_CHOICES[args.arch])
+        applied.append(f"arch={args.arch}")
+    if getattr(args, "device", None):
+        win.combo_device.setCurrentText(DEVICE_CHOICES[args.device])
+        applied.append(f"device={args.device}")
+    if getattr(args, "optimizer", None):
+        # Before --lr: switching the optimizer resets the learning rate to its
+        # default, so "--optimizer SGD --lr 0.002" trained at 0.01.
+        win.combo_optimizer.setCurrentText(args.optimizer)
+        applied.append(f"optimizer={args.optimizer}")
+    for flag, widget in (("epochs", win.spin_iterations), ("batch", win.spin_batch),
+                         ("lr", win.spin_lr), ("patience", win.spin_patience),
+                         ("val_frac", win.spin_val_frac),
+                         ("post_infer_conf", win.spin_post_infer_conf),
+                         ("post_infer_max", win.spin_post_infer_max)):
+        value = getattr(args, flag, None)
+        if value is not None:
+            widget.setValue(value)
+            applied.append(f"{flag}={value}")
+    for flag, widget in (("augment", win.chk_augment), ("post_infer", win.chk_post_infer)):
+        value = getattr(args, flag, None)
+        if value is not None:
+            widget.setChecked(bool(value))
+            applied.append(f"{flag}={bool(value)}")
+    if getattr(args, "augment", None):
+        # The checkbox alone augments nothing: each transform has its own
+        # control, all off by default, so "--augment" trained with none. It
+        # turns them on: flips + rotation (+-180 deg unless --aug-rotation
+        # says otherwise: top-down views), scale 0.8-1.2, brightness and
+        # contrast +-10%.
+        rot = getattr(args, "aug_rotation", None) or "180"
+        win.combo_aug_rotation.setCurrentIndex({"none": 0, "15": 1, "180": 2}[rot])
+        for chk in (win.chk_aug_scale, win.chk_aug_brightness, win.chk_aug_contrast):
+            chk.setChecked(True)
+        applied.append(f"aug_rotation={rot}")
+    if getattr(args, "freeze", None) is not None:
+        win.chk_freeze_backbone.setChecked(bool(args.freeze))
+        applied.append(f"freeze_backbone={bool(args.freeze)}")
+    if getattr(args, "mosaic", None) is not None:
+        win._mosaic_override = float(args.mosaic)
+        applied.append(f"mosaic={args.mosaic}")
+    if getattr(args, "copy_paste", None) is not None:
+        win._copy_paste_override = float(args.copy_paste)
+        applied.append(f"copy_paste={args.copy_paste}")
+    if getattr(args, "imgsz", None):
+        win._imgsz_override = int(args.imgsz)
+        applied.append(f"imgsz={args.imgsz}")
+    return applied
+
+
+def _launch_parser():
+    """Command line of ``python -m fnt.videoTracking.mask_tracker_gui``.
+
+    Opens the Mask Tracker on a project and, with ``--focus``, shows only the
+    listed frames for review; with ``--train`` it starts a segmentation run
+    exactly as the Train button would, with the loss plot and log on screen.
+    """
+    import argparse
+    p = argparse.ArgumentParser(
+        prog="mask-tracker", description="FNT Mask Tracker (GUI).")
+    p.add_argument("--project", default="",
+                   help="Open this project (its folder or project_config.json).")
+    p.add_argument("--focus", nargs="+", default=None, metavar="ITEM",
+                   help="Show only these frames in the frame list: frame "
+                        "filenames or paths, and/or .txt files listing them one "
+                        "per line. File > Show All Frames returns.")
+    p.add_argument("--train", action="store_true",
+                   help="Start a segmentation training run once the project is "
+                        "open, as the Train button would.")
+    p.add_argument("--train-only", dest="train_only", nargs="+", default=None, metavar="ITEM",
+                   help="With --train: train on these frames only (names, and/or .txt files "
+                        "listing them) -- e.g. while new classes are labelled on a subset, so "
+                        "the other frames don't teach the new objects as background.")
+    p.add_argument("--training-window-only", dest="training_window_only", action="store_true",
+                   help="With --train: show only the Segmentation Training window "
+                        "(the main window stays hidden; closing the training window "
+                        "quits), like MAD's --training-window-only.")
+    g = p.add_argument_group(
+        "training settings",
+        "Set in the Train panel before the run; any not given keep the "
+        "panel's value.")
+    g.add_argument("--arch", choices=sorted(ARCH_CHOICES))
+    g.add_argument("--epochs", type=int)
+    g.add_argument("--batch", type=int)
+    g.add_argument("--lr", type=float)
+    g.add_argument("--patience", type=int)
+    g.add_argument("--val-frac", dest="val_frac", type=float)
+    g.add_argument("--imgsz", type=int,
+                   help="YOLO input size in pixels (default 640).")
+    g.add_argument("--device", choices=sorted(DEVICE_CHOICES))
+    g.add_argument("--augment", dest="augment", action="store_true", default=None,
+                   help="Augment while training: flips, rotation, scale 0.8-1.2, "
+                        "brightness and contrast +-10%%.")
+    g.add_argument("--freeze", dest="freeze", action="store_true", default=None,
+                   help="Freeze the backbone (train the heads only).")
+    g.add_argument("--no-freeze", dest="freeze", action="store_false",
+                   help="Train the whole network (the default).")
+    g.add_argument("--mosaic", type=float,
+                   help="YOLO mosaic augmentation probability (0-1; default 1).")
+    g.add_argument("--copy-paste", dest="copy_paste", type=float,
+                   help="YOLO copy-paste augmentation probability (0-1; default 0.3): "
+                        "animals pasted between training images by their masks.")
+    g.add_argument("--optimizer", choices=["AdamW", "SGD"],
+                   help="Optimizer (AdamW wants a learning rate near 0.001-0.002; "
+                        "SGD near 0.01).")
+    g.add_argument("--aug-rotation", dest="aug_rotation", choices=["none", "15", "180"],
+                   help="Rotation with --augment: 180 (default; top-down views), "
+                        "15 (side views) or none.")
+    g.add_argument("--no-augment", dest="augment", action="store_false")
+    g.add_argument("--post-infer", dest="post_infer", action="store_true",
+                   default=None,
+                   help="After training, add the model's masks to the frames in "
+                        "the queue that have no approved mask, for review.")
+    g.add_argument("--no-post-infer", dest="post_infer", action="store_false")
+    g.add_argument("--post-infer-conf", dest="post_infer_conf", type=float)
+    g.add_argument("--post-infer-max", dest="post_infer_max", type=int)
+    p.add_argument("--predict", metavar="MODEL_DIR", default=None,
+                   help="Once the project is open, predict the queue's unreviewed frames "
+                        "with this trained model (as File > Predict Unreviewed Frames).")
+    i = p.add_argument_group(
+        "inference",
+        "Run the Inference tab on videos once the project is open, as Run "
+        "Inference would. Settings not given keep the tab's value.")
+    i.add_argument("--infer", nargs="+", default=None, metavar="VIDEO",
+                   help="Videos, folders (searched recursively) and/or .txt lists to track. "
+                        "Any that already have a <name>_MaskTracker folder are left out "
+                        "(never cleared).")
+    i.add_argument("--infer-model", dest="infer_model", default=None, metavar="MODEL_DIR",
+                   help="The trained model run folder; default: --settings-from's, else the "
+                        "one the tab selects.")
+    add_inference_settings(i)
+    return p
+
+
+def track_main(args) -> int:
+    """``mask_tracker_cli track``: open the project in the window and track the
+    videos from the Inference tab (see ``main``'s ``--infer``)."""
+    from .mask_tracker_cli import settings_argv
+    from .mtt_runs import find_track_videos
+    model = args.model
+    if not model and args.settings_from:
+        model = inference_settings(args).get("model_dir")
+    if not model:
+        print("track: give --model (or --settings-from a run that names one)", file=sys.stderr)
+        return 2
+    project = args.project or project_of_model(model)
+    if not project:
+        print(f"track: {model} is not inside a project's models/ folder; give --project",
+              file=sys.stderr)
+        return 2
+    videos = find_track_videos(args.videos)
+    if not videos:
+        print("track: no videos found", file=sys.stderr)
+        return 1
+    if args.redo:
+        from .mtt_runs import move_tracking_aside
+        for v in videos:
+            dest = move_tracking_aside(v)
+            if dest:
+                print(f"[MTT] moved the old tracking files to {dest} (the folder and its ROI files stay)",
+                      flush=True)
+    argv = (["--project", project, "--infer", *videos, "--infer-model", model]
+            + settings_argv(args))
+    return main(argv)
+
+
+def read_frame_names(items) -> set:
+    """Frame file names from names, paths and .txt lists (one per line)."""
+    out = set()
+    for it in items:
+        if it.lower().endswith(".txt") and os.path.isfile(it):
+            with open(it, encoding="utf-8") as fh:
+                out |= {os.path.basename(l.strip()) for l in fh if l.strip() and not l.startswith("#")}
+        else:
+            out.add(os.path.basename(it))
+    return out
+
+
+def _host_like_startup():
+    """The crash log, slot exception hook and HiDPI setup that the FNT
+    launcher's tool host gives a tool; a command-line start gets none of them
+    otherwise. Never blocks startup."""
+    try:
+        from fnt import tool_host as th
+        th.install_faulthandler("Mask Tracker (command line)")
+        th.install_slot_excepthook()
+        th.install_qt_message_handler()
+        if QApplication.instance() is None:
+            th._prepare_windows_taskbar()
+            th._enable_hidpi()
+        th._suppress_child_consoles()
+    except Exception:
+        pass
+
+
+def main(argv=None) -> int:
+    parser = _launch_parser()
+    # parse_known_args: Qt has command-line options of its own.
+    args, qt_args = parser.parse_known_args(
+        sys.argv[1:] if argv is None else argv)
+    if (args.train or args.focus or args.predict or args.infer) and not args.project:
+        parser.error("--train, --focus, --predict and --infer need --project")
+    try:
+        inference_settings(args)
+    except (ValueError, OSError) as e:
+        parser.error(str(e))
+    if args.training_window_only and not args.train:
+        parser.error("--training-window-only needs --train")
+    if args.train_only and not args.train:
+        parser.error("--train-only needs --train")
+    config = None
+    if args.project:
+        try:
+            config = resolve_project_config(args.project)
+        except FileNotFoundError as e:
+            parser.error(str(e))
+    _host_like_startup()
+    app = QApplication.instance() or QApplication([sys.argv[0]] + qt_args)
+    win = MaskTrackerWindow()
+    win._launched = True
+    win._window_only = bool(args.training_window_only)
+    if win._window_only:
+        app.setQuitOnLastWindowClosed(False)    # it quits when its training window closes
+    else:
+        win.show()
+    if config:
+        win._load_project(config)
+        if args.focus:
+            shown, missing = win.focus_frames(args.focus)
+            note = ""
+            if missing:
+                note = f"; not in training_frames/: {', '.join(missing[:5])}"
+                if len(missing) > 5:
+                    note += " ..."
+            print(f"[MTT] focus: {shown} frame(s){note}", flush=True)
+        if args.train_only:
+            win._train_only = read_frame_names(args.train_only)
+        applied = apply_training_args(win, args)
+        if applied:
+            print(f"[MTT] training settings: {', '.join(applied)}", flush=True)
+        if args.train:
+            QTimer.singleShot(500, win._start_training)
+        elif args.predict:
+            QTimer.singleShot(500, lambda: win._predict_queue_with_model(args.predict))
+        elif args.infer:
+            QTimer.singleShot(500, lambda: win._launch_inference(args))
+    return app.exec_()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

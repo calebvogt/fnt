@@ -90,7 +90,15 @@ def detect_proximity_bouts(df, threshold=0.5, gap_s=5, tag_identities=None,
     # a binning key the pairwise join would match almost nothing. The bin is
     # only the join key — the true millisecond timestamps are carried alongside
     # (ts_first/ts_last below) so bout edges and durations keep full resolution.
-    work['ts_rounded'] = work['Timestamp'].dt.floor('1s')
+    # Floored in UTC: flooring a local time raises on the hour a DST end
+    # repeats ("Cannot infer dst time from 2026-11-01 01:00:00", VC-T014), and
+    # every UTC offset is whole seconds, so the bins are the same.
+    ts = work['Timestamp']
+    if ts.dt.tz is not None:
+        work['ts_rounded'] = (ts.dt.tz_convert('UTC').dt.floor('1s')
+                              .dt.tz_convert(ts.dt.tz))
+    else:
+        work['ts_rounded'] = ts.dt.floor('1s')
 
     # Derive Day and Date from timestamp.
     #

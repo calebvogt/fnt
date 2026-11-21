@@ -8,10 +8,16 @@ hiddenimports += collect_submodules('torch')
 hiddenimports += collect_submodules('torchvision')
 hiddenimports += collect_submodules('segmentation_models_pytorch')
 hiddenimports += ['scipy.special.cython_special', 'sklearn.utils._typedefs']
+# The tool windows are opened by module name (fnt.tool_launcher.TOOL_REGISTRY ->
+# importlib in fnt.tool_host), and usv_detector exports lazily by name, so
+# PyInstaller never sees them imported. Bundle every fnt module; without this
+# v0.1.15 shipped without CAD, MAD, Compress WAVs and most other tools ("No
+# module named ..." when their button is clicked).
+hiddenimports += collect_submodules('fnt')
 
 datas = []
 datas += [('icons', 'icons')]
-datas += [('fnt/fed3/fed3_image.svg', 'fnt/fed3')]
+datas += [('fnt/fed3/ui/fed3.svg', 'fnt/fed3/ui')]
 datas += collect_data_files('ultralytics')
 datas += collect_data_files('sam2')
 datas += collect_data_files('segmentation_models_pytorch')

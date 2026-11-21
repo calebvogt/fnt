@@ -248,7 +248,7 @@ def _code(fn):
 
 def test_it_floats_after_the_scope_prompt_not_before():
     code = _code(MADMainWindow._start_inference)
-    i_gate = code.index("if not wav_paths:")
+    i_gate = code.index("if not wav_paths and not ridge_fill:")
     i_float = code.index("self._show_infer_progress_dialog()")
     assert i_gate < i_float
 

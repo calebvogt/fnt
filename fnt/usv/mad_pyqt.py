@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # Quiet the noisy Hugging Face cache symlink warning on Windows (symlinks need
 # Developer Mode/admin; caching still works fine without them). Set before any
@@ -43,6 +43,7 @@ from PyQt5.QtWidgets import (
     QListWidgetItem, QMainWindow, QMessageBox, QProgressBar, QPushButton,
     QRadioButton, QScrollArea, QScrollBar, QShortcut, QSizePolicy, QSlider,
     QSpinBox, QSplitter, QStatusBar, QStyle, QStyledItemDelegate, QToolButton,
+    QStyleOptionSlider,
     QStyleOptionViewItem, QTextEdit, QTreeWidget, QButtonGroup,
     QProgressDialog, QAbstractItemView, QListView, QTreeView,
     QTreeWidgetItem, QVBoxLayout, QWidget,
@@ -54,6 +55,7 @@ from fnt.usv.audio_widgets import (
     MAX_EXPORT_MP, SpectrogramWidget, WaveformOverviewWidget)
 from scipy.ndimage import binary_erosion as ndi_binary_erosion
 from fnt.usv.usv_detector.fnt_mask_store import REJECTED_KINDS
+from fnt.usv.usv_detector.spectrogram import NO_WINDOW
 from fnt.usv.usv_detector.mad_labels import pred_csv_sibling_path
 from fnt.usv.usv_detector.mad_project import (
     MADProjectConfig, PROJECT_INFO_FILENAME, create_mad_project,
@@ -69,6 +71,109 @@ try:
     HAS_SOUNDDEVICE = True
 except Exception:
     HAS_SOUNDDEVICE = False
+
+
+#: How long the interpreter waits, per thread, for a MAD worker still running
+#: at exit. The device probe is the one that matters: it imports torch, which
+#: takes seconds, and every window starts it.
+_EXIT_THREAD_WAIT_MS = 30_000
+
+
+def _join_mad_threads_at_exit():
+    """Let any MAD worker thread still running finish before Qt destroys it.
+
+    A QThread destroyed while running aborts the whole process (Qt's fatal
+    "destroyed while thread is still running", 0xC0000409 on Windows -- no
+    message, no traceback). closeEvent stops the window's threads, but a
+    window the interpreter tears down without closing never runs it: every
+    GUI test module did exactly that, passing all its tests and then exiting
+    127, and so does any script that builds a window and returns while the
+    device probe is still importing torch.
+
+    Asks each to stop, then waits (bounded) rather than terminate()-ing --
+    killing a thread mid-import leaves the interpreter in a state worse than
+    the abort. Runs from atexit, registered after PyQt's own import so it runs
+    before PyQt's teardown.
+    """
+    try:
+        app = QApplication.instance()
+    except Exception:
+        return
+    if app is None:
+        return
+    for w in list(app.topLevelWidgets()):
+        try:
+            threads = w.findChildren(QThread)
+        except RuntimeError:           # the C++ side is already gone
+            continue
+        for th in threads:
+            try:
+                if not th.isRunning():
+                    continue
+                if hasattr(th, 'request_stop'):
+                    th.request_stop()
+                th.quit()
+                th.wait(_EXIT_THREAD_WAIT_MS)
+            except RuntimeError:
+                continue
+
+
+import atexit  # noqa: E402
+atexit.register(_join_mad_threads_at_exit)
+
+
+#: Every type MAD hands to scipy.signal (arrays, their scalars, and the plain
+#: Python values passed as parameters). See _guard_scipy_against_partial_torch.
+_SCIPY_PRIME_TYPES = (
+    np.ndarray, np.memmap, np.ma.MaskedArray, np.matrix,
+    np.float16, np.float32, np.float64, np.complex64, np.complex128,
+    np.int8, np.int16, np.int32, np.int64, np.uint8, np.uint16, np.uint32,
+    np.uint64, np.bool_, int, float, complex, bool, str, bytes, list, tuple,
+    dict, type(None), slice, range,
+)
+
+
+def _guard_scipy_against_partial_torch() -> bool:
+    """Make scipy safe to call while torch is importing on another thread.
+
+    The device probe imports torch in the background so MAD opens in 1.7 s
+    rather than 3.4 s. But scipy >= 1.15 checks every argument with
+    ``is_torch_array``, which looks torch up in ``sys.modules`` -- and while
+    another thread is mid-import that is a half-built module, so the check
+    raises "partially initialized module 'torch' has no attribute 'Tensor'".
+    resample_poly, sosfiltfilt, resample and spectrogram all do it: pressing
+    Play or Het in MAD's first seconds, or loading the first file, could fail.
+
+    scipy caches that check per type (an lru_cache on _issubclass_fast), so
+    asking it once for every type MAD uses, before torch is anywhere near
+    sys.modules, settles each answer at False for good. Returns True when the
+    cache was primed (or torch is already in), False when this scipy has no
+    such cache and torch was imported here instead -- slower, but with no
+    half-imported module for anyone to see.
+    """
+    if "torch" in sys.modules:
+        return True        # imported, or a probe already primed and started
+    prime = None
+    for mod in ("scipy._external.array_api_compat.common._helpers",
+                "scipy._lib.array_api_compat.common._helpers"):
+        try:
+            prime = getattr(__import__(mod, fromlist=["_"]),
+                            "_issubclass_fast")
+            break
+        except Exception:
+            continue
+    if prime is None or not hasattr(prime, "cache_info"):
+        try:
+            import torch  # noqa: F401
+        except Exception:
+            pass
+        return False
+    for t in _SCIPY_PRIME_TYPES:
+        try:
+            prime(t, "torch", "Tensor")
+        except Exception:
+            pass
+    return True
 
 try:
     from PIL import Image as PILImage
@@ -107,6 +212,161 @@ _ANN_ID_SEQ = itertools.count(1)
 def _new_ann_id(prefix: str) -> str:
     """A process-unique annotation id, e.g. ``pred_00000042``."""
     return f"{prefix}_{next(_ANN_ID_SEQ):08d}"
+
+
+def merge_call_masks(anns):
+    """The union of several calls' masks, as ``(f0, f1, t0, t1, mask)``.
+
+    Returns None unless every call overlaps or touches (8-connected) another
+    one, directly or through a chain of them. Merging is for pieces of one
+    vocalisation -- two detections of a faint call plus the stroke painted
+    between them -- and a union of calls that never meet would store two calls
+    as one.
+    """
+    anns = [a for a in anns if a is not None]
+    if len(anns) < 2:
+        return None
+    for a in anns:
+        m = a.get('mask')
+        if m is None or not np.asarray(m).any():
+            return None
+    n = len(anns)
+
+    def _linked(i, j, pad):
+        a, b = anns[i], anns[j]
+        return not (a['t1'] + pad <= b['t0'] or b['t1'] + pad <= a['t0']
+                    or a['f1'] + pad <= b['f0'] or b['f1'] + pad <= a['f0'])
+
+    def _connected(edge):
+        seen, stack = {0}, [0]
+        while stack:
+            i = stack.pop()
+            for j in range(n):
+                if j not in seen and edge(i, j):
+                    seen.add(j)
+                    stack.append(j)
+        return len(seen) == n
+
+    # Boxes first: cheap, and it keeps calls seconds apart from allocating a
+    # union frame that spans the gap.
+    if not _connected(lambda i, j: _linked(i, j, 1)):
+        return None
+    f0 = min(int(a['f0']) for a in anns)
+    f1 = max(int(a['f1']) for a in anns)
+    t0 = min(int(a['t0']) for a in anns)
+    t1 = max(int(a['t1']) for a in anns)
+    placed = []
+    for a in anns:
+        m = np.asarray(a['mask']) > 0
+        h = min(m.shape[0], f1 - int(a['f0']))
+        w = min(m.shape[1], t1 - int(a['t0']))
+        full = np.zeros((f1 - f0, t1 - t0), dtype=bool)
+        r, c = int(a['f0']) - f0, int(a['t0']) - t0
+        full[r:r + h, c:c + w] = m[:h, :w]
+        placed.append(full)
+    from scipy.ndimage import binary_dilation
+    grown = [binary_dilation(p, structure=np.ones((3, 3), bool))
+             for p in placed]
+    if not _connected(lambda i, j: bool((grown[i] & placed[j]).any())):
+        return None
+    return f0, f1, t0, t1, np.logical_or.reduce(placed)
+
+
+def _tight_shape(f0, t0, mask):
+    """``(f0, f1, t0, t1, mask)`` cropped to the set pixels, or None."""
+    m = np.asarray(mask) > 0
+    rows = np.flatnonzero(m.any(axis=1))
+    if rows.size == 0:
+        return None
+    cols = np.flatnonzero(m.any(axis=0))
+    r0, r1 = int(rows[0]), int(rows[-1]) + 1
+    c0, c1 = int(cols[0]), int(cols[-1]) + 1
+    return (int(f0) + r0, int(f0) + r1, int(t0) + c0, int(t0) + c1,
+            np.ascontiguousarray(m[r0:r1, c0:c1]))
+
+
+def same_call_shape(ann, shape) -> bool:
+    """True when ``shape`` (``(f0, f1, t0, t1, mask)``) holds exactly the
+    call's pixels, wherever either box sits and however loosely it fits."""
+    m = np.asarray(ann.get('mask'))
+    h = min(int(ann['f1']) - int(ann['f0']), m.shape[0])
+    w = min(int(ann['t1']) - int(ann['t0']), m.shape[1])
+    a = _tight_shape(ann['f0'], ann['t0'], m[:h, :w])
+    b = _tight_shape(shape[0], shape[2], shape[4])
+    if a is None or b is None:
+        return a is None and b is None
+    return a[:4] == b[:4] and np.array_equal(a[4], b[4])
+
+
+def joint_edit_groups(members, box, painted):
+    """Sort the result of editing several calls' shapes together into calls.
+
+    ``members`` are the calls as they were before the edit; ``box`` and
+    ``painted`` the edited pixels (``(f0, f1, t0, t1)`` and the bool crop over
+    it). The edited pixels are split into connected components, 8-connected
+    -- the same "touch" :func:`merge_call_masks` accepts -- and a component
+    belongs to every member whose original pixels it still holds. Members that
+    share a component (a painted bridge, or pieces that already overlapped)
+    are one call now, chained: A joined to B and B to C is one call.
+
+    Returns ``(groups, strays, gone)``:
+
+    * ``groups``: ``[(member_indices, (f0, f1, t0, t1, mask)), ...]`` in member
+      order, each group's shape the union of its components;
+    * ``strays``: shapes of components holding no member pixel (a stroke that
+      touches none of the calls);
+    * ``gone``: indices of members erased to nothing.
+    """
+    from scipy import ndimage
+    painted = np.asarray(painted) > 0
+    bf0, bf1, bt0, bt1 = (int(v) for v in box)
+    lbl, n = ndimage.label(painted, structure=np.ones((3, 3), bool))
+    touch = []
+    for a in members:
+        m = np.asarray(a['mask']) > 0
+        af0, at0 = int(a['f0']), int(a['t0'])
+        af1 = af0 + min(int(a['f1']) - af0, m.shape[0])
+        at1 = at0 + min(int(a['t1']) - at0, m.shape[1])
+        of0, of1 = max(af0, bf0), min(af1, bf1)
+        ot0, ot1 = max(at0, bt0), min(at1, bt1)
+        labs = set()
+        if of1 > of0 and ot1 > ot0:
+            sub_l = lbl[of0 - bf0:of1 - bf0, ot0 - bt0:ot1 - bt0]
+            sub_m = m[of0 - af0:of1 - af0, ot0 - at0:ot1 - at0]
+            labs = {int(v) for v in np.unique(sub_l[sub_m])} - {0}
+        touch.append(labs)
+    # Union-find over members, joined through the components they share.
+    parent = list(range(len(members)))
+
+    def _root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    owner = {}
+    for i, labs in enumerate(touch):
+        for lab in labs:
+            if lab in owner:
+                ri, rj = _root(i), _root(owner[lab])
+                if ri != rj:
+                    parent[max(ri, rj)] = min(ri, rj)
+            else:
+                owner[lab] = i
+    by_root = {}
+    for i, labs in enumerate(touch):
+        if labs:
+            by_root.setdefault(_root(i), []).append(i)
+    groups = []
+    for root in sorted(by_root):
+        idx = by_root[root]
+        labs = sorted(set().union(*(touch[i] for i in idx)))
+        shape = _tight_shape(bf0, bt0, np.isin(lbl, labs))
+        groups.append((tuple(idx), shape))
+    strays = [_tight_shape(bf0, bt0, lbl == lab)
+              for lab in range(1, n + 1) if lab not in owner]
+    gone = [i for i, labs in enumerate(touch) if not labs]
+    return groups, strays, gone
 
 
 _ROLE_FILE_LABEL = Qt.UserRole + 20   # base filename for the count delegate
@@ -322,6 +582,12 @@ INFER_SETTINGS = {
 # v2: the v1 key could hold a width saved while the layout was over-constrained
 # (see the controls-bar note in _build_ui); those states are not worth migrating.
 SPLITTER_STATE_KEY = "mad/ui/splitter_state_v2"
+#: Heterodyne playback's local-oscillator frequency, in kHz.
+HET_LO_KEY = "mad/audio/het_lo_khz"
+HET_FLOOR_KEY = "mad/audio/het_floor_khz"
+#: Whether the training-window shading (W) is on.
+TRAIN_WINDOWS_KEY = "mad/ui/show_train_windows"
+RIDGES_KEY = "mad/ui/show_ridges"
 MAX_RECENT_PROJECTS = 8
 
 # Per-pixel mask values
@@ -330,6 +596,14 @@ MASK_POSITIVE = 1   # user-painted target
 MASK_NEGATIVE = 2   # auto-assigned inside committed time bands
 
 LABEL_SUFFIX = "_FNT_MAD_labels.png"
+
+#: Frames of context kept on each side of a call when it is saved as a training
+#: example (~65 ms at hop 128 / 250 kHz). Training supervises that whole patch
+#: -- every frequency, from this many frames before the call to as many after
+#: it -- so anything in it that is not a confirmed call is taught as
+#: background. The review overlay shades exactly this span; see
+#: MADSpectrogramWidget.training_windows. Examples saved before 2026-09 used 64.
+EXAMPLE_CONTEXT_FRAMES = 128
 
 
 # ======================================================================
@@ -364,6 +638,12 @@ _SEMANTIC_PALETTE = {
     'prob':      (255, 215, 40),
     'harmonic':  (120, 205, 255),
     'halo':      (0, 0, 0),
+    # Training-window shading: a faint lift of the spectrogram, not a hue --
+    # it marks a region, and must not read as a fifth review state.
+    'train_window': (255, 255, 255),
+    # A detection's brightness ridge: a line inside the mask, so it needs a hue
+    # of its own against the pending yellow it sits in.
+    'ridge':     (255, 120, 0),
 }
 # Inverted grayscale is the one *light* background, where white and bright
 #: Stroke width of a mask outline, and of the selected one. The halo pen is
@@ -372,6 +652,8 @@ _SEMANTIC_PALETTE = {
 #: ends of a colormap, so it is the line that thins, never the halo.
 MASK_OUTLINE_W = 1
 MASK_OUTLINE_W_SELECTED = 2
+#: Stroke width of a detection's brightness ridge.
+RIDGE_W = 2
 
 
 #: Everything File > Settings can change, in one place.
@@ -474,6 +756,8 @@ _SEMANTIC_PALETTE_LIGHT = {
     'prob':      (185, 125, 0),
     'harmonic':  (0, 90, 170),
     'halo':      (255, 255, 255),
+    'train_window': (0, 0, 0),
+    'ridge':     (190, 70, 0),
 }
 _OVERLAY_PALETTES = {
     name: _SEMANTIC_PALETTE
@@ -528,6 +812,10 @@ class MADSpectrogramWidget(SpectrogramWidget):
     request_context_menu = pyqtSignal(int, object)
     # A vertex-edit finished for the given annotation index.
     annotation_edit_finished = pyqtSignal(int)
+    # A joint shape edit (several calls at once) finished: a dict with the
+    # edited pixels ('box', 'mask'), the member ids ('ids') and 'anchor_id'.
+    # The members are back in the list, untouched, when it is emitted.
+    joint_edit_finished = pyqtSignal(object)
     # Left-click selected an annotation (no labeling tool engaged).
     annotation_clicked = pyqtSignal(int)
     # A rubber-band drag selected a set of annotations (indices; [] = cleared).
@@ -543,12 +831,20 @@ class MADSpectrogramWidget(SpectrogramWidget):
         # masks. ``self.mask`` is their union (uint8 {0,1}) kept for fill
         # rendering, save-target and inference-preserve compatibility.
         self.annotations: List[dict] = []
+        # Ridges of calls confirmed this session, by example id: {bins, t0,
+        # mask}. A drawn or edited mask gets its ridge when it is saved; an
+        # annotation adopts it while its mask still matches (see _has_ridge).
+        self.label_ridges: Dict[str, dict] = {}
         # Vertex-edit state (Phase F): index of the annotation being edited and
         # its polygon points in full-grid (t, f) coords.
         self._editing_ann_idx: Optional[int] = None
         self._edit_hidden_ann = None    # call lifted into _pending while edited
         self._edit_backup = None        # its untouched pixels, for Esc
-        self._temp_erase = False        # right-drag erase inside the brush
+        # A joint edit (several calls lifted into _pending at once): a list of
+        # (original index, call) in index order, or None.
+        self._joint_edit = None
+        self._joint_anchor_id = None
+        self._temp_erase = False       # right-drag erase inside the brush
         self.mask: Optional[np.ndarray] = None
         # Pending (unconfirmed) mask accumulated by brush / eraser / SAM
         # (uint8 {0,1}). Rendered yellow until the user confirms with Enter.
@@ -610,6 +906,10 @@ class MADSpectrogramWidget(SpectrogramWidget):
         # Predicted prob mask (float32 in [0,1]).
         self.pred_mask: Optional[np.ndarray] = None
         self._selected_ann_idx: Optional[int] = None
+        #: id of the call-queue's call in the recording on screen (None outside
+        #: a call queue): drawn with its own cyan frame so it stands apart from
+        #: the recording's other detections, selected or not.
+        self.queue_ann_id: Optional[str] = None
         # Rubber-band multi-select (drag a box over masks with no tool active).
         self._selected_set: set = set()
         #: (rect, annotation index) for every class label drawn in the
@@ -623,6 +923,8 @@ class MADSpectrogramWidget(SpectrogramWidget):
         self._open_note_idx = None
         self._rubber_start = None
         self._rubber_cur = None
+        #: Selection a shift-drag adds to; None for a plain drag.
+        self._rubber_base = None
         # Harmonic links as (lower_id, upper_id, n), drawn as dotted lines so a
         # stack reads as one call at a glance. This is the review surface for
         # the grouping rule, not decoration: seeing the links is how a wrong one
@@ -649,6 +951,7 @@ class MADSpectrogramWidget(SpectrogramWidget):
         self._pending = np.zeros_like(self.mask)
         self._pending_bbox = None
         self.annotations = []
+        self.label_ridges = {}
         self._mask_dirty = False
         self.clear_sam_prompts()
         self.update()
@@ -978,11 +1281,41 @@ class MADSpectrogramWidget(SpectrogramWidget):
     def get_pending(self) -> Optional[np.ndarray]:
         return self._pending
 
-    def clear_pending(self) -> None:
+    def _pending_dirty_box(self):
+        """(f0, f1, t0, t1) covering every pixel that can be set in
+        ``_pending``, or None when nothing can be: the tracked box joined with
+        the stroke history's extent (strokes are always inside the box too,
+        but a test or older caller may push a stroke without noting it)."""
+        box = self._pending_bbox
+        if self._pending_stack:
+            fcat = np.concatenate([s[0] for s in self._pending_stack])
+            tcat = np.concatenate([s[1] for s in self._pending_stack])
+            if fcat.size:
+                sb = (int(fcat.min()), int(fcat.max()) + 1,
+                      int(tcat.min()), int(tcat.max()) + 1)
+                box = sb if box is None else (
+                    min(box[0], sb[0]), max(box[1], sb[1]),
+                    min(box[2], sb[2]), max(box[3], sb[3]))
+        return box
+
+    def _zero_pending(self) -> None:
+        """Empty the pending buffer by clearing only its dirty box.
+
+        ``self._pending[:] = 0`` writes the whole grid -- 601 MB on a 10-minute
+        recording, about a fifth of a second each time, and it ran on every
+        Enter, Esc and Edit Shape. Every write into the buffer notes its region
+        (``_note_pending_region``), so the box holds every set pixel.
+        """
         if self._pending is not None:
-            self._pending[:] = 0
+            box = self._pending_dirty_box()
+            if box is not None:
+                f0, f1, t0, t1 = box
+                self._pending[f0:f1, t0:t1] = 0
         self._pending_bbox = None
         self._pending_stack = []
+
+    def clear_pending(self) -> None:
+        self._zero_pending()
         self.update()
 
     def undo_pending(self) -> bool:
@@ -1007,23 +1340,18 @@ class MADSpectrogramWidget(SpectrogramWidget):
         if p is None:
             return []
         from scipy import ndimage
-        if self._pending_stack:
-            fcat = np.concatenate([s[0] for s in self._pending_stack])
-            tcat = np.concatenate([s[1] for s in self._pending_stack])
-            bf0, bf1 = int(fcat.min()), int(fcat.max()) + 1
-            bt0, bt1 = int(tcat.min()), int(tcat.max()) + 1
-        elif self._pending_bbox is not None:
-            # Written without stroke history — Edit Shape loads a call straight
-            # into the buffer. The tracked box says where, so this stays a
-            # small crop.
-            bf0, bf1, bt0, bt1 = self._pending_bbox
-        else:
+        # The tracked box joined with the strokes' extent. It used to be the
+        # strokes alone whenever there were any, which during Edit Shape left
+        # out the call loaded into the buffer (it is written without a stroke).
+        box = self._pending_dirty_box()
+        if box is None:
             # Nothing has been written since the last clear, which is the state
             # during ordinary review. This used to fall through to
             # ``p.any(axis=1)`` over the whole grid — 601M booleans, ~322 ms
             # per keystroke on a 10-minute recording — to discover the same
             # thing the box already knows.
             return []
+        bf0, bf1, bt0, bt1 = box
         sub = p[bf0:bf1, bt0:bt1] > 0
         if not sub.any():
             return []
@@ -1040,12 +1368,20 @@ class MADSpectrogramWidget(SpectrogramWidget):
         return out
 
     def pending_bbox(self):
-        """Return (f0, f1, t0, t1) [half-open] of pending pixels, or None."""
-        if self._pending is None or not self._pending.any():
+        """Return (f0, f1, t0, t1) [half-open] of pending pixels, or None.
+
+        Scans the dirty box only, never the whole grid."""
+        box = None if self._pending is None else self._pending_dirty_box()
+        if box is None:
             return None
-        fs = np.where(self._pending.any(axis=1))[0]
-        ts = np.where(self._pending.any(axis=0))[0]
-        return int(fs[0]), int(fs[-1]) + 1, int(ts[0]), int(ts[-1]) + 1
+        bf0, bf1, bt0, bt1 = box
+        sub = self._pending[bf0:bf1, bt0:bt1]
+        rows = np.flatnonzero(sub.any(axis=1))
+        if rows.size == 0:
+            return None
+        cols = np.flatnonzero(sub.any(axis=0))
+        return (bf0 + int(rows[0]), bf0 + int(rows[-1]) + 1,
+                bt0 + int(cols[0]), bt0 + int(cols[-1]) + 1)
 
     # --- accepted-annotation lifecycle --------------------------------
     def _rebuild_confirmed_mask(self) -> None:
@@ -1057,6 +1393,33 @@ class MADSpectrogramWidget(SpectrogramWidget):
             f0, f1, t0, t1 = ann['f0'], ann['f1'], ann['t0'], ann['t1']
             sub = ann['mask']
             self.mask[f0:f1, t0:t1][sub] = MASK_POSITIVE
+
+    def _restamp_confirmed_region(self, f0: int, f1: int, t0: int,
+                                  t1: int) -> None:
+        """Recompute the union buffer inside one box only.
+
+        The same result as :meth:`_rebuild_confirmed_mask` for that box, which
+        is all a change to one call can alter -- without zeroing and
+        re-stamping the whole 601 MB grid. Used by Edit Shape, which took and
+        put back one call and paid for a full rebuild each way.
+        """
+        if self.mask is None:
+            return
+        f0, t0 = max(0, int(f0)), max(0, int(t0))
+        f1 = min(self.mask.shape[0], int(f1))
+        t1 = min(self.mask.shape[1], int(t1))
+        if f1 <= f0 or t1 <= t0:
+            return
+        self.mask[f0:f1, t0:t1] = 0
+        for ann in self.annotations:
+            af0, af1, at0, at1 = ann['f0'], ann['f1'], ann['t0'], ann['t1']
+            of0, of1 = max(f0, af0), min(f1, af1)
+            ot0, ot1 = max(t0, at0), min(t1, at1)
+            if of1 <= of0 or ot1 <= ot0:
+                continue
+            sub = np.asarray(ann['mask'])[of0 - af0:of1 - af0,
+                                          ot0 - at0:ot1 - at0]
+            self.mask[of0:of1, ot0:ot1][sub > 0] = MASK_POSITIVE
 
     def set_annotations(self, anns: List[dict]) -> None:
         self.annotations = list(anns)
@@ -1101,6 +1464,33 @@ class MADSpectrogramWidget(SpectrogramWidget):
                     return idx
         return None
 
+    def call_at(self, pos, spec_rect=None) -> Optional[int]:
+        """The call under a screen point: its class label, else its mask."""
+        ai = self.label_at(pos)
+        if ai is not None:
+            return ai
+        if spec_rect is None:
+            spec_rect = self._get_spec_rect()
+        idx = self._screen_to_spec_idx(pos.x(), pos.y(), spec_rect)
+        return None if idx is None else self.annotation_at(idx[0], idx[1])
+
+    def selected_indices(self) -> set:
+        """Every highlighted call: the click selection plus the multi-selection."""
+        sel = set(self._selected_set)
+        if self._selected_ann_idx is not None:
+            sel.add(self._selected_ann_idx)
+        return {i for i in sel if 0 <= i < len(self.annotations)}
+
+    def toggle_selected(self, ai: int) -> None:
+        """Shift-click: add a call to the selection, or take it out."""
+        if not (0 <= ai < len(self.annotations)):
+            return
+        sel = self.selected_indices() ^ {ai}
+        self._selected_set = sel
+        self._selected_ann_idx = None
+        self.update()
+        self.annotations_selected.emit(sorted(sel))
+
     # --- vertex editing (Phase F) -------------------------------------
     def _grid_to_screen(self, t, f, spec_rect, bounds):
         """Screen position of the spec PIXEL (t, f) — its centre, not its
@@ -1142,9 +1532,15 @@ class MADSpectrogramWidget(SpectrogramWidget):
         if self._pending is None:
             self._pending = np.zeros((self.n_freq_bins, self.n_time_frames),
                                      dtype=np.uint8)
-        # Anything already half-drawn is not part of this call.
-        self._pending[:] = 0
-        self._pending_bbox = None
+        # Anything already half-drawn is not part of this call. Every buffer
+        # op here is bounded to a box: on a 10-minute recording the grid is
+        # 513 x 1.17M (601 MB), and zeroing it, copying it for the backup and
+        # rebuilding the confirmed mask from scratch each touched all of it --
+        # 0.3-0.5 s per Edit Shape before the brush could be used, and much
+        # more under memory pressure. The stroke history goes too: strokes
+        # from an earlier edit made every later stroke's component count label
+        # a crop spanning both edits.
+        self._zero_pending()
         t0, t1 = int(ann['t0']), int(ann['t1'])
         f0, f1 = int(ann['f0']), int(ann['f1'])
         h = min(f1 - f0, self.n_freq_bins - f0, m.shape[0])
@@ -1153,21 +1549,126 @@ class MADSpectrogramWidget(SpectrogramWidget):
             return
         self._pending[f0:f0 + h, t0:t0 + w] = (m[:h, :w] > 0).astype(np.uint8)
         self._note_pending_region(f0, f0 + h, t0, t0 + w)
-        # Kept so Esc can put the call back exactly as it was.
-        self._edit_backup = (ann_idx, self._pending.copy())
+        # The call's own pixels (Esc puts the call back from the untouched
+        # annotation itself; this is the record of what was loaded). Was a
+        # copy of the whole grid.
+        self._edit_backup = (ann_idx, (f0, t0, self._pending[
+            f0:f0 + h, t0:t0 + w].copy()))
         self._editing_ann_idx = ann_idx
         # The call is being drawn now, so stop drawing it as an annotation too
         # — otherwise the outline and the pending mask render on top of a
         # single call and the edit is impossible to see.
         self._edit_hidden_ann = ann
         self.annotations.pop(ann_idx)
-        self._rebuild_confirmed_mask()
+        self._restamp_confirmed_region(f0, f1, t0, t1)
         # The caller turns the Paint tool on — the buttons live on the main
         # window, and mode and button state must not be able to disagree.
         self.update()
 
+    def start_joint_edit(self, indices, anchor_idx=None) -> None:
+        """Edit several calls' shapes in one edit (right-click on one of a
+        multi-selection -> Edit N shapes together).
+
+        For a faint call the model found in pieces (2026-11-09): joining them
+        was Paint a bridge, Enter, select every piece and the bridge, Merge.
+        Here every selected call goes into the pending buffer at once, the
+        brush and eraser work on all of them, and Enter hands the result to
+        the main window (``joint_edit_finished``), which merges what now
+        touches and saves what changed. Bounded to the calls' boxes, like
+        :meth:`start_edit`.
+        """
+        if self.n_freq_bins is None or self.n_time_frames is None:
+            return
+        idxs = sorted({int(i) for i in indices
+                       if 0 <= int(i) < len(self.annotations)})
+        members = []
+        for i in idxs:
+            m = self.annotations[i].get('mask')
+            if m is not None and np.asarray(m).size:
+                members.append((i, self.annotations[i]))
+        if len(members) < 2:
+            if members:
+                self.start_edit(members[0][0])
+            return
+        if self._pending is None:
+            self._pending = np.zeros((self.n_freq_bins, self.n_time_frames),
+                                     dtype=np.uint8)
+        self._zero_pending()
+        for _i, ann in members:
+            m = np.asarray(ann['mask'])
+            f0, t0 = int(ann['f0']), int(ann['t0'])
+            h = min(int(ann['f1']) - f0, self.n_freq_bins - f0, m.shape[0])
+            w = min(int(ann['t1']) - t0, self.n_time_frames - t0, m.shape[1])
+            if h <= 0 or w <= 0:
+                continue
+            self._pending[f0:f0 + h, t0:t0 + w] |= (
+                m[:h, :w] > 0).astype(np.uint8)
+            self._note_pending_region(f0, f0 + h, t0, t0 + w)
+        anchor = next((i for i, _a in members if i == anchor_idx),
+                      members[0][0])
+        self._joint_anchor_id = self.annotations[anchor].get('id')
+        self._joint_edit = members
+        # is_editing() and the right-click guard read this; nothing draws by
+        # it any more (the edited calls are out of the list).
+        self._editing_ann_idx = anchor
+        self._edit_hidden_ann = None
+        self._edit_backup = None
+        for i, _a in reversed(members):
+            self.annotations.pop(i)
+        for _i, ann in members:
+            self._restamp_call(ann)
+        self.update()
+
+    def is_joint_editing(self) -> bool:
+        return self._joint_edit is not None
+
+    def joint_edit_members(self) -> List[dict]:
+        """The calls in the joint edit, as they were when it began."""
+        return [a for _i, a in (self._joint_edit or ())]
+
+    def joint_edit_crop(self):
+        """``(box, bool crop)`` of the joint edit's pixels, or None if every
+        pixel was erased."""
+        box = self.pending_bbox() if self._pending is not None else None
+        if box is None:
+            return None
+        f0, f1, t0, t1 = box
+        return box, self._pending[f0:f1, t0:t1] > 0
+
+    def _end_joint_edit(self):
+        """Put the joint edit's calls back where they were, untouched, and
+        empty the buffer. Returns the edited pixels (as joint_edit_crop)."""
+        crop = self.joint_edit_crop()
+        members = self._joint_edit or []
+        self._joint_edit = None
+        self._editing_ann_idx = None
+        self._edit_hidden_ann = None
+        self._edit_backup = None
+        # Back at their own positions, so Esc leaves the list exactly as it
+        # was (ascending insertion rebuilds the original order).
+        for i, ann in members:
+            self.annotations.insert(min(i, len(self.annotations)), ann)
+        self._zero_pending()
+        self.set_paint_mode(None)
+        for _i, ann in members:
+            self._restamp_call(ann)
+        self.update()
+        return crop, [a for _i, a in members]
+
     def finish_edit(self):
         """Commit the painted mask back onto the call being edited."""
+        if self._joint_edit is not None:
+            anchor_id = self._joint_anchor_id
+            crop, members = self._end_joint_edit()
+            if crop is None:
+                # Erased to nothing: a cancel, as for one call.
+                return
+            box, mask = crop
+            self.joint_edit_finished.emit({
+                'box': box, 'mask': np.array(mask, dtype=bool),
+                'ids': [a.get('id') for a in members],
+                'anchor_id': anchor_id})
+            return
         ai = self._editing_ann_idx
         if ai is None:
             return
@@ -1176,40 +1677,57 @@ class MADSpectrogramWidget(SpectrogramWidget):
         self._edit_hidden_ann = None
         self._edit_backup = None
         pend = self._pending
-        if ann is None or pend is None or not pend.any():
+        # The painted extent, found inside the dirty box: ``pend.any()`` and
+        # ``np.nonzero(pend)`` over the whole grid cost ~3.5 s on a 10-minute
+        # recording, every Enter.
+        box = self.pending_bbox() if (ann is not None
+                                      and pend is not None) else None
+        if box is None:
             # Erased to nothing — treat as cancel rather than storing an empty
-            # call, which would train the model on a blank mask.
+            # call, which would train the model on a blank mask. Cancel puts
+            # back the call it is handed, so hand it back: it was cleared
+            # above, and the call vanished from the list until the file was
+            # reopened.
+            self._edit_hidden_ann = ann
             self.cancel_edit()
             return
-        fs, ts = np.nonzero(pend)
-        f0, f1 = int(fs.min()), int(fs.max()) + 1
-        t0, t1 = int(ts.min()), int(ts.max()) + 1
+        f0, f1, t0, t1 = box
         ann['f0'], ann['f1'] = f0, f1
         ann['t0'], ann['t1'] = t0, t1
         ann['mask'] = pend[f0:f1, t0:t1].astype(bool)
         idx = len(self.annotations)
         self.annotations.append(ann)
-        self._pending[:] = 0
-        self._pending_bbox = None
+        self._zero_pending()
         self.set_paint_mode(None)
-        self._rebuild_confirmed_mask()
+        # The call was taken out of the union when the edit began; adding it
+        # back is all that changed.
+        self._restamp_call(ann)
         self.annotation_edit_finished.emit(idx)
         self.update()
 
     def cancel_edit(self):
         """Abandon the edit and put the call back untouched."""
+        if self._joint_edit is not None:
+            self._end_joint_edit()
+            return
         ann = self._edit_hidden_ann
         if ann is not None:
             self.annotations.append(ann)
         self._editing_ann_idx = None
         self._edit_hidden_ann = None
         self._edit_backup = None
-        if self._pending is not None:
-            self._pending[:] = 0
-        self._pending_bbox = None
+        self._zero_pending()
         self.set_paint_mode(None)
-        self._rebuild_confirmed_mask()
+        if ann is not None:
+            self._restamp_call(ann)
         self.update()
+
+    def _restamp_call(self, ann: dict) -> None:
+        """OR one call into the confirmed union (its box only)."""
+        if self.mask is None or ann is None:
+            return
+        self._restamp_confirmed_region(ann['f0'], ann['f1'],
+                                       ann['t0'], ann['t1'])
 
     def is_editing(self) -> bool:
         return self._editing_ann_idx is not None
@@ -1373,10 +1891,9 @@ class MADSpectrogramWidget(SpectrogramWidget):
         return out or {ann_idx}
 
     def mousePressEvent(self, event):
-        self._selected_ann_idx = None
-        self._selected_set = set()
         self._rubber_start = None
         self._rubber_cur = None
+        self._rubber_base = None
         # Grab keyboard focus so arrow keys revert to preview pan/zoom (away
         # from the detections list).
         self.setFocus(Qt.MouseFocusReason)
@@ -1387,15 +1904,34 @@ class MADSpectrogramWidget(SpectrogramWidget):
 
         # --- right-click → context menu on an accepted annotation ---
         if event.button() == Qt.RightButton and self._editing_ann_idx is None:
-            ai = self.label_at(event.pos())
-            if ai is None:
-                idx = self._screen_to_spec_idx(
-                    event.pos().x(), event.pos().y(), spec_rect)
-                if idx is not None:
-                    ai = self.annotation_at(idx[0], idx[1])
+            ai = self.call_at(event.pos(), spec_rect)
+            # Right-clicking one of several selected calls keeps them all
+            # selected, because the menu offers to merge them. Anywhere else
+            # the click clears the selection, as every click does.
+            sel = self.selected_indices()
+            if ai is None or ai not in sel or len(sel) < 2:
+                self._selected_ann_idx = None
+                self._selected_set = set()
             if ai is not None:
                 self.request_context_menu.emit(ai, event.globalPos())
             return
+
+        # --- shift-click → add a call to the selection, or take it out ---
+        if (event.button() == Qt.LeftButton and self.paint_mode is None
+                and event.modifiers() & Qt.ShiftModifier):
+            ai = self.call_at(event.pos(), spec_rect)
+            if ai is not None:
+                self.toggle_selected(ai)
+                return
+            # Shift-drag over empty space adds a box of calls to the selection.
+            if spec_rect.contains(event.pos()):
+                self._rubber_base = self.selected_indices()
+                self._rubber_start = event.pos()
+                self._rubber_cur = event.pos()
+            return
+
+        self._selected_ann_idx = None
+        self._selected_set = set()
 
         if self.paint_mode == 'sam':
             if event.button() == Qt.LeftButton:
@@ -1526,17 +2062,22 @@ class MADSpectrogramWidget(SpectrogramWidget):
         redrag rather than an unnoticed deletion.
         """
         start = self._rubber_start
+        # A shift-drag adds to what was selected when it started.
+        base = self._rubber_base
         self._rubber_start = None
         self._rubber_cur = None
+        self._rubber_base = None
         spec_rect = self._get_spec_rect()
         a = self._screen_to_spec_idx(start.x(), start.y(), spec_rect)
         b = self._screen_to_spec_idx(end_pos.x(), end_pos.y(), spec_rect)
-        # A tiny drag = a click on empty space → clear the selection.
+        # A tiny drag = a click on empty space → clear the selection (a
+        # shift-click there leaves it alone).
         if (a is None or b is None or
                 (abs(end_pos.x() - start.x()) < 4 and
                  abs(end_pos.y() - start.y()) < 4)):
-            self._selected_set = set()
-            self.annotations_selected.emit([])
+            if base is None:
+                self._selected_set = set()
+                self.annotations_selected.emit([])
             self.update()
             return
         t_lo, t_hi = sorted((a[0], b[0]))
@@ -1548,6 +2089,9 @@ class MADSpectrogramWidget(SpectrogramWidget):
             if (ann['t0'] >= t_lo and ann['t1'] <= t_hi and
                     ann['f0'] >= f_lo and ann['f1'] <= f_hi):
                 hits.append(i)
+        if base is not None:
+            hits = sorted(set(hits) | base)
+            self._selected_ann_idx = None
         self._selected_set = set(hits)
         self.update()
         self.annotations_selected.emit(sorted(hits))
@@ -1636,6 +2180,106 @@ class MADSpectrogramWidget(SpectrogramWidget):
         """Review-overlay colors matched to the loaded spectrogram colormap."""
         return overlay_palette(getattr(self, 'colormap_name', None))
 
+    #: Shade the stretches training supervises (W toggles). On by default: the
+    #: rule it shows is not visible anywhere else, and getting it wrong teaches
+    #: real calls as background.
+    show_training_windows = True
+    #: Draw each detection's brightness ridge (see mad_ridge) through its mask.
+    show_ridges = True
+    #: Context each side of a call, in frames, that training uses on this
+    #: recording. The main window sets it from the project's context_ms and
+    #: the file's grid (see MADMainWindow._apply_training_context).
+    training_context_frames = EXAMPLE_CONTEXT_FRAMES
+
+    def training_windows(self) -> List[Tuple[int, int]]:
+        """Frame spans ``[t0, t1)`` that training supervises, merged and sorted.
+
+        Accepting or rejecting a call saves it as a training example: a patch
+        of EVERY frequency, from ``training_context_frames`` before the call
+        to as many after it, all supervised. So inside these spans anything that
+        is not a confirmed call -- a pending detection, or a call nobody
+        marked -- is taught as background, and outside them nothing is used.
+
+        Derived from the decisions on screen (anything not pending), so it
+        follows accept / reject / undo / delete with no store reads. Examples
+        saved with the older 64-frame context are drawn at today's width: the
+        shading can overstate one of those, never understate it.
+        """
+        n = int(self.n_time_frames or 0)
+        if n <= 0 or not self.annotations:
+            return []
+        ctx = int(self.training_context_frames)
+        spans = sorted(
+            (max(0, int(a['t0']) - ctx), min(n, int(a['t1']) + ctx))
+            for a in self.annotations if a.get('status') != 'prediction')
+        merged: List[List[int]] = []
+        for lo, hi in spans:
+            if hi <= lo:
+                continue
+            if merged and lo <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], hi)
+            else:
+                merged.append([lo, hi])
+        return [(lo, hi) for lo, hi in merged]
+
+    def undecided_in_training_windows(
+            self, windows: Optional[List[Tuple[int, int]]] = None) -> List[int]:
+        """Indices of pending detections that overlap a training window.
+
+        Each will be trained as background where it overlaps, unless it is
+        accepted or rejected -- this is the work a shaded window still needs.
+        Includes detections the min-score slider hides; they train the same.
+        """
+        import bisect
+        wins = self.training_windows() if windows is None else windows
+        if not wins:
+            return []
+        starts = [lo for lo, _hi in wins]
+        out = []
+        for i, a in enumerate(self.annotations):
+            if a.get('status') != 'prediction':
+                continue
+            t0, t1 = int(a['t0']), int(a['t1'])
+            # The last window starting before this detection ends is the only
+            # one that can reach it: windows are disjoint and sorted.
+            k = bisect.bisect_left(starts, t1) - 1
+            if k >= 0 and wins[k][1] > t0:
+                out.append(i)
+        return out
+
+    def _paint_training_windows(self, painter, spec_rect, t_start: int,
+                                t_end: int, pal: dict) -> None:
+        """Faint full-height bands over the supervised spans, dashed at the
+        edges so a band's limit reads even where the spectrogram is bright."""
+        wins = [(lo, hi) for lo, hi in self.training_windows()
+                if hi > t_start and lo < t_end]
+        if not wins:
+            return
+        r, g, b = pal.get('train_window', (255, 255, 255))
+        span = max(1, t_end - t_start)
+        left, width = spec_rect.left(), spec_rect.width()
+        top, bottom = spec_rect.top(), spec_rect.bottom()
+
+        def _x(t):
+            return left + (t - t_start) / span * width
+
+        fill = QColor(r, g, b, 30)
+        edge = QPen(QColor(r, g, b, 170))
+        edge.setStyle(Qt.DashLine)
+        edge.setWidth(1)
+        painter.save()
+        for lo, hi in wins:
+            x0 = max(left, _x(lo))
+            x1 = min(left + width, _x(hi))
+            painter.fillRect(QRectF(x0, top, max(1.0, x1 - x0),
+                                    bottom - top), fill)
+            painter.setPen(edge)
+            if lo > t_start:
+                painter.drawLine(QPointF(_x(lo), top), QPointF(_x(lo), bottom))
+            if hi < t_end:
+                painter.drawLine(QPointF(_x(hi), top), QPointF(_x(hi), bottom))
+        painter.restore()
+
     @staticmethod
     def _stroke_polys(painter, polys, color, width: int, halo,
                       style=Qt.SolidLine):
@@ -1652,6 +2296,59 @@ class MADSpectrogramWidget(SpectrogramWidget):
             painter.setPen(pen)
             for poly in polys:
                 painter.drawPolygon(poly)
+
+    def _paint_ridge(self, painter, ann, tpx_to_x, fpx_to_y, pal):
+        """A detection's brightness ridge: the brightest continuous path through
+        the pixels under its mask, one point per time column (mad_ridge). A blob
+        over a fast trill has a flat centroid; this line still shows the trill.
+
+        Drawn only while the mask is the one the ridge was computed from; a
+        mask drawn or edited by hand shows its ridge once it is confirmed."""
+        if not self._has_ridge(ann):
+            return
+        bins = ann['ridge_bins']
+        t0 = ann.get('ridge_t0', ann['t0'])
+        runs = []
+        # One row per piece where a mask's pieces share columns (mad_ridge).
+        for row in np.atleast_2d(bins):
+            cur = []
+            for j, b in enumerate(row):
+                if np.isfinite(b):
+                    cur.append(QPointF(tpx_to_x(t0 + j), fpx_to_y(b)))
+                elif cur:
+                    runs.append(cur)
+                    cur = []
+            if cur:
+                runs.append(cur)
+        painter.setBrush(Qt.NoBrush)
+        # 2 px: at the outline's 1 px the halo swallows the hue.
+        for col, w in ((pal['halo'], RIDGE_W + 2), (pal['ridge'], RIDGE_W)):
+            pen = QPen(QColor(*col))
+            pen.setWidth(w)
+            painter.setPen(pen)
+            for pts in runs:
+                if len(pts) > 1:
+                    painter.drawPolyline(QPolygonF(pts))
+                else:
+                    painter.drawPoint(pts[0])
+
+    def _has_ridge(self, ann) -> bool:
+        """True when ``ann`` has a ridge computed from its current mask: its
+        own (a prediction's crop, a reloaded label), or the one saved when its
+        mask was confirmed this session (``label_ridges``), adopted here."""
+        if (ann.get('ridge_bins') is not None
+                and ann.get('_ridge_mask') is ann.get('mask')):
+            return True
+        lr = self.label_ridges.get(str(ann.get('id')))
+        m = ann.get('mask')
+        if lr is None or m is None:
+            return False
+        m = np.asarray(m) > 0
+        if m.shape != lr['mask'].shape or not np.array_equal(m, lr['mask']):
+            return False
+        ann['ridge_bins'], ann['ridge_t0'] = lr['bins'], lr['t0']
+        ann['_ridge_mask'] = ann['mask']
+        return True
 
     @staticmethod
     def _draw_haloed_text(painter, pos, text, color, halo):
@@ -1797,6 +2494,11 @@ class MADSpectrogramWidget(SpectrogramWidget):
         )
         painter = QPainter(self)
         painter.drawImage(spec_rect.topLeft(), scaled)
+        # Under every outline and label, over the masks' fill: a region, not a
+        # call, so it must never hide what is drawn inside it.
+        if self.show_training_windows and self.view_mode != 'spec':
+            self._paint_training_windows(painter, spec_rect, t_start, t_end,
+                                         pal)
 
         def _t_to_x(t):
             frac = (t - t_start) / max(1, (t_end - t_start))
@@ -1856,9 +2558,10 @@ class MADSpectrogramWidget(SpectrogramWidget):
         # outlines/labels would be illegible clutter and (pre-fix) very slow.
         if (self.view_mode != 'spec' and self.annotations and HAS_CV2
                 and overlays_visible):
+            # No skip for the call being edited: Edit Shape takes it out of
+            # the list, and skipping by its old index hid whichever call moved
+            # into that slot (2026-11-09).
             for ai, ann in enumerate(self.annotations):
-                if ai == self._editing_ann_idx:
-                    continue
                 if self._score_hidden(ann):
                     continue
                 if (ann['t1'] <= t_start or ann['t0'] >= t_end or
@@ -1962,6 +2665,22 @@ class MADSpectrogramWidget(SpectrogramWidget):
                     painter.restore()
                     self._note_hits.append((mr.adjusted(-2, -2, 2, 2), ai))
 
+        # Brightness ridges, with the masks: "Spec only" (V) shows the bare
+        # spectrogram, so it hides them like every other overlay.
+        if (self.show_ridges and self.view_mode != 'spec' and overlays_visible
+                and self.annotations):
+            painter.save()
+            painter.setClipRect(spec_rect)
+            for ai, ann in enumerate(self.annotations):
+                if (ann.get('status') == 'rejected'
+                        or self._score_hidden(ann)):
+                    continue
+                if (ann['t1'] <= t_start or ann['t0'] >= t_end or
+                        ann['f1'] <= f_start or ann['f0'] >= f_end):
+                    continue
+                self._paint_ridge(painter, ann, _tpx_to_x, _fpx_to_y, pal)
+            painter.restore()
+
         self._draw_open_note(painter)
 
         # Dotted links from each fundamental to its harmonics. Drawn under
@@ -2039,6 +2758,47 @@ class MADSpectrogramWidget(SpectrogramWidget):
                         polys.append(poly)
                     self._stroke_polys(painter, polys, pal['selected'],
                                        MASK_OUTLINE_W_SELECTED, pal['halo'])
+
+        # Call queue: a dashed cyan frame round the queue's call, labelled, so
+        # it is never mistaken for one of the recording's other detections.
+        # Drawn at every zoom (a frame, not a contour), but hidden with the other
+        # overlays in the plain-spectrogram view (V), so the call can be seen
+        # clean.
+        if (self.queue_ann_id is not None and self.annotations
+                and self.view_mode != 'spec'):
+            qa = next((a for a in self.annotations
+                       if str(a.get('id')) == str(self.queue_ann_id)), None)
+            if qa is not None and not (qa['t1'] <= t_start or qa['t0'] >= t_end):
+                x0 = _t_to_x(max(qa['t0'], t_start))
+                x1 = _t_to_x(min(qa['t1'], t_end))
+                y0 = _f_to_y(min(qa['f1'], f_end))
+                y1 = _f_to_y(max(qa['f0'], f_start))
+                pad = 6
+                rect = QRectF(min(x0, x1) - pad, min(y0, y1) - pad,
+                              abs(x1 - x0) + 2 * pad, abs(y1 - y0) + 2 * pad)
+                halo = QPen(QColor(0, 0, 0))
+                halo.setWidthF(4.0)
+                painter.setPen(halo)
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRect(rect)
+                qpen = QPen(QColor(0, 229, 255))
+                qpen.setWidthF(2.0)
+                qpen.setStyle(Qt.DashLine)
+                painter.setPen(qpen)
+                painter.drawRect(rect)
+                f = painter.font()
+                f.setPointSize(9)
+                f.setBold(True)
+                painter.setFont(f)
+                tag = "QUEUED CALL"
+                tw = painter.fontMetrics().horizontalAdvance(tag)
+                tx = rect.center().x() - tw / 2
+                ty = max(rect.top() - 6, painter.fontMetrics().ascent() + 2)
+                painter.setPen(QColor(0, 0, 0))
+                for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    painter.drawText(QPointF(tx + dx, ty + dy), tag)
+                painter.setPen(QColor(0, 229, 255))
+                painter.drawText(QPointF(tx, ty), tag)
 
         # Rubber-band selection rectangle (dotted) while dragging. Uses the
         # palette's contrast color so it shows on light maps too.
@@ -2151,10 +2911,17 @@ def _train_config_report(cfg, n_examples: int) -> List[str]:
         f"  examples      : {n_examples} accepted label(s)",
         f"  model         : arch={g('model_arch')}  encoder={g('encoder_name')}",
         f"  optimisation  : epochs={g('n_epochs')}  batch={g('batch_size')}  "
-        f"lr={g('learning_rate')}",
+        f"lr={g('learning_rate')}  schedule={g('lr_schedule', 'none')}"
+        + (f" (patience {g('lr_plateau_patience')}, x{g('lr_plateau_factor')})"
+           if g('lr_schedule', 'none') == 'plateau' else ""),
         f"  loss          : {loss_desc}",
         f"  augmentation  : {'on' if g('augment') else 'OFF'}  "
-        f"tile_placements={g('tile_placements')}",
+        f"tile_placements={g('tile_placements')}  faint="
+        + (f"on (p={g('faint_p')}, {tuple(g('faint_db_range', ()))} dB, "
+           f"min SNR {g('faint_min_snr_db')} dB)"
+           if g('augment') and g('augment_faint') else "off"),
+        f"  balance       : max {g('max_examples_per_recording') or 'unlimited'}"
+        f" example(s) per recording",
         f"  split         : mode={g('split_mode', 'auto')}  "
         f"val_fraction={g('val_fraction')}  seed={g('split_seed')}",
         f"  early stop    : {early}",
@@ -2523,11 +3290,16 @@ class MADInferenceWorker(QThread):
     device_signal = pyqtSignal(str)      # resolved compute device
     file_done_signal = pyqtSignal(dict)  # per-file summary (incl. timing)
     retry_signal = pyqtSignal(int)       # n files about to be re-attempted
+    ridge_done_signal = pyqtSignal(dict)  # one ridge-filled recording
 
-    def __init__(self, cfg, wav_paths: List[str], parent=None):
+    def __init__(self, cfg, wav_paths: List[str], parent=None,
+                 ridge_fill: Optional[List[str]] = None):
         super().__init__(parent)
         self.cfg = cfg
         self.wav_paths = wav_paths
+        # Recordings already analysed by this model, whose missing ridges are
+        # filled after the inference (mad_inference.fill_ridges_for_run).
+        self.ridge_fill = list(ridge_fill or [])
         self._stop = False
         import threading
         # Event is *set* when running, *cleared* when paused.
@@ -2566,6 +3338,8 @@ class MADInferenceWorker(QThread):
                 on_device=lambda d: self.device_signal.emit(d),
                 on_file_done=lambda s: self.file_done_signal.emit(s),
                 on_retry_start=lambda k: self.retry_signal.emit(k),
+                ridge_fill=self.ridge_fill,
+                on_ridge_done=lambda r: self.ridge_done_signal.emit(r),
             )
             self.finished_signal.emit(results)
         except Exception as e:
@@ -3105,6 +3879,32 @@ class MADRunPanel(QWidget):
 # ======================================================================
 # SAM2-assisted labeling worker threads
 # ======================================================================
+def _file_signature(path: str):
+    """(mtime_ns, size) of a file, or None if it cannot be read."""
+    try:
+        st = os.stat(path)
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _read_crops_if_stable(h5_path: str):
+    """A recording's prediction crops with the .mad's signature, read off the
+    UI thread for a call queue's prefetch: ``(h5_path, signature, crops)``, or
+    None when there is no .mad or it changed while being read."""
+    try:
+        if not os.path.isfile(h5_path):
+            return None
+        from fnt.usv.usv_detector.fnt_mask_store import read_all_pred_masks
+        sig = _file_signature(h5_path)
+        crops = read_all_pred_masks(h5_path, include_ridge=True)
+        if sig is None or _file_signature(h5_path) != sig:
+            return None
+        return (h5_path, sig, crops)
+    except Exception:
+        return None
+
+
 class MADAudioLoadWorker(QThread):
     """Read one recording off the UI thread.
 
@@ -3121,7 +3921,8 @@ class MADAudioLoadWorker(QThread):
 
     loaded = pyqtSignal(int, object, int, str)   # token, audio, sr, error
 
-    def __init__(self, path: str, token: int, parent=None, view=None):
+    def __init__(self, path: str, token: int, parent=None, view=None,
+                 crops_h5: Optional[str] = None):
         super().__init__(parent)
         self._path = path
         self._token = token
@@ -3129,6 +3930,11 @@ class MADAudioLoadWorker(QThread):
         #: Spectrogram arrays for the first view, computed here so the UI
         #: thread does not have to. Read on the UI thread after `loaded`.
         self.spec = None
+        #: A call queue's prefetch also reads the recording's prediction crops
+        #: (``crops_h5``, its .mad): ``(h5 path, (mtime_ns, size), crops)``,
+        #: used only if the file is unchanged when the recording opens.
+        self._crops_h5 = crops_h5
+        self.crops = None
 
     def run(self):
         try:
@@ -3151,6 +3957,8 @@ class MADAudioLoadWorker(QThread):
                         lo_hz, hi_hz, total)
                 except Exception:
                     self.spec = None      # fall back to computing on demand
+            if self._crops_h5:
+                self.crops = _read_crops_if_stable(self._crops_h5)
             self.loaded.emit(self._token, audio, int(sr), "")
         except Exception as e:                    # surfaced on the UI thread
             self.loaded.emit(self._token, None, 0, str(e))
@@ -4993,6 +5801,106 @@ class _DoubleClickTile(QToolButton):
         event.accept()
 
 
+#: Remembers the audio mode of the last rendered clip.
+CLIP_AUDIO_MODE_KEY = "mad/export/clip_audio_mode"
+
+
+class MADClipOptionsDialog(QDialog):
+    """How a rendered clip should sound: slowed, heterodyned, or silent.
+
+    Asked at render time because the right answer depends on who the clip is
+    for. Slowed keeps the whole spectrum but stretches the call; heterodyne
+    keeps real time and the bout's rhythm but only hears calls near the LO;
+    silent is for a slide that will be talked over. The defaults are whatever
+    the user is listening with right now (see ``default_mode``), so pressing
+    Enter renders what they just heard.
+    """
+
+    def __init__(self, parent, view_dur: float, speeds, speed: float,
+                 lo_khz: int, mode: str = 'slow', nyquist_khz: float = 125.0):
+        super().__init__(parent)
+        self.setWindowTitle("Render Clip")
+        self._view_dur = float(view_dur)
+        v = QVBoxLayout(self)
+        v.addWidget(QLabel(f"Audio for this {view_dur:.2f} s window:"))
+
+        self.rb_slow = QRadioButton("Slowed down")
+        self.cmb_speed = QComboBox()
+        for s in speeds:
+            self.cmb_speed.addItem(f"{s:g}x", float(s))
+        i = min(range(len(speeds)), key=lambda k: abs(speeds[k] - speed))
+        self.cmb_speed.setCurrentIndex(i)
+        self.cmb_speed.setToolTip(
+            "Every frequency divided by the inverse of this, so a 40 kHz call "
+            "at 0.1x is heard at 4 kHz — and the clip is 10x longer.")
+        r1 = QHBoxLayout()
+        r1.addWidget(self.rb_slow)
+        r1.addWidget(self.cmb_speed)
+        r1.addStretch()
+        v.addLayout(r1)
+
+        self.rb_het = QRadioButton("Heterodyne, real time — LO")
+        self.spin_lo = QSpinBox()
+        self.spin_lo.setRange(5, max(6, int(nyquist_khz) - 1))
+        self.spin_lo.setSuffix(" kHz")
+        self.spin_lo.setValue(int(lo_khz))
+        self.spin_lo.setToolTip(
+            "Calls within ~12 kHz of the LO are heard, at real time; a call at "
+            "LO + 5 kHz plays at 5 kHz.")
+        r2 = QHBoxLayout()
+        r2.addWidget(self.rb_het)
+        r2.addWidget(self.spin_lo)
+        r2.addStretch()
+        v.addLayout(r2)
+
+        self.rb_silent = QRadioButton("Silent, real time")
+        v.addWidget(self.rb_silent)
+
+        self.lbl_len = QLabel()
+        self.lbl_len.setStyleSheet("color:#9fb8c8; font-size:10px;")
+        v.addWidget(self.lbl_len)
+
+        {'het': self.rb_het, 'silent': self.rb_silent}.get(
+            mode, self.rb_slow).setChecked(True)
+        for w in (self.rb_slow, self.rb_het, self.rb_silent):
+            w.toggled.connect(self._sync)
+        self.cmb_speed.currentIndexChanged.connect(self._sync)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Ok).setText("Render")
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        v.addWidget(bb)
+        self._sync()
+
+    def options(self) -> Dict:
+        if self.rb_het.isChecked():
+            return {'mode': 'het', 'lo_hz': self.spin_lo.value() * 1000.0,
+                    'speed': 1.0}
+        if self.rb_silent.isChecked():
+            return {'mode': 'silent', 'speed': 1.0}
+        return {'mode': 'slow', 'speed': float(self.cmb_speed.currentData())}
+
+    def _sync(self, *_):
+        self.cmb_speed.setEnabled(self.rb_slow.isChecked())
+        self.spin_lo.setEnabled(self.rb_het.isChecked())
+        o = self.options()
+        dur = self._view_dur / max(o['speed'], 1e-6)
+        self.lbl_len.setText(f"Clip length: {dur:.1f} s"
+                             + (f" ({dur / 60:.1f} min)" if dur >= 90 else ""))
+
+    @staticmethod
+    def default_mode(last_playback: Optional[str],
+                     last_render: Optional[str]) -> str:
+        """What the user is listening with now, else what they last
+        rendered, else slowed. Playback beats the remembered render: a clip
+        made right after listening with Het should sound like that."""
+        for m in (last_playback, last_render):
+            if m in ('slow', 'het', 'silent'):
+                return m
+        return 'slow'
+
+
 class MADClipDialog(QDialog):
     """Previews a rendered clip and offers to keep it. Closing discards it.
 
@@ -5571,20 +6479,44 @@ class MADClipWorker(QThread):
         super().__init__(parent)
         self.job = job
 
+    @staticmethod
+    def clip_audio(j: dict) -> np.ndarray:
+        """The clip's soundtrack for ``j['mode']`` ('slow' when absent, which
+        is every job written before heterodyne existed): ``n_out`` samples at
+        ``out_sr``, so it always matches the video's length."""
+        mode = j.get('mode', 'slow')
+        n_out = int(j['n_out'])
+        if mode == 'silent':
+            return np.zeros(n_out, dtype=np.float32)
+        seg = np.asarray(j['segment'], dtype=np.float32)
+        if mode == 'het':
+            from fnt.usv.usv_heterodyne import heterodyne_for_playback
+            # Normalised, unlike live playback: a clip is a file to present,
+            # and its slowed version is peak-normalised too.
+            y = heterodyne_for_playback(seg, j['sr'], j['lo_hz'],
+                                        out_rate=j['out_sr'],
+                                        floor_hz=j.get('floor_hz', 0.0))
+            # Same length as the video to the sample; resampling rounds.
+            if y.size < n_out:
+                y = np.pad(y, (0, n_out - y.size))
+            return y[:n_out]
+        from scipy import signal as _sig
+        slowed = _sig.resample(seg, n_out)
+        peak = float(np.max(np.abs(slowed))) if len(slowed) else 0.0
+        if peak > 0:
+            # Ultrasonic slowed into the audible band is very quiet.
+            slowed = slowed / peak * 0.97
+        return slowed
+
     def run(self):
         j = self.job
         try:
-            from scipy import signal as _sig
             import soundfile as _sf
-            slowed = _sig.resample(
-                np.asarray(j['segment'], dtype=np.float32), j['n_out'])
-            peak = float(np.max(np.abs(slowed))) if len(slowed) else 0.0
-            if peak > 0:
-                # Ultrasonic slowed into the audible band is very quiet.
-                slowed = slowed / peak * 0.97
-            _sf.write(j['wav'], slowed.astype(np.float32), j['out_sr'],
+            audio = self.clip_audio(j)
+            _sf.write(j['wav'], audio.astype(np.float32), j['out_sr'],
                       subtype='PCM_16')
-            proc = subprocess.run(j['cmd'], capture_output=True, text=True)
+            proc = subprocess.run(j['cmd'], capture_output=True, text=True,
+                                  **NO_WINDOW)
             if proc.returncode != 0 or not os.path.isfile(j['out']):
                 raise RuntimeError(
                     (proc.stderr or "ffmpeg failed").strip()[:600])
@@ -5822,7 +6754,7 @@ class MADDeviceProbeWorker(QThread):
         try:
             out = subprocess.run(
                 ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
-                capture_output=True, text=True, timeout=6)
+                capture_output=True, text=True, timeout=6, **NO_WINDOW)
             if out.returncode == 0 and out.stdout.strip():
                 return out.stdout.strip().splitlines()[0].strip()
         except Exception:
@@ -5865,10 +6797,67 @@ class MADDeviceProbeWorker(QThread):
 # ======================================================================
 # Main window
 # ======================================================================
+class ClickJumpSlider(QSlider):
+    """A slider that jumps to where its groove is clicked.
+
+    Qt's default moves one page step toward the click, and on a slider with a
+    handful of positions -- the nine playback speeds -- one page is the whole
+    range: a click in the middle sent the handle to an end, and the only way
+    to a middle value was to drag the handle. The press still starts a drag,
+    so click-and-slide works as before.
+    """
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.LeftButton:
+            opt = QStyleOptionSlider()
+            self.initStyleOption(opt)
+            style = self.style()
+            handle = style.subControlRect(QStyle.CC_Slider, opt,
+                                          QStyle.SC_SliderHandle, self)
+            if not handle.contains(ev.pos()):
+                groove = style.subControlRect(QStyle.CC_Slider, opt,
+                                              QStyle.SC_SliderGroove, self)
+                if self.orientation() == Qt.Horizontal:
+                    span = groove.width() - handle.width()
+                    pos = ev.pos().x() - groove.x() - handle.width() // 2
+                else:
+                    span = groove.height() - handle.height()
+                    pos = ev.pos().y() - groove.y() - handle.height() // 2
+                self.setValue(QStyle.sliderValueFromPosition(
+                    self.minimum(), self.maximum(), max(0, pos),
+                    max(1, span), opt.upsideDown))
+        super().mousePressEvent(ev)
+
+
 class MADMainWindow(QMainWindow):
     BASE_TITLE = "FNT Mask Audio Detector"
 
     _COPY_VIEW_LABEL = "Copy View"
+    _VIDEO_QC_OFF_TIP = (
+        "Fusion QC: what was happening at the microphone over the view — its "
+        "camera, the mice in it and the RFID reads at its zone, synced to the "
+        "playhead.\n"
+        "\n"
+        "Off: this project names no video. Put a video_qc.json in the project "
+        "folder saying where the video is, how to read the recordings' and the "
+        "videos' start times, and which camera watched each channel (see "
+        "fnt/usv/usv_detector/mad_video.py), then reopen the project.")
+    _VIDEO_QC_ON_TIP = (
+        "Fusion QC: open the video filmed alongside the view (plus 1 s either "
+        "side) — the microphone's own camera by default, any other camera of "
+        "the project on request.\n"
+        "\n"
+        "It follows the playhead: Play the audio and the frame keeps pace; drag "
+        "the video's slider or play it silently and the playhead line moves on "
+        "the spectrogram. Frames during the selected call get a red border.\n"
+        "\n"
+        "With a Mask Tracker model named for the camera, the mice it finds are "
+        "outlined; with RFID data named, the reads at the microphone's zone run "
+        "under the video.\n"
+        "\n"
+        "The two clocks come from the file names (or the Avisoft log), so check "
+        "the time the camera burns into each frame against the one shown above "
+        "it.")
     #: Copy-out resolution. Fixed at 600 — safe for a printed figure panel
     #: and comfortably above the 300 journal minimum. It was a picker, but
     #: every real use wanted the highest setting and the control cost a slot
@@ -5887,6 +6876,12 @@ class MADMainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        # Here rather than in main(), so MAD opened from anywhere gets it: a
+        # minimized or unfocused window is background work to Windows, which
+        # throttles it -- training and batch inference ran ~1.7x slower that
+        # way (see power.py).
+        from fnt.usv.usv_detector.power import keep_full_speed
+        keep_full_speed()
         self._apply_dark_theme()
         self.setWindowTitle(self.BASE_TITLE)
         self.setMinimumSize(1100, 750)
@@ -5901,6 +6896,10 @@ class MADMainWindow(QMainWindow):
         # Playback state
         self.is_playing = False
         self.playback_speed = 1.0
+        # Audio seconds per wall-clock second for the playback in progress:
+        # the Speed slider's value for normal play, 1.0 for heterodyne.
+        self._playback_rate = 1.0
+        self._playback_mode = None          # 'slow' | 'het' while playing
         self._speed_values = [0.01, 0.02, 0.03, 0.04, 0.05, 0.1, 0.2, 0.5, 1.0]
         self._playback_start_time = None
         self._playback_start_s = None
@@ -5970,6 +6969,16 @@ class MADMainWindow(QMainWindow):
         self._audio_workers: Dict[int, object] = {}
         self._audio_then: Dict[int, object] = {}
         self._loading_path: Optional[str] = None
+        # Call-queue prefetch (see _queue_prefetch_next): at most one recording
+        # decoded ahead, plus workers still finishing a prefetch that was
+        # dropped or taken over (kept alive until they end).
+        self._prefetch: Optional[dict] = None
+        self._prefetch_token = 0
+        self._prefetch_workers: Dict[int, object] = {}
+        self._prefetch_adopted: Dict[int, int] = {}   # prefetch -> load token
+        self._prefetch_restart = False
+        self._prefetch_hits = 0
+        self._prefetched_crops = None
 
         # Session-level class tracking (used when no project is open).
         self._session_classes: List[str] = ["USV"]
@@ -6124,6 +7133,8 @@ class MADMainWindow(QMainWindow):
         self.spectrogram.annotation_edit_finished.connect(
             self._on_annotation_edit_finished
         )
+        self.spectrogram.joint_edit_finished.connect(
+            self._on_joint_edit_finished)
         self.spectrogram.annotation_clicked.connect(
             self._on_annotation_clicked
         )
@@ -6139,6 +7150,13 @@ class MADMainWindow(QMainWindow):
         self.lbl_view_header.setStyleSheet(
             "color: #9a9a9a; font-size: 9px; padding: 1px 4px;")
         self.lbl_view_header.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        # One long line (a call queue adds a dozen items). As a plain QLabel
+        # its whole text was its minimum width, so a long header pushed the
+        # splitter and squeezed the left panel off its own edge (2026-11-09);
+        # let it be clipped on the right instead.
+        self.lbl_view_header.setSizePolicy(QSizePolicy.Ignored,
+                                           QSizePolicy.Preferred)
+        self.lbl_view_header.setMinimumWidth(1)
         # The 3D view's toggle sits at the right end of this line: it is a
         # view OF the spectrogram, so it belongs above it rather than among the
         # review tools, and the right end of the header was empty.
@@ -6155,10 +7173,56 @@ class MADMainWindow(QMainWindow):
         self.chk_trajectories.setFocusPolicy(Qt.NoFocus)
         self.chk_trajectories.setStyleSheet("font-size: 10px;")
         self.chk_trajectories.toggled.connect(self._set_trajectory_window_open)
+        # Training windows: what an accept or reject puts into training. It is
+        # a view of the spectrogram too, so it sits beside the 3D toggle.
+        self.chk_train_windows = QCheckBox("Training windows (W)")
+        self.chk_train_windows.setToolTip(
+            "Shade the stretches of this recording that training uses.\n\n"
+            "Accepting or rejecting a call saves it as a training example "
+            "covering EVERY frequency, from the project's training context "
+            "before the call to as much after it (~65 ms unless the project "
+            "sets context_ms). Training "
+            "supervises all of it: inside a shaded band, anything that is not "
+            "a confirmed call is taught as background -- including pending "
+            "detections and calls nobody marked. Outside the bands nothing is "
+            "used.\n\n"
+            "So inside a band: accept or reject every detection, and paint any "
+            "call the model missed. The header counts the pending detections "
+            "still inside a band.\nShortcut: W.")
+        self.chk_train_windows.setFocusPolicy(Qt.NoFocus)
+        self.chk_train_windows.setStyleSheet("font-size: 10px;")
+        try:
+            _show_tw = str(self._settings.value(
+                TRAIN_WINDOWS_KEY, "true")).lower() not in ("false", "0")
+        except Exception:
+            _show_tw = True
+        self.chk_train_windows.setChecked(_show_tw)
+        self.spectrogram.show_training_windows = _show_tw
+        self.chk_train_windows.toggled.connect(self._set_training_windows_shown)
+        self.chk_ridges = QCheckBox("Ridges")
+        self.chk_ridges.setToolTip(
+            "Draw each detection's brightness ridge: the brightest continuous "
+            "path through the pixels under its mask, one point per frame. It is "
+            "where the turns, depth and trill columns come from. A blob over a "
+            "fast trill has a flat centre; the ridge still oscillates.\n\n"
+            "Pending detections from inference only (an edited mask has none "
+            "until inference or `add-ridge` runs again).")
+        self.chk_ridges.setFocusPolicy(Qt.NoFocus)
+        self.chk_ridges.setStyleSheet("font-size: 10px;")
+        try:
+            _show_r = str(self._settings.value(
+                RIDGES_KEY, "true")).lower() not in ("false", "0")
+        except Exception:
+            _show_r = True
+        self.chk_ridges.setChecked(_show_r)
+        self.spectrogram.show_ridges = _show_r
+        self.chk_ridges.toggled.connect(self._set_ridges_shown)
         header_row = QHBoxLayout()
         header_row.setContentsMargins(0, 0, 4, 0)
         header_row.setSpacing(6)
         header_row.addWidget(self.lbl_view_header, 1)
+        header_row.addWidget(self.chk_ridges, 0, Qt.AlignRight)
+        header_row.addWidget(self.chk_train_windows, 0, Qt.AlignRight)
         header_row.addWidget(self.chk_trajectories, 0, Qt.AlignRight)
         right_layout.addLayout(header_row)
         right_layout.addWidget(self.spectrogram, 1)
@@ -6313,8 +7377,63 @@ class MADMainWindow(QMainWindow):
         self.btn_play.clicked.connect(self._toggle_playback)
         controls_layout.addWidget(self.btn_play)
 
+        # Heterodyne: the window at real time, ultrasound mixed down around
+        # the LO frequency beside it. Speed applies to Play only.
+        self.btn_het = QPushButton("Het")
+        self.btn_het.setFixedWidth(44)
+        self.btn_het.setToolTip(
+            "Heterodyne playback of the visible window at real-time speed "
+            "(Shift+Space).\n\n"
+            "Mixes the recording down by the LO frequency: a call at LO + "
+            "5 kHz is heard at 5 kHz, as it happens — rhythm and sweeps "
+            "intact, instead of stretched out by slowing down.\n"
+            "Calls within about 12 kHz of the LO are audible; set the LO just "
+            "below the calls you want. Both sides of the LO are heard "
+            "(LO ± 5 kHz both play at 5 kHz). Speed does not apply.")
+        self.btn_het.clicked.connect(self._toggle_het_playback)
+        controls_layout.addWidget(self.btn_het)
+
+        self.spin_het_lo = QSpinBox()
+        self.spin_het_lo.setRange(5, 120)
+        self.spin_het_lo.setSuffix(" kHz")
+        self.spin_het_lo.setFixedWidth(70)
+        self.spin_het_lo.setToolTip(
+            "Heterodyne LO: the frequency that plays as silence. Calls within "
+            "~12 kHz of it are heard. Remembered between sessions.")
+        try:
+            self.spin_het_lo.setValue(int(self._settings.value(
+                HET_LO_KEY, 40)))
+        except (TypeError, ValueError):
+            self.spin_het_lo.setValue(40)
+        self.spin_het_lo.valueChanged.connect(
+            lambda v: self._settings.setValue(HET_LO_KEY, int(v)))
+        self.spin_het_lo.installEventFilter(self._wheel_eater)
+        controls_layout.addWidget(self.spin_het_lo)
+
+        self.spin_het_floor = QSpinBox()
+        self.spin_het_floor.setRange(0, 120)
+        self.spin_het_floor.setSuffix(" kHz")
+        self.spin_het_floor.setSpecialValueText("No floor")
+        self.spin_het_floor.setFixedWidth(80)
+        self.spin_het_floor.setToolTip(
+            "Heterodyne floor: everything below this frequency is removed "
+            "before mixing, so only what lies above it is heard.\n"
+            "Heterodyne already hears only LO ± 12 kHz (28–52 kHz at a "
+            "40 kHz LO), so a floor below that changes nothing. It matters "
+            "between there and the LO: set it to the LO to hear only calls "
+            "above it. 0 = no floor. Remembered between sessions.")
+        try:
+            self.spin_het_floor.setValue(int(self._settings.value(
+                HET_FLOOR_KEY, 0)))
+        except (TypeError, ValueError):
+            self.spin_het_floor.setValue(0)
+        self.spin_het_floor.valueChanged.connect(
+            lambda v: self._settings.setValue(HET_FLOOR_KEY, int(v)))
+        self.spin_het_floor.installEventFilter(self._wheel_eater)
+        controls_layout.addWidget(self.spin_het_floor)
+
         controls_layout.addWidget(QLabel("Speed:"))
-        self.slider_speed = QSlider(Qt.Horizontal)
+        self.slider_speed = ClickJumpSlider(Qt.Horizontal)
         self.slider_speed.setRange(0, len(self._speed_values) - 1)
         self.slider_speed.setValue(len(self._speed_values) - 1)
         self.slider_speed.setFixedWidth(100)
@@ -6371,20 +7490,34 @@ class MADMainWindow(QMainWindow):
         self.btn_render_clip.setFocusPolicy(Qt.NoFocus)
         self.btn_render_clip.setToolTip(
             "Render the current view as an mp4: the spectrogram exactly as it "
-            "stands, with the playhead sweeping across it and the audio "
-            "slowed to the Speed setting — so an ultrasonic call is both "
-            "visible and audible.\n"
+            "stands, with the playhead sweeping across it — so an ultrasonic "
+            "call is both visible and audible.\n"
             "\n"
-            "The view and the speed are taken at the moment you press this, "
+            "You choose the sound first: slowed down (whole spectrum, longer "
+            "clip), heterodyne at real time (calls near the LO, rhythm "
+            "intact), or silent. It defaults to what you are listening with.\n"
+            "\n"
+            "The view and the audio settings are taken when you press Render, "
             "so changing them while it renders will not affect the result.\n"
             "\n"
             "The clip opens in a window that plays it. It lives in a temp file "
             "until you Save it — closing that window discards it.\n"
             "\n"
-            "Note the speed multiplies the length: at 0.03x a 0.66 s window "
-            "becomes a 22 s clip. Requires ffmpeg on PATH.")
-        self.btn_render_clip.clicked.connect(self.render_spectrogram_clip)
+            "Slowing multiplies the length: at 0.03x a 0.66 s window becomes "
+            "a 22 s clip. Requires ffmpeg on PATH.")
+        # A lambda: clicked() passes its checked flag, which would arrive as
+        # the options argument.
+        self.btn_render_clip.clicked.connect(
+            lambda _checked=False: self.render_spectrogram_clip())
         controls_layout.addWidget(self.btn_render_clip)
+
+        self.btn_video_qc = QPushButton("Fusion QC")
+        self.btn_video_qc.setFixedWidth(84)
+        self.btn_video_qc.setFocusPolicy(Qt.NoFocus)
+        self.btn_video_qc.setEnabled(False)
+        self.btn_video_qc.setToolTip(self._VIDEO_QC_OFF_TIP)
+        self.btn_video_qc.clicked.connect(lambda _checked=False: self._show_video_qc())
+        controls_layout.addWidget(self.btn_video_qc)
 
         # The controls row is one non-wrapping run of fixed-width widgets, so
         # its layout minimum (1120px at the default font) propagated up as the
@@ -6719,6 +7852,11 @@ class MADMainWindow(QMainWindow):
         self.btn_view_cycle.clicked.connect(self._shortcut_cycle_view)
         view_row.addWidget(self.btn_view_cycle)
         view_row.addStretch()
+        # The project's labelling rules (LABELING_GUIDE.md): hover to read,
+        # click to open or edit.
+        from fnt.labeling_guide import GuideButton
+        self.btn_guide = GuideButton()
+        view_row.addWidget(self.btn_guide)
         vbox.addLayout(view_row)
 
         # Legend. Colors are colormap-dependent (see _OVERLAY_PALETTES), so the
@@ -6737,12 +7875,32 @@ class MADMainWindow(QMainWindow):
         layout.addWidget(group)
 
     def _infer_perf_kwargs(self) -> dict:
-        """Performance-only inference settings, shared by every place that
-        builds a MADInferenceConfig so the two paths can't drift apart."""
+        """Performance settings, and the project's ridge setting, shared by
+        every place that builds a MADInferenceConfig so the paths can't drift
+        apart."""
         return {
             'batch_size': self.spin_infer_batch.value(),
             'amp': self.chk_infer_amp.isChecked(),
+            'ridge': self._ridge_on(),
         }
+
+    def _ridge_on(self) -> bool:
+        """The project's ridge setting (on without a project)."""
+        return bool(getattr(self._project, 'ridge', True)
+                    if getattr(self, '_project', None) is not None else True)
+
+    def _set_ridge_setting(self, on: bool) -> None:
+        """Brightness ridges on/off for this project (saved with it) and for
+        every store write in this process."""
+        from fnt.usv.usv_detector.fnt_mask_store import set_ridge_enabled
+        set_ridge_enabled(on)
+        if getattr(self, '_project', None) is not None and                 bool(getattr(self._project, 'ridge', True)) != bool(on):
+            self._project.ridge = bool(on)
+            try:
+                self._project.save()
+            except Exception as e:
+                self._log(f"Could not save the ridge setting: {e}")
+        self._ridge_checked = set()
 
     def _overlay_palette(self) -> dict:
         """Review colors for the loaded spectrogram colormap. Shared by the
@@ -7324,6 +8482,20 @@ class MADMainWindow(QMainWindow):
         self.chk_infer_harmonics.setToolTip(HARMONIC_TOGGLE_TIP)
         iform.addRow("", self.chk_infer_harmonics)
 
+        self.chk_infer_ridge = QCheckBox("Brightness ridges")
+        self.chk_infer_ridge.setChecked(True)
+        self.chk_infer_ridge.setToolTip(
+            "<b>Brightness ridge</b> of every detection and label: the "
+            "brightest continuous line through the pixels under its mask "
+            "(its frequency contour), with its turns, turn rate, depth and "
+            "whether it is a trill. One ridge per piece of a mask, so two "
+            "pieces merged into one call never get a jump between them.<br><br>"
+            "On, a run also fills in the ridges of recordings it skips as "
+            "already analysed, and opening a recording fills what its stored "
+            "spectrograms allow. A project setting, for every run.")
+        self.chk_infer_ridge.toggled.connect(self._set_ridge_setting)
+        iform.addRow("", self.chk_infer_ridge)
+
         self.combo_infer_device = QComboBox()
         self._fill_device_combo(self.combo_infer_device)
         self.combo_infer_device.setToolTip(
@@ -7484,21 +8656,28 @@ class MADMainWindow(QMainWindow):
             else:
                 w.valueChanged.connect(fn)
 
-    def _show_inference_summary_dialog(self, results, cfg=None):
+    def _show_inference_summary_dialog(self, results, cfg=None,
+                                       ridge_line=None):
         """Report what a manual inference run found, and acknowledge it.
 
         Finding nothing is a result, not a silent no-op: it usually means the
         threshold or the minimum blob size excluded everything, so the dialog
         names both rather than leaving the user to guess why the file came
-        back empty.
+        back empty. ``ridge_line`` reports the run's ridge pass; a run that
+        had nothing to infer reports only that.
         """
         results = list(results or [])
         ok = [r for r in results if 'error' not in r]
         errs = [r for r in results if 'error' in r]
         total = sum(int(r.get('n_blobs') or 0) for r in ok)
 
+        ridge_only = bool(ridge_line) and not results
         lines = []
-        if total:
+        if ridge_only:
+            lines.append("Every recording was already analysed by this model "
+                         "at these settings.")
+            cfg = None                      # no threshold advice: nothing ran
+        elif total:
             lines.append(f"{total} detection(s) across {len(ok)} file(s), "
                          "pending review.")
         else:
@@ -7520,11 +8699,26 @@ class MADMainWindow(QMainWindow):
                     "grid is not kept, so this cannot be re-filtered after "
                     "the fact.")
 
+        # With --inference-window-only the main window is hidden, and a dialog
+        # owned by a hidden window never appears: MAD sat on an invisible
+        # summary all night. Unowned and brought forward instead.
+        window_only = getattr(self, '_window_only', False)
+        if ridge_line:
+            lines.append(ridge_line)
         dlg = MADRunSummaryTable(
             self, "Inference complete",
+            "Ridges complete." if ridge_only else
             "Inference complete." if total else
             "Inference complete — nothing detected.",
             lines, results)
+        if window_only:
+            # Keeps its reference to MAD for its buttons; loses the owner.
+            dlg.setParent(None)
+            dlg.setWindowFlags(Qt.Window | Qt.WindowTitleHint
+                               | Qt.WindowCloseButtonHint)
+            dlg.show()
+            dlg.raise_()
+            dlg.activateWindow()
         dlg.exec_()
 
     def _show_settings_dialog(self):
@@ -7906,7 +9100,7 @@ class MADMainWindow(QMainWindow):
         score_row = QHBoxLayout()
         score_row.setSpacing(4)
         score_row.addWidget(QLabel("Min score:"))
-        self.slider_min_score = QSlider(Qt.Horizontal)
+        self.slider_min_score = ClickJumpSlider(Qt.Horizontal)
         self.slider_min_score.setRange(0, 100)
         self.slider_min_score.setValue(0)
         self.slider_min_score.setToolTip(
@@ -8320,6 +9514,9 @@ class MADMainWindow(QMainWindow):
             aid = a.get('id')
             if aid is not None and aid != prev.get('id'):
                 minted.add(str(aid))
+        # A merge says what it minted: its call has a box no earlier call had,
+        # so the accept rule above cannot recognise it.
+        minted |= {str(x) for x in (snap.get('minted_ids') or ())}
         # A None baseline means no example was committed during the
         # operation, so nothing was minted and the store diff has nothing to
         # confirm. Treating it as an empty set would drop the second guard;
@@ -8333,6 +9530,10 @@ class MADMainWindow(QMainWindow):
                 n_del += 1
             except Exception:
                 continue
+            # Gone now, so an example the operation destroyed under the same
+            # id (a merge re-saves under a member's deterministic id) can be
+            # put back below.
+            now_ids.discard(ex_id)
             if self._project is not None:
                 try:
                     from fnt.usv.usv_detector.mad_examples import delete_example
@@ -8354,6 +9555,15 @@ class MADMainWindow(QMainWindow):
 
     def _undo_review_action(self):
         """Reverse the last review action (accept/reject/delete) on this file."""
+        sg_ = getattr(self, 'spectrogram', None)
+        if sg_ is not None and sg_.is_editing():
+            # The calls being edited are out of the list until Enter or Esc
+            # puts them back; restoring a snapshot underneath would have Esc
+            # add them a second time.
+            self.status_bar.showMessage(
+                "Finish the shape edit (Enter) or cancel it (Esc) first — "
+                "U takes back the last stroke")
+            return
         if not self._undo_stack:
             self.status_bar.showMessage("Nothing to undo")
             return
@@ -8823,6 +10033,8 @@ class MADMainWindow(QMainWindow):
             count_text += f"  ·  {self._n_score_hidden} below min score"
         if lbl:
             lbl.setText(count_text)
+        if bool(getattr(self, '_call_queue', None)):
+            self._mark_queue_row()
         self._update_pred_review_widgets()
         self._update_train_button_count()
         self._update_file_list_counts()
@@ -8967,6 +10179,13 @@ class MADMainWindow(QMainWindow):
         # switch files if the row names a DIFFERENT one.
         active = self._active_wav_path()
         if not (active and os.path.basename(active) == wav):
+            if self._queue_active():
+                # In a call queue the list only ever shows the recording on
+                # screen; a row naming another one is left over from the
+                # recording being replaced (the switch is asynchronous).
+                # Following it reopened that recording's FIRST queued call --
+                # the queue jumped back toward its start (2026-11-09).
+                return
             for i, p in enumerate(self.audio_files):
                 if os.path.basename(p) == wav:
                     if i != self.current_file_idx:
@@ -9223,10 +10442,15 @@ class MADMainWindow(QMainWindow):
         pos = self._selected_review_pos(order)
         has_sel = pos is not None
         nav_text = (f"{pos + 1}/{n}" if has_sel else f"0/{n}")
+        can_prev, can_next = has_sel and pos > 0, has_sel and pos < n - 1
+        if bool(getattr(self, '_call_queue', None)):
+            qn, qp = len(self._call_queue), self._call_queue_pos
+            nav_text = f"Call {qp + 1}/{qn}"
+            can_prev, can_next = qp > 0, qp < qn - 1
         has_pending = len(self._pred_indices()) > 0
         for s in getattr(self, '_review_sets', []):
-            s['prev'].setEnabled(has_sel and pos > 0)
-            s['next'].setEnabled(has_sel and pos < n - 1)
+            s['prev'].setEnabled(can_prev)
+            s['next'].setEnabled(can_next)
             for k in ('accept', 'reject', 'skip'):
                 s[k].setEnabled(has_sel)
             if s.get('delete') is not None:
@@ -9369,7 +10593,11 @@ class MADMainWindow(QMainWindow):
 
     def _pred_prev(self):
         """Back: move the selection to the previous detection in the list
-        (any status — so you can revisit an already accepted/rejected call)."""
+        (any status — so you can revisit an already accepted/rejected call);
+        in a call queue, the previous call of the queue."""
+        if bool(getattr(self, '_call_queue', None)):
+            self._queue_step(-1)
+            return
         order = self._review_order()
         if not order:
             return
@@ -9377,7 +10605,11 @@ class MADMainWindow(QMainWindow):
         self._select_review_pos((len(order) - 1) if pos is None else max(0, pos - 1))
 
     def _pred_next(self):
-        """Next: move the selection to the next detection in the list."""
+        """Next: move the selection to the next detection in the list; in a
+        call queue, the next call of the queue, in whichever recording."""
+        if bool(getattr(self, '_call_queue', None)):
+            self._queue_step(+1)
+            return
         order = self._review_order()
         if not order:
             return
@@ -9477,12 +10709,20 @@ class MADMainWindow(QMainWindow):
             was_pending = st == 'prediction'
             # One list, one meaning: accepting a call in the Audio list confirms
             # it as a label, so it trains the model on the next run.
+            old_id = ann.get('id')
             self._accept_prediction(sel)
             mark("save")
-            self._after_review_decision(
-                self.spectrogram.annotations[sel].get('id')
-                if sel < len(self.spectrogram.annotations) else ann.get('id'),
-                was_pending)
+            new_id = (self.spectrogram.annotations[sel].get('id')
+                      if sel < len(self.spectrogram.annotations) else old_id)
+            # Accepting saves the call as a training example under a new id; a
+            # call queue tracks its call by id, so carry the queue over to it
+            # (else deciding the queued call reads as deciding some other one
+            # and auto-advance stays inside the recording).
+            if (old_id is not None
+                    and old_id == getattr(self, '_call_queue_ann_id', None)):
+                self._call_queue_ann_id = new_id
+                self.spectrogram.queue_ann_id = new_id
+            self._after_review_decision(new_id, was_pending)
             mark("advance")
 
     def _reject_current_pred(self):
@@ -9743,6 +10983,39 @@ class MADMainWindow(QMainWindow):
             self._touch_current_file_badge()
             self._update_view_header()
         self._mark("badge")
+        if (bool(getattr(self, '_call_queue', None)) and decided_id is not None
+                and (decided_id == getattr(self, '_call_queue_ann_id', None)
+                     or getattr(self, '_queue_window_mode', False))):
+            # Deciding the queue's own call puts call +- context into training,
+            # so first walk through every pending detection inside that window
+            # (each decision widens it, so it is re-read every time), then move
+            # on through the queue -- not through this recording's other
+            # detections; the end-of-file prompt is for per-recording review.
+            # Re-deciding the queued call itself counts too: a queue of earlier
+            # decisions to check (2026-11-09, flipping Sophia's labels) is
+            # worked through by flipping them, and each flip is that item done.
+            is_queued = decided_id == getattr(self, '_call_queue_ann_id', None)
+            if self._auto_advance and (was_pending or is_queued):
+                # A judging-only queue (--no-window-walk: e.g. scoring two
+                # models' disagreements) wants each decision to move straight
+                # to the next queued call; its neighbours are not being taught.
+                left = (self._queue_window_pending()
+                        if getattr(self, '_queue_window_walk', True) else [])
+                if left:
+                    self._queue_window_mode = True
+                    self._center_and_select_ann(left[0])
+                    self._update_view_header()
+                    self.status_bar.showMessage(
+                        f"Training window: {len(left)} pending detection(s) "
+                        "to decide before the next queued call (Skip leaves "
+                        "them as background and moves on)")
+                else:
+                    self._queue_window_mode = False
+                    self._queue_step(+1)
+            else:
+                self._reselect_by_id(decided_id)
+            self._mark("select")
+            return
         if self._auto_advance and was_pending:
             if not (self._select_next_pending_from_id(successor)
                     or self._select_next_pending_after_id(decided_id)):
@@ -9790,6 +11063,10 @@ class MADMainWindow(QMainWindow):
         """
         if self._pred_indices():
             return  # still pending — nothing to prompt
+        if self._queue_active():
+            # A call queue moves through its own list; "next file" would open
+            # some recording's first queued call, far back in the queue.
+            return
         n = self._reviewed_count
         if n <= 0:
             return  # nothing was actually reviewed this file — no prompt
@@ -10072,7 +11349,12 @@ class MADMainWindow(QMainWindow):
 
     def _skip_current_pred(self):
         """Leave the current detection undecided and jump to the next pending
-        one after it (no decision recorded)."""
+        one after it (no decision recorded); in a call queue, on to the
+        queue's next call."""
+        if bool(getattr(self, '_call_queue', None)) and not self._box_sel_ids:
+            self._count_skips(1)
+            self._queue_step(+1)
+            return
         sg = self.spectrogram
         sel = sg._selected_ann_idx
         if self._box_sel_ids:
@@ -10317,6 +11599,38 @@ class MADMainWindow(QMainWindow):
         if not self._focus_is_edit():
             self.chk_trajectories.toggle()
 
+    def _apply_training_context(self):
+        """Point the shading (and the save margin) at the project's training
+        context, converted to frames on the loaded file's grid."""
+        from fnt.usv.usv_detector.mad_examples import context_frames
+        sg = self.spectrogram
+        ms = getattr(self._project, 'context_ms', None)
+        sg.training_context_frames = context_frames(
+            ms, self.sample_rate, getattr(sg, 'hop', None))
+        sg.update()
+
+    def _shortcut_training_windows(self):
+        """W shows or hides the training-window shading."""
+        if not self._focus_is_edit():
+            self.chk_train_windows.toggle()
+
+    def _set_ridges_shown(self, on: bool):
+        self.spectrogram.show_ridges = bool(on)
+        try:
+            self._settings.setValue(RIDGES_KEY, bool(on))
+        except Exception:
+            pass
+        self.spectrogram.update()
+
+    def _set_training_windows_shown(self, on: bool):
+        self.spectrogram.show_training_windows = bool(on)
+        try:
+            self._settings.setValue(TRAIN_WINDOWS_KEY, bool(on))
+        except Exception:
+            pass
+        self.spectrogram.update()
+        self._update_view_header()
+
     def _set_trajectory_window_open(self, on: bool):
         """The header checkbox (and T) drive this; the window's own X comes
         back through ``visibility_changed`` so the box always tells the truth."""
@@ -10336,6 +11650,121 @@ class MADMainWindow(QMainWindow):
             chk.blockSignals(True)
             chk.setChecked(visible)
             chk.blockSignals(False)
+
+    # ------------------------------------------------------------------
+    # Video QC: the camera that watched the microphone (mad_video_qc)
+    # ------------------------------------------------------------------
+    def _load_video_qc_config(self):
+        """Read the project's video_qc.json (None if it has none) and set the
+        button. A broken file is reported, not raised: video is optional."""
+        from fnt.usv.usv_detector.mad_video import VideoQCConfig
+        self._video_qc_cfg = None
+        proj = getattr(self, '_project', None)
+        try:
+            self._video_qc_cfg = VideoQCConfig.load(
+                getattr(proj, 'project_dir', None))
+        except Exception as e:
+            self._log(f"video_qc.json could not be read: {e}")
+        on = self._video_qc_cfg is not None
+        if hasattr(self, 'btn_video_qc'):
+            self.btn_video_qc.setEnabled(on)
+            self.btn_video_qc.setToolTip(
+                self._VIDEO_QC_ON_TIP if on else self._VIDEO_QC_OFF_TIP)
+
+    def _video_qc_window(self, create: bool = False):
+        dlg = getattr(self, '_video_qc_dialog', None)
+        if dlg is not None:
+            try:
+                import sip
+                if sip.isdeleted(dlg):
+                    dlg = None
+            except Exception:
+                pass
+        if dlg is None and create:
+            from fnt.usv.mad_video_qc import MADVideoQCWindow
+            dlg = MADVideoQCWindow(self)
+            dlg.position_changed.connect(self._on_video_qc_position)
+            dlg.visibility_changed.connect(self._on_video_qc_visibility)
+        self._video_qc_dialog = dlg
+        return dlg
+
+    def _show_video_qc(self):
+        """Open (or refresh) the Video QC window on the view: the stretch on
+        screen plus 1 s either side, from the channel's own camera."""
+        from fnt.usv.usv_detector.mad_video import VideoQCConfig
+        wav = self._active_wav_path()
+        if not wav or self.audio_data is None:
+            self.status_bar.showMessage("Load a recording first")
+            return
+        # Re-read the file each time, so an edit to it applies without reopening.
+        try:
+            cfg = VideoQCConfig.load(getattr(self._project, 'project_dir', None))
+        except Exception as e:
+            QMessageBox.warning(self, "Video QC",
+                                f"video_qc.json could not be read:\n\n{e}")
+            return
+        if cfg is None:
+            QMessageBox.information(self, "Video QC", self._VIDEO_QC_OFF_TIP)
+            return
+        self._video_qc_cfg = cfg
+        sg = self.spectrogram
+        total = float(getattr(sg, 'total_duration', 0.0) or 0.0)
+        t0 = max(0.0, float(sg.view_start) - 1.0)
+        t1 = float(sg.view_end) + 1.0
+        if total > 0:
+            t1 = min(total, t1)
+        dlg = self._video_qc_window(create=True)
+        dlg.request(wav, t0, t1, cfg)
+        self._update_video_qc_mark()
+        self.present_window(dlg)
+
+    def _on_video_qc_position(self, t_s: float):
+        """The video's slider or its own player moved: draw the playhead line
+        there (MAD's own playback, when running, owns the line)."""
+        if getattr(self, 'is_playing', False):
+            return
+        self.spectrogram.playback_position = float(t_s)
+        self.spectrogram.update()
+
+    def _on_video_qc_visibility(self, visible: bool):
+        if not visible and not getattr(self, 'is_playing', False):
+            self.spectrogram.playback_position = None
+            self.spectrogram.update()
+
+    def _notify_video_qc_playback(self, event: str, pos: float = 0.0):
+        dlg = self._video_qc_window()
+        if dlg is None:
+            return
+        try:
+            if not dlg.isVisible():
+                return
+            if event == 'start':
+                dlg.playback_started(self._playback_start_s, self._playback_end_s)
+            elif event == 'tick':
+                dlg.playback_tick(pos)
+            else:
+                dlg.playback_stopped()
+        except RuntimeError:
+            self._video_qc_dialog = None       # C++ side already gone
+
+    def _update_video_qc_mark(self):
+        """Give the Video QC window the selected call's time, for its red border."""
+        dlg = self._video_qc_window()
+        if dlg is None:
+            return
+        try:
+            if not dlg.isVisible():
+                return
+            sg = self.spectrogram
+            i = getattr(sg, '_selected_ann_idx', None)
+            anns = getattr(sg, 'annotations', None) or []
+            if i is None or not (0 <= i < len(anns)):
+                dlg.set_call_mark(None, None)
+                return
+            s_per_px = sg.hop / float(sg.sample_rate)
+            dlg.set_call_mark(anns[i]['t0'] * s_per_px, anns[i]['t1'] * s_per_px)
+        except (RuntimeError, KeyError, AttributeError, TypeError):
+            pass
 
     def _show_trajectory_window(self):
         """Open (or raise) the 3D call-trajectory view.
@@ -10364,8 +11793,10 @@ class MADMainWindow(QMainWindow):
         self.present_window(dlg)
 
     def _notify_trajectory_playback(self, event: str, pos: float = 0.0):
-        """Drive the 3D view's player from the spectrogram's playhead:
-        'start' | 'tick' (every playhead update) | 'stop'."""
+        """Drive the 3D view's player — and the Video QC window — from the
+        spectrogram's playhead: 'start' | 'tick' (every playhead update) |
+        'stop'."""
+        self._notify_video_qc_playback(event, pos)
         dlg = getattr(self, '_trajectory_dialog', None)
         if dlg is None:
             return
@@ -10386,6 +11817,7 @@ class MADMainWindow(QMainWindow):
                                 view_changed: bool = False):
         """Tell an open 3D view that the calls, the view or the selection
         changed. Cheap when the window is closed — which is almost always."""
+        self._update_video_qc_mark()
         dlg = getattr(self, '_trajectory_dialog', None)
         if dlg is None:
             return
@@ -10474,23 +11906,26 @@ class MADMainWindow(QMainWindow):
         except Exception:
             return {}, None
 
+    def _row_overlaps_ann(self, r, a, dt, df):
+        """True when detection row ``r`` (seconds, Hz) and annotation ``a``
+        (frames, bins) share any part of their bounding boxes."""
+        if dt <= 0 or df <= 0:
+            return False
+        t_org = self._frame_time_origin_s()
+        rt0, rt1 = (r['start_s'] - t_org) / dt, (r['stop_s'] - t_org) / dt
+        rf0, rf1 = r['min_freq_hz'] / df, r['max_freq_hz'] / df
+        return not (a['t1'] <= rt0 or a['t0'] >= rt1
+                    or a['f1'] <= rf0 or a['f0'] >= rf1)
+
     def _find_overlapping_confirmed(self, r, dt, df):
         """Return a confirmed (status-less) annotation whose bbox overlaps the
         CSV row ``r`` (used to reconcile a rejected call against a stale green),
         or None."""
-        if dt <= 0 or df <= 0:
-            return None
-        t_org = self._frame_time_origin_s()
-        rt0, rt1 = (r['start_s'] - t_org) / dt, (r['stop_s'] - t_org) / dt
-        rf0, rf1 = r['min_freq_hz'] / df, r['max_freq_hz'] / df
         for a in self.spectrogram.annotations:
             if a.get('status'):  # only status-less confirmed (green) masks
                 continue
-            if a['t1'] <= rt0 or a['t0'] >= rt1:
-                continue
-            if a['f1'] <= rf0 or a['f0'] >= rf1:
-                continue
-            return a
+            if self._row_overlaps_ann(r, a, dt, df):
+                return a
         return None
 
     def _load_predictions_as_annotations(self, wav: Optional[str] = None):
@@ -10538,10 +11973,16 @@ class MADMainWindow(QMainWindow):
                 and not self._has_rejected_examples(wav)):
             return
 
+        # The ridges this file's stored spectrograms allow, filled before the
+        # crops are read so they draw on this very load.
+        self._fill_open_ridges(wav)
+
         # Per-blob crops (few MB). Migrate a legacy prob file once, carving
         # crops from the CSV's blob boxes when a CSV is present so blob_ids and
         # accept/reject status stay joined.
-        crops = read_all_pred_masks(h5_path)
+        crops = self._take_prefetched_crops(h5_path)
+        if crops is None:
+            crops = read_all_pred_masks(h5_path, include_ridge=True)
         if not crops and has_prob(h5_path):
             crops, migrated_rows = self._migrate_legacy_prob(h5_path, sp, rows)
             if rows is None:
@@ -10578,7 +12019,10 @@ class MADMainWindow(QMainWindow):
         # reject renders as a real outline rather than a filled bounding box.
         # Keyed by example id, which is what the CSV row carries as its call id.
         demoted = {}
-        for store in self._example_store_paths(wav):
+        # Recording's own .mad first: it is the master copy, and the project
+        # store is a cache rebuilt at training time. With the cache first, a
+        # rejection repaired in the .mad still drew from its stale cache copy.
+        for store in reversed(self._example_store_paths(wav)):
             try:
                 from fnt.usv.usv_detector.mad_examples import (
                     _examples_to_annotations)
@@ -10613,6 +12057,16 @@ class MADMainWindow(QMainWindow):
         by_key = {str(r.get('blob_id')): r for r in rows}
         for key, d in demoted.items():
             r = by_key.get(key)
+            # A rejected *prediction* keeps the blob_id of the row it came
+            # from, and that row is keyed by blob_id, not by this example id.
+            # Without this match the call loaded twice: a red "Reject" with
+            # the same detection still pending beneath it. Re-running inference
+            # numbers blobs from 1 again, so the number alone is not enough;
+            # the rejection must also overlap the row it claims.
+            if r is None and d.get('blob_id') is not None:
+                cand = by_key.get(str(d['blob_id']))
+                if cand is not None and self._row_overlaps_ann(cand, d, dt, df):
+                    r = cand
             if r is None:
                 t_org = self._frame_time_origin_s()
                 r = {
@@ -10729,6 +12183,13 @@ class MADMainWindow(QMainWindow):
                 'tags': list(r.get('tags') or []),
                 'csv_path': csv_path if os.path.isfile(csv_path) else None,
             })
+            if crop is not None and crop.get('ridge_khz') is not None:
+                # kHz -> spectrogram bins; tied to this mask object, so an
+                # edit (which replaces the mask) hides a ridge it no longer fits.
+                a = sg.annotations[-1]
+                a['ridge_bins'] = (np.asarray(crop['ridge_khz'], np.float64)
+                                   * 1000.0 / df)
+                a['_ridge_mask'] = a['mask']
             n_added += 1
             if ann_status == 'prediction':
                 n_pending += 1
@@ -10774,7 +12235,7 @@ class MADMainWindow(QMainWindow):
     def _build_inline_train_config(self):
         from fnt.usv.usv_detector.mad_training import UNetTrainingConfig
         sp = self._spec_params()
-        return UNetTrainingConfig(
+        kw = dict(
             project_dir=self._project.project_dir,
             model_arch=self.combo_arch.currentData(),
             encoder_name=self.combo_train_encoder.currentText(),
@@ -10792,7 +12253,12 @@ class MADMainWindow(QMainWindow):
             augment=self.chk_train_augment.isChecked(),
             loss=self.combo_train_loss.currentData() or 'bce_dice',
             split_mode=self.combo_train_split.currentData() or 'call',
+            context_ms=getattr(self._project, 'context_ms', None),
         )
+        # A launched run's settings without a panel control (or whose control
+        # could not take the value) win over the panel -- see launch_training.
+        kw.update(getattr(self, '_launch_overrides', None) or {})
+        return UNetTrainingConfig(**kw)
 
     def _apply_latest_training_config(self):
         """Pre-fill the training-option widgets from the most recent model's
@@ -10857,6 +12323,188 @@ class MADMainWindow(QMainWindow):
         except Exception as e:
             self._log(f"Could not apply latest training config: {e}")
 
+    #: Training-config fields that have a control in the training panel, and
+    #: how to set it. Overrides for these are written INTO the panel, so a
+    #: launched run shows exactly what it is training with.
+    def _train_panel_setters(self):
+        def _combo_data(name):
+            def set_(v):
+                w = getattr(self, name, None)
+                if w is not None:
+                    i = w.findData(v)
+                    if i >= 0:
+                        w.setCurrentIndex(i)
+                        return True
+                return False
+            return set_
+
+        def _combo_text(name):
+            def set_(v):
+                w = getattr(self, name, None)
+                if w is not None:
+                    i = w.findText(str(v))
+                    if i >= 0:
+                        w.setCurrentIndex(i)
+                        return True
+                return False
+            return set_
+
+        def _value(name, cast):
+            def set_(v):
+                w = getattr(self, name, None)
+                if w is None:
+                    return False
+                w.setValue(cast(v))
+                return True
+            return set_
+
+        def _check(name):
+            def set_(v):
+                w = getattr(self, name, None)
+                if w is None:
+                    return False
+                w.setChecked(bool(v))
+                return True
+            return set_
+
+        return {
+            'n_epochs': _value('spin_train_epochs', int),
+            'early_stop_patience': _value('spin_train_patience', int),
+            'batch_size': _value('spin_train_batch', int),
+            'learning_rate': _value('spin_train_lr', float),
+            'val_fraction': _value('spin_train_val', float),
+            'split_mode': _combo_data('combo_train_split'),
+            'loss': _combo_data('combo_train_loss'),
+            'augment': _check('chk_train_augment'),
+            'encoder_name': _combo_text('combo_train_encoder'),
+            'model_arch': _combo_data('combo_arch'),
+        }
+
+    def set_post_inference_settings(self, threshold=None, min_blob=None,
+                                    merge=None, merge_gap=None,
+                                    harmonics=None) -> None:
+        """Put dictated detection settings into the post-training controls.
+
+        For launched runs (``--infer-threshold`` and friends). Set in the
+        panel rather than passed around it, so the window shows what the
+        re-detection will use -- and because the post-training and Run
+        Inference copies are linked, the Run Inference box agrees with it.
+        A launched run used to inherit whatever the panel last held: min blob
+        100 and merge off, against the 50 / merge-on runs it was meant to
+        repeat. None leaves a setting alone.
+        """
+        if threshold is not None:
+            self.spin_post_threshold.setValue(float(threshold))
+        if min_blob is not None:
+            self.spin_post_min_blob.setValue(int(min_blob))
+        if merge is not None:
+            self.chk_post_merge.setChecked(bool(merge))
+        if merge_gap is not None:
+            self.spin_post_merge_gap.setValue(float(merge_gap))
+        if harmonics is not None:
+            self.chk_post_harmonics.setChecked(bool(harmonics))
+
+    def launch_inference(self, model: str, wavs: Optional[List[str]] = None) -> int:
+        """Run inference on every recording in the project, as a dictated or
+        command-line launch (``--infer``). Returns how many files it started.
+
+        Detection settings come from the panel (set them first with
+        :meth:`set_post_inference_settings`). Recordings this model already
+        analysed at these settings are skipped without asking -- the run logs
+        and each store's provenance say which -- so a stopped run resumes by
+        launching it again.
+        """
+        from fnt.usv.usv_detector.mad_batch import (
+            RunSettings, completed_by_settings, partition_done)
+        from fnt.usv.usv_detector.mad_inference import MADInferenceConfig
+        quit_after = getattr(self, '_window_only', False)
+        path = model
+        if os.path.isdir(path):
+            path = os.path.join(path, 'weights.pt')
+        if not os.path.isfile(path):
+            QMessageBox.warning(self, "Model missing", f"No model at {model}")
+            if quit_after:
+                QTimer.singleShot(0, QApplication.instance().quit)
+            return 0
+        self._infer_group_harmonics = self.chk_post_harmonics.isChecked()
+        cfg = MADInferenceConfig(
+            model_path=path,
+            threshold=self.spin_post_threshold.value(),
+            min_blob_pixels=self.spin_post_min_blob.value(),
+            merge_consecutive=self.chk_post_merge.isChecked(),
+            merge_max_gap_s=self.spin_post_merge_gap.value(),
+            device=self._device_value(self.combo_infer_device),
+            save_blob_csv=False,   # the .mad holds the run; CSV is an export
+            preserve_labels=not self.chk_infer_redetect.isChecked(),
+            training_data_dir=(self._project.training_data_dir
+                               if self._project else ""),
+            **self._infer_perf_kwargs(),
+        )
+        # The project's recordings, unless the launch named folders
+        # (--infer-folder): then every wav under them, in the order given.
+        wavs = [w for w in (self.audio_files if wavs is None else wavs)
+                if w and not self._is_missing(w)]
+        settings = RunSettings.from_config(cfg)
+        manifest_done: set = set()
+        root = self._batch_run_root()
+        if root:
+            try:
+                manifest_done = completed_by_settings(root, settings)
+            except Exception:
+                pass
+        todo, done = partition_done(wavs, settings, manifest_done)
+        self._log(f"Launched inference with {os.path.basename(os.path.dirname(path))}: "
+                  f"{len(done)} of {len(wavs)} recording(s) already analysed "
+                  f"at these settings, {len(todo)} to run")
+        ridge_fill = done if cfg.ridge else []
+        if not todo and not ridge_fill:
+            QMessageBox.information(
+                self, "Nothing to analyse",
+                f"All {len(wavs)} recording(s) are already analysed by this "
+                "model at these settings.")
+            if quit_after:
+                QTimer.singleShot(0, QApplication.instance().quit)
+            return 0
+        # As Run Inference does: arm Stop. Without it a launched run had no
+        # working Stop -- the button stayed greyed out for the whole run.
+        self.btn_infer_run.setEnabled(False)
+        self.infer_panel.start_run()
+        self._start_inference(cfg, todo, reporter=self.infer_panel,
+                              skip_scope_prompt=True, ridge_fill=ridge_fill)
+        return len(todo)
+
+    def launch_training(self, overrides=None, infer_after: bool = False):
+        """Start a run as if Run Training were pressed, with ``overrides``
+        (``UNetTrainingConfig`` fields) applied on top of the panel.
+
+        For runs started from outside -- ``mad-gui --project ... --train``, or
+        a run dictated to an assistant -- so the GUI still shows the usual
+        graph and previews. Fields with a control are set in the panel; the
+        rest (LR schedule, faint augmentation, per-recording cap, ...) apply to
+        this run only.
+
+        Post-training inference runs only with ``infer_after``. A dictated
+        "train a new model" must not quietly re-detect every recording in the
+        project, and the overwrite confirmation it would otherwise raise would
+        sit unanswered on an unattended machine -- passing the flag IS the
+        confirmation.
+        """
+        overrides = dict(overrides or {})
+        setters = self._train_panel_setters()
+        extra = {}
+        for k, v in overrides.items():
+            fn = setters.get(k)
+            if fn is None or not fn(v):
+                extra[k] = v
+        self._launch_overrides = extra
+        self._launch_infer = 'yes' if infer_after else 'no'
+        try:
+            self._on_train_clicked()
+        finally:
+            # One run only: a later press of Run Training uses the panel.
+            self._launch_overrides = {}
+            self._launch_infer = None
+
     def _on_inline_train(self):
         # Already training? The Train button doubles as "re-show the graph".
         if self._training_active:
@@ -10889,8 +12537,13 @@ class MADMainWindow(QMainWindow):
         # Inference" path / active-learning loop). With no target ticked this is
         # "Run Training" — training only. Confirm the overwrite up front so the
         # run proceeds unattended; declining just skips the auto-inference.
-        infer_wavs = self._post_training_targets()
-        if infer_wavs and not self._confirm_overwrite_predictions(infer_wavs):
+        launch = getattr(self, '_launch_infer', None)
+        infer_wavs = [] if launch == 'no' else self._post_training_targets()
+        if launch == 'no':
+            self._log("Post-training inference off for this launched run "
+                      "(start with --infer-after to run it)")
+        elif (infer_wavs and launch != 'yes'
+              and not self._confirm_overwrite_predictions(infer_wavs)):
             infer_wavs = []
             self._log("Post-training inference skipped (declined overwrite)")
         self._post_train_infer_wavs = infer_wavs
@@ -11006,10 +12659,53 @@ class MADMainWindow(QMainWindow):
         if self._train_dialog is not None:
             self._train_dialog.close()
 
+    def _window_only_close_prompt(self, what: str = "training") -> str:
+        """'stop' or 'cancel' for closing the only window mid-run. There is
+        no 'keep running' here: with the main window hidden, nothing would be
+        left on screen to show or stop the run."""
+        parent = (self._train_dialog if what == "training"
+                  else getattr(self, '_infer_dialog', None)) or self
+        box = QMessageBox(parent)
+        box.setWindowTitle(f"{what.capitalize()} in progress")
+        box.setText(f"A{'n' if what[0] in 'aeiou' else ''} {what} run is "
+                    "still in progress.")
+        box.setInformativeText("Stop it and close MAD?")
+        stop = box.addButton(f"Stop {what}", QMessageBox.DestructiveRole)
+        box.addButton("Cancel", QMessageBox.RejectRole)
+        box.exec_()
+        return 'stop' if box.clickedButton() is stop else 'cancel'
+
+    def _after_training_run(self):
+        """A training-window-only launch quits once a run it was asked to
+        stop has wound down (see _on_train_dialog_close)."""
+        if getattr(self, '_quit_when_idle', False):
+            QTimer.singleShot(0, QApplication.instance().quit)
+
     def _on_train_dialog_close(self, event):
         """Closing the training window mid-run: keep it in the background (just
         hide) or stop the run — never silently kill a long run. When the close
-        is triggered by 'Stop Training Early', skip the prompt entirely."""
+        is triggered by 'Stop Training Early', skip the prompt entirely.
+
+        Launched with ``--training-window-only`` that window is all of MAD, so
+        closing it quits -- after the run, or after stopping it."""
+        if getattr(self, '_window_only', False):
+            if (not self._training_active
+                    or getattr(self, '_closing_train_windows', False)):
+                event.accept()
+                QTimer.singleShot(0, QApplication.instance().quit)
+                return
+            if self._window_only_close_prompt() != 'stop':
+                event.ignore()
+                return
+            try:
+                self.train_panel._on_stop()
+            except Exception:
+                pass
+            # Quit once the stopped run has written its results; quitting now
+            # would destroy the worker mid-epoch.
+            self._quit_when_idle = True
+            event.accept()
+            return
         if not self._training_active or getattr(self, '_closing_train_windows',
                                                  False):
             event.accept()
@@ -11178,15 +12874,83 @@ class MADMainWindow(QMainWindow):
 
     def _on_infer_window_closed(self):
         """The user closed the floating progress window. The run goes on; its
-        controls go back to the sidebar, and the user is told where."""
+        controls go back to the sidebar, and the user is told where.
+
+        Launched with ``--inference-window-only`` that window is all of MAD:
+        mid-run, closing it asks whether to stop (Cancel puts it back); once
+        the run is over, it quits."""
         running = bool(getattr(self, 'btn_infer_pause', None) is not None
                        and self.btn_infer_pause.isEnabled())
+        if getattr(self, '_window_only', False):
+            self._close_infer_progress_dialog()
+            if not running:
+                QTimer.singleShot(0, QApplication.instance().quit)
+                return
+            if self._window_only_close_prompt("inference") == 'stop':
+                worker = getattr(self, '_infer_worker', None)
+                if worker is not None:
+                    worker.request_stop()
+            # Either way the window comes back: to keep running, or to show
+            # the run winding down to its summary, after which MAD quits.
+            self._show_infer_progress_dialog()
+            return
         self._close_infer_progress_dialog()
         if running:
             msg = ("Inference is still running — its progress, Pause and Stop "
                    "are back in the Run Inference section.")
             self.status_bar.showMessage(msg, 8000)
             self._log(msg)
+
+    def watch_stop_request(self, project_dir: str):
+        """Stop this run, with no prompt, when ``mad stop`` writes the
+        STOP_INFERENCE file into the project folder (checked every 5 s).
+
+        For --inference-window-only runs, so a run can be stopped by command
+        (a dictated "stop the inference") rather than by clicking through the
+        close prompt. A file left from an earlier stop is cleared first."""
+        from fnt.usv.usv_detector.mad_project import STOP_REQUEST_FILENAME
+        self._stop_request_path = os.path.join(project_dir, STOP_REQUEST_FILENAME)
+        try:
+            os.remove(self._stop_request_path)
+        except OSError:
+            pass
+        self._stop_request_timer = QTimer(self)
+        self._stop_request_timer.setInterval(5000)
+        self._stop_request_timer.timeout.connect(self._check_stop_request)
+        self._stop_request_timer.start()
+
+    def _check_stop_request(self):
+        path = getattr(self, '_stop_request_path', '')
+        if not path or not os.path.exists(path):
+            return
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        self._stop_request_timer.stop()
+        worker = getattr(self, '_infer_worker', None)
+        if worker is not None:
+            # The run winds down (the current file finishes), then ends in
+            # _quit_window_only_inference like any other window-only run.
+            self._log("Stop requested by `mad stop`: stopping after the "
+                      "current file, then quitting.")
+            worker.request_stop()
+        else:
+            self._quit_window_only_inference([])
+
+    def _quit_window_only_inference(self, results, error: str = ""):
+        """End of an ``--inference-window-only`` run, finished, stopped or
+        failed: log one line and quit, with no dialog to close. The caller
+        (a scheduled chain, an assistant) reads the run's manifest."""
+        if error:
+            self._log("Inference failed: " + error[:2000])
+        else:
+            results = results or []
+            failed = sum(1 for r in results if 'error' in r)
+            self._log(f"Inference ended: {len(results)} file(s), "
+                      f"{failed} failed; quitting.")
+        self._close_infer_progress_dialog()
+        QTimer.singleShot(0, QApplication.instance().quit)
 
     def _close_infer_progress_dialog(self):
         """Put the progress box back in the Inference section and close the
@@ -11842,7 +13606,11 @@ class MADMainWindow(QMainWindow):
         except Exception as ex:
             QMessageBox.critical(self, "Could not read the saved list", str(ex))
             return
-        have = {os.path.normcase(os.path.abspath(p)) for p in self.audio_files}
+        # Against the registry, not the visible list: in a focus the list
+        # shows a handful of recordings, and comparing against it would
+        # re-register every hidden one as a duplicate.
+        have = {os.path.normcase(os.path.abspath(e.path))
+                for e in self._project.audio_entries()}
         back = [e for e in saved
                 if os.path.normcase(os.path.abspath(e['path'])) not in have]
         if not back:
@@ -12134,6 +13902,13 @@ class MADMainWindow(QMainWindow):
         folders = self._pick_folders()
         if not folders:
             return
+        self.set_inference_folders(folders)
+
+    def set_inference_folders(self, folders) -> List[str]:
+        """Make ``folders`` (each walked to the bottom) the Folder scope of the
+        next inference run, as Choose Folder(s)... does; returns their wavs,
+        de-duplicated in the order given. Detections are written next to each
+        wav; nothing is added to the project."""
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             wavs, seen = [], set()
@@ -12166,6 +13941,7 @@ class MADMainWindow(QMainWindow):
             self.lbl_infer_folder.setStyleSheet(
                 "color: #c8a05a; font-size: 9px;")
         self._update_run_button()
+        return wavs
 
     def _gather_inference_targets(self) -> List[str]:
         """Wav paths to run inference on, from the Audio-list and Folder scope
@@ -12208,6 +13984,33 @@ class MADMainWindow(QMainWindow):
             else:
                 a += 1
         return (a, p, r)
+
+    def _fill_open_ridges(self, wav: str) -> None:
+        """Fill the brightness ridges a recording's .mad lacks, from what it
+        stores (``fill_ridges`` without the audio: detections analysed before
+        MAD kept their spectrogram wait for a run's ridge pass). Never while a
+        run holds the file, not with ridges off. A stamped file costs one
+        attribute read; one the fill could not complete is not retried this
+        session (each try reads every mask)."""
+        from fnt.usv.usv_detector.fnt_mask_store import ridge_enabled
+        key = self._path_key(wav)
+        checked = getattr(self, '_ridge_checked', None)
+        if checked is None:
+            checked = self._ridge_checked = set()
+        if key in checked or not ridge_enabled() or self._is_infer_locked(wav):
+            return
+        try:
+            from fnt.usv.usv_detector.mad_inference import fill_ridges
+            r = fill_ridges(wav, use_audio=False)
+        except Exception as e:
+            checked.add(key)
+            self._log(f"Ridges of {os.path.basename(wav)} not filled: {e}")
+            return
+        if r.get('needed') and not r.get('stamped'):
+            checked.add(key)
+        if r.get('pred') or r.get('examples'):
+            self._log(f"Ridges filled in {os.path.basename(wav)}: "
+                      f"{r['pred']} detection(s), {r['examples']} label(s)")
 
     @staticmethod
     def _path_key(fp) -> str:
@@ -12675,6 +14478,15 @@ class MADMainWindow(QMainWindow):
         # panel: it is a once-a-project action, and sharing a row (and a
         # dialog) with the everyday prune is what made it reachable by
         # accident. No shortcut, for the same reason.
+        # Leaves a focus (``--focus`` on launch, or focus_recordings()):
+        # the project always held everything; this shows it again.
+        self.act_show_all = QAction("Show &All Recordings", self)
+        self.act_show_all.setToolTip(
+            "Leave the focus and list every recording in the project.")
+        self.act_show_all.triggered.connect(self.clear_focus)
+        self.act_show_all.setEnabled(False)
+        file_menu.addAction(self.act_show_all)
+
         self.act_empty_list = QAction("&Empty the Audio List…", self)
         self.act_empty_list.setToolTip(
             "Take every recording out of the Audio list. Nothing is deleted — "
@@ -12689,6 +14501,16 @@ class MADMainWindow(QMainWindow):
             "how many, and how fast the run went.")
         self.act_run_summary.triggered.connect(self._show_run_summary)
         file_menu.addAction(self.act_run_summary)
+
+        self.act_export_tables = QAction("E&xport…", self)
+        self.act_export_tables.setToolTip(
+            "Folder-wide tables from the .mad files: one row per recording, "
+            "one per detection and one per labelled call (with spectrogram "
+            "images if asked), for analysis in R or pandas.\n\n"
+            "Exporting again into the same folder reads only the recordings "
+            "whose .mad changed.")
+        self.act_export_tables.triggered.connect(self._show_export_dialog)
+        file_menu.addAction(self.act_export_tables)
 
         self.act_export_csv = QAction("&Export Annotations to CSV…", self)
         self.act_export_csv.setToolTip(
@@ -12896,6 +14718,9 @@ class MADMainWindow(QMainWindow):
 
     def _start_device_probe(self):
         """Kick off the background compute-device probe (once)."""
+        # Before the probe starts importing torch: from then until it
+        # finishes, scipy would see a half-imported torch.
+        _guard_scipy_against_partial_torch()
         self._device_probe = MADDeviceProbeWorker(self)
         self._device_probe.done_signal.connect(self._on_device_probe_done)
         self._device_probe.start()
@@ -12937,7 +14762,7 @@ class MADMainWindow(QMainWindow):
             out = subprocess.run(
                 ['nvidia-smi',
                  '--query-gpu=name,driver_version', '--format=csv,noheader'],
-                capture_output=True, text=True, timeout=6)
+                capture_output=True, text=True, timeout=6, **NO_WINDOW)
             if out.returncode != 0 or not out.stdout.strip():
                 return None
             first = out.stdout.strip().splitlines()[0]
@@ -12950,7 +14775,7 @@ class MADMainWindow(QMainWindow):
         # --query-gpu fields, so parse it out of the plain nvidia-smi output.
         try:
             banner = subprocess.run(['nvidia-smi'], capture_output=True,
-                                    text=True, timeout=6)
+                                    text=True, timeout=6, **NO_WINDOW)
             m = re.search(r'CUDA Version:\s*([0-9]+\.[0-9]+)', banner.stdout)
             if m:
                 info['cuda'] = float(m.group(1))
@@ -13127,6 +14952,7 @@ class MADMainWindow(QMainWindow):
         # are fully dedicated to zoom; B/N step Back/Next through detections.
         make(Qt.Key_G, self._show_gallery)         # Gallery (grid review)
         make(Qt.Key_T, self._shortcut_trajectories)  # 3D call trajectories
+        make(Qt.Key_W, self._shortcut_training_windows)  # training windows
         make(Qt.Key_B, self._shortcut_pred_prev)   # Back (previous detection)
         make(Qt.Key_N, self._shortcut_pred_next)   # Next detection
         make(Qt.Key_P, self._shortcut_toggle_brush)   # Paint (brush) tool
@@ -13140,6 +14966,7 @@ class MADMainWindow(QMainWindow):
         make(Qt.Key_Enter, self._confirm_pending)
         make(Qt.Key_Escape, self._clear_pending)
         make(Qt.Key_Space, self._shortcut_toggle_playback)
+        make("Shift+Space", self._shortcut_toggle_het_playback)
         make("[", self._shortcut_brush_smaller)
         make("]", self._shortcut_brush_bigger)
         make("V", self._shortcut_cycle_view)
@@ -13295,6 +15122,12 @@ class MADMainWindow(QMainWindow):
         if self.btn_play.isEnabled() or self.is_playing:
             self._toggle_playback()
 
+    def _shortcut_toggle_het_playback(self):
+        if self._focus_is_edit():
+            return
+        if self.btn_het.isEnabled() or self.is_playing:
+            self._toggle_het_playback()
+
     def _shortcut_toggle_brush(self):
         if self._focus_is_edit():
             return
@@ -13386,6 +15219,33 @@ class MADMainWindow(QMainWindow):
     # ==================================================================
     # Project lifecycle
     # ==================================================================
+    def _show_export_dialog(self):
+        """File ▸ Export…: the folder-wide tables (mad_export), in a window of
+        their own. Offers the project's recordings (the Audio list's with no
+        project open) or folders; one window at a time."""
+        dlg = getattr(self, '_export_dialog', None)
+        try:
+            if dlg is not None and dlg.isVisible():
+                dlg.raise_()
+                dlg.activateWindow()
+                return
+        except RuntimeError:            # closed and deleted
+            pass
+        from fnt.usv.mad_export_dialog import MADExportDialog
+        if self._project is not None:
+            wavs = [e.path for e in self._project.audio_entries()]
+            label = "Project recordings"
+        else:
+            wavs, label = list(self.audio_files), "Audio list"
+        dlg = MADExportDialog(self, wavs=wavs, wavs_label=label,
+                              settings=self._settings,
+                              start_dir=self._default_browse_dir(),
+                              parented=False)
+        dlg.setAttribute(Qt.WA_DeleteOnClose, True)
+        self._keep_window(dlg)
+        self._export_dialog = dlg
+        dlg.show()
+
     def _export_annotations_csv(self):
         """Write a CSV beside every recording under a chosen folder.
 
@@ -13395,7 +15255,7 @@ class MADMainWindow(QMainWindow):
         are measured with today's feature code against the audio, instead of
         being frozen at whatever ran the day each call was confirmed.
         """
-        start = (self._project.root if self._project
+        start = (self._project.project_dir if self._project
                  else self._default_browse_dir())
         folder = QFileDialog.getExistingDirectory(
             self, "Export annotations for every recording under…", start)
@@ -13760,6 +15620,16 @@ class MADMainWindow(QMainWindow):
 
     def _activate_project(self, cfg: MADProjectConfig):
         self._project = cfg
+        self._ridge_checked = set()
+        self._load_video_qc_config()
+        if hasattr(self, 'btn_guide'):
+            self.btn_guide.set_project(cfg.project_dir)
+        if hasattr(self, 'chk_infer_ridge'):
+            self.chk_infer_ridge.blockSignals(True)
+            self.chk_infer_ridge.setChecked(bool(getattr(cfg, 'ridge', True)))
+            self.chk_infer_ridge.blockSignals(False)
+        from fnt.usv.usv_detector.fnt_mask_store import set_ridge_enabled
+        set_ridge_enabled(bool(getattr(cfg, 'ridge', True)))
         # training_data/ moved out of models/ on 2026-09-08 — it is an input to
         # models, not one of them. Contents are a cache rebuilt from the .mad
         # sidecars each run, so a failed move costs a rebuild and nothing more.
@@ -13833,6 +15703,8 @@ class MADMainWindow(QMainWindow):
                 f"Closed project: {self._project.project_name}"
             )
         self._project = None
+        self._focus_keys = None      # a focus belongs to the project it was on
+        self._drop_prefetch()
         self.audio_files = []
         self.current_file_idx = 0
         self.audio_data = None
@@ -13886,6 +15758,698 @@ class MADMainWindow(QMainWindow):
         if dup:
             msg += f", skipped {dup} already loaded"
         self.status_bar.showMessage(msg)
+
+    # ------------------------------------------------------------------
+    # Focus: show a chosen handful of the project's recordings
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _focus_lines(items) -> List[Tuple[str, Optional[str], str]]:
+        """Expand focus arguments into (recording, detection, note) rows.
+
+        A ``.txt`` file is one recording per line (path or bare filename;
+        blank lines and ``#`` comments skipped), anything else is itself a
+        path or filename. A line may add, after a tab, a detection number (its
+        blob_id) and, after another tab, a note: such lines make a *call
+        queue*, reviewed call by call (see :meth:`_queue_goto`)."""
+        out: List[Tuple[str, Optional[str], str]] = []
+        for it in items or ():
+            it = str(it).strip().strip('"')
+            if not it:
+                continue
+            if it.lower().endswith('.txt') and os.path.isfile(it):
+                with open(it, encoding='utf-8', errors='replace') as f:
+                    for line in f:
+                        line = line.split('#', 1)[0].rstrip()
+                        parts = [p.strip().strip('"') for p in line.split('\t')]
+                        if not parts[0]:
+                            continue
+                        bid = parts[1] if len(parts) > 1 and parts[1] else None
+                        note = parts[2] if len(parts) > 2 else ''
+                        out.append((parts[0], bid, note))
+            else:
+                out.append((it, None, ''))
+        return out
+
+    @classmethod
+    def _focus_items(cls, items) -> List[str]:
+        """The recordings named by focus arguments, in order (see
+        :meth:`_focus_lines`)."""
+        return [p for p, _, _ in cls._focus_lines(items)]
+
+    def _apply_focus(self, paths: List[str]) -> List[str]:
+        """``paths`` (the project's registry, in order) cut down to the focus,
+        or unchanged when there is none.
+
+        Only ever the *displayed* list. The registry is written exclusively
+        from the project's own entries, so a focused session cannot shrink the
+        project -- training still reads every registered recording, and
+        Show All Recordings puts the rest straight back.
+        """
+        keys = getattr(self, '_focus_keys', None)
+        if not keys:
+            return list(paths)
+        return [p for p in paths
+                if self._path_key(p) in keys
+                or os.path.basename(p).lower() in keys]
+
+    def focus_recordings(self, items) -> Tuple[int, List[str]]:
+        """Show only ``items`` in the Audio list. Returns (shown, unmatched).
+
+        Items are matched against the project's registry by full path, then
+        by filename -- so a list of bare names copied out of a report works. A
+        full path to a wav the project does not hold yet is registered first:
+        labelling it has to count toward training, and an unregistered file's
+        labels would not.
+        """
+        if self._project is None:
+            return 0, list(items or ())
+        wanted = self._focus_items(items)
+        entries = self._project.audio_entries()
+        by_path = {self._path_key(e.path) for e in entries}
+        by_name = {os.path.basename(e.path).lower() for e in entries}
+        new = [w for w in wanted
+               if os.path.isabs(w) and os.path.isfile(w)
+               and self._path_key(w) not in by_path
+               and w.lower().endswith('.wav')]
+        if new:
+            self._register_audio_files(new)
+            entries = self._project.audio_entries()
+            by_path = {self._path_key(e.path) for e in entries}
+            by_name = {os.path.basename(e.path).lower() for e in entries}
+        keys, unmatched = set(), []
+        for w in wanted:
+            k = self._path_key(w)
+            n = os.path.basename(w).lower()
+            if k in by_path:
+                keys.add(k)
+            elif n in by_name:
+                keys.add(n)
+            else:
+                unmatched.append(w)
+        if not keys:
+            return 0, unmatched
+        self._focus_keys = keys
+        queue = self._build_call_queue(items)
+        if queue:
+            self._read_queue_decisions()
+            pos = self._saved_queue_pos(items, len(queue))
+            # Resume on a call still to decide: where it was left, else the
+            # first one skipped earlier; a fully decided queue opens where it
+            # was left.
+            nxt = self._queue_next_open(pos)
+            if nxt is None:
+                nxt = self._queue_next_open(0)
+            pos = pos if nxt is None else nxt
+            self._show_registry(keep=queue[pos][0],
+                                then=lambda: self._queue_goto(pos))
+        else:
+            self._show_registry()
+        n = len(self.audio_files)
+        self._update_focus_banner()
+        self._log(f"Focus: {n} of {len(entries)} recording(s)"
+                  + (f"; {len(unmatched)} not in the project: "
+                     + ", ".join(os.path.basename(u) for u in unmatched[:5])
+                     if unmatched else ""))
+        return n, unmatched
+
+    def clear_focus(self):
+        """Back to every recording in the project."""
+        if not getattr(self, '_focus_keys', None):
+            return
+        current = (self.audio_files[self.current_file_idx]
+                   if 0 <= self.current_file_idx < len(self.audio_files)
+                   else None)
+        self._focus_keys = None
+        self._call_queue = []
+        self._call_queue_ann_id = None
+        self.spectrogram.queue_ann_id = None
+        self._mark_queue_row()
+        self._drop_prefetch()
+        self._show_registry(keep=current)
+        self._update_focus_banner()
+        self._log("Showing all recordings")
+
+    # ------------------------------------------------------------------
+    # Call queue: a focus list that names detections, reviewed call by call
+    # ------------------------------------------------------------------
+    def _build_call_queue(self, items) -> List[Tuple[str, str, str]]:
+        """(registered path, blob_id, note) for every focus line that names a
+        detection, in the file's order; [] when none does, which leaves the
+        focus an ordinary per-recording one. The queue's file is remembered so
+        the position can be restored next time it is opened."""
+        rows = [r for r in self._focus_lines(items) if r[1] is not None]
+        self._call_queue = []
+        self._queue_decided = set()
+        self._drop_prefetch()
+        self._call_queue_pos = 0
+        self._call_queue_ann_id = None
+        if not rows:
+            return []
+        by_key = {self._path_key(p): p for p in self.audio_files}
+        by_name = {os.path.basename(p).lower(): p for p in self.audio_files}
+        entries = [e.path for e in self._project.audio_entries()]
+        by_key.update({self._path_key(p): p for p in entries})
+        by_name.update({os.path.basename(p).lower(): p for p in entries})
+        for path, bid, note in rows:
+            full = by_key.get(self._path_key(path)) or by_name.get(
+                os.path.basename(path).lower())
+            if full is not None:
+                self._call_queue.append((full, str(bid), note))
+        txt = [str(i) for i in (items or ()) if str(i).lower().endswith('.txt')]
+        self._call_queue_key = (
+            "mad/call_queue_pos/" + os.path.normcase(os.path.abspath(txt[0]))
+            if len(txt) == 1 else None)
+        return self._call_queue
+
+    def _saved_queue_pos(self, items, n: int) -> int:
+        """Where this queue was left last time (0 the first time)."""
+        key = getattr(self, '_call_queue_key', None)
+        if not key:
+            return 0
+        try:
+            pos = int(self._settings.value(key, 0))
+        except (TypeError, ValueError):
+            pos = 0
+        return max(0, min(pos, n - 1))
+
+    def _queue_active(self) -> bool:
+        return bool(getattr(self, '_call_queue', None))
+
+    def _queue_window_pending(self) -> List[int]:
+        """Pending detections inside the training window that holds the queue's
+        call, nearest first.
+
+        Once the queued call is decided, training supervises call +- context;
+        anything still pending in that span would be taught as background. The
+        window is the merged one from :meth:`training_windows`, so every
+        decision inside it widens it and this is re-read after each one, until
+        nothing pending overlaps it. Empty while the queued call is pending.
+        """
+        qa = self._queue_ann()
+        if qa is None or qa.get('status') == 'prediction':
+            return []
+        sg = self.spectrogram
+        t0, t1 = int(qa['t0']), int(qa['t1'])
+        win = next(((lo, hi) for lo, hi in sg.training_windows()
+                    if lo <= t0 and hi >= t1), None)
+        if win is None:
+            return []
+        mid = (t0 + t1) / 2.0
+        anns = sg.annotations
+        return sorted(sg.undecided_in_training_windows([win]),
+                      key=lambda i: abs((int(anns[i]['t0'])
+                                         + int(anns[i]['t1'])) / 2.0 - mid))
+
+    def _queue_goto(self, pos: int):
+        """Open the queue's ``pos``-th call: its recording (asynchronously, if
+        it is not the one on screen), centred and selected."""
+        queue = getattr(self, '_call_queue', None)
+        if not queue:
+            return
+        self._note_queue_decisions()       # the recording about to be replaced
+        self._queue_window_mode = False
+        pos = max(0, min(pos, len(queue) - 1))
+        self._call_queue_pos = pos
+        key = getattr(self, '_call_queue_key', None)
+        if key:
+            self._settings.setValue(key, pos)
+        path = queue[pos][0]
+        idx = next((i for i, p in enumerate(self.audio_files)
+                    if self._path_key(p) == self._path_key(path)), None)
+        if idx is None:
+            self.status_bar.showMessage(
+                f"Call {pos + 1}: {os.path.basename(path)} is not in the "
+                "Audio list")
+            return
+        if idx == self.current_file_idx and self.audio_data is not None:
+            self._queue_select_current()
+            return
+        # The marker belongs to the recording that is leaving the screen.
+        self.spectrogram.queue_ann_id = None
+        # The same sequencing as _focus_confirmed_call: the row change starts
+        # the load, and the selection waits until the recording is on screen.
+        # _queue_nav tells _on_file_selected the row change is ours, not a
+        # click to redirect.
+        tok = self._audio_token
+        self._queue_nav = True
+        try:
+            self.file_list.setCurrentRow(idx)
+        finally:
+            self._queue_nav = False
+        self.current_file_idx = idx
+        if (self._audio_token != tok and self._loading_path is not None
+                and self._path_key(self._loading_path)
+                == self._path_key(self.audio_files[idx])):
+            # The row change already started this recording's load
+            # (_on_file_selected); wait on that one. Starting a second load
+            # here decoded every queued recording twice, side by side -- the
+            # first copy thrown away as superseded.
+            self._audio_then[self._audio_token] = self._queue_select_current
+        else:
+            self._load_current_file(then=self._queue_select_current)
+
+    def _queue_select_current(self):
+        """Select the queue's current call in the recording on screen."""
+        queue = getattr(self, '_call_queue', None)
+        if not queue:
+            return
+        path, bid, note = queue[self._call_queue_pos]
+        anns = self.spectrogram.annotations
+        idx = next((i for i, a in enumerate(anns)
+                    if str(a.get('blob_id')) == bid), None)
+        n = len(queue)
+        if idx is None:
+            self._call_queue_ann_id = None
+            self.spectrogram.queue_ann_id = None
+            self.spectrogram._selected_ann_idx = None
+            self.spectrogram.update()
+            # The queued detection was deleted (e.g. as a harmonic sliver): go on
+            # to the next call in the direction of travel rather than leaving an
+            # empty selection on the recording's start (2026-11-09: reopening on
+            # a deleted call showed no call at all).
+            step = getattr(self, '_queue_dir', 1)
+            nxt = self._call_queue_pos + step
+            if 0 <= nxt < n:
+                self.status_bar.showMessage(
+                    f"Call {self._call_queue_pos + 1}/{n}: detection {bid} was "
+                    f"deleted — on to call {nxt + 1}")
+                QTimer.singleShot(0, lambda p=nxt: self._queue_goto(p))
+            else:
+                self.status_bar.showMessage(
+                    f"Call {self._call_queue_pos + 1}/{n}: detection {bid} is no "
+                    f"longer in {os.path.basename(path)}")
+            self._mark_queue_row()
+            self._update_view_header()
+            return
+        else:
+            self._call_queue_ann_id = anns[idx].get('id')
+            self.spectrogram.queue_ann_id = self._call_queue_ann_id
+            self._center_and_select_ann(idx)
+            self.status_bar.showMessage(
+                f"Call {self._call_queue_pos + 1}/{n}: "
+                f"{os.path.basename(path)}, detection {bid}"
+                + (f" — {note}" if note else ""))
+            # Back on a queued call that was decided in an earlier session (or
+            # before Back/Next): its training-window walk resumes where it was
+            # left, so the pending neighbours are selected one by one and their
+            # decisions move on through the window, then the queue (2026-11-09:
+            # reopening left the walk off -- nothing selected, decisions on the
+            # neighbours advanced through the recording instead).
+            left = (self._queue_window_pending()
+                    if self._auto_advance
+                    and getattr(self, '_queue_window_walk', True) else [])
+            if left:
+                self._queue_window_mode = True
+                self._center_and_select_ann(left[0])
+                self.status_bar.showMessage(
+                    f"Call {self._call_queue_pos + 1}/{n} is decided; "
+                    f"{len(left)} pending detection(s) left in its training "
+                    "window (Skip leaves them as background and moves on)")
+        self._mark_queue_row()
+        self._update_view_header()
+        self._update_pred_review_widgets()
+        self._queue_prefetch_next()
+
+    # --- call-queue prefetch -------------------------------------------
+    def _queue_prefetch_target(self) -> Optional[str]:
+        """The recording of the queue's next call in a different recording
+        than the current call's, or None."""
+        queue = getattr(self, '_call_queue', None)
+        if not queue:
+            return None
+        pos = self._call_queue_pos
+        here = self._path_key(queue[pos][0])
+        for p in range(pos + 1, len(queue)):
+            if self._path_key(queue[p][0]) != here:
+                return queue[p][0]
+        return None
+
+    def _queue_prefetch_next(self):
+        """Decode the next queued recording in the background while the user
+        works on this call.
+
+        Stepping to a call in another recording decoded the whole file on the
+        spot -- 600 s of IMA ADPCM through ffmpeg, about 3 s, and 5 s or more
+        with the inference run sharing the machine -- and every queue step
+        paid it. Read ahead with the same worker a normal open uses, at most
+        one recording (~600 MB of float32 samples) is kept; the open that asks
+        for it takes it over (_adopt_prefetch), finished or still running.
+        Only in a call queue, whose next file is known.
+        """
+        path = self._queue_prefetch_target()
+        if (path is None or not os.path.isfile(path)
+                or self._is_infer_locked(path)):
+            self._drop_prefetch()
+            return
+        key = self._path_key(path)
+        here = self._loaded_wav_path or self._loading_path
+        if here is not None and self._path_key(here) == key:
+            return
+        pf = self._prefetch
+        if pf is not None and pf['key'] == key:
+            return
+        self._drop_prefetch()
+        if self._prefetch_workers:
+            # A dropped prefetch is still decoding. Two at once would double
+            # the CPU and the memory, so this one starts when that one ends.
+            self._prefetch_restart = True
+            return
+        from fnt.usv.usv_detector.fnt_mask_store import masks_sibling_path
+        self._prefetch_token += 1
+        pt = self._prefetch_token
+        sg = self.spectrogram
+        win = (sg.view_end - sg.view_start) if sg.view_end > sg.view_start else 2.0
+        try:
+            h5 = masks_sibling_path(path)
+        except Exception:
+            h5 = None
+        worker = MADAudioLoadWorker(path, pt, self,
+                                    view=(win, sg.min_freq, sg.max_freq),
+                                    crops_h5=h5)
+        worker.loaded.connect(self._on_prefetch_loaded)
+        self._prefetch_workers[pt] = worker
+        self._prefetch = {'key': key, 'path': path, 'token': pt,
+                          'worker': worker, 'done': False,
+                          'audio': None, 'sr': 0}
+        worker.start()
+
+    def _on_prefetch_loaded(self, pt: int, audio, sr: int, err: str):
+        worker = self._prefetch_workers.pop(pt, None)
+        load_token = self._prefetch_adopted.pop(pt, None)
+        if load_token is not None:
+            # Taken over while it ran: finish it as the open it became (the
+            # worker is already in _audio_workers under that token, and the
+            # usual stale-token check applies).
+            self._on_audio_loaded(load_token, audio, sr, err)
+        else:
+            pf = self._prefetch
+            if pf is not None and pf['token'] == pt and audio is not None:
+                pf.update(done=True, audio=audio, sr=int(sr))
+            else:
+                if pf is not None and pf['token'] == pt:
+                    self._prefetch = None      # failed: a normal open reports it
+                if worker is not None:
+                    worker.deleteLater()
+        if self._prefetch_restart and not self._prefetch_workers:
+            self._prefetch_restart = False
+            if (self._queue_active() and self.audio_data is not None
+                    and self._loading_path is None):
+                self._queue_prefetch_next()
+
+    def _adopt_prefetch(self, filepath: str, token: int) -> bool:
+        """Serve the open of ``filepath`` (load ``token``) from the prefetch,
+        if it holds that recording. True if it did."""
+        pf = self._prefetch
+        if (pf is None or not self._queue_active()
+                or pf['key'] != self._path_key(filepath)):
+            return False
+        self._prefetch = None
+        worker = pf['worker']
+        self._audio_workers[token] = worker
+        self._prefetch_hits += 1
+        if pf['done']:
+            audio, sr = pf['audio'], pf['sr']
+            # Asynchronously, like a worker's signal: the caller expects the
+            # open to finish after it returns.
+            QTimer.singleShot(
+                0, lambda: self._on_audio_loaded(token, audio, sr, ""))
+        else:
+            self._prefetch_adopted[pf['token']] = token
+        return True
+
+    def _drop_prefetch(self):
+        """Forget the prefetched recording. A read still running is left to
+        finish (a QThread cannot be stopped mid-decode) and then discarded."""
+        pf, self._prefetch = self._prefetch, None
+        self._prefetch_restart = False
+        if pf is not None and pf['done']:
+            pf['worker'].deleteLater()     # its samples go with it
+
+    def _take_prefetched_crops(self, h5_path: str):
+        """The prediction crops a queue prefetch read for ``h5_path``, if the
+        .mad is unchanged since (else None: read it again)."""
+        got, self._prefetched_crops = self._prefetched_crops, None
+        if got is None:
+            return None
+        path, sig, crops = got
+        if (os.path.normcase(os.path.abspath(path))
+                != os.path.normcase(os.path.abspath(h5_path))
+                or _file_signature(h5_path) != sig):
+            return None
+        return crops
+
+    def _queue_pos_for_file(self, path: str) -> Optional[int]:
+        """The queue position to open for ``path``: the current one if it is
+        that recording's, else its next undecided queued call at or after the
+        current position, else its first undecided one, else its first.
+
+        Never simply its first: a queue interleaves recordings, so a
+        recording's first call is usually near the start of the queue and
+        opening it threw the reviewer back over work already done."""
+        key = self._path_key(path)
+        hits = [i for i, (p, _, _) in enumerate(getattr(self, '_call_queue', []))
+                if self._path_key(p) == key]
+        if not hits:
+            return None
+        if self._call_queue_pos in hits:
+            return self._call_queue_pos
+        open_ = [i for i in hits if not self._queue_is_decided(i)]
+        ahead = [i for i in open_ if i >= self._call_queue_pos]
+        return (ahead or open_ or hits)[0]
+
+    # --- which queued calls are already decided --------------------------
+    def _read_queue_decisions(self):
+        """(recording key, blob_id) of every queued detection that already has
+        a decision (an accepted or rejected example carrying its blob_id), read
+        from the queued recordings' .mad files when the queue opens."""
+        from fnt.usv.usv_detector.fnt_mask_store import (
+            masks_sibling_path, td_iter_meta)
+        done = set()
+        for path in {p for p, _, _ in self._call_queue}:
+            key = self._path_key(path)
+            try:
+                for meta in td_iter_meta(masks_sibling_path(path)):
+                    bid = meta.get('blob_id')
+                    if bid is not None and not isinstance(bid, bool):
+                        done.add((key, str(bid)))
+            except Exception:
+                continue
+        self._queue_decided = done
+
+    def _note_queue_decisions(self):
+        """Fold the recording on screen into the decided set (its annotations
+        are the live truth for it)."""
+        here = getattr(self, '_loaded_wav_path', None)
+        if here is None or not self._queue_active():
+            return
+        key = self._path_key(here)
+        done = getattr(self, '_queue_decided', None)
+        if done is None:
+            done = self._queue_decided = set()
+        for a in self.spectrogram.annotations:
+            bid = a.get('blob_id')
+            if bid is None:
+                continue
+            if a.get('status') == 'prediction':
+                done.discard((key, str(bid)))
+            else:
+                done.add((key, str(bid)))
+
+    def _queue_is_decided(self, pos: int) -> bool:
+        path, bid, _ = self._call_queue[pos]
+        here = getattr(self, '_loaded_wav_path', None)
+        if here is not None and self._path_key(here) == self._path_key(path):
+            a = next((a for a in self.spectrogram.annotations
+                      if str(a.get('blob_id')) == bid), None)
+            if a is not None and a.get('status') != 'prediction':
+                return True
+        return (self._path_key(path), bid) in getattr(self, '_queue_decided', ())
+
+    def _queue_next_open(self, start: int) -> Optional[int]:
+        """First undecided queued call at or after ``start``, or None."""
+        for p in range(max(0, start), len(self._call_queue)):
+            if not self._queue_is_decided(p):
+                return p
+        return None
+
+    def _queue_step_file(self, step: int):
+        """The Audio list's Prev/Next in a call queue: the queue's next (or
+        previous) call in a different recording."""
+        queue = getattr(self, '_call_queue', None)
+        if not queue:
+            return
+        here = self._path_key(queue[self._call_queue_pos][0])
+        pos = self._call_queue_pos + step
+        while 0 <= pos < len(queue) and self._path_key(queue[pos][0]) == here:
+            pos += step
+        if 0 <= pos < len(queue):
+            self._queue_goto(pos)
+        elif pos >= len(queue):
+            self.status_bar.showMessage(
+                f"End of the queue: all {len(queue)} calls shown")
+
+    def _queue_ann(self) -> Optional[dict]:
+        """The queue's call in the recording on screen, if it is there."""
+        qid = getattr(self, '_call_queue_ann_id', None)
+        if qid is None:
+            return None
+        return next((a for a in self.spectrogram.annotations
+                     if a.get('id') == qid), None)
+
+    def _mark_queue_row(self):
+        """In the Detections list: the queued call's row in bold cyan with a ▶,
+        every other row dimmed -- they are the recording's other detections,
+        shown for context, not part of the queue."""
+        tree = getattr(self, 'annotation_list', None)
+        grp = getattr(self, '_grp_detections', None)
+        queue = getattr(self, '_call_queue', None)
+        if grp is not None:
+            grp.setTitle("Detections in this recording (▶ = queued call)"
+                         if queue else "Detections")
+        if tree is None or not queue:
+            return
+        qid = getattr(self, '_call_queue_ann_id', None)
+        cyan, ncols = QColor(0, 229, 255), tree.columnCount()
+        pal = self._overlay_palette()
+        for r in range(tree.topLevelItemCount()):
+            item = tree.topLevelItem(r)
+            data = item.data(0, Qt.UserRole)
+            is_q = (qid is not None and isinstance(data, tuple)
+                    and len(data) > 3 and data[2] == qid)
+            f = item.font(0)
+            f.setBold(is_q)
+            if is_q:
+                col = cyan
+            else:
+                # From the row's status, not its current colour, so a row that
+                # was the queued call a moment ago loses the cyan too.
+                kind = data[3] if isinstance(data, tuple) and len(data) > 3 else ''
+                col = QColor(*(pal['pending'] if kind == 'prediction'
+                               else pal['rejected'] if kind == 'rejected'
+                               else pal['drawing'] if kind == 'pending'
+                               else pal['confirmed']))
+                col.setAlpha(110)
+            for c in range(ncols):
+                item.setFont(c, f)
+                item.setForeground(c, col)
+            text = item.text(0)
+            if is_q and not text.startswith("▶"):
+                item.setText(0, "▶ " + text)
+                tree.scrollToItem(item)
+            elif not is_q and text.startswith("▶ "):
+                item.setText(0, text[2:])
+
+    def _queue_header_html(self) -> str:
+        """The call-queue line above the spectrogram ('' outside a queue)."""
+        queue = getattr(self, '_call_queue', None)
+        if not queue:
+            return ""
+        pos = self._call_queue_pos
+        path, bid, note = queue[pos]
+        ann = self._queue_ann()
+        if ann is None:
+            where = f"detection {bid}"
+        else:
+            dt = (self.spectrogram.hop / float(self.sample_rate)
+                  if self.sample_rate else 0)
+            st = ann.get('status')
+            state = ("" if st == 'prediction'
+                     else " (already rejected)" if st == 'rejected'
+                     else " (already accepted)")
+            where = f"detection {bid} at {ann['t0'] * dt:.2f} s{state}"
+            n_win = len(self._queue_window_pending())
+            if n_win:
+                where += (f" &nbsp;·&nbsp; <span style='color:#ff9f40'>"
+                          f"{n_win} pending in its training window</span>")
+        left = sum(1 for p in range(len(queue)) if not self._queue_is_decided(p))
+        return (f"<span style='background:#00505a; color:#00e5ff'>"
+                f"&nbsp;<b>CALL QUEUE {pos + 1}/{len(queue)}</b>"
+                f" · {left} to decide&nbsp;</span>"
+                f" &nbsp;<span style='color:#00e5ff'>{where}"
+                + (f" &nbsp;·&nbsp; {note}" if note else "")
+                + "</span> &nbsp;&nbsp; ")
+
+    def _queue_step(self, step: int):
+        """Next / Skip / auto-advance (+1): the next queued call still to
+        decide -- calls decided earlier (in an earlier session, or in a
+        training-window walk) are passed over. Past the end, back to the first
+        one still undecided, if any. Back (-1) steps one call, decided or not,
+        so earlier decisions can be revisited."""
+        n = len(self._call_queue)
+        self._queue_dir = 1 if step >= 0 else -1   # a deleted queued call is passed over this way
+        if step < 0:
+            pos = self._call_queue_pos + step
+            if pos >= 0:
+                self._queue_goto(pos)
+            return
+        self._note_queue_decisions()
+        pos = self._queue_next_open(self._call_queue_pos + step)
+        if pos is None:
+            first = self._queue_next_open(0)
+            if first is None:
+                self.status_bar.showMessage(
+                    f"End of the queue: all {n} calls decided")
+                return
+            if first == self._call_queue_pos:
+                self.status_bar.showMessage(
+                    "End of the queue: this is the only call still undecided")
+                return
+            left = sum(1 for p in range(n) if not self._queue_is_decided(p))
+            self._queue_goto(first)
+            self.status_bar.showMessage(
+                f"End of the queue — back to the first of {left} skipped "
+                "call(s) still undecided")
+            return
+        self._queue_goto(pos)
+
+    def _show_registry(self, keep: Optional[str] = None, then=None):
+        """Rebuild the Audio list from the registry through the focus, and
+        open ``keep`` (or the first recording); ``then`` runs once it is open."""
+        entries = self._project.audio_entries()
+        self.audio_files = self._apply_focus([e.path for e in entries])
+        self._missing_audio = self._missing_paths(entries)
+        self.current_file_idx = (self.audio_files.index(keep)
+                                 if keep in self.audio_files else 0)
+        self._refresh_file_list()
+        self._scan_all_file_counts()
+        self.file_list.blockSignals(True)
+        self.file_list.setCurrentRow(self.current_file_idx
+                                     if self.audio_files else -1)
+        self.file_list.blockSignals(False)
+        if self.audio_files:
+            self._load_current_file(then=then)
+        self._update_scope_labels()
+        self._update_project_state()
+        self._sync_list_buttons()
+
+    def _update_focus_banner(self):
+        """Say it everywhere a glance lands: a list that silently shows 11 of
+        378 recordings reads as a project that lost 367."""
+        keys = getattr(self, '_focus_keys', None)
+        cfg = self._project
+        name = cfg.project_name if cfg is not None else ""
+        total = len(cfg.audio_entries()) if cfg is not None else 0
+        if keys and cfg is not None:
+            queue = getattr(self, '_call_queue', None)
+            tag = (f"call queue: {len(queue)} calls in {len(self.audio_files)} "
+                   f"recordings" if queue
+                   else f"focus: {len(self.audio_files)} of {total}")
+            self.setWindowTitle(f"{self.BASE_TITLE} — {name}  [{tag}]")
+            self.lbl_project_status.setText(
+                f"Project: {name} — {tag} (File ▸ Show All Recordings)")
+            self.lbl_project_status.setStyleSheet(
+                "color: #FFB74D; font-size: 10px; padding: 3px 6px;")
+        elif cfg is not None:
+            self.setWindowTitle(f"{self.BASE_TITLE} — {name}")
+            self.lbl_project_status.setText(f"Project: {name}")
+            self.lbl_project_status.setStyleSheet(
+                "color: #4CAF50; font-size: 10px; padding: 3px 6px;")
+        if hasattr(self, 'act_show_all'):
+            self.act_show_all.setEnabled(bool(keys))
+        if hasattr(self, 'act_empty_list'):
+            # Emptying acts on the visible list; in a focus that is a quiet way
+            # to unregister exactly the recordings being worked on.
+            self.act_empty_list.setEnabled(not keys)
 
     def _rescan_project_wavs(self) -> int:
         """Load the project's registered audio into the Audio list.
@@ -13944,7 +16508,7 @@ class MADMainWindow(QMainWindow):
         if adopted or moved or backfilled:
             self._project.save()
 
-        self.audio_files = [e.path for e in entries]
+        self.audio_files = self._apply_focus([e.path for e in entries])
         self.current_file_idx = 0
         self._missing_audio = self._missing_paths(entries)
         self._refresh_file_list()
@@ -14192,7 +16756,7 @@ class MADMainWindow(QMainWindow):
         current = (self.audio_files[self.current_file_idx]
                    if 0 <= self.current_file_idx < len(self.audio_files)
                    else None)
-        self.audio_files = [e.path for e in entries]
+        self.audio_files = self._apply_focus([e.path for e in entries])
         self._missing_audio = self._missing_paths(entries)
         if current in self.audio_files:
             self.current_file_idx = self.audio_files.index(current)
@@ -14420,11 +16984,24 @@ class MADMainWindow(QMainWindow):
         # the first two are work already done and the last is work still to do,
         # so putting pending last means the eye lands on the number that says
         # whether this recording needs attention.
+        # Pending detections inside a training window will train as background
+        # unless decided -- the one count here that is a correctness problem
+        # rather than a to-do, so it is only shown when it is not zero.
+        inside = ""
+        sg = self.spectrogram
+        if getattr(sg, 'show_training_windows', False) and pend:
+            n_in = len(sg.undecided_in_training_windows())
+            if n_in:
+                inside = (f" &nbsp;·&nbsp; <span style='color:#ff9f40'>"
+                          f"{n_in} pending inside training windows</span>")
+        queue_html = (self._queue_header_html()
+                      if bool(getattr(self, '_call_queue', None)) else "")
         lbl.setText(
+            queue_html +
             f"<b>{base}</b> &nbsp;·&nbsp; {pos} &nbsp;·&nbsp; "
             f"<span style='color:#3fbf5f'>{acc} accepted</span> &nbsp;·&nbsp; "
             f"<span style='color:#d64545'>{rej} rejected</span> &nbsp;·&nbsp; "
-            f"<span style='color:#d8c341'>{pend} pending</span>")
+            f"<span style='color:#d8c341'>{pend} pending</span>{inside}")
 
     def _touch_current_file_badge(self):
         """Re-badge JUST the on-screen recording's Audio-list row from memory.
@@ -14657,6 +17234,15 @@ class MADMainWindow(QMainWindow):
             self.lbl_data_summary.setText(label)
 
     def _on_file_selected(self, row: int):
+        if (0 <= row < len(self.audio_files)
+                and bool(getattr(self, '_call_queue', None))
+                and not getattr(self, '_queue_nav', False)):
+            # In a call queue, picking a recording opens its queued call, so
+            # the queue position never drifts from what is on screen.
+            pos = self._queue_pos_for_file(self.audio_files[row])
+            if pos is not None and pos != self._call_queue_pos:
+                self._queue_goto(pos)
+                return
         if 0 <= row < len(self.audio_files):
             if self._is_infer_locked(self.audio_files[row]):
                 # Disabled rows are unreachable by mouse, but Prev/Next and
@@ -14679,10 +17265,16 @@ class MADMainWindow(QMainWindow):
             self._update_review_buttons_for_source()
 
     def _prev_file(self):
+        if bool(getattr(self, '_call_queue', None)):
+            self._queue_step_file(-1)
+            return
         if self.current_file_idx > 0:
             self.file_list.setCurrentRow(self.current_file_idx - 1)
 
     def _next_file(self):
+        if bool(getattr(self, '_call_queue', None)):
+            self._queue_step_file(+1)
+            return
         if self.current_file_idx < len(self.audio_files) - 1:
             self.file_list.setCurrentRow(self.current_file_idx + 1)
 
@@ -14811,6 +17403,13 @@ class MADMainWindow(QMainWindow):
         recording set — so it is worth a trip to the menu. Living beside a
         button it shared a dialog with is what made it reachable by accident.
         """
+        if getattr(self, '_focus_keys', None):
+            QMessageBox.information(
+                self, "Showing a focus",
+                "The Audio list is showing a focus, not the whole project. "
+                "File ▸ Show All Recordings first — emptying from here would "
+                "unregister exactly the recordings being worked on.")
+            return
         n = len(self.audio_files)
         if not n:
             return
@@ -15183,6 +17782,10 @@ class MADMainWindow(QMainWindow):
         self._loading_path = filepath
         if then is not None:
             self._audio_then[token] = then
+        # A call queue decodes its next recording ahead of time; take that
+        # read over instead of starting a second one.
+        if self._adopt_prefetch(filepath, token):
+            return
         # Precompute the opening view in the worker. It is the window the
         # user is already looking at, carried over from the previous file.
         sg = self.spectrogram
@@ -15198,12 +17801,16 @@ class MADMainWindow(QMainWindow):
         user has already asked for a different one."""
         worker = self._audio_workers.pop(token, None)
         spec = getattr(worker, 'spec', None) if worker is not None else None
+        crops = getattr(worker, 'crops', None) if worker is not None else None
         if worker is not None:
             worker.deleteLater()
         then = self._audio_then.pop(token, None)
         if token != self._audio_token:
             return          # superseded — the user moved on, drop it silently
         self._loading_path = None
+        # A queue prefetch's prediction crops, for _load_predictions_as_
+        # annotations to use if the .mad is unchanged by then (None otherwise).
+        self._prefetched_crops = crops
         if not (0 <= self.current_file_idx < len(self.audio_files)):
             return
         filepath = self.audio_files[self.current_file_idx]
@@ -15224,8 +17831,16 @@ class MADMainWindow(QMainWindow):
             # through the event loop lets the overlay paint, keeps the window
             # answering the OS, and lets a second file click supersede this one
             # mid-way instead of queueing behind it.
-            prev_window = (self.spectrogram.view_end
-                           - self.spectrogram.view_start)
+            # Keep the width the user is looking at -- but only when there IS
+            # one. With nothing loaded (straight after opening a project, or
+            # after a failed open) the spectrogram's view is a 10 s
+            # placeholder, and keeping that showed ten seconds under a Window
+            # control reading 2 s, on every file after it as well. The
+            # control is the user's setting, so it decides then.
+            sg0 = self.spectrogram
+            prev_window = ((sg0.view_end - sg0.view_start)
+                           if sg0.total_duration > 0
+                           else self.spin_view_window.value())
 
             def stage_spectrogram():
                 if token != self._audio_token:
@@ -15343,6 +17958,7 @@ class MADMainWindow(QMainWindow):
             noverlap=int(grid.get('noverlap', sp['noverlap'])),
             nfft=int(grid.get('nfft', sp['nfft'])),
         )
+        self._apply_training_context()
         wav_name = os.path.basename(wav_path)
         grid = (self.spectrogram.n_freq_bins, self.spectrogram.n_time_frames)
         self._load_forced_harmonics(wav_path)
@@ -15763,6 +18379,22 @@ class MADMainWindow(QMainWindow):
         save it as a self-contained training example, then merge it into the
         confirmed buffer."""
         sg = self.spectrogram
+        if sg.is_joint_editing():
+            # A stroke that reaches none of the calls is a bridge that fell
+            # short, not a call: keep the edit open so it can be joined up or
+            # erased, rather than dropping it or saving it as a label.
+            crop = sg.joint_edit_crop()
+            if crop is not None:
+                _g, strays, _gone = joint_edit_groups(
+                    sg.joint_edit_members(), *crop)
+                if strays:
+                    self.status_bar.showMessage(
+                        f"{len(strays)} painted stroke(s) touch none of the "
+                        "calls — join them up or erase them (Esc cancels)")
+                    return
+            sg.finish_edit()
+            self._clear_tool_buttons()
+            return
         if sg.is_editing():
             sg.finish_edit()
             self._clear_tool_buttons()
@@ -16021,15 +18653,46 @@ class MADMainWindow(QMainWindow):
             except Exception:
                 pass
 
+    @staticmethod
+    def _confirmed_window(annotations, t_lo: int, width: int,
+                          n_freq: int) -> np.ndarray:
+        """Confirmed calls stamped on frames ``[t_lo, t_lo + width)``.
+
+        The neighbours an example records. Confirmed means a label or an
+        accepted detection; pending and rejected detections are left out.
+        This used to read the canvas mask, which stamps EVERY annotation --
+        so a label saved next to a pending tone detection, or next to a
+        rejection, recorded it as a confirmed neighbour, and training
+        supervises a label's neighbours as calls. Measured on the anosmia
+        project: 15,368 of 836,066 neighbour pixels (60 labels) came from
+        detections nobody had accepted, 2,895 of them on the 21 kHz tone.
+        """
+        win = np.zeros((n_freq, max(0, int(width))), dtype=np.uint8)
+        for a in annotations or ():
+            if a.get('status') not in (None, 'accepted'):
+                continue
+            m = a.get('mask')
+            if m is None:
+                continue
+            a0, f0 = int(a['t0']) - t_lo, int(a['f0'])
+            c0, c1 = max(0, a0), min(win.shape[1], a0 + m.shape[1])
+            r1 = min(n_freq, f0 + m.shape[0])
+            if c1 <= c0 or r1 <= f0:
+                continue
+            win[f0:r1, c0:c1] |= (np.asarray(m)[:r1 - f0, c0 - a0:c1 - a0]
+                                  > 0).astype(np.uint8)
+        return win
+
     def _save_component_example(self, class_name: str, comp,
                                 blob_id=None, kind: str = 'label',
                                 score=None, provenance=None) -> str:
         """Save one connected-component mask as a self-contained example.
         ``comp`` is ``(f0, f1, t0, t1, local_bool)``. Returns the example id.
 
-        ``kind='negative'`` stores the same spectrogram patch with an **empty**
-        mask, so training supervises every pixel of it as "not a call". Used to
-        turn rejections into hard negatives; see :meth:`_save_rejection_negative`.
+        ``kind='negative'`` stores a rejected prediction: ``mask`` is the
+        rejected call's own shape (what the overlay draws and re-runs suppress),
+        and training supervises the whole patch as "not a call" apart from any
+        confirmed neighbours. See :meth:`_save_rejection_negative`.
 
         With a project: saves to ``training_data.h5`` (consolidated store).
         Without: saves to the per-wav ``_FNT_masks.h5`` sibling so labels
@@ -16062,8 +18725,11 @@ class MADMainWindow(QMainWindow):
         # Context kept on each side of the call. 128 frames (~65 ms at hop
         # 128 / 250 kHz) makes a typical patch wider than a 256-frame training
         # tile, so tiles can be cut with real audio on BOTH sides of the call
-        # instead of synthetic fill. Older examples used 64.
-        margin = 128
+        # instead of synthetic fill. Older examples used 64. The training-window
+        # overlay reads the same constant, so what it shades is what trains.
+        margin = max(EXAMPLE_CONTEXT_FRAMES,
+                     int(getattr(sg, 'training_context_frames',
+                                 EXAMPLE_CONTEXT_FRAMES)))
         pt0 = max(0, t0 - margin)
         pt1 = min(n_time, t1 + margin)
 
@@ -16104,17 +18770,10 @@ class MADMainWindow(QMainWindow):
         if tw > 0:
             mask_patch[f0:f1, lt0:lt0 + tw] = local[:, :tw].astype(np.uint8)
         neighbors_patch = None
-        confirmed = getattr(sg, 'mask', None)
-        if confirmed is not None and getattr(confirmed, 'size', 0):
-            win = confirmed[:, pt0:pt0 + W]
-            hh = min(mask_patch.shape[0], win.shape[0])
-            ww = min(mask_patch.shape[1], win.shape[1])
-            if hh > 0 and ww > 0:
-                nb = np.zeros_like(mask_patch)
-                nb[:hh, :ww] = (win[:hh, :ww] > 0).astype(np.uint8)
-                nb[mask_patch > 0] = 0        # disjoint from this call
-                if nb.any():
-                    neighbors_patch = nb
+        nb = self._confirmed_window(sg.annotations, pt0, W, n_freq)
+        nb[mask_patch > 0] = 0                # disjoint from this call
+        if nb.any():
+            neighbors_patch = nb
 
         df = (sr / 2.0) / (nfft // 2)
         dt = hop / float(sr)
@@ -16174,29 +18833,23 @@ class MADMainWindow(QMainWindow):
             if v not in (None, ''):
                 meta[k] = v
         if kind == 'negative':
-            # A hard negative supervises the REJECTED blob as background — not
-            # the whole patch. Zeroing everything would also erase any genuine
-            # confirmed call sharing the crop (rejections often sit right next
-            # to real calls), teaching the model that a call it was elsewhere
-            # told to find is background. Drop this component, keep the rest.
-            keep = mask_patch.copy()
-            if tw > 0:
-                keep[f0:f1, lt0:lt0 + tw] = 0
-            confirmed = getattr(sg, 'mask', None)
-            if confirmed is not None and getattr(confirmed, 'size', 0):
-                win = confirmed[:, pt0:pt0 + W]
-                hh = min(keep.shape[0], win.shape[0])
-                ww = min(keep.shape[1], win.shape[1])
-                if hh > 0 and ww > 0:
-                    np.maximum(keep[:hh, :ww],
-                               (win[:hh, :ww] > 0).astype(np.uint8),
-                               out=keep[:hh, :ww])
-                    if tw > 0:
-                        # The rejected component itself is never positive.
-                        keep[f0:f1, lt0:lt0 + tw] = np.where(
-                            local[:, :tw].astype(bool), 0,
-                            keep[f0:f1, lt0:lt0 + tw])
-            mask_patch = keep
+            # A rejection keeps the store's contract like everything else:
+            # ``mask`` is the rejected call's OWN shape, ``neighbors`` the
+            # confirmed calls sharing the window. Training ignores ``mask`` on a
+            # negative (the target is all background) and excludes the
+            # neighbours from the loss, so a real call in the corner of a
+            # rejection is never taught as noise.
+            #
+            # This used to store the neighbours IN ``mask`` and the rejected
+            # shape nowhere. Three things broke: reopening a file drew every
+            # rejection as a bounding box (no shape to draw); the re-run
+            # suppressor painted the neighbours instead of the rejected call;
+            # and because ``neighbors`` is written exclusive of ``mask``, it
+            # came out empty -- so the confirmed calls the old code meant to
+            # protect were trained as background after all. 2,125 rejections
+            # in the anosmia project were stored that way; see
+            # mad_fix_rejection_shapes for the repair.
+            meta['mask_is_own'] = True
         # Labels always save to the sibling h5 next to the recording — one
         # source of truth per wav, project or not. The project's consolidated
         # training_data.h5 is rebuilt from the Audio list at train time.
@@ -16235,6 +18888,16 @@ class MADMainWindow(QMainWindow):
         # example comes through here, so this is the one place the cached count
         # has to be dropped.
         self._invalidate_label_count(wav_path)
+        # The ridge just saved with a label, for the overlay: a SAM or painted
+        # mask has no prediction crop to draw one from.
+        rg = res.get('ridge') or {}
+        if kind == 'label' and rg.get('khz') is not None:
+            sg.label_ridges[str(ex_id)] = {
+                'bins': np.asarray(rg['khz'], np.float64) * 1000.0 / df,
+                't0': int(pt0) + int(rg['t_off']),
+                'mask': np.asarray(local) > 0}
+        else:
+            sg.label_ridges.pop(str(ex_id), None)
         # Hand the pre-write id list to the undo snapshot that is waiting for
         # it. Only the first commit of an operation sets it: a snapshot covers
         # one user action, and its baseline is the state before that action.
@@ -16256,9 +18919,12 @@ class MADMainWindow(QMainWindow):
     def _clear_pending(self):
         sg = self.spectrogram
         if sg.is_editing():
+            joint = sg.is_joint_editing()
             sg.cancel_edit()
             self._clear_tool_buttons()
-            self.status_bar.showMessage("Mask edit cancelled — call unchanged")
+            self.status_bar.showMessage(
+                "Shape edit cancelled — calls unchanged" if joint
+                else "Mask edit cancelled — call unchanged")
             return
         if sg.has_pending() or sg.has_sam_prompts():
             sg.clear_pending()
@@ -16272,6 +18938,11 @@ class MADMainWindow(QMainWindow):
         if sg.undo_pending():
             self._refresh_pending_status()
             self._log("Undo: removed last pending mask")
+            return
+        if sg.is_editing():
+            # Nothing painted left to take back. Falling through removed the
+            # last call in the list -- one not being edited (2026-11-09).
+            self.status_bar.showMessage("No stroke to take back")
             return
         if sg.annotations:
             ann = sg.remove_annotation(len(sg.annotations) - 1)
@@ -16721,8 +19392,23 @@ class MADMainWindow(QMainWindow):
         if not (0 <= ann_idx < len(sg.annotations)):
             return
         menu = QMenu(self)
+        # --- merge: right-click on one of several shift- or box-selected calls
+        merge_idx = self._box_sel_indices()
+        a_merge = a_joint = None
+        if ann_idx in merge_idx and len(merge_idx) >= 2:
+            a_merge = menu.addAction(f"Merge {len(merge_idx)} selected calls")
+            if merge_call_masks([sg.annotations[i] for i in merge_idx]) is None:
+                a_merge.setText(f"Merge {len(merge_idx)} selected calls "
+                                "(they must overlap or touch)")
+                a_merge.setEnabled(False)
+            # Paint the joins and merge in one edit (2026-11-09): whatever
+            # touches on Enter becomes one call.
+            a_joint = menu.addAction(
+                f"Edit {len(merge_idx)} shapes together")
+            menu.addSeparator()
         a_class = menu.addAction("Edit class…")
-        a_shape = menu.addAction("Edit shape")
+        a_shape = menu.addAction("Edit shape" if a_joint is None
+                                 else "Edit shape (this call only)")
 
         # --- note + tags -------------------------------------------------
         # Only on a judged call. A pending detection is replaced wholesale by
@@ -16788,6 +19474,16 @@ class MADMainWindow(QMainWindow):
         menu.addSeparator()
         a_del = menu.addAction("Delete")
         act = menu.exec_(global_pos)
+        if a_merge is not None and act == a_merge:
+            self._merge_calls(merge_idx, ann_idx)
+            return
+        if a_joint is not None and act == a_joint:
+            self._start_joint_edit(merge_idx, ann_idx)
+            return
+        if a_merge is not None and act is not None:
+            # Every other entry acts on this one call. Let the multi-selection
+            # go first: an edit or a delete renumbers the calls it points at.
+            self._clear_box_selection()
         if act is not None and act in tag_actions:
             self._toggle_tag(ann_idx, tag_actions[act])
             return
@@ -16816,12 +19512,7 @@ class MADMainWindow(QMainWindow):
             what = self._pred_describe(ann_idx)
             sg.start_edit(ann_idx)
             if sg.is_editing():
-                # Editing is painting: arm the brush through the same path the
-                # Paint button uses, so the button reflects the live mode.
-                self.btn_sam.setChecked(False)
-                self.btn_erase.setChecked(False)
-                self.btn_paint.setChecked(True)
-                self._on_brush_clicked(True)
+                self._arm_edit_brush()
                 self.status_bar.showMessage(
                     "Editing mask — paint to add, E (or right-drag) to erase, "
                     "scroll to resize the brush, Enter to finish, Esc to cancel"
@@ -16829,6 +19520,36 @@ class MADMainWindow(QMainWindow):
                 self._log(f"Edit mask {what}")
         elif act == a_del:
             self._delete_annotation(ann_idx)
+
+    def _arm_edit_brush(self):
+        """Editing is painting: arm the brush through the same path the Paint
+        button uses, so the button reflects the live mode."""
+        self.btn_sam.setChecked(False)
+        self.btn_erase.setChecked(False)
+        self.btn_paint.setChecked(True)
+        self._on_brush_clicked(True)
+
+    def _start_joint_edit(self, indices, anchor_idx=None):
+        """Right-click -> Edit N shapes together: every selected call in one
+        shape edit. Paint the joins, Enter merges whatever touches
+        (:meth:`_on_joint_edit_finished`), Esc leaves all of them as they were.
+        """
+        sg = self.spectrogram
+        idxs = sorted({i for i in indices if 0 <= i < len(sg.annotations)})
+        if len(idxs) < 2 or sg.is_editing():
+            return
+        # The calls leave the list for the edit, so the indices the
+        # multi-selection resolves to stop meaning them.
+        self._clear_box_selection()
+        sg.start_joint_edit(idxs, anchor_idx)
+        if not sg.is_editing():
+            return
+        self._arm_edit_brush()
+        self.status_bar.showMessage(
+            f"Editing {len(idxs)} shapes — paint to join pieces, E (or "
+            "right-drag) to erase; Enter: calls that touch become one call, "
+            "Esc cancels")
+        self._log(f"Edit {len(idxs)} shapes together")
 
     def _edit_annotation_class(self, ann_idx):
         sg = self.spectrogram
@@ -16963,8 +19684,9 @@ class MADMainWindow(QMainWindow):
         self._update_pred_review_widgets()
 
     def _on_box_selection(self, indices):
-        """Rubber-band drag selected a set of detections — remember their ids
-        (stable across list refresh) so A/R/D act on the whole group."""
+        """A rubber-band drag or a shift-click selected a set of detections —
+        remember their ids (stable across list refresh) so A/R/D, and Merge on
+        the right-click menu, act on the whole group."""
         sg = self.spectrogram
         self._box_sel_ids = [sg.annotations[i].get('id')
                              for i in indices if 0 <= i < len(sg.annotations)]
@@ -16972,7 +19694,9 @@ class MADMainWindow(QMainWindow):
         if n:
             self.status_bar.showMessage(
                 f"{n} detection(s) selected — A=accept, R=reject, "
-                "D=delete, S=skip (all)")
+                "D=delete, S=skip (all)"
+                + ("; right-click one to merge them or edit their shapes "
+                   "together" if n > 1 else ""))
             self._log(f"Box-selected {n} detection(s)")
         else:
             self.status_bar.showMessage("Selection cleared")
@@ -17182,6 +19906,29 @@ class MADMainWindow(QMainWindow):
         self._delete_annotation(sel)
         self._log("Deleted detection")
         self.status_bar.showMessage("Deleted detection (D)")
+        # In a call queue, deleting the queued call or a pending call during its
+        # training-window walk continues the walk, then the queue -- like
+        # Accept / Reject (2026-11-09: Delete jumped to the recording's next
+        # pending detection, outside the window).
+        deleted_queued = (ann.get('id') is not None
+                          and ann.get('id') == getattr(self, '_call_queue_ann_id', None))
+        if (self._queue_active() and self._auto_advance and was_pending
+                and (deleted_queued or getattr(self, '_queue_window_mode', False))):
+            self._reviewed_count += 1
+            left = ([] if deleted_queued
+                    or not getattr(self, '_queue_window_walk', True)
+                    else self._queue_window_pending())
+            if left:
+                self._queue_window_mode = True
+                self._center_and_select_ann(left[0])
+                self._update_view_header()
+                self.status_bar.showMessage(
+                    f"Deleted detection (D) — {len(left)} pending detection(s) "
+                    "left in the training window")
+            else:
+                self._queue_window_mode = False
+                self._queue_step(+1)
+            return
         # Advance only when Auto-advance is ON (jump to the next pending). When
         # OFF, stay put — don't move/recenter; just clear the now-stale
         # selection so Back (B) / Next (N) drive navigation.
@@ -17264,12 +20011,20 @@ class MADMainWindow(QMainWindow):
         ann = sg.annotations[ann_idx]
         old_id = ann.get('id')
         was_status = ann.get('status')
+        # A model detection's blob_id names its prediction crop and stays with
+        # the call, as Accept and Merge keep it: QC scoring reads hits from it,
+        # the loader matches the saved label to the crop it replaces (so the
+        # detection does not come back as pending), Delete removes the crop
+        # through it, and a call queue finds its call by it. A hand label's
+        # blob_id only mirrors its own example id, so it follows the new one.
+        bid = ann.get('blob_id')
+        is_detection = bid is not None and str(bid) != str(old_id)
         comp = (ann['f0'], ann['f1'], ann['t0'], ann['t1'], ann['mask'])
         try:
             new_id = self._save_component_example(
                 ann.get('category') or 'USV', comp,
-                blob_id=ann.get('blob_id'), score=ann.get('score'),
-                provenance=ann.get('provenance'))
+                blob_id=bid if is_detection else None,
+                score=ann.get('score'), provenance=ann.get('provenance'))
         except Exception:
             return
         if old_id and old_id != new_id:
@@ -17290,7 +20045,16 @@ class MADMainWindow(QMainWindow):
             # Drop the stale CSV row keyed by the old id.
             self._remove_pred_csv_row({'blob_id': old_id})
         ann['id'] = new_id
-        ann['blob_id'] = new_id
+        ann['blob_id'] = bid if is_detection else new_id
+        # The call queue tracks its call by id, and the save above gave the call
+        # a new one; carry the queue over, as Accept does (else the queue lost
+        # its call: the header dropped it and deciding the neighbours walked
+        # the whole recording instead of the call's training window).
+        is_queued = (old_id is not None
+                     and old_id == getattr(self, '_call_queue_ann_id', None))
+        if is_queued:
+            self._call_queue_ann_id = new_id
+            sg.queue_ann_id = new_id
         ann.setdefault('source', 'label')
         ann.update(getattr(self, '_last_example_stats', {}))  # refreshed stats
         # Redrawing a mask is an affirmative decision about the call, so the
@@ -17308,7 +20072,9 @@ class MADMainWindow(QMainWindow):
         # helper is a no-op anyway). What records this decision is the
         # kind='label' example saved above, carrying blob_id so the loader can
         # match it to the prediction crop it replaces.
-        sg._rebuild_confirmed_mask()
+        # No confirmed-mask rebuild: the union covers every call whatever its
+        # status, and finish_edit already stamped the new shape. The full
+        # rebuild here zeroed and re-stamped the 601 MB grid on every Enter.
         sg.update()
         if self._project is not None:
             try:
@@ -17322,6 +20088,302 @@ class MADMainWindow(QMainWindow):
                 "Mask shape updated — call accepted")
         else:
             self.status_bar.showMessage("Updated mask shape")
+        # An edit that accepts a call is a decision, so in a call queue it moves
+        # on the way Accept does: editing the queued call (or a pending call in
+        # its training window, during the window walk) goes through the same
+        # tail -- walk the window's pending calls, then the next queued call.
+        # Only there: elsewhere an edit has never moved the selection.
+        if (promoted and self._queue_active()
+                and (is_queued or getattr(self, '_queue_window_mode', False))):
+            self._after_review_decision(new_id, was_status == 'prediction')
+
+    def _merge_calls(self, indices, anchor_idx=None) -> bool:
+        """Merge several calls into one accepted call (right-click → Merge).
+
+        For a faint call the model found in pieces: accept or select the
+        pieces, paint the stretch between them, shift-click them all and merge.
+        The calls must overlap or touch (:func:`merge_call_masks`), whatever
+        their status; the merged call is accepted, like an edited shape.
+
+        The merged call is saved as one new label example, and every member's
+        example, rejection negative and prediction crop goes -- except the crop
+        of the one detection the merged call stays tied to: the queued call's
+        in a call queue, else the right-clicked call's, else the earliest
+        member's. Keeping a model blob_id means the merged call still counts
+        as a detection the model made (QC scoring reads hits from the blob_id)
+        and reopening the file does not show that detection again as pending.
+        Cmd/Ctrl+Z undoes the whole merge. Edit N shapes together
+        (:meth:`_on_joint_edit_finished`) saves through the same
+        :meth:`_commit_shape_changes`.
+        """
+        sg = self.spectrogram
+        idxs = sorted({i for i in indices if 0 <= i < len(sg.annotations)})
+        members = [sg.annotations[i] for i in idxs]
+        merged = merge_call_masks(members)
+        if merged is None:
+            self.status_bar.showMessage(
+                "Merge needs two or more calls that overlap or touch")
+            return False
+        if self.audio_data is None or self._active_wav_path() is None:
+            return False
+        if anchor_idx not in idxs:
+            anchor_idx = idxs[0]
+        anchor_id = sg.annotations[anchor_idx].get('id')
+        done = self._commit_shape_changes([(members, merged)], [], anchor_id,
+                                          "Merge calls")
+        if done is None:
+            return False
+        new_id = done[members[0].get('id')]
+        self._clear_box_selection()
+        sg._selected_ann_idx = self._ann_index_by_id(new_id)
+        sg.update()
+        self._select_list_row_for_id(new_id)
+        self._update_pred_review_widgets()
+        self._log(f"Merged {len(members)} calls into one")
+        self.status_bar.showMessage(
+            f"Merged {len(members)} calls into one accepted call "
+            "(Ctrl+Z undoes)")
+        return True
+
+    def _ann_index_by_id(self, ann_id) -> Optional[int]:
+        return next((i for i, a in enumerate(self.spectrogram.annotations)
+                     if a.get('id') == ann_id), None)
+
+    def _commit_shape_changes(self, merges, edits, anchor_id, label):
+        """Save new shapes for calls as ONE undoable step.
+
+        ``merges`` is ``[(member calls, shape), ...]``: each list of calls
+        becomes one accepted call with that ``(f0, f1, t0, t1, mask)`` shape,
+        as Merge makes it. ``edits`` is ``[(call, shape), ...]``: the call
+        takes that shape and is accepted, as Edit shape + Enter saves it (the
+        model's blob_id kept). ``anchor_id`` is the right-clicked call: its
+        class names a merged call, and its detection is kept, after the queued
+        call's. Returns ``{member id: id of the call it is now}``, or None if a
+        save failed (everything is then put back).
+
+        Order matters for undo. Everything the change destroys -- member
+        examples, rejection negatives, prediction crops -- goes before the
+        first save, because undo recognises a minted example by its id being
+        new since that save, and a merged call or an accepted detection's new
+        shape re-saves under a member's deterministic id: destroyed after the
+        first save, that id would count as old and the original never came
+        back. The new shapes are all in the list before any save too, so each
+        saved patch records the final layout as its neighbours.
+        """
+        sg = self.spectrogram
+        default = ((self._project.last_class if self._project
+                    else self._session_last_class) or 'USV')
+        qid = (getattr(self, '_call_queue_ann_id', None)
+               if self._queue_active() else None)
+        plans = []
+        for members, shape in merges:
+            by_time = sorted(members, key=lambda a: (a['t0'], a['f0']))
+            prefer = ([a for a in members if qid is not None
+                       and a.get('id') == qid]
+                      + [a for a in members if a.get('id') == anchor_id]
+                      + by_time)
+            dets = [a for a in prefer if isinstance(a.get('blob_id'), int)]
+            keep = dets[0] if dets else None
+            head = next((a for a in members if a.get('id') == anchor_id),
+                        keep or by_time[0])
+            plans.append({'members': list(members), 'shape': shape,
+                          'keep': keep,
+                          'category': head.get('category') or default})
+        if not plans and not edits:
+            return {}
+        self._snapshot_for_undo(label, crops=True)
+        snap = self._undo_stack[-1] if self._undo_stack else None
+        boxes = []
+        # 1. What the change destroys, before the first save (see above).
+        for p in plans:
+            kept_blob = p['keep'].get('blob_id') if p['keep'] else None
+            for a in p['members']:
+                boxes.append((a['f0'], a['f1'], a['t0'], a['t1']))
+                if (isinstance(a.get('blob_id'), int)
+                        and a.get('blob_id') != kept_blob):
+                    self._delete_pred_crop(a)
+            for a in p['members']:
+                i = next((k for k, x in enumerate(sg.annotations)
+                          if x is a), None)
+                if i is not None:
+                    self._delete_annotation(i, refresh=False)
+        wav = self._active_wav_path()
+        edit_plans = []
+        for a, shape in edits:
+            old_id = a.get('id')
+            bid = a.get('blob_id')
+            edit_plans.append({'ann': a, 'shape': shape, 'old_id': old_id,
+                               'bid': bid,
+                               'is_det': (bid is not None
+                                          and str(bid) != str(old_id))})
+            boxes.append((a['f0'], a['f1'], a['t0'], a['t1']))
+            if a.get('status') == 'rejected':
+                self._drop_rejection_negative(a)
+            if not old_id:
+                continue
+            self._remember_undo_example(old_id)
+            if self._project is not None:
+                from fnt.usv.usv_detector.mad_examples import delete_example
+                try:
+                    delete_example(self._project.training_data_dir, old_id)
+                except Exception:
+                    pass
+            if wav:
+                try:
+                    from fnt.usv.usv_detector.fnt_mask_store import (
+                        masks_sibling_path, td_delete)
+                    td_delete(masks_sibling_path(wav), old_id)
+                except Exception:
+                    pass
+            self._remove_pred_csv_row({'blob_id': old_id})
+        # 2. The final layout, before any save.
+        for e in edit_plans:
+            f0, f1, t0, t1, mask = e['shape']
+            e['ann'].update(f0=f0, f1=f1, t0=t0, t1=t1, mask=mask,
+                            status='accepted')
+            boxes.append((f0, f1, t0, t1))
+        for p in plans:
+            f0, f1, t0, t1, mask = p['shape']
+            keep = p['keep']
+            ann = {'id': None,
+                   'blob_id': keep.get('blob_id') if keep else None,
+                   'category': p['category'], 'f0': f0, 'f1': f1,
+                   't0': t0, 't1': t1, 'mask': mask, 'status': 'accepted',
+                   'source': 'label'}
+            if keep is not None:
+                ann['score'] = keep.get('score')
+                ann['provenance'] = keep.get('provenance')
+            sg.annotations.append(ann)
+            p['ann'] = ann
+            boxes.append((f0, f1, t0, t1))
+        if boxes:
+            sg._restamp_confirmed_region(
+                min(b[0] for b in boxes), max(b[1] for b in boxes),
+                min(b[2] for b in boxes), max(b[3] for b in boxes))
+        # 3. Save.
+        done = {}
+        try:
+            for e in edit_plans:
+                a = e['ann']
+                new_id = self._save_component_example(
+                    a.get('category') or 'USV', e['shape'],
+                    blob_id=e['bid'] if e['is_det'] else None,
+                    score=a.get('score'), provenance=a.get('provenance'))
+                if snap is not None:
+                    snap.setdefault('minted_ids', set()).add(str(new_id))
+                a['id'] = new_id
+                a['blob_id'] = e['bid'] if e['is_det'] else new_id
+                a.setdefault('source', 'label')
+                a.update(getattr(self, '_last_example_stats', {}))
+                done[e['old_id']] = new_id
+            for p in plans:
+                ann, keep = p['ann'], p['keep']
+                new_id = self._save_component_example(
+                    p['category'], p['shape'],
+                    blob_id=keep.get('blob_id') if keep else None,
+                    score=keep.get('score') if keep else None,
+                    provenance=keep.get('provenance') if keep else None)
+                if snap is not None:
+                    snap.setdefault('minted_ids', set()).add(str(new_id))
+                ann['id'] = new_id
+                if keep is None:
+                    ann['blob_id'] = new_id
+                ann.update(getattr(self, '_last_example_stats', {}))
+                for a in p['members']:
+                    done[a.get('id')] = new_id
+        except Exception as e:
+            self._undo_review_action()      # put every call back
+            self.status_bar.showMessage(f"{label} failed: {e}")
+            return None
+        # The queue tracks its call by id, and every changed call has a new
+        # one; carry it over, as Accept and Edit shape do.
+        if qid is not None and qid in done:
+            self._call_queue_ann_id = done[qid]
+            sg.queue_ann_id = done[qid]
+        self._pred_review_idx = None        # members' positions are gone
+        sg.update()
+        if self._project is not None:
+            try:
+                self._project.save()
+            except Exception:
+                pass
+        self._refresh_annotation_list()
+        return done
+
+    def _on_joint_edit_finished(self, res):
+        """Enter on a joint shape edit (Edit N shapes together).
+
+        The edited pixels are split into connected components
+        (:func:`joint_edit_groups`): calls that now touch -- through a painted
+        bridge or because they overlapped already -- become ONE accepted call,
+        as Merge makes it; a call on its own whose shape changed is saved as
+        an edited shape (accepted, as Edit shape + Enter); a call left as it
+        was keeps its status, so a pending detection nobody touched stays
+        pending. One Cmd/Ctrl+Z undoes all of it. In a call queue, a change
+        that holds the queued call counts as deciding it, as Edit shape does.
+        """
+        sg = self.spectrogram
+        if self.audio_data is None or self._active_wav_path() is None:
+            return
+        pos = {a.get('id'): i for i, a in enumerate(sg.annotations)}
+        members = [sg.annotations[pos[i]] for i in (res.get('ids') or ())
+                   if i in pos]
+        if not members:
+            return
+        groups, _strays, gone = joint_edit_groups(
+            members, res['box'], res['mask'])
+        merges = [([members[k] for k in g], shape)
+                  for g, shape in groups if len(g) > 1]
+        edits = [(members[g[0]], shape) for g, shape in groups
+                 if len(g) == 1 and not same_call_shape(members[g[0]], shape)]
+        anchor_id = res.get('anchor_id')
+        note = (f" ({len(gone)} call(s) erased completely left as they were "
+                "— Delete removes a call)" if gone else "")
+        if not merges and not edits:
+            self._reselect_by_id(anchor_id)
+            self.status_bar.showMessage("Shapes unchanged — nothing saved"
+                                        + note)
+            return
+        was = {a.get('id'): a.get('status') for a in members}
+        order = ([a.get('id') for ms, _s in merges for a in ms]
+                 + [a.get('id') for a, _s in edits])
+        qid = (getattr(self, '_call_queue_ann_id', None)
+               if self._queue_active() else None)
+        done = self._commit_shape_changes(merges, edits, anchor_id,
+                                          "Edit shapes together")
+        if done is None:
+            return
+        n_pieces = sum(len(ms) for ms, _s in merges)
+        bits = []
+        if merges:
+            bits.append(f"{n_pieces} calls merged into {len(merges)}")
+        if edits:
+            bits.append(f"{len(edits)} shape(s) edited")
+        self._log("Edit shapes together: " + ", ".join(bits))
+        self.status_bar.showMessage(
+            "; ".join(bits) + " — accepted (Ctrl+Z undoes)" + note)
+        # An edit or merge accepts its calls, so in a call queue it is a
+        # decision, as a single Edit shape is: holding the queued call it
+        # moves on like Accept of that call; during the window walk, deciding
+        # a pending call there continues the walk.
+        if self._queue_active():
+            decided = was_pending = None
+            if qid is not None and qid in done:
+                decided = done[qid]
+                was_pending = was.get(qid) == 'prediction'
+            elif getattr(self, '_queue_window_mode', False):
+                old = next((i for i in order if was.get(i) == 'prediction'),
+                           None)
+                if old is not None:
+                    decided, was_pending = done[old], True
+            if decided is not None:
+                self._after_review_decision(decided, was_pending)
+                return
+        focus = done.get(anchor_id) or done[order[0]]
+        sg._selected_ann_idx = self._ann_index_by_id(focus)
+        sg.update()
+        self._select_list_row_for_id(focus)
+        self._update_pred_review_widgets()
 
     def _on_clear_clicked(self):
         # Discards the in-progress pending mask. Confirmed calls are saved
@@ -17495,6 +20557,8 @@ class MADMainWindow(QMainWindow):
         has_audio = self.audio_data is not None and HAS_SOUNDDEVICE
         self.btn_play.setEnabled(has_audio)
         self.slider_speed.setEnabled(has_audio)
+        if hasattr(self, 'btn_het'):
+            self.btn_het.setEnabled(has_audio)
 
     def _on_speed_changed(self, idx: int):
         speed = self._speed_values[idx]
@@ -17517,11 +20581,44 @@ class MADMainWindow(QMainWindow):
         else:
             self._play_visible()
 
-    def _play_visible(self):
+    def _toggle_het_playback(self):
+        """Heterodyne play/stop. Either button stops whatever is playing:
+        pressing Het during slowed playback means "stop this", not "start a
+        second stream on top of it"."""
+        if self.is_playing:
+            self._stop_playback()
+        else:
+            self._play_visible(mode='het')
+
+    #: Audio played before the selected call, in seconds of wall-clock
+    #: listening (so at 0.03x speed it is 15 ms of audio, at 1x 0.1 s at most).
+    PLAY_LEAD_WALL_S = 0.5
+
+    def _play_from_selected_s(self, view_start: float, view_stop: float,
+                              mode: str) -> float:
+        """Where Play starts: just before the selected call when it is on
+        screen, so a wide view does not mean waiting through the audio left of
+        the call (half the window when the call is centred, at slowed speed
+        tens of seconds). With no call selected, or one off screen, the left
+        edge of the view, as before."""
+        anns = self.spectrogram.annotations
+        sel = self.spectrogram._selected_ann_idx
+        if sel is None or not (0 <= sel < len(anns)) or not self.sample_rate:
+            return view_start
+        dt = self.spectrogram.hop / float(self.sample_rate)
+        t0 = anns[sel]['t0'] * dt
+        if not (view_start <= t0 < view_stop):
+            return view_start
+        rate = 1.0 if mode == 'het' else self.playback_speed
+        lead = min(0.1, self.PLAY_LEAD_WALL_S * rate)
+        return max(view_start, t0 - lead)
+
+    def _play_visible(self, mode: str = 'slow'):
         if not HAS_SOUNDDEVICE or self.audio_data is None:
             return
         start_s, stop_s = self.spectrogram.get_view_range()
         total_duration = len(self.audio_data) / self.sample_rate
+        start_s = max(start_s, self._play_from_selected_s(start_s, stop_s, mode))
         start_s = max(0, start_s)
         stop_s = min(total_duration, stop_s)
         start_sample = int(start_s * self.sample_rate)
@@ -17530,14 +20627,37 @@ class MADMainWindow(QMainWindow):
         if len(segment) < 100:
             return
         try:
-            output_sr = 44100
-            original_duration = len(segment) / self.sample_rate
-            output_duration = original_duration / self.playback_speed
-            n_output_samples = int(output_duration * output_sr)
-            if n_output_samples < 100:
-                return
-            from scipy import signal
-            segment = signal.resample(segment, n_output_samples).astype(np.float32)
+            if mode == 'het':
+                from fnt.usv.usv_heterodyne import (
+                    HETERODYNE_OUT_SR, heterodyne_for_playback)
+                output_sr = HETERODYNE_OUT_SR
+                lo_hz = self.spin_het_lo.value() * 1000.0
+                floor_hz = self.spin_het_floor.value() * 1000.0
+                for what, hz in (("LO", lo_hz), ("Floor", floor_hz)):
+                    if hz >= self.sample_rate / 2:
+                        self.status_bar.showMessage(
+                            f"{what} {hz / 1000:g} kHz is above this "
+                            f"recording's Nyquist "
+                            f"({self.sample_rate / 2000:g} kHz)")
+                        return
+                # At the level slowed playback plays the same window: the
+                # normalised version was ~31 dB louder, a jolt in headphones.
+                segment = heterodyne_for_playback(
+                    segment, self.sample_rate, lo_hz, floor_hz=floor_hz,
+                    match_level=True)
+                if len(segment) < 100:
+                    return
+                rate = 1.0
+            else:
+                output_sr = 44100
+                original_duration = len(segment) / self.sample_rate
+                output_duration = original_duration / self.playback_speed
+                n_output_samples = int(output_duration * output_sr)
+                if n_output_samples < 100:
+                    return
+                from scipy import signal
+                segment = signal.resample(segment, n_output_samples).astype(np.float32)
+                rate = self.playback_speed
             import time as _time
             sd.play(segment, output_sr)
             # Record the wall-clock start as close to sd.play() as possible so
@@ -17556,7 +20676,10 @@ class MADMainWindow(QMainWindow):
             except Exception:
                 pass
             self.is_playing = True
-            self.btn_play.setText("Stop")
+            self._playback_mode = mode
+            self._last_playback_mode = mode     # Render Clip defaults to it
+            self._playback_rate = rate
+            (self.btn_het if mode == 'het' else self.btn_play).setText("Stop")
             self._playback_start_s = start_s
             self._playback_end_s = stop_s
             self._playback_timer.start()
@@ -17571,7 +20694,10 @@ class MADMainWindow(QMainWindow):
             except Exception:
                 pass
         self.is_playing = False
+        self._playback_mode = None
         self.btn_play.setText("Play")
+        if hasattr(self, 'btn_het'):
+            self.btn_het.setText("Het")
         self._playback_timer.stop()
         self.spectrogram.playback_position = None
         self.spectrogram.update()
@@ -17658,13 +20784,15 @@ class MADMainWindow(QMainWindow):
     CLIP_FPS = 30
     CLIP_TARGET_WIDTH = 1280
 
-    def render_spectrogram_clip(self):
+    def render_spectrogram_clip(self, options: Optional[Dict] = None):
         """Render the current view as an mp4: static frame, sweeping playhead.
 
-        The frame is the view as it stands when the button is pressed, and the
-        audio is slowed by whatever the speed slider reads at that moment —
-        both are snapshotted, so changing either mid-render cannot desync the
-        result from what the user asked for.
+        The frame is the view as it stands when the button is pressed. The
+        audio is chosen in :class:`MADClipOptionsDialog` -- slowed by a
+        speed, heterodyned at real time around an LO, or silent -- defaulting
+        to what the user is listening with; pass ``options`` to skip asking.
+        Everything is snapshotted, so changing the view or the controls
+        mid-render cannot desync the result from what the user asked for.
 
         Only the playhead moves, so ffmpeg animates it from a single still via
         ``drawbox`` rather than being fed thousands of near-identical frames.
@@ -17685,7 +20813,6 @@ class MADMainWindow(QMainWindow):
             return
 
         # --- snapshot everything the render depends on -------------------
-        speed = float(self.playback_speed)
         start_s, stop_s = self.spectrogram.get_view_range()
         total = len(self.audio_data) / self.sample_rate
         start_s, stop_s = max(0.0, start_s), min(total, stop_s)
@@ -17693,6 +20820,30 @@ class MADMainWindow(QMainWindow):
         if view_dur <= 0:
             self.status_bar.showMessage("Nothing to render — empty view.")
             return
+        if options is None:
+            dlg = MADClipOptionsDialog(
+                self, view_dur, self._speed_values,
+                float(self.playback_speed), self.spin_het_lo.value(),
+                mode=MADClipOptionsDialog.default_mode(
+                    getattr(self, '_last_playback_mode', None),
+                    self._settings.value(CLIP_AUDIO_MODE_KEY, None)),
+                nyquist_khz=self.sample_rate / 2000.0)
+            if dlg.exec_() != QDialog.Accepted:
+                return
+            options = dlg.options()
+        mode = options.get('mode', 'slow')
+        self._settings.setValue(CLIP_AUDIO_MODE_KEY, mode)
+        speed = float(options.get('speed', 1.0)) if mode == 'slow' else 1.0
+        lo_hz = float(options.get('lo_hz', self.spin_het_lo.value() * 1000.0))
+        if mode == 'het' and lo_hz >= self.sample_rate / 2:
+            self.status_bar.showMessage(
+                f"LO {lo_hz / 1000:g} kHz is above this recording's Nyquist")
+            return
+        audio_desc = {'slow': f"{speed:g}x",
+                      'het': f"heterodyne LO {lo_hz / 1000:g} kHz",
+                      'silent': "silent"}[mode]
+        audio_tag = {'slow': f"{speed:g}x", 'het': f"het{lo_hz / 1000:g}k",
+                     'silent': "silent"}[mode]
         clip_dur = view_dur / max(speed, 1e-6)
         if clip_dur > self.MAX_CLIP_SECONDS:
             if QMessageBox.question(
@@ -17711,7 +20862,7 @@ class MADMainWindow(QMainWindow):
         self.spectrogram._cursor_pos = None
         QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
         self.status_bar.showMessage(
-            f"Rendering {clip_dur:.1f} s clip at {speed:g}x…")
+            f"Rendering {clip_dur:.1f} s clip ({audio_desc})…")
         QApplication.processEvents()
 
         tmpdir = tempfile.mkdtemp(prefix="mad_clip_")
@@ -17719,7 +20870,7 @@ class MADMainWindow(QMainWindow):
         wav = os.path.join(tmpdir, "audio.wav")
         stem = Path(self._active_wav_path() or "clip").stem
         out = os.path.join(
-            tmpdir, f"{stem}_{start_s:.2f}-{stop_s:.2f}s_{speed:g}x.mp4")
+            tmpdir, f"{stem}_{start_s:.2f}-{stop_s:.2f}s_{audio_tag}.mp4")
         try:
             # --- still frame, scaled to an even, 4-byte-aligned width ----
             dpi = 96.0 * max(1.0, self.CLIP_TARGET_WIDTH
@@ -17750,13 +20901,25 @@ class MADMainWindow(QMainWindow):
                 f"x='{x0:.2f}+({x1:.2f}-{x0:.2f})*t/{clip_dur:.4f}':y=0,"
                 "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p[v]"
             )
-            out_sr = 44100
+            if mode == 'het':
+                from fnt.usv.usv_heterodyne import HETERODYNE_OUT_SR
+                out_sr = HETERODYNE_OUT_SR
+            else:
+                out_sr = 44100
             job = {
                 'segment': self.audio_data[
                     int(start_s * self.sample_rate):
                     int(stop_s * self.sample_rate)].copy(),
                 'n_out': max(100, int(clip_dur * out_sr)),
                 'out_sr': out_sr,
+                'mode': mode,
+                'lo_hz': lo_hz,
+                # The floor the Het button plays with, so the clip sounds
+                # like what was heard. Ignored past Nyquist.
+                'floor_hz': (self.spin_het_floor.value() * 1000.0
+                             if self.spin_het_floor.value() * 1000.0
+                             < self.sample_rate / 2 else 0.0),
+                'sr': self.sample_rate,
                 'wav': wav,
                 'out': out,
                 'cmd': [
@@ -17791,7 +20954,7 @@ class MADMainWindow(QMainWindow):
         base_meta = (
             f"{os.path.basename(str(self._active_wav_path() or ''))}  ·  "
             f"{start_s:.2f}–{stop_s:.2f} s ({view_dur:.2f} s of audio)  ·  "
-            f"{speed:g}x → {clip_dur:.1f} s clip  ·  "
+            f"{audio_desc} → {clip_dur:.1f} s clip  ·  "
             f"{img.width()}x{img.height()}")
 
         def _reset_button():
@@ -17869,7 +21032,8 @@ class MADMainWindow(QMainWindow):
             _time.time() - self._playback_start_time - self._playback_latency
         )
         elapsed = max(0.0, elapsed)
-        audio_elapsed = elapsed * self.playback_speed
+        audio_elapsed = elapsed * getattr(self, '_playback_rate',
+                                          self.playback_speed)
         current_pos = self._playback_start_s + audio_elapsed
         if current_pos >= self._playback_end_s:
             self._stop_playback()
@@ -17883,7 +21047,13 @@ class MADMainWindow(QMainWindow):
     # ==================================================================
     def _remember_recent(self, project_dir: str):
         recent = self._settings.value(RECENT_PROJECTS_KEY, [], type=list) or []
-        recent = [p for p in recent if p != project_dir]
+
+        def _same(p):
+            # By location, not spelling: a project_dir now comes from where
+            # the file was opened, so 'Z:/a\b' and 'Z:\a\b' are one project.
+            return (os.path.normcase(os.path.normpath(str(p)))
+                    == os.path.normcase(os.path.normpath(str(project_dir))))
+        recent = [p for p in recent if not _same(p)]
         recent.insert(0, project_dir)
         recent = recent[:MAX_RECENT_PROJECTS]
         self._settings.setValue(RECENT_PROJECTS_KEY, recent)
@@ -18018,6 +21188,16 @@ class MADMainWindow(QMainWindow):
                 progress.set_main(metrics.get('file_i', 0),
                                   max(1, metrics.get('file_n', 1)))
                 progress.set_sub(0, 1)
+            elif status == 'capped':
+                # Said out loud: the run trains on fewer examples than the
+                # label count in its name, and the log should say whose.
+                for rec, kinds in sorted((metrics.get('capped') or {}).items()):
+                    parts = ", ".join(
+                        f"{k} {kept}/{tot}"
+                        for k, (kept, tot) in sorted(kinds.items()))
+                    line = f"Per-recording cap: {rec} — kept {parts}"
+                    progress.append(line)
+                    self._log(line)
             elif status == 'split':
                 for line in (_split_report(metrics)
                              + _balance_report(metrics)):
@@ -18035,12 +21215,16 @@ class MADMainWindow(QMainWindow):
                 pstr = (f" (no-improve {metrics.get('epochs_without_improvement', 0)}"
                         f"/{metrics.get('patience', 0)})"
                         if metrics.get('patience', 0) else "")
+                # The rate moves now (plateau schedule), and a drop is the
+                # usual reason the curves change slope -- so show it.
+                lr = metrics.get('lr')
+                lrstr = f"  lr={lr:.1e}" if lr is not None else ""
                 progress.set_stage(
                     f"Epoch {epoch}/{total} — "
                     f"train_loss={metrics.get('train_loss', 0):.4f}  "
                     f"val_loss={metrics.get('val_loss', 0):.4f}  "
                     f"val_dice={metrics.get('val_dice', 0):.3f}"
-                    f"{pstr}"
+                    f"{lrstr}{pstr}"
                 )
                 progress.set_main(epoch, total)
                 progress.append(
@@ -18173,6 +21357,9 @@ class MADMainWindow(QMainWindow):
         worker.progress_signal.connect(on_progress)
         worker.finished_signal.connect(on_finished)
         worker.error_signal.connect(on_error)
+        # After on_finished/on_error, which record the run first.
+        worker.finished_signal.connect(lambda *_: self._after_training_run())
+        worker.error_signal.connect(lambda *_: self._after_training_run())
         progress.cancel_requested.connect(worker.request_stop)
         worker.start()
         if owns_modal:
@@ -18883,17 +22070,28 @@ class MADMainWindow(QMainWindow):
         if done:
             self._log(f"Resuming: skipping {len(done):,} already-analyzed "
                       f"file(s)")
+            self._scope_ridge_fill = list(done)
             return todo
         return wav_paths
 
     def _start_inference(self, cfg, wav_paths: List[str], reporter=None,
-                         skip_scope_prompt: bool = False):
+                         skip_scope_prompt: bool = False,
+                         ridge_fill: Optional[List[str]] = None):
         # A run chained after training must not stop to ask anything: the
         # user pressed one button and walked away. Everything that needs an
         # answer is asked in _on_inline_train, before the run starts.
+        #
+        # ``ridge_fill``: recordings this model analysed before, skipped by a
+        # resume; their missing brightness ridges are filled after the
+        # inference. The scope prompt supplies them when it resumes.
+        ridge_fill = list(ridge_fill or [])
         if not skip_scope_prompt:
+            self._scope_ridge_fill = []
             wav_paths = self._confirm_run_scope(cfg, wav_paths)
-        if not wav_paths:
+            ridge_fill = list(self._scope_ridge_fill)
+        if not getattr(cfg, 'ridge', True):
+            ridge_fill = []
+        if not wav_paths and not ridge_fill:
             self.status_bar.showMessage("Nothing to analyze")
             self._update_infer_run_enabled()
             return
@@ -18912,7 +22110,13 @@ class MADMainWindow(QMainWindow):
         # its own "Inference complete" box beside the "Run complete" one.
         is_chained_tail = bool(getattr(self, '_post_train_infer_wavs', None))
         progress = reporter or MADRunProgressDialog(self, "MAD Inference")
-        progress.set_stage(f"Running inference on {len(wav_paths)} file(s)…")
+        progress.set_stage(f"Running inference on {len(wav_paths)} file(s)…"
+                           if wav_paths else
+                           f"Checking the ridges of {len(ridge_fill)} "
+                           f"analysed file(s)…")
+        if ridge_fill:
+            progress.append(f"Then: missing brightness ridges of "
+                            f"{len(ridge_fill)} already-analysed file(s)")
         progress.append(f"Model: {cfg.model_path}")
         progress.append(f"Threshold: {cfg.threshold}  "
                         f"Min blob: {cfg.min_blob_pixels}px")
@@ -18948,7 +22152,8 @@ class MADMainWindow(QMainWindow):
                 self._log(f"Could not open run manifest: {e}")
                 self._manifest = None
 
-        worker = MADInferenceWorker(cfg, wav_paths, parent=self)
+        worker = MADInferenceWorker(cfg, wav_paths, parent=self,
+                                    ridge_fill=ridge_fill)
         self._infer_worker = worker
         if hasattr(self, 'btn_infer_pause'):
             self.btn_infer_pause.setText("Pause")
@@ -18968,8 +22173,13 @@ class MADMainWindow(QMainWindow):
         # Per-run, so re-running a recording regroups it rather than being
         # skipped as already done.
         self._harmonics_grouped = set()
-        self._infer_locked = {self._path_key(w) for w in wav_paths}
+        # The ridge pass writes to the skipped recordings too: locked until
+        # it has passed them.
+        self._infer_locked = {self._path_key(w)
+                              for w in list(wav_paths) + ridge_fill}
         self._refresh_file_list_locks()
+        ridge_log = {'pred': 0, 'examples': 0, 'specs': 0, 'files': 0,
+                     'errors': [], 'freed': 0}
 
         # Human-readable stage labels so the X/Y is obviously *tiles* scanned by
         # the model (not detections — those are counted at the end).
@@ -18983,6 +22193,18 @@ class MADMainWindow(QMainWindow):
         scan = {'fi': None, 't0': 0.0, 'i0': 0}
 
         def on_progress(file_i, file_n, wav_name, stage, si, sn):
+            if stage == 'ridge':
+                progress.set_stage(f"Ridges {file_i + 1}/{file_n}: {wav_name}")
+                progress.set_main(file_i, file_n)
+                progress.set_sub(0, 1)
+                # Unlock what the pass is done with, in batches: a lock
+                # refresh walks the whole Audio list.
+                if file_i - ridge_log['freed'] >= 25:
+                    for w in ridge_fill[ridge_log['freed']:file_i]:
+                        self._infer_locked.discard(self._path_key(w))
+                    ridge_log['freed'] = file_i
+                    self._refresh_file_list_locks()
+                return
             label = stage_labels.get(stage, stage)
             if stage == 'infer':
                 now = _t.time()
@@ -19101,13 +22323,33 @@ class MADMainWindow(QMainWindow):
                     progress.append(
                         f"  {Path(r['wav_path']).name}: {r['n_blobs']} blob(s)"
                     )
-            progress.mark_done(ok=(len(errors) == 0))
+            ridge_line = None
+            if ridge_fill:
+                line = ridge_line = (f"Ridges of the {len(ridge_fill)} already-analysed "
+                        f"file(s): {ridge_log['files']} filled, "
+                        f"{ridge_log['pred']} detection(s), "
+                        f"{ridge_log['examples']} label(s)"
+                        + (f", {ridge_log['specs']} spectrogram(s) from the "
+                           f"audio" if ridge_log['specs'] else "")
+                        + (f", {len(ridge_log['errors'])} failed"
+                           if ridge_log['errors'] else "") + ".")
+                progress.append(line)
+                self._log(line)
+            progress.mark_done(ok=(len(errors) == 0
+                                   and not ridge_log['errors']))
             self.status_bar.showMessage(
                 f"Inference complete — {len(results)} file(s), {total} blob(s)"
             )
             # Refresh the Audio-list status ticks, then auto-open something for
             # review: the currently-previewed file if it was inferred, else the
             # first target file.
+            if getattr(self, '_window_only', False):
+                # Nothing but this run is on screen: quit. No summary dialog,
+                # which would wait for someone to close it; the run's manifest
+                # and the log hold the same news. The Audio-list refresh and
+                # the auto-opened file are for a main window that is not there.
+                self._quit_window_only_inference(results)
+                return
             self._scan_all_file_counts()
             self._update_run_button()
             active = self._active_wav_path()
@@ -19125,7 +22367,8 @@ class MADMainWindow(QMainWindow):
             # A chained training run reports both halves in its own summary;
             # a second dialog here would be the same news twice.
             if not is_chained_tail:
-                self._show_inference_summary_dialog(results, cfg)
+                self._show_inference_summary_dialog(results, cfg,
+                                                    ridge_line=ridge_line)
                 self.infer_panel.reset_idle()
 
         def on_error(msg: str):
@@ -19139,6 +22382,8 @@ class MADMainWindow(QMainWindow):
                 self.btn_infer_pause.setEnabled(False)
             progress.append("\nERROR:\n" + msg)
             progress.mark_done(ok=False)
+            if getattr(self, '_window_only', False):
+                self._quit_window_only_inference(None, error=msg)
 
         def on_device(dev: str):
             desc = dev
@@ -19203,6 +22448,24 @@ class MADMainWindow(QMainWindow):
             progress.append(line)
             self._log(line)
 
+        def on_ridge_done(r):
+            name = os.path.basename(str(r.get('wav_path', '')))
+            if r.get('error'):
+                ridge_log['errors'].append(name)
+                line = f"  ✖ ridges {name}: FAILED — {r['error']}"
+            elif r.get('pred') or r.get('examples') or r.get('specs'):
+                for k in ('pred', 'examples', 'specs'):
+                    ridge_log[k] += int(r.get(k) or 0)
+                ridge_log['files'] += 1
+                line = (f"  ridges {name}: {r.get('pred', 0)} detection(s), "
+                        f"{r.get('examples', 0)} label(s)"
+                        + (f" ({r['specs']} spectrogram(s) from the audio)"
+                           if r.get('specs') else ""))
+            else:
+                return
+            progress.append(line)
+            self._log(line)
+
         def on_retry(n):
             line = (f"\nRetrying {n} failed file(s) — every per-file grid has "
                     f"been released, so this pass has headroom the first did "
@@ -19213,6 +22476,7 @@ class MADMainWindow(QMainWindow):
         worker.device_signal.connect(on_device)
         worker.retry_signal.connect(on_retry)
         worker.file_done_signal.connect(on_file_done)
+        worker.ridge_done_signal.connect(on_ridge_done)
         worker.progress_signal.connect(on_progress)
         worker.finished_signal.connect(on_finished)
         worker.error_signal.connect(on_error)
@@ -19278,6 +22542,9 @@ class MADMainWindow(QMainWindow):
         # A background read still touching the file would outlive the window.
         self._audio_token += 1          # nothing landing now is wanted
         self._wait_for_audio_load(timeout_ms=5000)
+        self._drop_prefetch()
+        for wk in list(self._prefetch_workers.values()):
+            wk.wait(5000)           # a prefetch read would outlive it too
 
         # The windows this one owns are independent top-levels (Qt.Window, so
         # they can be sent behind the main window rather than floating over
@@ -19324,11 +22591,197 @@ class MADMainWindow(QMainWindow):
         super().closeEvent(event)
 
 
-def main():
-    app = QApplication.instance() or QApplication(sys.argv)
+def _launch_parser():
+    """``python -m fnt.usv.mad_pyqt [--project DIR] [--train [training flags]]``
+
+    Opens MAD on a project and, with ``--train``, starts a training run exactly
+    as the Run Training button would, graph and previews included. The
+    training flags are the same set as ``mad train`` (one definition, in
+    ``cli.add_training_args``); only the ones actually given override the
+    panel.
+    """
+    import argparse
+    from fnt.usv.usv_detector.cli import (
+        add_training_args, suppress_training_defaults)
+    p = argparse.ArgumentParser(
+        prog="mad-gui", description="Mask Audio Detector (GUI).")
+    p.add_argument("--project", default="",
+                   help="Open this MAD project on start.")
+    p.add_argument("--train", action="store_true",
+                   help="Start a training run once the project is open.")
+    p.add_argument("--infer-after", action="store_true",
+                   help="With --train: run the panel's post-training "
+                        "inference when training finishes (off by default "
+                        "for launched runs).")
+    p.add_argument("--training-window-only", action="store_true",
+                   help="With --train: show only the training window (loss "
+                        "and live predictions), not MAD's main window. "
+                        "Closing it quits MAD. Not combinable with "
+                        "--infer-after, whose progress would be invisible.")
+    p.add_argument("--infer", default=None, metavar="MODEL",
+                   help="Run inference over the project's recordings with "
+                        "this model (weights.pt or its run folder), skipping "
+                        "recordings already analysed at the same settings. "
+                        "Detection settings: the --infer-* flags, else the "
+                        "panel's.")
+    p.add_argument("--infer-folder", action="append", default=None,
+                   metavar="DIR",
+                   help="With --infer: run on every wav under DIR (repeatable; "
+                        "folders run in the order given) instead of the "
+                        "project's recordings, as Choose Folder(s)... does. "
+                        "Detections are written next to each wav; nothing is "
+                        "added to the project.")
+    p.add_argument("--inference-window-only", action="store_true",
+                   help="With --infer: show only the Running Inference "
+                        "window (progress, Pause, Stop), not MAD's main "
+                        "window. MAD quits after the run's summary.")
+    p.add_argument("--focus", nargs="+", default=None, metavar="ITEM",
+                   help="Show only these recordings in the Audio list: wav "
+                        "paths, bare filenames, and/or .txt files listing "
+                        "them one per line. The project keeps every "
+                        "recording; File > Show All Recordings returns.")
+    p.add_argument("--no-window-walk", action="store_true",
+                   help="With a call-queue --focus: Accept / Reject move "
+                        "straight to the next queued call, without first "
+                        "walking the pending detections in the decided call's "
+                        "training window. For judging-only queues (e.g. two "
+                        "models' disagreements) whose neighbours are not "
+                        "being labelled for training.")
+    g = p.add_argument_group(
+        "post-training inference",
+        "Detection settings for --infer-after, set in the panel before the "
+        "run starts. Any not given keep the panel's value.")
+    g.add_argument("--infer-threshold", type=float, default=None,
+                   metavar="P", help="Probability threshold.")
+    g.add_argument("--infer-min-blob", type=int, default=None, metavar="PX",
+                   help="Min blob pixels.")
+    g.add_argument("--infer-merge", dest="infer_merge", action="store_true",
+                   default=None, help="Merge consecutive fragments.")
+    g.add_argument("--no-infer-merge", dest="infer_merge",
+                   action="store_false")
+    g.add_argument("--infer-merge-gap", type=float, default=None,
+                   metavar="S", help="Merge gap in seconds.")
+    g.add_argument("--infer-harmonics", dest="infer_harmonics",
+                   action="store_true", default=None,
+                   help="Group harmonics into calls.")
+    g.add_argument("--no-infer-harmonics", dest="infer_harmonics",
+                   action="store_false")
+    add_training_args(p)
+    suppress_training_defaults(p)
+    return p
+
+
+def apply_launch_window_mode(win, app, training_window_only: bool) -> None:
+    """Show MAD's main window -- or, for a dictated training run, keep it
+    hidden so the training window is all that appears (closing that window
+    quits; see _on_train_dialog_close). The app must not quit on its own when
+    that window closes mid-run, so quitting is left to MAD."""
+    win._window_only = bool(training_window_only)
+    if win._window_only:
+        app.setQuitOnLastWindowClosed(False)
+    else:
+        win.show()
+
+
+def _host_like_startup():
+    """Set MAD up the way the FNT launcher's tool host does.
+
+    A MAD started from the launcher runs inside fnt.tool_host, which installs
+    the native-crash log (every thread's stack to ~/.fnt/faulthandler_crash.log
+    on an access violation), the slot exception hook (a Python error in a
+    button handler is logged instead of aborting the process), HiDPI scaling and
+    console-free child processes. Started from the command line it had none of
+    these, so a crash left no trace. Never blocks startup.
+    """
+    try:
+        from fnt import tool_host as th
+        th.install_faulthandler("MAD (command line)")
+        th.install_slot_excepthook()
+        th.install_qt_message_handler()
+        if QApplication.instance() is None:
+            th._prepare_windows_taskbar()
+            th._enable_hidpi()
+        th._suppress_child_consoles()
+    except Exception:
+        pass
+
+
+def main(argv=None):
+    parser = _launch_parser()
+    # parse_known_args: Qt has command-line options of its own.
+    args, qt_args = parser.parse_known_args(
+        sys.argv[1:] if argv is None else argv)
+    if (args.train or args.focus) and not args.project:
+        parser.error("--train and --focus need --project")
+    if args.training_window_only and (not args.train or args.infer_after
+                                      or args.focus):
+        parser.error("--training-window-only needs --train, and does not "
+                     "combine with --infer-after or --focus")
+    if args.infer and (args.train or not args.project):
+        parser.error("--infer needs --project and does not combine with "
+                     "--train (use --infer-after)")
+    if args.inference_window_only and (not args.infer or args.focus):
+        parser.error("--inference-window-only needs --infer, and does not "
+                     "combine with --focus")
+    if args.infer_folder and (not args.infer or args.focus):
+        parser.error("--infer-folder needs --infer, and does not combine "
+                     "with --focus")
+    for d in args.infer_folder or ():
+        if not os.path.isdir(d):
+            parser.error(f"--infer-folder: no such folder: {d}")
+    _host_like_startup()
+    app = QApplication.instance() or QApplication([sys.argv[0]] + qt_args)
     MADMainWindow._apply_dark_theme()  # consistent dark look on all platforms
     win = MADMainWindow()
-    win.show()
+    apply_launch_window_mode(
+        win, app, args.training_window_only or args.inference_window_only)
+    if args.project:
+        from fnt.usv.usv_detector.cli import training_overrides
+        overrides = training_overrides(args)
+
+        def _start():
+            path = args.project
+            if os.path.isdir(path):
+                path = os.path.join(path, PROJECT_INFO_FILENAME)
+            win._open_project_from_path(path)
+            if args.focus and win._project is not None:
+                win._queue_window_walk = not args.no_window_walk
+                shown, missing = win.focus_recordings(args.focus)
+                msg = f"Focus: {shown} recording(s)"
+                if missing:
+                    msg += (f" — {len(missing)} not found in the project: "
+                            + ", ".join(os.path.basename(m)
+                                        for m in missing[:3]))
+                win.status_bar.showMessage(msg)
+            if args.train and win._project is not None:
+                # After the project's own startup work (file list, the
+                # pre-fill from the last run's settings), so the overrides
+                # land on top of it rather than being overwritten by it.
+                def _launch():
+                    win.set_post_inference_settings(
+                        threshold=args.infer_threshold,
+                        min_blob=args.infer_min_blob,
+                        merge=args.infer_merge,
+                        merge_gap=args.infer_merge_gap,
+                        harmonics=args.infer_harmonics)
+                    win.launch_training(overrides,
+                                        infer_after=args.infer_after)
+                QTimer.singleShot(500, _launch)
+            if args.infer and win._project is not None:
+                def _launch_infer():
+                    win.set_post_inference_settings(
+                        threshold=args.infer_threshold,
+                        min_blob=args.infer_min_blob,
+                        merge=args.infer_merge,
+                        merge_gap=args.infer_merge_gap,
+                        harmonics=args.infer_harmonics)
+                    wavs = (win.set_inference_folders(args.infer_folder)
+                            if args.infer_folder else None)
+                    win.launch_inference(args.infer, wavs=wavs)
+                    if args.inference_window_only:
+                        win.watch_stop_request(win._project.project_dir)
+                QTimer.singleShot(500, _launch_infer)
+        QTimer.singleShot(0, _start)
     if QApplication.instance() is app:
         sys.exit(app.exec_())
 

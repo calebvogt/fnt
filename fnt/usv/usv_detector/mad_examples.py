@@ -116,6 +116,46 @@ def _iter_legacy_examples(dataset_dir: str) -> Iterator[Dict]:
         yield {"meta": meta, "spec": spec, "mask": mask}
 
 
+#: dataset_source_names() results, keyed by the store's files and versions.
+_SOURCE_NAME_CACHE: Dict[tuple, frozenset] = {}
+
+
+def dataset_source_names(dataset_dir: str) -> frozenset:
+    """Names of the recordings with at least one example in the project store
+    (the h5 and any legacy triplets), read from metadata only.
+
+    reconstruct_file_mask reads the whole store to find one recording's
+    examples. Inference asks that for every recording without a sidecar --
+    on a folder run, every recording -- and against a 600 MB store it cost
+    ~8 s a file: ~4 days of a 42,000-file run spent finding nothing. With this
+    index a recording the store doesn't hold is skipped without a read.
+    Cached per store version (each file's size and mtime), so a store rebuilt
+    at the start of training is read afresh.
+    """
+    from . import fnt_mask_store as _ms
+    d = Path(dataset_dir)
+    h5 = Path(_store_path(dataset_dir))
+    legacy = sorted(d.glob("*.json")) if d.is_dir() else []
+    files = [p for p in [h5, *legacy] if p.is_file()]
+    key = (str(d), tuple((str(p), p.stat().st_size, p.stat().st_mtime_ns)
+                         for p in files))
+    hit = _SOURCE_NAME_CACHE.get(key)
+    if hit is not None:
+        return hit
+    names = set()
+    if h5.is_file():
+        for meta in _ms.td_iter_meta(str(h5)):
+            names.add(Path(str(meta.get("source_wav", ""))).name)
+    for j in legacy:
+        try:
+            with open(j) as f:
+                names.add(Path(str(json.load(f).get("source_wav", ""))).name)
+        except Exception:
+            continue
+    _SOURCE_NAME_CACHE[key] = frozenset(names)
+    return _SOURCE_NAME_CACHE[key]
+
+
 def iter_examples(dataset_dir: str) -> Iterator[Dict]:
     """Yield example dicts ``{meta, spec, mask}`` from the consolidated h5 store
     **and** any legacy PNG/JSON triplets (h5 wins on id collision).
@@ -320,6 +360,28 @@ def _bbox_from_meta(meta):
     return f0, f1, t0, t1
 
 
+def _replace_with_retry(src: str, dst: str, attempts: int = 20,
+                        delay_s: float = 1.5) -> None:
+    """``os.replace`` that waits out a brief lock on ``dst``.
+
+    On Windows the swap fails with WinError 5 while any process holds the old
+    store open, even just to read it — another MAD window, an inference run on
+    the same project, or a virus scanner on the share. Those reads last a
+    moment, so retry for ~30 s before giving up; a store that stays locked
+    still raises, leaving the previous store in place.
+    """
+    import os
+    import time
+    for i in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == attempts - 1:
+                raise
+            time.sleep(delay_s)
+
+
 def rebuild_training_store(training_data_dir: str, wav_paths) -> int:
     """Rebuild the consolidated training store from the per-recording sidecars.
 
@@ -390,7 +452,7 @@ def rebuild_training_store(training_data_dir: str, wav_paths) -> int:
                 f"{len(failed)} label(s) could not be copied. "
                 f"First error — {failed[0]}")
         if n:
-            os.replace(tmp, store)      # atomic swap; old store until now
+            _replace_with_retry(tmp, store)  # atomic swap; old store until now
         else:
             _drop_tmp()
             if os.path.isfile(store):
@@ -421,11 +483,11 @@ def _examples_to_annotations(examples, wav_name, grid_shape, kinds=("label",)):
             continue
         m = ex["mask"] > 0
         if not m.any():
-            # A rejected *prediction* is stored as a hard negative with its
-            # component deliberately zeroed — nothing in that patch is a call.
-            # It is still a decision the reviewer made and wants to see, so
-            # rebuild the box from the metadata every example carries. A true
-            # hand-painted negative has no such box and is still skipped.
+            # A rejection saved before 2026-10-11 has no shape of its own (see
+            # mad_fix_rejection_shapes, which repairs them). It is still a
+            # decision the reviewer made and wants to see, so rebuild the box
+            # from the metadata every example carries. A true hand-painted
+            # negative has no such box and is still skipped.
             box = _bbox_from_meta(meta)
             if box is None:
                 continue
@@ -479,6 +541,18 @@ def _examples_to_annotations(examples, wav_name, grid_shape, kinds=("label",)):
         # with no example behind it" and not draw the call twice.
         if meta.get("blob_id") is not None:
             ann["blob_id"] = meta["blob_id"]
+        # The label's brightness ridge, in spectrogram bins, from the frame it
+        # starts at; tied to this mask object like a prediction's (MAD hides a
+        # ridge once its mask is edited).
+        if ex.get("ridge") is not None:
+            try:
+                df_hz = float(meta["sample_rate"]) / 2.0 / (int(meta["nfft"]) // 2)
+            except (KeyError, TypeError, ValueError, ZeroDivisionError):
+                df_hz = None
+            if df_hz:
+                ann["ridge_bins"] = np.asarray(ex["ridge"], np.float64) * 1000.0 / df_hz
+                ann["ridge_t0"] = t_off + int(ex.get("ridge_t_off") or 0)
+                ann["_ridge_mask"] = ann["mask"]
         yield ann
 
 
@@ -526,6 +600,7 @@ def iter_file_rejected_annotations(
 def reconstruct_file_mask(
     dataset_dir: str, wav_name: str, grid_shape: Tuple[int, int],
     extra_stores: Optional[Sequence[str]] = None,
+    kinds: Sequence[str] = ("label",),
 ) -> np.ndarray:
     """Rebuild the confirmed-positive mask for one source file.
 
@@ -552,7 +627,9 @@ def reconstruct_file_mask(
     target = Path(str(wav_name)).name
 
     def _sources():
-        if dataset_dir:
+        # Only when the store holds this recording at all (an index lookup),
+        # rather than reading the whole store to find nothing.
+        if dataset_dir and target in dataset_source_names(dataset_dir):
             yield from iter_examples(dataset_dir)
         for store in (extra_stores or ()):
             if store and Path(store).is_file():
@@ -575,7 +652,10 @@ def reconstruct_file_mask(
         # the overlay, and worse, shielding its pixels from re-detection via
         # inference's preserve_labels. A rejected region is exactly a region
         # the model should be allowed to look at again.
-        if _ms.example_kind(meta) != "label":
+        # ``kinds`` lets inference ask for the rejected set separately: those
+        # are suppressed on a re-run (see mad_inference), but never painted as
+        # labels.
+        if _ms.example_kind(meta) not in kinds:
             continue
         t_off = int(meta.get("patch_t_off") or 0)
         f_off = int(meta.get("patch_f_off") or 0)
@@ -663,6 +743,185 @@ def _place_in_tile(spec: np.ndarray, mask: np.ndarray, tile_h: int,
             _crop_or_pad(w, tile_h, tile_w, 0, 0))
 
 
+def cap_examples_per_recording(examples: List[Dict], cap: int, *,
+                               seed: int = 0,
+                               report: Optional[Dict] = None) -> List[Dict]:
+    """Keep at most ``cap`` examples per (recording, label-or-negative).
+
+    Order is preserved for what is kept, and the choice is seeded, so the same
+    store and seed always train on the same subset.
+    """
+    import os as _os
+    from . import fnt_mask_store as _ms
+    if cap <= 0:
+        return list(examples)
+    buckets: Dict[Tuple[str, str], List[int]] = {}
+    for i, ex in enumerate(examples):
+        meta = ex.get("meta") or {}
+        rec = _os.path.basename(str(meta.get("source_wav", "") or ""))
+        kind = ("negative" if _ms.example_kind(meta) in ("negative", "rejected")
+                else "label")
+        buckets.setdefault((rec, kind), []).append(i)
+    # Separate stream from tile placement, so turning the cap on or off does
+    # not also reshuffle where every kept call lands in its tile.
+    rng = np.random.default_rng(int(seed) + 7919)
+    keep = set()
+    for (rec, kind), idx in sorted(buckets.items()):
+        if len(idx) <= cap:
+            keep.update(idx)
+            continue
+        chosen = rng.choice(len(idx), size=cap, replace=False)
+        keep.update(idx[j] for j in chosen)
+        if report is not None:
+            report.setdefault(rec or "?", {})[kind] = (cap, len(idx))
+    return [ex for i, ex in enumerate(examples) if i in keep]
+
+
+#: Context saved on each side of a call, in spectrogram frames, when a project
+#: sets no ``context_ms``: ~65 ms at hop 128 / 250 kHz.
+DEFAULT_CONTEXT_FRAMES = 128
+
+
+def context_frames(context_ms, sample_rate, hop) -> int:
+    """Frames of context for ``context_ms`` on a grid (``hop`` samples per
+    frame); the legacy :data:`DEFAULT_CONTEXT_FRAMES` when no context or no
+    usable grid is given."""
+    try:
+        if context_ms is None or not sample_rate or not hop or hop <= 0:
+            return DEFAULT_CONTEXT_FRAMES
+        return max(0, int(round(float(context_ms) / 1000.0
+                                * float(sample_rate) / float(hop))))
+    except (TypeError, ValueError):
+        return DEFAULT_CONTEXT_FRAMES
+
+
+def crop_to_context(ex: Dict, context_ms) -> Dict:
+    """Narrow an example's patch to its own call +/- ``context_ms``.
+
+    Patches are saved with the legacy context (or wider); the project's
+    context decides how much of it trains. Cropping, never padding: an example
+    saved narrower than the context keeps what it has. Measured from the
+    example's own ``mask`` (a label's call, a rejection's own shape), so an
+    example with no own pixels is left alone.
+    """
+    if context_ms is None:
+        return ex
+    m = np.asarray(ex.get("mask")) > 0
+    if m.ndim != 2 or not m.any():
+        return ex
+    meta = dict(ex.get("meta") or {})
+    hop = (meta.get("nperseg") or 0) - (meta.get("noverlap") or 0)
+    ctx = context_frames(context_ms, meta.get("sample_rate"), hop)
+    cols = np.flatnonzero(m.any(axis=0))
+    lo = max(0, int(cols[0]) - ctx)
+    hi = min(m.shape[1], int(cols[-1]) + 1 + ctx)
+    if lo == 0 and hi == m.shape[1]:
+        return ex
+    out = dict(ex)
+    for k in ("spec", "mask", "neighbors"):
+        if out.get(k) is not None:
+            out[k] = np.asarray(out[k])[:, lo:hi]
+    meta["patch_t_off"] = int(meta.get("patch_t_off") or 0) + lo
+    out["meta"] = meta
+    return out
+
+
+#: Spectrogram grid an example's frame offsets are counted on. Two examples'
+#: patches line up only when all of these agree.
+_GRID_KEYS = ("nperseg", "noverlap", "nfft", "sample_rate")
+
+
+def _neighbour_placeable(ex: Dict) -> bool:
+    """Can this example's window be laid over its recording's other calls?
+    Needs its patch offset, its recording, and a mask."""
+    import os as _os
+    meta = ex.get("meta") or {}
+    return (meta.get("patch_t_off") is not None
+            and bool(_os.path.basename(str(meta.get("source_wav", "") or "")))
+            and ex.get("mask") is not None)
+
+
+def confirmed_neighbours(examples: Sequence[Dict]) -> List[Optional[np.ndarray]]:
+    """For each example, the OTHER confirmed calls on its recording that fall
+    inside its patch window: a bool array shaped like the patch, or ``None``.
+
+    The ``neighbors`` an example stores is a snapshot of the calls confirmed
+    at the moment it was saved. A call accepted later in the same bout is
+    therefore missing from every earlier call's window, and training taught it
+    as background -- the very thing ``neighbors`` exists to prevent, and
+    worst in dense bouts. Measured on the 8x8 mouse project
+    (mad_v1_VoleCosm, 2026-10-11): 48 of 413 labels, 6.7% of all neighbour
+    pixels, 22% on one C57 trial. Rebuilding the windows from the whole store
+    at training time makes the order calls were accepted in irrelevant.
+
+    Only labels (painted calls and accepted detections) are neighbours;
+    rejections never are. A call's own pixels are placed by its stored
+    ``patch_t_off``/``patch_f_off``, so only examples cut on the same
+    recording and the same grid are compared. Recordings are matched by
+    basename, the same key the train/val split groups on.
+    """
+    import bisect
+    import os as _os
+    from . import fnt_mask_store as _ms
+
+    def _rec(meta):
+        return _os.path.basename(str(meta.get("source_wav", "") or ""))
+
+    def _placed(meta):
+        return meta.get("patch_t_off") is not None
+
+    groups: Dict[tuple, List[int]] = {}
+    for i, ex in enumerate(examples):
+        meta = ex.get("meta") or {}
+        if (_ms.example_kind(meta) == "label" and _placed(meta) and _rec(meta)
+                and ex.get("mask") is not None):
+            key = (_rec(meta),) + tuple(meta.get(k) for k in _GRID_KEYS)
+            groups.setdefault(key, []).append(i)
+    # Per group: labels sorted by start frame, so each window only visits the
+    # labels that can reach it rather than every label on the recording.
+    index = {}
+    for key, idx in groups.items():
+        idx = sorted(idx, key=lambda j: int(examples[j]["meta"]["patch_t_off"]))
+        starts = [int(examples[j]["meta"]["patch_t_off"]) for j in idx]
+        widest = max(np.asarray(examples[j]["mask"]).shape[1] for j in idx)
+        index[key] = (idx, starts, widest)
+
+    out: List[Optional[np.ndarray]] = [None] * len(examples)
+    for i, ex in enumerate(examples):
+        meta = ex.get("meta") or {}
+        if not _neighbour_placeable(ex):
+            continue
+        found = index.get((_rec(meta),) + tuple(meta.get(k) for k in _GRID_KEYS))
+        if found is None:
+            continue
+        idx, starts, widest = found
+        H, W = np.asarray(ex["mask"]).shape
+        a_t = int(meta["patch_t_off"])
+        a_f = int(meta.get("patch_f_off") or 0)
+        win = None
+        lo = bisect.bisect_left(starts, a_t - widest + 1)
+        hi = bisect.bisect_left(starts, a_t + W)
+        for j in idx[lo:hi]:
+            if j == i:
+                continue
+            bm = examples[j]["meta"]
+            b = np.asarray(examples[j]["mask"]) > 0
+            b_t = int(bm["patch_t_off"])
+            b_f = int(bm.get("patch_f_off") or 0)
+            t0, t1 = max(a_t, b_t), min(a_t + W, b_t + b.shape[1])
+            f0, f1 = max(a_f, b_f), min(a_f + H, b_f + b.shape[0])
+            if t1 <= t0 or f1 <= f0:
+                continue
+            piece = b[f0 - b_f:f1 - b_f, t0 - b_t:t1 - b_t]
+            if not piece.any():
+                continue
+            if win is None:
+                win = np.zeros((H, W), dtype=bool)
+            win[f0 - a_f:f1 - a_f, t0 - a_t:t1 - a_t] |= piece
+        out[i] = win
+    return out
+
+
 def collect_training_examples(
     dataset_dir: str,
     tile_time_frames: int = TILE_TIME_FRAMES,
@@ -671,8 +930,21 @@ def collect_training_examples(
     return_groups: bool = False,
     placements: int = 3,
     seed: int = 0,
+    max_per_recording: int = 0,
+    cap_report: Optional[Dict] = None,
+    context_ms: Optional[float] = None,
 ):
     """Assemble ``(specs, targets, weights)`` stacks from saved examples.
+
+    ``context_ms`` crops every patch to its call +/- that much (see
+    :func:`crop_to_context`); None trains each patch as saved.
+
+    ``max_per_recording`` (0 = off) keeps at most that many examples from any
+    one recording, labels and hard negatives counted separately, chosen at
+    random under ``seed``. Pass a dict as ``cap_report`` to have it filled with
+    ``{recording: {'label': (kept, total), ...}}`` for each recording the cap
+    actually trimmed. See ``UNetTrainingConfig.max_examples_per_recording``
+    for why whole examples, and never pixels, are what gets dropped.
 
     Each example patch is sliced into one or more tiles of shape
     ``(tile_freq_bins, tile_time_frames)``. The whole patch is supervised, so
@@ -701,6 +973,29 @@ def collect_training_examples(
     """
     from . import fnt_mask_store as _ms
     examples = list(iter_examples(dataset_dir))
+    # Neighbours from the whole store, not the snapshot each example took when
+    # it was saved (see confirmed_neighbours) -- and before the cap: a call the
+    # cap leaves out of training is still a confirmed call in its neighbours'
+    # windows.
+    #
+    # The rebuild REPLACES the snapshot wherever an example can be placed on
+    # its recording. Snapshots were read from the canvas, which also held
+    # pending and rejected detections, so they carried pixels nobody accepted
+    # -- 15,368 of 836,066 snapshot pixels in mad_v5_VC (60 labels, 2,895 on
+    # the 21 kHz tone) -- and a label's neighbours train as calls. Every pixel
+    # of a call confirmed now is in the rebuild; anything only the snapshot
+    # holds was pending, rejected, or a label since deleted. An example that
+    # cannot be placed keeps its snapshot.
+    for ex, rebuilt in zip(examples, confirmed_neighbours(examples)):
+        if not _neighbour_placeable(ex):
+            continue
+        ex["neighbors"] = rebuilt
+    # After the neighbours, which place calls by the full patch's offsets.
+    if context_ms is not None:
+        examples = [crop_to_context(ex, context_ms) for ex in examples]
+    if max_per_recording and max_per_recording > 0:
+        examples = cap_examples_per_recording(
+            examples, int(max_per_recording), seed=seed, report=cap_report)
     specs: List[np.ndarray] = []
     targets: List[np.ndarray] = []
     weights: List[np.ndarray] = []

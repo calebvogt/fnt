@@ -1,3 +1,8 @@
+---
+hide:
+  - navigation
+---
+
 # Installation
 
 There are two ways to run FNT: the pre-built **standalone executable** (recommended for most users) or a **development installation** (if you want to modify the code).
@@ -80,11 +85,11 @@ fnt
 
 ## GPU Support (Optional)
 
-For SAM-based video tracking and MAD model training/inference, GPU acceleration provides a large speedup. Install PyTorch with CUDA support:
+For SAM-based video tracking, the Mask Tracker and MAD training and inference, a GPU is a large speedup. Install PyTorch with CUDA support. The right command depends on your NVIDIA driver: MAD's **Help ▸ Check GPU / CUDA setup…** prints the exact `pip` command for your machine, or pick one on [pytorch.org](https://pytorch.org/get-started/locally/). For example, for CUDA 12.6:
 
 ```bash
 conda activate fnt
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
 ```
 
 Verify GPU detection:

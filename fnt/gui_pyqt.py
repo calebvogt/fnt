@@ -48,7 +48,6 @@ except ImportError:
 
 import threading
 from datetime import datetime
-from fnt.fed3.fed_widgets import FEDTabWidget
 from fnt.tool_launcher import ToolProcessManager
 
 
@@ -230,6 +229,12 @@ class FNTMainWindow(QMainWindow):
             QPushButton:disabled {
                 background-color: #3f3f3f;
                 color: #cccccc;
+                /* Qt sizes a styled button from the most specific rule that
+                   matches it. Without the padding restated here, a disabled
+                   button was measured for a box narrower than the label the
+                   enabled rule paints, and clipped it. */
+                padding: 6px 14px;
+                border-radius: 4px;
             }
             QGroupBox {
                 font-weight: bold;
@@ -627,7 +632,7 @@ class FNTMainWindow(QMainWindow):
 
         buttons = [
             ("RFID Preprocessing Tool",
-             "Universal RFID preprocessing: raw data → movement bouts → GBI → social networks",
+             "Biomark downloads → cleaned reads, bouts, zone holders and co-occupancy, with QC reports",
              self.run_rfid_preprocessing),
         ]
 
@@ -656,8 +661,8 @@ class FNTMainWindow(QMainWindow):
         group_layout = QGridLayout()
 
         buttons = [
-            ("FED Processing Tool",
-             "Universal FED tool for monitoring and managing devices",
+            ("FED3",
+             "Run FED3 experiments: protocols, devices, live data",
              self.run_fed_processing),
         ]
 
@@ -668,80 +673,44 @@ class FNTMainWindow(QMainWindow):
         layout.addStretch()
 
     def run_fed_processing(self):
-        """Launch FED Processing Tool"""
-        try:
-            class FEDWindow(QMainWindow):
-                def __init__(self, parent=None):
-                    super().__init__(parent)
-                    self.fed_widget = None
-
-                def closeEvent(self, event):
-                    if self.fed_widget:
-                        try:
-                            self.fed_widget.cleanup()
-                        except Exception as e:
-                            print(f"Error cleaning up FED widget: {e}")
-                    event.accept()
-
-            self.fed_window = FEDWindow(self)
-            self.fed_window.setWindowTitle("FED Processing Tool")
-            self.fed_window.resize(1000, 800)
-            self.fed_window.setStyleSheet(self.styleSheet())
-
-            # Wrap FEDTabWidget in a container with margins to match other FNT windows
-            container = QWidget()
-            container_layout = QVBoxLayout(container)
-            container_layout.setContentsMargins(10, 10, 10, 10)
-
-            fed_widget = FEDTabWidget(parent=self.fed_window, worker_class=WorkerThread)
-            self.fed_window.fed_widget = fed_widget
-            container_layout.addWidget(fed_widget)
-
-            self.fed_window.setCentralWidget(container)
-            self.fed_window.show()
-        except Exception as e:
-            QMessageBox.critical(
-                self, "Error",
-                f"Failed to launch FED tool: {str(e)}"
-            )
+        """Open the FED3 window in its own process."""
+        self.tools.launch("fed3")
 
     def create_wifp_tab(self):
-        """Create the WiFP (Wireless Fiber Photometry) processing tab"""
-        tab, layout = self._make_scrollable_tab("WiFP")
+        """Create the Fiber Photometry tab"""
+        tab, layout = self._make_scrollable_tab("Photometry")
         
         # Description
-        desc = QLabel("Doric Wireless Fiber Photometry (WiFP) analysis tools")
+        desc = QLabel("Fiber photometry: dF/F, z-scores and video alignment")
         desc.setFont(QFont("Arial", 10, QFont.Bold))
         desc.setStyleSheet("color: #cccccc; margin: 10px;")
         layout.addWidget(desc)
         
-        # Doric Processing group
-        doric_group = QGroupBox("Doric WiFP Processing")
-        doric_layout = QGridLayout()
+        fp_group = QGroupBox("Fiber Photometry")
+        fp_layout = QGridLayout()
         
-        doric_buttons = [
-            ("Process .doric Files", "Batch process .doric files: calculate ΔF/F, sync with video, export CSV", self.run_doric_processor),
-            ("Explore .doric Structure", "View the internal HDF5 structure of a .doric file", self.run_doric_explorer),
+        fp_buttons = [
+            ("Fiber Photometry", "Batch dF/F and z-score (Warden lab MATLAB, GuPPy or PhAT methods), aligned to video", self.run_fiber_photometry),
+            ("Explore .doric Structure", "View the internal HDF5 structure of a Doric .doric file", self.run_doric_explorer),
         ]
         
-        self.create_button_grid(doric_layout, doric_buttons)
-        doric_group.setLayout(doric_layout)
-        layout.addWidget(doric_group)
+        self.create_button_grid(fp_layout, fp_buttons)
+        fp_group.setLayout(fp_layout)
+        layout.addWidget(fp_group)
         
         # Info panel
-        info_group = QGroupBox("About WiFP Processing")
+        info_group = QGroupBox("About")
         info_layout = QVBoxLayout()
         
         info_label = QLabel(
             "<b>Workflow:</b><br>"
-            "1. Record behavior video and fiber photometry with Doric WiFP system<br>"
-            "2. Use 'Process .doric Files' to calculate ΔF/F with isosbestic correction<br>"
-            "3. Outputs: CSV (Frame, Time, ΔF/F) + combined video with trace overlay<br><br>"
-            "<b>Supported:</b><br>"
-            "• Auto-detection of 470nm signal and 405/415nm isosbestic channels<br>"
-            "• Video synchronization using timestamps from .doric file<br>"
-            "• Batch processing of entire folders<br>"
-            "• Manual channel selection if auto-detection fails"
+            "1. Record photometry and behaviour video (supported so far: Doric wireless, .doric)<br>"
+            "2. 'Fiber Photometry': pick a pipeline, preview the first recording, process the batch<br>"
+            "3. Outputs: per-sample and per-video-frame CSVs (dF/F, z-score), the video with the traces "
+            "scrolling underneath, and a settings record<br><br>"
+            "<b>Pipelines:</b> Warden lab MATLAB (default), GuPPy (Sherathiya et al. 2021) and PhAT "
+            "(Murphy et al. 2023), with wireless dropouts removed.<br>"
+            "See docs/tools/fiber-photometry.md for the methods and their citations."
         )
         info_label.setTextFormat(Qt.RichText)
         info_label.setStyleSheet("color: #cccccc; background-color: #1e1e1e; padding: 15px; border: 1px solid #3f3f3f; border-radius: 4px;")
@@ -1062,15 +1031,15 @@ class FNTMainWindow(QMainWindow):
         """Launch Data Transfer tool for copying data files to a destination folder"""
         self.tools.launch("github_csv_transfer")
 
-    # Doric WiFP Processing Methods
-    def run_doric_processor(self):
-        """Launch Doric WiFP Fiber Photometry Processor"""
-        self.tools.launch("doric_processor")
+    # Fiber photometry
+    def run_fiber_photometry(self):
+        """Launch the Fiber Photometry tool"""
+        self.tools.launch("fiber_photometry")
     
     def run_doric_explorer(self):
         """Run the .doric file structure explorer"""
         try:
-            from fnt.DoricFP.explore_doric_structure import main as explore_main
+            from fnt.fiberPhotometry.explore_doric_structure import main as explore_main
             import subprocess
             import sys
             
@@ -1085,7 +1054,7 @@ class FNTMainWindow(QMainWindow):
             
             # Run the explorer script in a terminal to see output
             python_exe = sys.executable
-            script_path = Path(__file__).parent / "DoricFP" / "explore_doric_structure.py"
+            script_path = Path(__file__).parent / "fiberPhotometry" / "explore_doric_structure.py"
             
             # Run in new terminal window
             if sys.platform == 'win32':
@@ -1472,14 +1441,6 @@ class FNTMainWindow(QMainWindow):
     
     def closeEvent(self, event):
         """Handle window close event"""
-        # Close the FED processing window if open (which will trigger its own
-        # closeEvent and cleanup). FED still runs in-process.
-        if hasattr(self, 'fed_window') and self.fed_window is not None:
-            try:
-                self.fed_window.close()
-            except Exception:
-                pass
-
         # Tool windows run in their own processes and get hard-terminated on
         # quit, with no chance to save in-progress work. We can't see inside
         # another process to know whether it's mid-export, so list what's still

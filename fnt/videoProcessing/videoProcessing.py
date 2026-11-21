@@ -13,7 +13,10 @@ import glob
 import re
 import shutil
 import tempfile
+import zlib
 from pathlib import Path
+
+from fnt.usv.usv_detector.power import keep_full_speed
 
 try:
     from PyQt5.QtWidgets import (
@@ -174,6 +177,31 @@ def make_output_filename(video_file, output_format, replace_whitespace=False,
     return f"{name}.{output_format}"
 
 
+def in_shard(video_file, shard):
+    """True when *video_file* belongs to ``shard`` = ``(k, n)``, part k of n (1-based).
+
+    The split is by a hash of the file name, not by position in a listing, so it
+    does not depend on how many files a folder holds or the order they are found:
+    n windows started on one folder with shards 1/n .. n/n never take the same file.
+    ``None`` keeps every file.
+    """
+    if not shard:
+        return True
+    k, n = shard
+    return zlib.crc32(os.path.basename(video_file).encode("utf-8")) % n == k - 1
+
+
+def parse_shard(text):
+    """``"2/4"`` -> ``(2, 4)``; raises ValueError unless 1 <= k <= n."""
+    k, sep, n = str(text).partition("/")
+    if not sep:
+        raise ValueError(f"shard {text!r}: expected K/N, e.g. 2/4")
+    k, n = int(k), int(n)
+    if not 1 <= k <= n:
+        raise ValueError(f"shard {text!r}: K must be between 1 and N")
+    return k, n
+
+
 def rgb_to_ass(rgb, alpha=0):
     """Convert an (r, g, b) tuple to an ASS colour string &HAABBGGRR.
 
@@ -240,7 +268,8 @@ class VideoProcessorWorker(QThread):
                  instance_id=1, skip_already_processed=False,
                  burn_subtitles=False, subtitle_style=None,
                  replace_whitespace=False, filename_prefix="", filename_suffix="",
-                 input_extensions=None):
+                 input_extensions=None, shard=None, recover_damaged=True,
+                 stream_copy=False):
         super().__init__()
         self.input_dirs = input_dirs
         self.input_videos = input_videos
@@ -261,6 +290,17 @@ class VideoProcessorWorker(QThread):
         self.filename_prefix = filename_prefix
         self.filename_suffix = filename_suffix
         self.input_extensions = list(input_extensions) if input_extensions else list(DEFAULT_VIDEO_GLOBS)
+        self.shard = shard  # (k, n): only this part of the files (see in_shard)
+        # Damaged AVIs (lost blocks): rebuild at the recording's real length,
+        # black where frames are lost (see avi_recovery), instead of failing or
+        # encoding with the lost frames left out (video then runs ahead of the
+        # camera clock).
+        self.recover_damaged = recover_damaged
+        # A source that already is what the encode would make (H.264/H.265 at the
+        # target size and frame rate, gray when gray is asked for, no lost frames) is
+        # copied into the output container instead of re-encoded (see
+        # _stream_copy_blocker); anything else is encoded as usual.
+        self.stream_copy = stream_copy
         self.should_stop = False
         # Retry transient failures (e.g. network drops reading from a mapped
         # network drive cause FFmpeg to crash mid-read). max_retries is the
@@ -311,6 +351,253 @@ class VideoProcessorWorker(QThread):
         except Exception:
             pass
         return None
+
+    @staticmethod
+    def _media_duration(filepath):
+        """Container duration in seconds via ffprobe, or None."""
+        try:
+            r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                                "-of", "csv=p=0", filepath],
+                               capture_output=True, text=True, timeout=30)
+            return float(r.stdout.strip()) if r.returncode == 0 else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _avi_header_intact(filepath):
+        """Whether an AVI still has its header (the list that leads to its frames)."""
+        from fnt.videoProcessing.avi_recovery import _parse_header
+        try:
+            with open(filepath, "rb") as f:
+                return _parse_header(f.read(1 << 20))[0] is not None
+        except OSError:
+            return True
+
+    def _probe_gaps(self, video, name):
+        """Lost stretches of a video with its own timestamps (frame_gaps), or None.
+        Reports them; the encode then draws their frames black."""
+        from fnt.videoProcessing import frame_gaps as G
+        fg = G.probe(video)
+        if fg and fg.gaps:
+            self.progress_update.emit(
+                f"  🩹 {name}: {len(fg.gaps):,} stretch(es) of lost frames "
+                f"({fg.lost_s:,.1f} s); they stay at their real time, drawn black")
+        return fg
+
+    def _write_gap_csv(self, fg, partial_file, name):
+        """The frames CSV (recovered_frames/, as for damaged AVIs) of an encode whose
+        lost stretches were drawn black."""
+        from fnt.videoProcessing import frame_gaps as G
+        from fnt.videoProcessing import avi_recovery as R
+        try:
+            rows, n, black = G.frame_rows(fg, self.frame_rate)
+            res = R.RecoveryResult(partial_file, n, n - black, black, rows,
+                                   {"fps": self.frame_rate, "gaps": len(fg.gaps)})
+            rep_dir = os.path.join(os.path.dirname(partial_file), "recovered_frames")
+            os.makedirs(rep_dir, exist_ok=True)
+            out_name = os.path.splitext(os.path.basename(partial_file[:-len(".partial")]))[0]
+            R.write_frames_csv(res, os.path.join(rep_dir, out_name + "_frames.csv"))
+            self.progress_update.emit(
+                f"  🩹 {name}: {black:,} of {n:,} frames black — see proc/recovered_frames/")
+        except Exception as e:
+            self.progress_update.emit(f"  🩹 {name}: frames CSV not written: {e}")
+
+    def _lost_time(self, source, output):
+        """Seconds the encode is shorter than its source, when that is more than a
+        few seconds (frames lost in the source were left out), else 0."""
+        src, out = self._media_duration(source), self._media_duration(output)
+        if not src or not out:
+            return 0
+        lost = src - out
+        return lost if lost > max(5.0, 0.005 * src) else 0
+
+    def _recover_avi(self, avi, original, partial_file):
+        """Rebuild ``avi`` into ``partial_file`` at its real length (avi_recovery):
+        surviving frames in place, black where frames are lost. ``original`` is
+        the file's own path (its folder is searched for an intact recording of the
+        same recorder when the header is lost). Writes a frames CSV beside the
+        outputs (recovered_frames/). Returns True on success."""
+        from fnt.videoProcessing import avi_recovery as R
+        name = os.path.basename(original)
+        try:
+            with open(avi, "rb") as f:
+                data = f.read()
+            ref = None
+            if R._parse_header(data)[0] is None:
+                ref = R.find_reference(original)
+                self.progress_update.emit(
+                    f"  🩹 header lost; using {os.path.basename(ref['path'])} for its settings"
+                    if ref else "  🩹 header lost and no intact recording beside it to borrow from")
+            amap = R.map_avi(avi, data, ref)
+            if amap is None:
+                self.progress_update.emit(f"  🩹 {name}: nothing can be placed in time; not recoverable")
+                return False
+            usable = sum(len(r) for r in R.frame_runs(amap))
+            self.progress_update.emit(
+                f"  🩹 {name}: {usable:,} of {amap.total_frames:,} frames survive "
+                f"({usable / max(1, amap.total_frames):.0%}); rebuilding at real length…")
+            tmp = partial_file + ".recovering"
+            step = [0]
+
+            def prog(done, total):
+                if done * 10 // max(1, total) > step[0]:
+                    step[0] = done * 10 // max(1, total)
+                    self.progress_update.emit(f"    {done:,}/{total:,} frames")
+
+            res = R.recover_avi(avi, tmp, self.build_raw_encoder_command,
+                                gray=self.grayscale, fps=self.frame_rate, progress=prog,
+                                should_stop=lambda: self.should_stop, data=data, amap=amap)
+            if res is None:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+                self.progress_update.emit(f"  🩹 {name}: rebuild failed")
+                return False
+            os.replace(tmp, partial_file)
+            rep_dir = os.path.join(os.path.dirname(partial_file), "recovered_frames")
+            os.makedirs(rep_dir, exist_ok=True)
+            out_name = os.path.splitext(os.path.basename(partial_file[:-len(".partial")]))[0]
+            R.write_frames_csv(res, os.path.join(rep_dir, out_name + "_frames.csv"))
+            est = sum(b - a + 1 for a, b, k, h in res.rows if h == "estimated")
+            self.progress_update.emit(
+                f"  🩹 {name}: {res.recovered:,}/{res.total_frames:,} frames recovered "
+                f"({res.recovered / res.total_frames:.1%}), {res.black:,} black"
+                + (f", {est:,} placed by estimate" if est else "")
+                + " — see proc/recovered_frames/")
+            return True
+        except Exception as e:
+            self.progress_update.emit(f"  🩹 {name}: rebuild error: {e}")
+            return False
+
+    # ------------------------------------------------------------ stream copy
+    COPY_CODECS = ("h264", "hevc")
+    COPY_PIX_FMTS = ("yuv420p", "yuvj420p", "gray")
+    COPY_FORMATS = ("mp4", "mov", "mkv", "matroska")
+
+    @staticmethod
+    def _probe_stream(filepath):
+        """codec, width, height, pix_fmt and frame rates of the first video stream."""
+        try:
+            r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                                "stream=codec_name,width,height,pix_fmt,r_frame_rate,avg_frame_rate",
+                                "-of", "json", filepath], capture_output=True, text=True, timeout=60)
+            import json
+            return json.loads(r.stdout)["streams"][0] if r.returncode == 0 else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _rate(text):
+        try:
+            a, b = str(text).split("/")
+            return float(a) / float(b) if float(b) else None
+        except Exception:
+            return None
+
+    def _has_colour(self, filepath, duration):
+        """Whether any of three frames (10%, 50%, 90% in) has colour: chroma away from
+        neutral. None when the frames cannot be read."""
+        import numpy as np
+        w, h = self._target_resolution()
+        for frac in (0.1, 0.5, 0.9):
+            try:
+                # -ss before -i: jump to the keyframe near there (any frame will do)
+                r = subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-ss",
+                                    f"{(duration or 0) * frac:.2f}", "-i", filepath,
+                                    "-frames:v", "1", "-f", "rawvideo",
+                                    "-pix_fmt", "yuv420p", "-"], capture_output=True, timeout=120)
+            except Exception:
+                return None
+            b = np.frombuffer(r.stdout, np.uint8)
+            if len(b) != w * h * 3 // 2:
+                return None
+            uv = b[w * h:].astype(np.int16) - 128
+            if np.mean(np.abs(uv) > 3) > 0.001:
+                return True
+        return False
+
+    def _stream_copy_blocker(self, src, gaps, is_avi):
+        """Why ``src`` cannot simply be copied into the output, or None when it can:
+        it must already be H.264 or H.265, 8-bit 4:2:0, at the target size and frame
+        rate, gray when gray is asked for, with no lost frames (mp4/mkv: no jumps in its
+        timestamps; AVIs are checked after the copy)."""
+        if self.burn_subtitles:
+            return "burning subtitles needs a re-encode"
+        if self.output_format not in self.COPY_FORMATS:
+            return f"stream copy writes mp4/mov/mkv, not {self.output_format}"
+        st = self._probe_stream(src)
+        if not st:
+            return "its video stream cannot be read"
+        if st.get("codec_name") not in self.COPY_CODECS:
+            return f"it is {st.get('codec_name')}, not H.264/H.265"
+        if st.get("pix_fmt") not in self.COPY_PIX_FMTS:
+            return f"its pixel format is {st.get('pix_fmt')}"
+        if (st.get("width"), st.get("height")) != self._target_resolution():
+            return f"it is {st.get('width')}x{st.get('height')}, not {'x'.join(map(str, self._target_resolution()))}"
+        for key in ("r_frame_rate", "avg_frame_rate"):
+            fps = self._rate(st.get(key))
+            if fps is None or abs(fps - float(self.frame_rate)) > 0.01:
+                return f"its frame rate is {st.get(key)}, not {self.frame_rate}"
+        if not is_avi:
+            if gaps is None:
+                from fnt.videoProcessing import frame_gaps as G
+                gaps = G.probe(src)
+            if gaps is None:
+                return "its timestamps cannot be read"
+            if gaps.gaps:
+                return f"it has {len(gaps.gaps)} stretch(es) of lost frames"
+        if self.grayscale:
+            colour = self._has_colour(src, self._media_duration(src))
+            if colour is None:
+                return "its frames cannot be checked for colour"
+            if colour:
+                return "it has colour"
+        return None
+
+    def _stream_copy(self, src, original, partial_file, is_avi):
+        """Copy ``src``'s video into ``partial_file`` without re-encoding. Returns None
+        when the copy is good, else why it is not (the caller encodes instead)."""
+        st = self._probe_stream(src) or {}
+        cmd = ["ffmpeg", "-y", "-nostdin", "-v", "error", "-fflags", "+genpts", "-i", src,
+               "-map", "0:v:0", "-c:v", "copy"]
+        if st.get("codec_name") == "hevc" and self.output_format in ("mp4", "mov"):
+            cmd += ["-tag:v", "hvc1"]                    # HEVC in mp4 as players expect
+        if self.remove_audio:
+            cmd += ["-an"]
+        else:
+            cmd += ["-map", "0:a?", "-c:a", "aac", "-b:a", "128k"]
+        cmd += ["-movflags", "+faststart", "-avoid_negative_ts", "make_zero",
+                "-f", self.output_format, partial_file]
+        try:
+            r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                               timeout=3600)
+        except Exception as e:
+            return f"the copy failed: {e}"
+        if r.returncode != 0:
+            return f"the copy failed: {r.stderr.strip()[-300:]}"
+        if is_avi and not self._avi_header_intact(src):
+            return "its header is lost"
+        src_d, out_d = self._media_duration(src), self._media_duration(partial_file)
+        if not src_d or not out_d:
+            return "the copy's length cannot be read"
+        if abs(src_d - out_d) > max(1.0, 0.002 * src_d):
+            return (f"the copy is {src_d - out_d:,.1f} s off the recording's length "
+                    f"(frames lost in the source)")
+        return None
+
+    def _try_stream_copy(self, src, original, partial_file, output_file, gaps, is_avi):
+        """Stream-copy ``src`` when it qualifies; True when the output is done."""
+        name = os.path.basename(original)
+        why = self._stream_copy_blocker(src, gaps, is_avi)
+        if why is None:
+            why = self._stream_copy(src, original, partial_file, is_avi)
+            if why is None:
+                os.replace(partial_file, output_file)
+                self.progress_update.emit(f"✅ Completed (stream copy, not re-encoded): {name}")
+                return True
+            if os.path.exists(partial_file):
+                os.remove(partial_file)
+        self.progress_update.emit(f"  re-encoding {name}: {why}")
+        return False
 
     def _copy_to_failed(self, video_file, parent_dir):
         """Copy a failed video file to proc_failed_copies/ directory."""
@@ -450,6 +737,17 @@ class VideoProcessorWorker(QThread):
 
             self.progress_update.emit(f"Found {total_files} video files...")
 
+            if self.shard:
+                file_list = [(f, d) for f, d in file_list if in_shard(f, self.shard)]
+                self.progress_update.emit(
+                    f"Shard {self.shard[0]}/{self.shard[1]}: {len(file_list)} of "
+                    f"{total_files} files are this window's (the other shards take the rest)")
+                total_files = len(file_list)
+                discovered_total = total_files
+                if total_files == 0:
+                    self.finished.emit(True, "Nothing to do: no files in this shard.")
+                    return
+
             # --- Decide what actually needs doing, once, before starting ---
             file_list, skipped_count = self._plan_work(file_list)
 
@@ -568,10 +866,16 @@ class VideoProcessorWorker(QThread):
         local_copy = None
         local_sub_copy = None
         tmp_dir = None
+        partial_file = None
         try:
             # Get filename and build output path
             video_filename = os.path.basename(video_file)
             output_file = os.path.join(out_dir, self._get_output_filename(video_file))
+            # FFmpeg writes here and the file is renamed to output_file only once
+            # it is complete and verified, so a stop, a kill or a crash never
+            # leaves a half-encoded video under the real name (which a later
+            # --skip-existing run would count as done).
+            partial_file = output_file + ".partial"
 
             self.progress_update.emit(f"Processing: {video_filename}")
 
@@ -597,8 +901,21 @@ class VideoProcessorWorker(QThread):
                             tmp_dir, os.path.basename(sub_file))
                         shutil.copy2(sub_file, local_sub_copy)
 
+            is_avi = video_file.lower().endswith(".avi")
+            # Videos with their own timestamps (mp4, mkv, ...): frames lost in the
+            # source leave a jump that the fps filter fills with copies of the last
+            # frame; find the jumps first so the encode draws those frames black
+            gaps = None
+            if self.recover_damaged and not is_avi:
+                gaps = self._probe_gaps(ffmpeg_input, video_filename)
+
+            # Already what the encode would make: copy it as it is
+            if self.stream_copy and self._try_stream_copy(
+                    ffmpeg_input, video_file, partial_file, output_file, gaps, is_avi):
+                return True
+
             # Build FFmpeg command based on settings
-            cmd = self.build_ffmpeg_command(ffmpeg_input, output_file)
+            cmd = self.build_ffmpeg_command(ffmpeg_input, partial_file, gaps=gaps)
 
             # When burning subtitles we run ffmpeg from the video's own folder so
             # the .smi can be referenced by basename in the filtergraph (avoids
@@ -622,6 +939,9 @@ class VideoProcessorWorker(QThread):
                 bufsize=1,
                 cwd=run_cwd
             )
+            # Windows throttles windowless children onto the E-cores once the
+            # display is off; ffmpeg does not inherit our opt-out (see power.py).
+            keep_full_speed(process.pid)
 
             # Use a background thread to read lines from stdout so we can
             # detect stalls without blocking (works cross-platform, inc. Windows).
@@ -658,6 +978,11 @@ class VideoProcessorWorker(QThread):
                         process.wait(timeout=5)
                     except subprocess.TimeoutExpired:
                         process.kill()
+                        process.wait()
+                    # The half-encoded partial is thrown away (finally below);
+                    # the file starts over on the next run.
+                    self.progress_update.emit(
+                        f"⏹ Stopped: {video_filename} (partial output discarded)")
                     return False
 
                 try:
@@ -675,13 +1000,7 @@ class VideoProcessorWorker(QThread):
                             process.wait(timeout=5)
                         except subprocess.TimeoutExpired:
                             pass
-                        # Clean up partial output
-                        try:
-                            if os.path.exists(output_file):
-                                os.remove(output_file)
-                        except Exception:
-                            pass
-                        return False
+                        return False  # the partial output is removed in finally
                     continue
 
                 if line is None:
@@ -708,13 +1027,26 @@ class VideoProcessorWorker(QThread):
                     for ln in list(recent_lines)[-12:]:
                         self.progress_update.emit(f"    │ {ln}")
                     self.progress_update.emit("    ────────────────────────")
-                # Clean up partial output file
-                try:
-                    if os.path.exists(output_file):
-                        os.remove(output_file)
-                except Exception:
-                    pass
-                return False
+                if not (self.recover_damaged and is_avi and not self.should_stop
+                        and self._recover_avi(ffmpeg_input, video_file, partial_file)):
+                    return False  # the partial output is removed in finally
+            elif self.recover_damaged and is_avi:
+                why = None
+                if not self._avi_header_intact(ffmpeg_input):
+                    why = "its header is lost, so FFmpeg read only what it could guess"
+                else:
+                    lost = self._lost_time(ffmpeg_input, partial_file)
+                    if lost:
+                        why = (f"the encode is {lost:,.0f} s shorter than the recording (frames "
+                               f"lost in the source were left out, so the video runs ahead of "
+                               f"its clock)")
+                if why:
+                    self.progress_update.emit(f"⚠️ {video_filename}: {why}")
+                    if not self._recover_avi(ffmpeg_input, video_file, partial_file):
+                        self.progress_update.emit(
+                            "  keeping the shortened encode")
+            elif gaps and gaps.gaps:
+                self._write_gap_csv(gaps, partial_file, video_filename)
 
             # --- Post-processing verification: confirm output resolution ---
             if self.resolution == "1080p":
@@ -722,20 +1054,17 @@ class VideoProcessorWorker(QThread):
             else:
                 target_w, target_h = 1280, 720
 
-            res = self._get_video_resolution(output_file)
+            res = self._get_video_resolution(partial_file)
             if res is not None:
                 actual_w, actual_h = res
                 if actual_w != target_w or actual_h != target_h:
                     self.progress_update.emit(
                         f"⚠️ Resolution mismatch after processing {video_filename}: "
                         f"got {actual_w}x{actual_h}, expected {target_w}x{target_h}")
-                    # Remove the bad output so it doesn't pollute future skip checks
-                    try:
-                        os.remove(output_file)
-                    except Exception:
-                        pass
-                    return False
+                    return False  # the bad partial is removed in finally
 
+            # Complete: give it the real name (replaces an older output, if any)
+            os.replace(partial_file, output_file)
             self.progress_update.emit(f"✅ Completed: {video_filename}")
             return True
 
@@ -744,14 +1073,41 @@ class VideoProcessorWorker(QThread):
             return False
 
         finally:
+            # Whatever stopped the encode (Stop, a failure, a stall, an error),
+            # its half-written output is thrown away.
+            if partial_file and os.path.exists(partial_file):
+                try:
+                    os.remove(partial_file)
+                except Exception:
+                    pass
             if tmp_dir:
                 try:
                     shutil.rmtree(tmp_dir, ignore_errors=True)
                 except Exception:
                     pass
     
-    def build_ffmpeg_command(self, input_file, output_file):
-        """Build the FFmpeg command based on user settings with SLEAP-compatible frame handling"""
+    def _encoder_args(self):
+        """The encoder part of the FFmpeg command: the chosen codec and its quality.
+
+        CPU codecs (libx265/libx264) take the speed preset and CRF. The NVIDIA GPU
+        encoders (*_nvenc) have neither: they run constant-quality VBR at the
+        balanced preset p4, with CQ = CRF + 8. On VT-P001 resource-zone IR video
+        (720p HEVC sources, 2026-10-23) CQ 28 matched x265 ultrafast CRF 20 in
+        SSIM against the source (0.945 vs 0.942) at about 1.5x the size at 720p,
+        but upscaled to 1080p the files came out ~3.7x x265's (500 vs 136 kbps)
+        at the same speed (decode + scale on the CPU set the pace). Use them to
+        keep encoding off an unstable CPU, not as the standard settings.
+        """
+        if self.codec.endswith("_nvenc"):
+            return ["-c:v", self.codec, "-preset", "p4", "-rc", "vbr",
+                    "-cq", str(min(51, int(self.crf_quality) + 8)), "-b:v", "0"]
+        return ["-vcodec", self.codec,                 # libx265 or libx264
+                "-preset", self.preset,                # speed preset
+                "-crf", str(self.crf_quality)]         # quality (0-51): lower is better
+
+    def build_ffmpeg_command(self, input_file, output_file, gaps=None):
+        """Build the FFmpeg command based on user settings with SLEAP-compatible frame handling.
+        ``gaps`` (frame_gaps.FrameGaps): stretches of lost frames, drawn black."""
         
         # Get resolution dimensions
         if self.resolution == "1080p":
@@ -765,9 +1121,7 @@ class VideoProcessorWorker(QThread):
             "-hwaccel", "none",
             "-threads", "4",
             "-i", input_file,
-            "-vcodec", self.codec,               # User-selected codec (libx265 or libx264)
-            "-preset", self.preset,              # User-selected speed preset
-            "-crf", str(self.crf_quality),       # Quality (0-51): lower is better
+        ] + self._encoder_args() + [
             "-pix_fmt", "yuv420p",
         ]
         
@@ -779,7 +1133,14 @@ class VideoProcessorWorker(QThread):
             "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709",
             f"fps={self.frame_rate}",
         ]
-        
+        # Lost stretches: the fps filter repeats the last frame across them; paint
+        # those frames black (t is still the source's time here)
+        if gaps is not None:
+            from fnt.videoProcessing.frame_gaps import blackout_filter
+            box = blackout_filter(gaps, self.frame_rate)
+            if box:
+                video_filters.append(box)
+
         # Add audio option
         if self.remove_audio:
             cmd.append("-an")  # Remove audio
@@ -841,8 +1202,29 @@ class VideoProcessorWorker(QThread):
                     f"{os.path.basename(input_file)} — processing without timestamps")
 
         video_filter = ",".join(video_filters)
-        cmd.extend(["-vf", video_filter, output_file])
+        # The container is named, not read from the extension: the encode
+        # writes to "<output>.partial" (see process_single_file).
+        cmd.extend(["-vf", video_filter, "-f", self.output_format, output_file])
 
+        return cmd
+
+
+    def build_raw_encoder_command(self, width, height, pix_fmt, fps, output_file):
+        """FFmpeg command that encodes raw frames from stdin (width x height,
+        ``pix_fmt``, at ``fps``) with this run's settings: frame rate, scaling and
+        padding, grayscale, encoder. Used to rebuild damaged AVIs; no audio."""
+        width_t, height_t = self._target_resolution()
+        vf = [f"fps={self.frame_rate}",
+              f"scale={width_t}:{height_t}:force_original_aspect_ratio=decrease:eval=frame",
+              f"pad={width_t}:{height_t}:-1:-1:color=black"]
+        if self.grayscale:
+            vf.append("format=gray")
+        cmd = ["ffmpeg", "-y", "-nostdin", "-v", "error",
+               "-f", "rawvideo", "-pix_fmt", pix_fmt, "-s", f"{width}x{height}",
+               "-r", f"{fps:g}", "-i", "pipe:"]
+        cmd += self._encoder_args() + ["-pix_fmt", "yuv420p", "-an",
+                                       "-movflags", "+faststart",
+                                       "-vf", ",".join(vf), "-f", self.output_format, output_file]
         return cmd
 
 
@@ -1402,6 +1784,33 @@ class VideoProcessingGUI(QMainWindow):
         group_layout.addWidget(self.subtitle_style_btn, row, 1, 1, 1)
         row += 1
 
+        # Damaged AVIs: rebuild at real length
+        self.recover_check = QCheckBox("Keep damaged videos at their real length (lost frames black)")
+        self.recover_check.setChecked(True)
+        self.recover_check.setToolTip(
+            "When an AVI has lost blocks (FFmpeg cannot open it, or its encode comes out "
+            "shorter than the recording), rebuild it from the frames that survive, each at "
+            "its real time, with black where frames are lost, so the video stays in step "
+            "with the camera clock. In an mp4, mkv or other video with its own timestamps, "
+            "frames lost in the source are drawn black instead of repeating the last frame "
+            "before them. A frames CSV in proc/recovered_frames/ lists what is recovered "
+            "and what is black.")
+        group_layout.addWidget(self.recover_check, row, 0, 1, 2)
+        row += 1
+
+        # Stream copy: keep a source that already is what the encode would make
+        self.stream_copy_check = QCheckBox("Copy videos that need no re-encoding (much faster)")
+        self.stream_copy_check.setChecked(True)
+        self.stream_copy_check.setToolTip(
+            "A video that is already H.264/H.265 at the chosen size and frame rate, gray "
+            "(when Convert to Grayscale is on), with no lost frames, is copied into the "
+            "output as it is: no re-encoding, so it takes seconds instead of minutes and "
+            "loses no detail; audio is dropped as usual. Its file is larger than an x265 "
+            "encode (about the camera's own bitrate). Anything else (other codecs, sizes "
+            "or frame rates, colour, lost frames) is encoded with the settings below.")
+        group_layout.addWidget(self.stream_copy_check, row, 0, 1, 2)
+        row += 1
+
         # Remove whitespace from output filenames option
         self.replace_whitespace_check = QCheckBox("Remove whitespace from filenames")
         self.replace_whitespace_check.setChecked(False)
@@ -1477,9 +1886,14 @@ class VideoProcessingGUI(QMainWindow):
         # Video Codec option
         advanced_layout.addWidget(QLabel("Video Codec:"), 0, 0)
         self.codec_combo = QComboBox()
-        self.codec_combo.addItems(["libx265 (H.265/HEVC)", "libx264 (H.264/AVC)"])
+        self.codec_combo.addItems(["libx265 (H.265/HEVC)", "libx264 (H.264/AVC)",
+                                   "hevc_nvenc (H.265, NVIDIA GPU)", "h264_nvenc (H.264, NVIDIA GPU)"])
         self.codec_combo.setCurrentText("libx265 (H.265/HEVC)")
-        self.codec_combo.setToolTip("Video codec: H.265 offers better compression but slower encoding; H.264 is more compatible")
+        self.codec_combo.setToolTip(
+            "Video codec: H.265 offers better compression but slower encoding; H.264 is more compatible.\n"
+            "The NVIDIA GPU encoders (nvenc) take the encoding off the CPU. They ignore the speed preset and\n"
+            "use quality CQ = CRF + 8. Their files are much larger than x265's (~3.7x for 720p video upscaled\n"
+            "to 1080p), so x265 stays the standard.")
         advanced_layout.addWidget(self.codec_combo, 0, 1)
         
         # Speed Preset option
@@ -1868,7 +2282,14 @@ class VideoProcessingGUI(QMainWindow):
             if os.path.exists(expected_output) and os.path.getsize(expected_output) > 0:
                 already_processed_count += 1
 
-        if already_processed_count > 0:
+        if already_processed_count > 0 and getattr(self, '_auto_skip_existing', False):
+            # --skip-existing: an unattended launch answers "Skip Already
+            # Processed" itself instead of waiting on the dialog.
+            skip_already_processed = True
+            self.log_message(
+                f"Skipping videos already processed ({already_processed_count} of "
+                f"{total_video_count} have output in proc/) -- --skip-existing")
+        elif already_processed_count > 0:
             msg_box = QMessageBox(self)
             msg_box.setWindowTitle("Already Processed Videos Detected")
             msg_box.setText(
@@ -1911,7 +2332,7 @@ class VideoProcessingGUI(QMainWindow):
         self.log_message("Starting video preprocessing...")
         self.log_message(f"Settings: {frame_rate} fps, {resolution}, {codec}, Preset: {preset}, CRF: {crf_quality}, Format: {output_format}")
         self.log_message(f"Input types: {self.input_types_combo.currentText()}")
-        self.log_message(f"Options: Grayscale: {grayscale}, Remove Audio: {remove_audio}, Contrast: {apply_clahe}, Remove Whitespace: {replace_whitespace}")
+        self.log_message(f"Options: Grayscale: {grayscale}, Remove Audio: {remove_audio}, Contrast: {apply_clahe}, Remove Whitespace: {replace_whitespace}, Keep damaged videos at real length: {self.recover_check.isChecked()}, Copy videos that need no re-encoding: {self.stream_copy_check.isChecked()}")
         if filename_prefix or filename_suffix:
             self.log_message(
                 f"Filename: prefix='{filename_prefix}', suffix='{filename_suffix}'")
@@ -1943,7 +2364,10 @@ class VideoProcessingGUI(QMainWindow):
             replace_whitespace=replace_whitespace,
             filename_prefix=filename_prefix,
             filename_suffix=filename_suffix,
-            input_extensions=input_extensions
+            input_extensions=input_extensions,
+            shard=getattr(self, '_shard', None),
+            recover_damaged=self.recover_check.isChecked(),
+            stream_copy=self.stream_copy_check.isChecked(),
         )
         self.worker.progress_update.connect(self.log_message)
         self.worker.file_progress.connect(self.update_file_progress)
@@ -2144,19 +2568,79 @@ class VideoProcessingGUI(QMainWindow):
             event.accept()
 
 
-def main():
+def _launch_parser():
+    """``--input-dir DIR`` (repeatable) preselects folders; ``--start`` then
+    runs them with the window's default settings, exactly as pressing Start
+    would -- so a dictated or queued run still shows its progress on screen."""
+    import argparse
+    p = argparse.ArgumentParser(prog="video-preprocessing",
+                                description="FNT Video PreProcessing.")
+    p.add_argument("--input-dir", action="append", default=[], metavar="DIR",
+                   help="Folder of videos to process (repeatable).")
+    p.add_argument("--start", action="store_true",
+                   help="Start processing the --input-dir folders at once, "
+                        "with the default settings.")
+    p.add_argument("--codec", default=None, metavar="CODEC",
+                   help="Video codec to select: libx265, libx264, hevc_nvenc or "
+                        "h264_nvenc (the last two encode on an NVIDIA GPU).")
+    p.add_argument("--skip-existing", action="store_true",
+                   help="Skip videos that already have an output in proc/ without "
+                        "asking (to resume an unattended run).")
+    p.add_argument("--shard", default=None, metavar="K/N",
+                   help="Process only part K of N of the files (split by file name), "
+                        "so N windows started with 1/N .. N/N encode one folder in "
+                        "parallel without taking the same file.")
+    p.add_argument("--no-stream-copy", action="store_true",
+                   help="Re-encode every video, also those that could be copied as they are.")
+    return p
+
+
+def apply_launch_args(window, args) -> None:
+    """Preselect ``args.input_dir`` in ``window``, the ``args.codec`` and the
+    ``args.shard``; start if ``args.start``."""
+    if getattr(args, 'shard', None):
+        try:
+            window._shard = parse_shard(args.shard)
+        except ValueError as e:
+            raise SystemExit(f"--shard: {e}")
+        window.setWindowTitle(f"{window.windowTitle()} (shard {args.shard})")
+    if getattr(args, 'codec', None):
+        items = [window.codec_combo.itemText(i) for i in range(window.codec_combo.count())]
+        match = [t for t in items if t.split()[0] == args.codec]
+        if not match:
+            raise SystemExit(f"--codec {args.codec}: not one of "
+                             + ", ".join(t.split()[0] for t in items))
+        window.codec_combo.setCurrentText(match[0])
+    window._auto_skip_existing = bool(getattr(args, 'skip_existing', False))
+    if getattr(args, 'no_stream_copy', False):
+        window.stream_copy_check.setChecked(False)
+    for d in args.input_dir:
+        d = os.path.abspath(d)
+        if os.path.isdir(d) and d not in window.selected_dirs:
+            window.selected_dirs.append(d)
+    if window.selected_dirs:
+        window.update_directory_display()
+        window.start_btn.setEnabled(True)
+        if args.start:
+            QTimer.singleShot(500, window.start_processing)
+
+
+def main(argv=None):
     """Main entry point"""
     if not PYQT_AVAILABLE:
         print("PyQt5 is required for this tool. Please install it with: pip install PyQt5")
         return
-    
-    app = QApplication(sys.argv)
+
+    args, qt_args = _launch_parser().parse_known_args(
+        sys.argv[1:] if argv is None else argv)
+    app = QApplication([sys.argv[0]] + qt_args)
     app.setApplicationName("Video Processing Tool")
     app.setApplicationVersion("1.0")
-    
+
     window = VideoProcessingGUI()
     window.show()
-    
+    apply_launch_args(window, args)
+
     sys.exit(app.exec_())
 
 

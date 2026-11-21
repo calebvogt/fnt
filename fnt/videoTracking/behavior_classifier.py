@@ -160,6 +160,155 @@ def normalize_features(vec: np.ndarray, mean, std) -> np.ndarray:
             / np.asarray(std, dtype=np.float32)).astype(np.float32)
 
 
+def video_key(path: Optional[str]) -> str:
+    """Grouping key for a clip's source video.
+
+    The file name rather than the full path, so one video reached through two
+    drive mappings (Z:\\ and a UNC share) is still one group. Two different
+    videos that happen to share a name merge into one group, which only makes
+    the split coarser, never leakier.
+    """
+    return os.path.basename(str(path or "")).lower()
+
+
+def grouped_split(labels, videos, clips, val_fraction: float, seed: int = 0):
+    """Hold out whole videos for validation, keeping every class represented.
+
+    Samples are one labelled animal in one clip. Splitting them at random puts
+    near-copies on both sides: the same huddle seen from each of its two mice,
+    and neighbouring clips of the same animals in the same light. Validation
+    then measures memory of a session rather than recognition of a behaviour.
+    Holding out whole videos asks the question that matters: does the model
+    score video it has never seen?
+
+    With a single source video there is nothing to hold out, so whole clips
+    are held out instead (one clip's animals always stay together) and
+    ``info["unit"]`` says so; that score is still optimistic.
+
+    Videos are chosen greedily to bring each class's validation share towards
+    ``val_fraction`` without overshooting it. A class found in only one video
+    keeps that video in training, because holding it out would leave nothing
+    to learn the class from; it is reported in ``info["train_only_classes"]``.
+
+    Returns ``(train_idx, val_idx, info)``.
+    """
+    import random
+    from collections import Counter
+
+    labels = list(labels)
+    n = len(labels)
+    video_keys = [video_key(v) if v else f"clip:{c}" for v, c in zip(videos, clips)]
+    if len(set(video_keys)) >= 2:
+        unit_kind, units = "video", video_keys
+    else:
+        unit_kind, units = "clip", [str(c) for c in clips]
+
+    n_cls = Counter(labels)
+    unit_counts: Dict[str, Counter] = {}
+    for u, lbl in zip(units, labels):
+        unit_counts.setdefault(u, Counter())[lbl] += 1
+    units_with: Dict[object, set] = {}
+    for u, cnt in unit_counts.items():
+        for lbl in cnt:
+            units_with.setdefault(lbl, set()).add(u)
+
+    info = {
+        "unit": unit_kind,
+        "seed": seed,
+        "val_units": [],
+        "train_only_classes": sorted(
+            (lbl for lbl, us in units_with.items() if len(us) < 2), key=str),
+    }
+
+    val: set = set()
+    if val_fraction > 0 and len(unit_counts) >= 2:
+        order = sorted(unit_counts)
+        random.Random(seed).shuffle(order)
+        target = {lbl: val_fraction * k for lbl, k in n_cls.items()}
+        got: Counter = Counter()
+
+        def keeps_training(u):
+            # Every class must keep at least one unit on the training side.
+            return all(len(units_with[lbl] - val - {u}) >= 1 for lbl in unit_counts[u])
+
+        def gain(u):
+            g = 0.0
+            for lbl, k in unit_counts[u].items():
+                need = max(0.0, target[lbl] - got[lbl])
+                g += (min(k, need) - 0.5 * max(0.0, k - need)) / n_cls[lbl]
+            return g
+
+        while sum(got.values()) < val_fraction * n:
+            cands = [u for u in order if u not in val and keeps_training(u)]
+            if not cands:
+                break
+            best = max(cands, key=gain)  # ties go to the earliest in shuffled order
+            if gain(best) <= 0:
+                break
+            val.add(best)
+            got.update(unit_counts[best])
+
+        # A class that could be validated but drew no validation examples gets
+        # its smallest eligible unit, even if that overshoots the fraction.
+        for lbl in sorted(n_cls, key=str):
+            if got[lbl] or len(units_with[lbl]) < 2:
+                continue
+            cands = [u for u in order
+                     if lbl in unit_counts[u] and u not in val and keeps_training(u)]
+            if cands:
+                pick = min(cands, key=lambda u: sum(unit_counts[u].values()))
+                val.add(pick)
+                got.update(unit_counts[pick])
+
+    train_idx = [i for i in range(n) if units[i] not in val]
+    val_idx = [i for i in range(n) if units[i] in val]
+    info["val_units"] = sorted(val)
+    info["n_units"] = len(unit_counts)
+    info["per_class"] = {
+        lbl: {"train": sum(1 for i in train_idx if labels[i] == lbl),
+              "val": sum(1 for i in val_idx if labels[i] == lbl)}
+        for lbl in sorted(n_cls, key=str)
+    }
+    info["classes_without_val"] = [
+        lbl for lbl, c in info["per_class"].items() if c["val"] == 0]
+    return train_idx, val_idx, info
+
+
+def classification_report(y_true, y_pred, n_classes: int) -> dict:
+    """Confusion matrix and per-class precision, recall and F1.
+
+    Behaviour classes are badly unbalanced -- hours of resting for seconds of
+    fighting -- so plain accuracy mostly measures the common class. Balanced
+    accuracy (mean per-class recall) and macro F1 weight every behaviour
+    equally; classes absent from ``y_true`` are left out of both averages.
+    """
+    cm = np.zeros((n_classes, n_classes), dtype=np.int64)
+    for t, p in zip(y_true, y_pred):
+        cm[int(t), int(p)] += 1
+    support = cm.sum(axis=1)
+    predicted = cm.sum(axis=0)
+    tp = np.diag(cm).astype(np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        recall = np.where(support > 0, tp / np.maximum(support, 1), np.nan)
+        precision = np.where(predicted > 0, tp / np.maximum(predicted, 1),
+                             np.where(support > 0, 0.0, np.nan))
+        f1 = np.where((precision + recall) > 0,
+                      2 * precision * recall / (precision + recall), 0.0)
+    f1 = np.where(support > 0, f1, np.nan)
+    present = support > 0
+    total = int(cm.sum())
+    return {
+        "confusion": cm,
+        "support": support,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "accuracy": float(tp.sum() / total) if total else 0.0,
+        "balanced_accuracy": float(np.nanmean(recall[present])) if present.any() else 0.0,
+        "macro_f1": float(np.nanmean(f1[present])) if present.any() else 0.0,
+    }
+
+
 def image_to_tensor(scene: np.ndarray):
     """(H, W, C) uint8 composite to a normalised CHW float tensor."""
     import torch

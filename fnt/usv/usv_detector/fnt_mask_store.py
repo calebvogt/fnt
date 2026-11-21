@@ -398,22 +398,26 @@ def set_infer_run_attrs(h5_path: str, **params) -> None:
                 f.attrs[k] = round(float(v), 6)
 
 
+def _run_attrs(f) -> Dict:
+    out: Dict = {}
+    for k in _RUN_KEYS:
+        if k in f.attrs:
+            v = f.attrs[k]
+            out[k] = (v.decode() if isinstance(v, bytes)
+                      else v.item() if hasattr(v, "item") else v)
+    return out
+
+
 def get_infer_run_attrs(h5_path: str) -> Dict:
     """The last run's settings, or {} when inference has never been run."""
     _require_h5()
     if not os.path.isfile(h5_path):
         return {}
-    out: Dict = {}
     try:
         with h5py.File(h5_path, "r") as f:
-            for k in _RUN_KEYS:
-                if k in f.attrs:
-                    v = f.attrs[k]
-                    out[k] = (v.decode() if isinstance(v, bytes)
-                              else v.item() if hasattr(v, "item") else v)
+            return _run_attrs(f)
     except Exception:
         return {}
-    return out
 
 
 def was_inferred(h5_path: str) -> bool:
@@ -499,18 +503,44 @@ def review_complete_at(h5_path: str) -> str:
         return ""
 
 
+def _grid_attrs(f) -> Dict:
+    out: Dict = {}
+    for k in _GRID_KEYS:
+        if k in f.attrs:
+            out[k] = int(f.attrs[k])
+    if "schema_version" in f.attrs:
+        out["schema_version"] = int(f.attrs["schema_version"])
+    return out
+
+
 def get_grid_attrs(h5_path: str) -> Dict:
     """Return the recorded grid params, or {} if the file/attrs are absent."""
     _require_h5()
     if not os.path.isfile(h5_path):
         return {}
-    out: Dict = {}
     with h5py.File(h5_path, "r") as f:
-        for k in _GRID_KEYS:
-            if k in f.attrs:
-                out[k] = int(f.attrs[k])
-        if "schema_version" in f.attrs:
-            out["schema_version"] = int(f.attrs["schema_version"])
+        return _grid_attrs(f)
+
+
+def read_store_summary(h5_path: str, preds: bool = False,
+                       example_meta: bool = False) -> Dict:
+    """What a reader of many recordings needs from one store, in ONE open.
+
+    ``{grid, run}`` (as :func:`get_grid_attrs` and :func:`get_infer_run_attrs`),
+    plus ``preds`` (as :func:`read_all_pred_masks`) and ``example_meta`` (as
+    :func:`td_iter_meta`, a list) when asked. Each of those opens the file on
+    its own, and on a network share an open costs ~9 ms before anything is
+    read -- six minutes of opening alone for a 40,000-recording run read four
+    times over (mad_export). Raises OSError when the file cannot be opened,
+    e.g. while MAD is writing it.
+    """
+    _require_h5()
+    with h5py.File(h5_path, "r") as f:
+        out = {"grid": _grid_attrs(f), "run": _run_attrs(f)}
+        if preds:
+            out["preds"] = _pred_records(f)
+        if example_meta:
+            out["example_meta"] = list(_iter_meta(f))
     return out
 
 
@@ -612,8 +642,250 @@ PRED_GROUP = "pred_calls"
 #: the next file switch. Running it per recording during a batch is the whole
 #: point of the inference toggle, and that needs somewhere on the crop to put
 #: the answer.
+#: ``joined_from`` (the blob_ids, comma-separated) and ``n_pieces`` mark a
+#: detection that ``mad join-fragments`` made from several (mad_join,
+#: 2026-11-09). They are listed here so a GUI rewrite of the crop keeps them:
+#: a string survives the str() below, where a list attr would not.
 PRED_ATTRS = ("score", "class", "model_name", "threshold", "min_blob_pixels",
-              "harmonic_call_id", "harmonic_n", "f0_hz")
+              "harmonic_call_id", "harmonic_n", "f0_hz", "joined_from", "n_pieces")
+# Read back with them; written only by _store_ridge (computed, never copied).
+_RIDGE_ATTRS = ("ridge_turns", "ridge_rate_hz", "ridge_depth_khz", "ridge_trill")
+
+#: The spectrogram image (uint8, MAD's 0-255 levels) inside each prediction
+#: crop, saved beside its mask as ``/pred_specs/<blob_id>`` (same shape and
+#: offsets). A mask says where a call is; these levels say what it looks like
+#: inside, so a call's contour (e.g. the brightest continuous path through
+#: the mask) can be measured from the store without the audio. A mask drawn as
+#: a blob over a fast trill has a flat centroid; the levels inside do not.
+PRED_SPEC_GROUP = "pred_specs"
+
+#: The brightness ridge of each prediction with a stored spectrogram (see
+#: mad_ridge): ``/pred_ridge/<blob_id>`` holds the ridge in kHz per time column of
+#: the crop (NaN where the mask is empty), and the crop's dataset carries
+#: ``ridge_turns``, ``ridge_rate_hz``, ``ridge_depth_khz`` and ``ridge_trill``.
+#: Recomputed whenever a crop is written with its spectrogram.
+PRED_RIDGE_GROUP = "pred_ridge"
+
+
+#: Whether MAD computes brightness ridges at all: the project setting ``ridge`` (on by default),
+#: applied by the GUI when a project opens and by ``mad infer --no-ridge``. Off, every write
+#: still drops a stale ridge but stores no new one, and the backfills do nothing.
+_RIDGE_ON = True
+
+
+def set_ridge_enabled(on: bool) -> None:
+    """Turn ridge computation on or off for this process (see :data:`_RIDGE_ON`)."""
+    global _RIDGE_ON
+    _RIDGE_ON = bool(on)
+
+
+def ridge_enabled() -> bool:
+    return _RIDGE_ON
+
+
+#: Root attr: the :data:`mad_ridge.RIDGE_VERSION` this file's ridges were completed under, set
+#: once every detection with a spectrogram and every label has its ridge (as far as the file
+#: allows: no grid, no spectrogram or no pixels inside a label's bounds leave none). A file
+#: without it is checked, filled and stamped by :func:`fill_ridges`.
+RIDGE_VERSION_ATTR = "ridge_version"
+
+
+def _unstamp(f) -> None:
+    if RIDGE_VERSION_ATTR in f.attrs:
+        del f.attrs[RIDGE_VERSION_ATTR]
+
+
+def _ridge_units(f):
+    """(kHz per bin, ms per frame) from a file's grid attrs, or None."""
+    try:
+        sr = float(f.attrs["sample_rate"])
+        nperseg, noverlap, nfft = (int(f.attrs["nperseg"]), int(f.attrs["noverlap"]),
+                                   int(f.attrs["nfft"]))
+    except KeyError:
+        return None
+    from .mad_ridge import grid_units
+    return grid_units(sr, nperseg, noverlap, nfft)
+
+
+def _store_ridge(f, key: str, ds, m: np.ndarray, spec, units) -> None:
+    """Compute and store one crop's ridge (attrs on ``ds``, path in /pred_ridge);
+    without a spectrogram or grid, drop any stale one."""
+    from .mad_ridge import RIDGE_ATTRS, ridge_measures
+    rgrp = f.get(PRED_RIDGE_GROUP)
+    if rgrp is not None and key in rgrp:
+        del rgrp[key]
+    for k in RIDGE_ATTRS:
+        if k in ds.attrs:
+            del ds.attrs[k]
+    if not _RIDGE_ON:
+        _unstamp(f)                            # a later fill must look at this crop again
+        return
+    if spec is None or units is None or np.asarray(spec).shape != m.shape:
+        return
+    res = ridge_measures(np.asarray(spec), m > 0, units[0], units[1],
+                         f_off=int(ds.attrs.get("f_off", 0)))
+    if res is None:
+        return
+    for k in RIDGE_ATTRS:
+        ds.attrs[k] = res[k]
+    f.require_group(PRED_RIDGE_GROUP).create_dataset(
+        key, data=res["khz"], compression="gzip", compression_opts=4)
+
+
+#: A training example's ridge: the dataset ``ridge`` in its group (kHz per time
+#: frame of the call's own span, NaN where its mask is empty there), the attr
+#: ``ridge_t_off`` (the patch frame that span starts at) and the measures as
+#: attrs, named as on a prediction. Recomputed whenever an example is written,
+#: its mask changes or its bounds change.
+EXAMPLE_RIDGE_DS = "ridge"
+_EXAMPLE_BOUNDS = ("t_start_s", "t_stop_s", "f_low_hz", "f_high_hz", "patch_t0_s")
+
+
+def example_ridge(spec, mask, meta) -> Optional[Dict]:
+    """The brightness ridge of one training example (see mad_ridge), or None.
+
+    The call's own pixels are its mask inside its time and frequency bounds
+    from ``meta`` -- the cut the 2021_8x8_Mus analysis makes of a verified
+    call, so the two agree. ``spec`` is the patch (uint8 0-255, or a float
+    image in [0, 1], scaled as it is stored). The result carries ``t_off``, the
+    patch frame the ridge starts at."""
+    from .mad_examples import _bbox_from_meta
+    from .mad_ridge import grid_units, ridge_measures
+    meta = meta or {}
+    box = _bbox_from_meta(meta)
+    if box is None:
+        return None
+    try:
+        df_khz, dt_ms = grid_units(float(meta["sample_rate"]), int(meta["nperseg"]),
+                                   int(meta["noverlap"]), int(meta["nfft"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+    m = np.asarray(mask) > 0
+    s = np.asarray(spec)
+    if s.shape != m.shape:
+        return None
+    if s.dtype != np.uint8:
+        s = (np.clip(s, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+    f0, f1, t0, t1 = box
+    f1, t1 = min(f1, m.shape[0]), min(t1, m.shape[1])
+    if f1 <= f0 or t1 <= t0:
+        return None
+    res = ridge_measures(s[f0:f1, t0:t1], m[f0:f1, t0:t1], df_khz, dt_ms, f_off=f0)
+    if res is not None:
+        res["t_off"] = int(t0)
+    return res
+
+
+def store_example_ridge(g, spec=None, mask=None, meta=None) -> Optional[Dict]:
+    """(Re)compute an example group's ridge, dropping any stale one first.
+
+    ``spec``, ``mask`` and ``meta`` default to what the group holds. Returns
+    the measures stored (``{ridge_turns, ...}``) plus the ridge itself
+    (``khz``, starting at patch frame ``t_off``) for the overlay, or None when
+    the example has no ridge (no pixels inside its bounds, or no grid in its
+    meta). Never raises: a ridge must not stop a label from being saved."""
+    from .mad_ridge import RIDGE_ATTRS
+    try:
+        if EXAMPLE_RIDGE_DS in g:
+            del g[EXAMPLE_RIDGE_DS]
+        for k in RIDGE_ATTRS + ("ridge_t_off",):
+            if k in g.attrs:
+                del g.attrs[k]
+        if not _RIDGE_ON:
+            _unstamp(g.file)
+            return None
+        if spec is None:
+            spec = g["spec"][()]
+        if mask is None:
+            mask = g["mask"][()]
+        if meta is None:
+            meta = json.loads(g.attrs.get("meta_json", "{}"))
+        res = example_ridge(spec, mask, meta)
+        if res is None:
+            return None
+        for k in RIDGE_ATTRS:
+            g.attrs[k] = res[k]
+        g.attrs["ridge_t_off"] = res["t_off"]
+        g.create_dataset(EXAMPLE_RIDGE_DS, data=res["khz"], compression="gzip",
+                         compression_opts=4)
+        out = {k: res[k] for k in RIDGE_ATTRS}
+        out.update(khz=res["khz"], t_off=res["t_off"])
+        return out
+    except Exception:
+        return None
+
+
+def _stale_pieces(f, mask) -> bool:
+    """True for a mask in several pieces whose ridge may predate per-piece ridges (the file
+    is not stamped with the current :data:`RIDGE_VERSION_ATTR`)."""
+    from .mad_ridge import RIDGE_VERSION, mask_pieces
+    if int(f.attrs.get(RIDGE_VERSION_ATTR, 0)) >= RIDGE_VERSION:
+        return False
+    return len(mask_pieces(np.asarray(mask) > 0)) > 1
+
+
+def add_example_ridges(h5_path: str, overwrite: bool = False,
+                       redo_pieces: bool = False) -> int:
+    """Store the brightness ridge of every training example that has none yet
+    (all of them with ``overwrite``), in a recording's .mad or a project's
+    training store. No audio needed. ``redo_pieces`` also recomputes a
+    multi-piece mask whose ridge may predate per-piece ridges (in a file not
+    yet stamped; it reads every mask). Returns the number stored."""
+    _require_h5()
+    if not _RIDGE_ON or not os.path.isfile(h5_path):
+        return 0
+    n = 0
+    with h5py.File(h5_path, "a") as f:
+        ex = f.get("examples")
+        if ex is None:
+            return 0
+        for key in list(ex.keys()):
+            g = ex[key]
+            if (not overwrite and "ridge_turns" in g.attrs
+                    and not (redo_pieces and _stale_pieces(f, g["mask"][()]))):
+                continue
+            n += store_example_ridge(g) is not None
+    return n
+
+
+def read_example_ridges(h5_path: str) -> Dict[str, Dict]:
+    """``{example_id: {kind, blob_id, ridge_turns, ...}}`` for every training
+    example with a stored ridge (attributes only)."""
+    from .mad_ridge import RIDGE_ATTRS
+    _require_h5()
+    out: Dict[str, Dict] = {}
+    if not os.path.isfile(h5_path):
+        return out
+    with h5py.File(h5_path, "r") as f:
+        ex = f.get("examples")
+        if ex is None:
+            return out
+        for key in ex:
+            g = ex[key]
+            if "ridge_turns" not in g.attrs:
+                continue
+            try:
+                meta = json.loads(g.attrs.get("meta_json", "{}"))
+            except Exception:
+                meta = {}
+            rec = {"kind": example_kind(meta), "blob_id": meta.get("blob_id")}
+            for k in RIDGE_ATTRS:
+                if k in g.attrs:
+                    v = g.attrs[k]
+                    rec[k] = v.item() if hasattr(v, "item") else v
+            out[key] = rec
+    return out
+
+
+def spec_crop(spec, f_off: int, t_off: int, shape) -> np.ndarray:
+    """The ``shape`` (freq x time) window of a full-file spectrogram image at
+    (f_off, t_off), as uint8 0-255 (a float image in [0, 1] is scaled, as
+    :func:`td_save_example` does for example patches)."""
+    h, w = int(shape[0]), int(shape[1])
+    s = np.asarray(spec[f_off:f_off + h, t_off:t_off + w])
+    if s.dtype != np.uint8:
+        s = (np.clip(s, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+    return np.ascontiguousarray(s)
 
 
 @_reporting_write
@@ -625,16 +897,43 @@ def write_pred_masks(h5_path: str, crops: List[Dict]) -> None:
     offsets on the full spec grid. Any of :data:`PRED_ATTRS` present is stored
     with it. Also caches ``n_pred_blobs`` so file lists can show the count
     without reading any crop.
+
+    A crop may carry ``spec`` (the image under its mask, same shape), written
+    to :data:`PRED_SPEC_GROUP`. A crop without one keeps the spec already
+    stored for its blob_id when the offsets and shape are unchanged (the GUI
+    rewrites crops it has not reshaped without ever holding the image).
     """
     _require_h5()
     os.makedirs(os.path.dirname(h5_path) or ".", exist_ok=True)
     with h5py.File(h5_path, "a") as f:
-        if PRED_GROUP in f:
-            del f[PRED_GROUP]
+        old_specs = {}
+        if PRED_SPEC_GROUP in f and PRED_GROUP in f:
+            for key in f[PRED_SPEC_GROUP]:
+                if key in f[PRED_GROUP]:
+                    ds = f[PRED_GROUP][key]
+                    old_specs[key] = (int(ds.attrs.get("f_off", 0)),
+                                      int(ds.attrs.get("t_off", 0)),
+                                      f[PRED_SPEC_GROUP][key][()])
+        for g in (PRED_GROUP, PRED_SPEC_GROUP, PRED_RIDGE_GROUP):
+            if g in f:
+                del f[g]
         grp = f.require_group(PRED_GROUP)
+        sgrp = None
+        units = _ridge_units(f)
         for c in crops:
             m = (np.asarray(c["mask"]) > 0).astype(np.uint8)
             key = str(c["blob_id"])
+            f_off, t_off = int(c.get("f_off", 0)), int(c.get("t_off", 0))
+            s = c.get("spec")
+            if s is None and key in old_specs:
+                of, ot, os_ = old_specs[key]
+                if (of, ot) == (f_off, t_off) and os_.shape == m.shape:
+                    s = os_
+            if s is not None and np.asarray(s).shape == m.shape:
+                if sgrp is None:
+                    sgrp = f.require_group(PRED_SPEC_GROUP)
+                sgrp.create_dataset(key, data=np.asarray(s, np.uint8),
+                                    compression="gzip", compression_opts=4)
             ds = grp.create_dataset(key, data=m, compression="gzip",
                                     compression_opts=4)
             ds.attrs["f_off"] = int(c.get("f_off", 0))
@@ -646,37 +945,55 @@ def write_pred_masks(h5_path: str, crops: List[Dict]) -> None:
                 # h5py cannot store None, and a mixed-type attr is a trap for
                 # readers — keep numbers numeric and everything else a string.
                 ds.attrs[k] = v if isinstance(v, (int, float)) else str(v)
+            if s is not None and np.asarray(s).shape == m.shape:
+                _store_ridge(f, key, ds, m, s, units)
         f.attrs["n_pred_blobs"] = int(len(crops))
 
 
-def read_all_pred_masks(h5_path: str) -> Dict[str, Dict]:
+def read_all_pred_masks(h5_path: str, include_spec: bool = False,
+                        include_ridge: bool = False) -> Dict[str, Dict]:
     """Return ``{blob_id: {mask(bool), f_off, t_off}}`` for every stored
     prediction crop (cheap — only small per-blob arrays, never the grid).
 
     Any of :data:`PRED_ATTRS` stored with a crop (score, class, model
     provenance) comes back alongside it, so a pending detection can be fully
-    described without consulting the CSV."""
+    described without consulting the CSV. ``include_spec`` adds ``spec`` (the
+    uint8 image under the mask) for crops that have one; ``include_ridge`` adds
+    ``ridge_khz`` (the brightness ridge per time column). The ridge measures
+    (ridge_turns, ridge_rate_hz, ridge_depth_khz, ridge_trill) come back
+    whenever stored."""
     _require_h5()
-    out: Dict[str, Dict] = {}
     if not os.path.isfile(h5_path):
-        return out
+        return {}
     with h5py.File(h5_path, "r") as f:
-        grp = f.get(PRED_GROUP)
-        if grp is None:
-            return out
-        for key in grp:
-            ds = grp[key]
-            rec = {
-                "mask": ds[()].astype(bool),
-                "f_off": int(ds.attrs.get("f_off", 0)),
-                "t_off": int(ds.attrs.get("t_off", 0)),
-            }
-            for k in PRED_ATTRS:
-                if k in ds.attrs:
-                    v = ds.attrs[k]
-                    rec[k] = (v.decode() if isinstance(v, bytes)
-                              else v.item() if hasattr(v, "item") else v)
-            out[key] = rec
+        return _pred_records(f, include_spec, include_ridge)
+
+
+def _pred_records(f, include_spec: bool = False,
+                  include_ridge: bool = False) -> Dict[str, Dict]:
+    out: Dict[str, Dict] = {}
+    grp = f.get(PRED_GROUP)
+    if grp is None:
+        return out
+    sgrp = f.get(PRED_SPEC_GROUP) if include_spec else None
+    rgrp = f.get(PRED_RIDGE_GROUP) if include_ridge else None
+    for key in grp:
+        ds = grp[key]
+        rec = {
+            "mask": ds[()].astype(bool),
+            "f_off": int(ds.attrs.get("f_off", 0)),
+            "t_off": int(ds.attrs.get("t_off", 0)),
+        }
+        if sgrp is not None and key in sgrp:
+            rec["spec"] = sgrp[key][()]
+        if rgrp is not None and key in rgrp:
+            rec["ridge_khz"] = rgrp[key][()]
+        for k in PRED_ATTRS + _RIDGE_ATTRS:
+            if k in ds.attrs:
+                v = ds.attrs[k]
+                rec[k] = (v.decode() if isinstance(v, bytes)
+                          else v.item() if hasattr(v, "item") else v)
+        out[key] = rec
     return out
 
 
@@ -709,7 +1026,7 @@ def read_pred_masks(h5_path: str, blob_ids) -> Dict[str, Dict]:
                 "f_off": int(ds.attrs.get("f_off", 0)),
                 "t_off": int(ds.attrs.get("t_off", 0)),
             }
-            for k in PRED_ATTRS:
+            for k in PRED_ATTRS + _RIDGE_ATTRS:
                 if k in ds.attrs:
                     v = ds.attrs[k]
                     rec[k] = (v.decode() if isinstance(v, bytes)
@@ -737,11 +1054,13 @@ def write_pred_mask_subset(h5_path: str, crops: List[Dict]) -> None:
     os.makedirs(os.path.dirname(h5_path) or ".", exist_ok=True)
     with h5py.File(h5_path, "a") as f:
         grp = f.require_group(PRED_GROUP)
+        units = _ridge_units(f)
         for c in crops:
             key = str(c["blob_id"])
+            m = (np.asarray(c["mask"]) > 0).astype(np.uint8)
+            _replace_pred_spec(f, key, c, m)
             if key in grp:
                 del grp[key]
-            m = (np.asarray(c["mask"]) > 0).astype(np.uint8)
             ds = grp.create_dataset(key, data=m, compression="gzip",
                                     compression_opts=4)
             ds.attrs["f_off"] = int(c.get("f_off", 0))
@@ -751,9 +1070,34 @@ def write_pred_mask_subset(h5_path: str, crops: List[Dict]) -> None:
                 if v is None or v == "":
                     continue
                 ds.attrs[k] = v if isinstance(v, (int, float)) else str(v)
+            sgrp = f.get(PRED_SPEC_GROUP)
+            _store_ridge(f, key, ds, m, sgrp[key][()] if sgrp is not None and key in sgrp else None,
+                         units)
         # Kept in step so file lists can still show the count without reading
         # a single crop.
         f.attrs["n_pred_blobs"] = int(len(grp))
+
+
+def _replace_pred_spec(f, key: str, c: Dict, m: np.ndarray) -> None:
+    """Keep /pred_specs/<key> in step with a crop being (re)written: the crop's
+    own ``spec`` if it brings one; else the stored one while the offsets and
+    shape are unchanged; else none (a reshaped mask's old image would be the
+    wrong window). Call before the old crop is deleted."""
+    sgrp = f.get(PRED_SPEC_GROUP)
+    old = sgrp.get(key) if sgrp is not None else None
+    s = c.get("spec")
+    if s is None and old is not None:
+        ds = f[PRED_GROUP].get(key) if PRED_GROUP in f else None
+        if (ds is not None and old.shape == m.shape
+                and int(ds.attrs.get("f_off", 0)) == int(c.get("f_off", 0))
+                and int(ds.attrs.get("t_off", 0)) == int(c.get("t_off", 0))):
+            return                                  # unchanged: keep it
+    if old is not None:
+        del sgrp[key]
+    if s is not None and np.asarray(s).shape == m.shape:
+        f.require_group(PRED_SPEC_GROUP).create_dataset(
+            key, data=np.asarray(s, np.uint8), compression="gzip",
+            compression_opts=4)
 
 
 def list_pred_ids(h5_path: str) -> List[str]:
@@ -858,6 +1202,74 @@ def has_pred_masks(h5_path: str) -> bool:
 
 
 @_reporting_write
+def add_pred_ridges(h5_path: str, overwrite: bool = False,
+                    redo_pieces: bool = False) -> int:
+    """Store the brightness ridge of every prediction that has its spectrogram
+    (/pred_specs) but no ridge yet (all of them with ``overwrite``). No audio
+    needed. ``redo_pieces`` as in :func:`add_example_ridges`. Returns the
+    number computed."""
+    _require_h5()
+    if not _RIDGE_ON or not os.path.isfile(h5_path):
+        return 0
+    n = 0
+    with h5py.File(h5_path, "a") as f:
+        grp, sgrp = f.get(PRED_GROUP), f.get(PRED_SPEC_GROUP)
+        units = _ridge_units(f)
+        if grp is None or sgrp is None or units is None:
+            return 0
+        for key in list(grp.keys()):
+            ds = grp[key]
+            if key not in sgrp:
+                continue
+            done = not overwrite and "ridge_turns" in ds.attrs
+            if done and not redo_pieces:
+                continue
+            m = ds[()]
+            if done and not _stale_pieces(f, m):
+                continue
+            _store_ridge(f, key, ds, m, sgrp[key][()], units)
+            n += "ridge_turns" in ds.attrs
+    return n
+
+
+def ridge_status(h5_path: str) -> Dict:
+    """What a recording's .mad still lacks for ridges, read-only.
+
+    ``{needed, pred, pred_no_spec, examples}``: ``needed`` is False for a file stamped with the
+    current :data:`RIDGE_VERSION_ATTR` (one attribute read) or with nothing to measure;
+    otherwise ``pred`` counts detections without a ridge, ``pred_no_spec`` those of them
+    without their spectrogram (they need the audio), ``examples`` labels without one."""
+    from .mad_ridge import RIDGE_VERSION
+    _require_h5()
+    out = {"needed": False, "pred": 0, "pred_no_spec": 0, "examples": 0}
+    if not os.path.isfile(h5_path):
+        return out
+    with h5py.File(h5_path, "r") as f:
+        if int(f.attrs.get(RIDGE_VERSION_ATTR, 0)) >= RIDGE_VERSION:
+            return out
+        grp, sgrp, ex = f.get(PRED_GROUP), f.get(PRED_SPEC_GROUP), f.get("examples")
+        if not (grp is not None and len(grp)) and not (ex is not None and len(ex)):
+            return out
+        out["needed"] = True                   # unstamped: multi-piece ridges may be stale
+        for key in (grp or {}):
+            if "ridge_turns" not in grp[key].attrs:
+                out["pred"] += 1
+                out["pred_no_spec"] += sgrp is None or key not in sgrp
+        for key in (ex or {}):
+            out["examples"] += "ridge_turns" not in ex[key].attrs
+    return out
+
+
+@_reporting_write
+def mark_ridges_complete(h5_path: str) -> None:
+    """Stamp the file with the current ridge version (see :data:`RIDGE_VERSION_ATTR`)."""
+    from .mad_ridge import RIDGE_VERSION
+    _require_h5()
+    with h5py.File(h5_path, "a") as f:
+        f.attrs[RIDGE_VERSION_ATTR] = int(RIDGE_VERSION)
+
+
+@_reporting_write
 def delete_pred_mask(h5_path: str, blob_id) -> None:
     """Remove one prediction crop by blob_id (no-op if absent). Used when a
     prediction is *deleted* (vs rejected, which keeps its crop)."""
@@ -866,9 +1278,10 @@ def delete_pred_mask(h5_path: str, blob_id) -> None:
         return
     try:
         with h5py.File(h5_path, "a") as f:
-            grp = f.get(PRED_GROUP)
-            if grp is not None and str(blob_id) in grp:
-                del grp[str(blob_id)]
+            for g in (PRED_GROUP, PRED_SPEC_GROUP, PRED_RIDGE_GROUP):
+                grp = f.get(g)
+                if grp is not None and str(blob_id) in grp:
+                    del grp[str(blob_id)]
     except Exception:
         pass
 
@@ -891,6 +1304,12 @@ def delete_pred_masks(h5_path: str, blob_ids) -> None:
             for key in list(grp.keys()):
                 if key in want:
                     del grp[key]
+            for g in (PRED_SPEC_GROUP, PRED_RIDGE_GROUP):
+                sgrp = f.get(g)
+                if sgrp is not None:
+                    for key in list(sgrp.keys()):
+                        if key in want:
+                            del sgrp[key]
             f.attrs["n_pred_blobs"] = int(len(grp))
     except Exception:
         pass
@@ -903,8 +1322,9 @@ def clear_pred_masks(h5_path: str) -> None:
     if not os.path.isfile(h5_path):
         return
     with h5py.File(h5_path, "a") as f:
-        if PRED_GROUP in f:
-            del f[PRED_GROUP]
+        for g in (PRED_GROUP, PRED_SPEC_GROUP, PRED_RIDGE_GROUP):
+            if g in f:
+                del f[g]
         if "n_pred_blobs" in f.attrs:
             del f.attrs["n_pred_blobs"]
 
@@ -1069,6 +1489,7 @@ def td_save_example(h5_path: str, spec_patch: np.ndarray,
         g.create_dataset("mask", data=mask, compression="gzip", compression_opts=4)
         _write_neighbors(g, neighbors_patch, mask)
         g.attrs["meta_json"] = json.dumps(meta)
+        store_example_ridge(g, spec, mask, meta)
     return example_id
 
 
@@ -1119,9 +1540,9 @@ def td_commit_example(h5_path: str, spec_patch: np.ndarray,
     ``replace_blob_id`` drops any other *label* example recorded for that
     detection, which is what keeps re-accepting from stacking copies.
 
-    Returns ``{'id', 'ids_before', 'dropped'}``: the id written, the example ids
-    that existed beforehand (what the undo snapshot needs) and the stale ids
-    removed.
+    Returns ``{'id', 'ids_before', 'dropped', 'ridge'}``: the id written, the
+    example ids that existed beforehand (what the undo snapshot needs), the
+    stale ids removed, and the call's ridge measures (None without one).
     """
     _require_h5()
     import uuid
@@ -1168,7 +1589,9 @@ def td_commit_example(h5_path: str, spec_patch: np.ndarray,
                          compression_opts=4)
         _write_neighbors(g, neighbors_patch, mask)
         g.attrs["meta_json"] = json.dumps(meta)
-    return {"id": example_id, "ids_before": ids_before, "dropped": dropped}
+        ridge = store_example_ridge(g, spec, mask, meta)
+    return {"id": example_id, "ids_before": ids_before, "dropped": dropped,
+            "ridge": ridge}
 
 
 def _apply_grid_attrs(f, params: Dict) -> None:
@@ -1260,7 +1683,13 @@ def td_iter_file_examples(h5_path: str, wav_name: str,
             # `neighbors` is deliberately NOT read here: every caller of this
             # function wants per-call geometry for the overlay, and the whole
             # point of the split is that those readers see only this call.
-            yield {"meta": meta, "spec": spec, "mask": mask}
+            item = {"meta": meta, "spec": spec, "mask": mask}
+            # The call's ridge, so the overlay can draw a label's ridge too
+            # (a few hundred floats; see store_example_ridge).
+            if EXAMPLE_RIDGE_DS in g:
+                item["ridge"] = g[EXAMPLE_RIDGE_DS][()]
+                item["ridge_t_off"] = int(g.attrs.get("ridge_t_off", 0))
+            yield item
 
 
 def td_read_example(h5_path: str, example_id: str) -> Optional[Dict]:
@@ -1316,16 +1745,20 @@ def td_iter_meta(h5_path: str) -> Iterator[Dict]:
         return
     try:
         with h5py.File(h5_path, "r") as f:
-            ex = f.get("examples")
-            if ex is None:
-                return
-            for key in ex:
-                try:
-                    yield json.loads(ex[key].attrs.get("meta_json", "{}"))
-                except Exception:
-                    continue
+            yield from _iter_meta(f)
     except Exception:
         return
+
+
+def _iter_meta(f) -> Iterator[Dict]:
+    ex = f.get("examples")
+    if ex is None:
+        return
+    for key in ex:
+        try:
+            yield json.loads(ex[key].attrs.get("meta_json", "{}"))
+        except Exception:
+            continue
 
 
 def td_count(h5_path: str, kind: Optional[str] = None) -> int:
@@ -1462,6 +1895,7 @@ def td_update_mask(h5_path: str, example_id: str, mask_patch: np.ndarray,
             meta = json.loads(g.attrs.get("meta_json", "{}"))
             meta.update(meta_updates)
             g.attrs["meta_json"] = json.dumps(meta)
+        store_example_ridge(g)
 
 
 @_reporting_write
@@ -1483,6 +1917,8 @@ def td_update_meta(h5_path: str, example_id: str, updates: Dict) -> bool:
         meta = json.loads(g.attrs.get("meta_json", "{}"))
         meta.update(updates)
         g.attrs["meta_json"] = json.dumps(meta)
+        if any(k in updates for k in _EXAMPLE_BOUNDS):
+            store_example_ridge(g, meta=meta)       # the call's span moved
         return True
 
 

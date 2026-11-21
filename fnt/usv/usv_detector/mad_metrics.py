@@ -26,7 +26,10 @@ EVAL_NAME = "eval.json"
 #: Run directories are named ``<timestamp>_<arch>_n=<n labels>``; the label
 #: count is the x-axis of the trend, since it is the thing the user spends
 #: effort on between rounds.
-_RUN_RE = re.compile(r"^(?P<ts>\d{8}_\d{6})_(?P<arch>.+?)_n=(?P<n>\d+)$")
+# An optional tag may follow the label count (``..._n=1398_ft_r6``, from
+# --run-suffix): the count stays readable in the name.
+_RUN_RE = re.compile(
+    r"^(?P<ts>\d{8}_\d{6})_(?P<arch>[A-Za-z0-9]+?)_n=(?P<n>\d+)(?:_(?P<tag>.+))?$")
 
 
 # ----------------------------------------------------------------------
@@ -70,13 +73,17 @@ def load_eval(run_dir: str):
 
 
 def parse_run_name(name: str) -> Dict:
-    """``20260908_203506_unet_n=161`` -> ts / arch / n_labels. ``{}`` if it does
-    not parse, so a hand-renamed directory is skipped rather than crashing."""
+    """``20260908_203506_unet_n=161`` -> ts / arch / n_labels, plus ``tag`` for
+    ``..._n=1398_ft_r6``. ``{}`` if it does not parse, so a hand-renamed
+    directory is skipped rather than crashing."""
     m = _RUN_RE.match(os.path.basename(str(name).rstrip("/\\")))
     if not m:
         return {}
-    return {'timestamp': m.group('ts'), 'arch': m.group('arch'),
-            'n_labels': int(m.group('n'))}
+    out = {'timestamp': m.group('ts'), 'arch': m.group('arch'),
+           'n_labels': int(m.group('n'))}
+    if m.group('tag'):
+        out['tag'] = m.group('tag')
+    return out
 
 
 def model_run_dirs(models_dir: str) -> List[str]:
