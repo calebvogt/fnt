@@ -758,6 +758,40 @@ in place of the drive bars, and two more pages: **Brain activity**, a raster of
 every unit over time for the selected animal, and **Brain output**, the turn
 and speed it asked for.
 
+### Showing a run to someone else: `--movie`
+
+```bash
+# the first half hour of a run, as a GIF
+python -m fnt.abma --preset anosmia --males 3 --females 3 --brain vole_forager --movie
+
+# side by side: the cohort as described, and the same animals on methimazole,
+# released hungry and thirsty so foraging starts at once
+python -m fnt.abma --preset anosmia --males 3 --females 3 --brain vole_forager \
+    --movie --movie-hours 0.33 --movie-deprived 60 --movie-vs-mmz
+```
+
+`core/movie.py` films trial 0 of the run — the enclosure from above, each
+animal (males blue, females red) with a fading trail, and each animal's hunger
+and thirst underneath — and writes `<out>/<name>/movie.gif` (`--movie mp4`
+with ffmpeg installed). The film is about 300 frames whatever its length, so a
+longer one plays faster rather than growing. It works for the rule-based
+animal too; leave `--brain` off.
+
+### A whole comparison in one line
+
+The intact-versus-methimazole study takes the same description an ordinary run
+does, and a brain:
+
+```bash
+# 3 males + 3 females, 5 days; 2 replicates intact, 2 on methimazole
+python -m fnt.abma --preset anosmia --males 3 --females 3 --days 5 \
+    --anosmia-study --doses 0,1 --replicates 2 --brain vole_forager --name mmz_3m3f
+```
+
+Add `--dry-run` to see what would run. Replicates are paired: replicate *r*
+starts from the same release and the same founders in both arms. Results land
+in `<out>/mmz_3m3f/results/` (`metrics_long.csv` for R, `comparison.csv`).
+
 ### Bench assays: does it behave like an animal?
 
 Before trusting a brain in an enclosure, test it the way you would a new line:

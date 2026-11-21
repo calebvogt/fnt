@@ -42,6 +42,39 @@ from .core.config import ExperimentConfig, default_vole_experiment
 from .core.runner import run_experiment
 
 
+def study_base(args) -> ExperimentConfig | None:
+    """The cohort and enclosure an ``--anosmia-study`` compares its arms in.
+
+    The study used to accept only a config file. It now takes the same
+    one-line description an ordinary run does (``--preset``, ``--males``,
+    ``--females``, ``--season``) and ``--brain``, so "3 males and 3 females in
+    this enclosure for 5 days, two replicates intact and two on methimazole"
+    is one command. ``None`` means nothing was described: the study's own
+    default (the vole cage) applies.
+    """
+    from .core.compose import design
+
+    described = args.preset or args.males or args.females
+    if not (args.config or described or args.brain):
+        return None
+    cfg = design(
+        preset=args.preset,
+        base=(ExperimentConfig.from_json(args.config) if args.config
+              else None),
+        males=args.males, females=args.females, species=args.species,
+        days=args.days, seed=args.seed, name=args.name, season=args.season,
+        year=args.year) if (args.config or described) else None
+    if cfg is None:
+        from .core.presets import vole_anosmia
+        cfg = vole_anosmia()
+    if args.brain:
+        from .core.brain import find_brain
+        find_brain(args.brain)                 # raises with the list of names
+        cfg.brain.enabled = True
+        cfg.brain.name = args.brain
+    return cfg
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
         prog="python -m fnt.abma",
@@ -103,6 +136,23 @@ def main(argv=None) -> int:
                    help="With --watch, load the design but do not start it.")
     d.add_argument("--dry-run", action="store_true",
                    help="Print what would run, then exit without running.")
+    m = p.add_argument_group(
+        "movie",
+        "Film the start of a run instead of running the experiment: the "
+        "enclosure from above, each animal with a trail, hunger and thirst "
+        "underneath. Written to <out>/<name>/movie.gif.")
+    m.add_argument("--movie", nargs="?", const="gif", choices=["gif", "mp4"],
+                   help="Write an animation (gif by default; mp4 needs "
+                        "ffmpeg).")
+    m.add_argument("--movie-hours", type=float, default=0.5,
+                   help="How much of the run to film, from release "
+                        "(default 0.5 h).")
+    m.add_argument("--movie-deprived", type=float, metavar="LEVEL",
+                   help="Release every animal this hungry and thirsty "
+                        "(0-100), so foraging starts at once.")
+    m.add_argument("--movie-vs-mmz", action="store_true",
+                   help="Side by side: the cohort as described, and the same "
+                        "animals after methimazole.")
     b = p.add_argument_group(
         "learned brains",
         "Drive the animals with a trained neural network instead of the "
@@ -183,8 +233,10 @@ def main(argv=None) -> int:
     if args.anosmia_study:
         from .core.study import anosmia_study, run_study
 
-        base = (ExperimentConfig.from_json(args.config) if args.config
-                else None)
+        try:
+            base = study_base(args)
+        except (ValueError, FileNotFoundError) as e:
+            p.error(str(e))
         try:
             doses = tuple(float(d) for d in args.doses.split(",") if d.strip())
         except ValueError:
@@ -194,9 +246,21 @@ def main(argv=None) -> int:
         study = anosmia_study(base=base, doses=doses,
                               replicates=args.replicates, days=args.days,
                               mechanistic_nose=not args.scalar_nose)
+        if args.name:
+            study.name = args.name
         if args.seed is not None:
             study.base_seed = args.seed
         study_dir = os.path.join(args.out, study.name)
+        if base is not None:
+            from .core.compose import summary as _summary
+            base.n_trials = args.replicates     # what the study will run
+            print(_summary(base))
+        print(f"{len(doses)} arms (methimazole dose "
+              f"{', '.join(f'{d:g}' for d in doses)}) x {args.replicates} "
+              f"replicate(s), {study.base.days:g} days each"
+              + (f", learned brain '{args.brain}'" if args.brain else ""))
+        if args.dry_run:
+            return 0
         run_study(study, study_dir, log_cb=print)
         print(f"\nStudy written to {study_dir}")
         print("  results/metrics_long.csv   tidy long table, for R")
@@ -242,6 +306,32 @@ def main(argv=None) -> int:
 
     print(summary(cfg))
     if args.dry_run:
+        return 0
+
+    if args.movie:
+        from .core import movie
+
+        out_dir = os.path.join(args.out, cfg.name)
+        os.makedirs(out_dir, exist_ok=True)
+        seconds = max(float(cfg.dt), args.movie_hours * 3600.0)
+        # about 300 frames whatever the length, so a longer film plays faster
+        # rather than growing
+        sample = max(float(cfg.dt), seconds / 300.0)
+        prep = (movie.arrive_deprived(args.movie_deprived)
+                if args.movie_deprived is not None else None)
+        nervous = (f"learned brain '{cfg.brain.name}'" if cfg.brain.enabled
+                   else "rule-based")
+        clips = [movie.film(cfg, seconds, sample_s=sample, prepare=prep,
+                            title="Intact" if args.movie_vs_mmz else cfg.name)]
+        if args.movie_vs_mmz:
+            clips.append(movie.film(movie.anosmic(cfg), seconds,
+                                    sample_s=sample, prepare=prep,
+                                    title="Anosmic (methimazole)"))
+        n = clips[0].xy.shape[1]
+        path = movie.render(
+            clips, os.path.join(out_dir, "movie." + args.movie),
+            caption=f"{n} animals, {nervous}")
+        print("wrote", path)
         return 0
 
     if args.assay == "vitals":
