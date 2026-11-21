@@ -14,6 +14,13 @@ Override a few fields for a quick test or a batch sweep::
 
     python -m fnt.abma my_experiment.json --out ~/runs --trials 5 --days 3 --parallel
 
+Give the animals a learned brain, and ask what one of them would have done if
+it had been less hungry six hours in::
+
+    python -m fnt.abma --list-brains
+    python -m fnt.abma --preset vole --brain vole_forager --days 2 --out ~/runs
+    python -m fnt.abma --preset vole --twin hunger-30@0 --out ~/runs
+
 Run the saline-vs-methimazole dose-response — the design ABMA exists for —
 without touching the GUI::
 
@@ -96,7 +103,35 @@ def main(argv=None) -> int:
                    help="With --watch, load the design but do not start it.")
     d.add_argument("--dry-run", action="store_true",
                    help="Print what would run, then exit without running.")
+    b = p.add_argument_group(
+        "learned brains",
+        "Drive the animals with a trained neural network instead of the "
+        "rule-based policy, and ask counterfactual questions of them.")
+    b.add_argument("--brain", metavar="NAME",
+                   help="Give every animal this learned brain (a name from "
+                        "--list-brains, or a path to a .npz).")
+    b.add_argument("--list-brains", action="store_true",
+                   help="Print the brains that can be asked for, and exit.")
+    b.add_argument("--twin", action="append", metavar="TWEAK",
+                   help="Live one life twice: run to --fork-hours, copy the "
+                        "world, apply TWEAK to the copy, and compare. E.g. "
+                        "'hunger-30@0' (animal 0 thirty points less hungry), "
+                        "'smell_ability=0@males', 'rnn:12=1@0~10' (clamp unit "
+                        "12 on for 10 s; needs --brain). Repeatable.")
+    b.add_argument("--fork-hours", type=float, default=6.0,
+                   help="When the two lives part (default 6 h into the run).")
+    b.add_argument("--horizon-hours", type=float, default=6.0,
+                   help="How long both lives are followed (default 6 h).")
     args = p.parse_args(argv)
+
+    if args.list_brains:
+        from .core.brain import Brain, list_brains
+        found = list_brains()
+        if not found:
+            print("No brains yet. Train one with: python -m fnt.abma.learn")
+        for name, path in found:
+            print(f"{name}\n    {Brain.load(path).describe()}\n    {path}")
+        return 0
 
     if args.list_presets:
         from .core.presets import all_presets
@@ -151,6 +186,16 @@ def main(argv=None) -> int:
         p.error(str(e))
     if args.parallel:
         cfg.parallel = True
+    if args.brain:
+        from .core.brain import find_brain
+        try:
+            find_brain(args.brain)
+        except FileNotFoundError as e:
+            p.error(str(e))
+        cfg.brain.enabled = True
+        cfg.brain.name = args.brain
+        if not args.name:
+            cfg.name = f"{cfg.name}_brain"
     if args.save_config:
         # the target folder often does not exist yet — asking someone to mkdir
         # before saving a config they just described is pure friction
@@ -161,6 +206,24 @@ def main(argv=None) -> int:
 
     print(summary(cfg))
     if args.dry_run:
+        return 0
+
+    if args.twin:
+        from .core.twin import run_twin
+        from .core.twin_plot import save_png
+        import json
+
+        out_dir = os.path.join(args.out, cfg.name)
+        os.makedirs(out_dir, exist_ok=True)
+        try:
+            res = run_twin(cfg, args.twin,
+                           fork_at_s=args.fork_hours * 3600.0,
+                           horizon_s=args.horizon_hours * 3600.0)
+        except ValueError as e:
+            p.error(str(e))
+        print(json.dumps(res.summary(), indent=2))
+        print("\nwrote", res.save(os.path.join(out_dir, "twin.npz")))
+        print("wrote", save_png(res, os.path.join(out_dir, "twin.png"), cfg))
         return 0
 
     if args.watch:
