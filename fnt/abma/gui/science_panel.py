@@ -520,6 +520,12 @@ class BrainRaster(QWidget):
         self.setMouseTracking(True)
         self._img = None
         self._plot = (0, 0, 1, 1)
+        self._labels: list = []
+
+    def set_unit_labels(self, labels) -> None:
+        """What driving each unit does to the motor output (from
+        ``Brain.unit_labels()``), shown when hovering its row."""
+        self._labels = list(labels or [])
 
     def clear(self) -> None:
         self.cols.clear()
@@ -590,8 +596,10 @@ class BrainRaster(QWidget):
         x, y, pw, ph = self._plot
         units = len(self.cols[-1])
         if y <= ev.y() < y + ph and x <= ev.x() < x + pw:
-            u = int((ev.y() - y) / ph * units)
-            self.setToolTip(f"recurrent unit {min(units - 1, max(0, u))}")
+            u = min(units - 1, max(0, int((ev.y() - y) / ph * units)))
+            what = self._labels[u] if u < len(self._labels) else ""
+            self.setToolTip(f"recurrent unit {u}"
+                            + (f" — driving it {what}" if what else ""))
 
 
 # --------------------------------------------------------------------------- #

@@ -142,7 +142,15 @@ def main(argv=None) -> int:
         if not found:
             print("No brains yet. Train one with: python -m fnt.abma.learn")
         for name, path in found:
-            print(f"{name}\n    {Brain.load(path).describe()}\n    {path}")
+            b = Brain.load(path)
+            print(f"{name}\n    {b.describe()}\n    {path}")
+            cu = b.command_units(3)
+            print("    units one synapse from the muscles — turn: "
+                  + ", ".join(f"{u} ({'left' if w > 0 else 'right'})"
+                              for u, w in cu["turn"])
+                  + "; speed: "
+                  + ", ".join(f"{u} ({'faster' if w > 0 else 'slower'})"
+                              for u, w in cu["speed"]))
         return 0
 
     if args.assay and args.assay != "vitals":

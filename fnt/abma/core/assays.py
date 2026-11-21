@@ -317,12 +317,19 @@ def vitals(cfg: ExperimentConfig, days: float = 2.0, policy=None,
 
 
 def format_vitals(v: dict) -> str:
-    ok = (v["alive"] == v["animals"] and v["health_min"] > 95
-          and v["energy_worst_ever"] > 5 and v["thirst_worst_ever"] < 95)
+    # two separate questions: can they feed and water themselves, and what do
+    # they do to each other. An enclosure where everyone eats well and fights
+    # constantly is a different finding from one where someone goes hungry.
+    fed = (v["energy_worst_ever"] > 20 and v["thirst_worst_ever"] < 80
+           and v["fed_everyone"] and v["watered_everyone"])
+    hurt = v["alive"] < v["animals"] or v["health_min"] < 95
+    verdict = ("they keep themselves fed and watered" if fed else
+               "NOT feeding or watering themselves here")
+    if hurt:
+        verdict += "; injuries from fighting"
     lines = [
         f"{v['animals']} animals, {v['days']:g} days — "
-        + ("they keep themselves alive and well" if ok else
-           "NOT self-sufficient here"),
+        + verdict,
         f"  energy  mean {v['energy_mean']:5.1f}  lowest now "
         f"{v['energy_min']:5.1f}  lowest ever {v['energy_worst_ever']:5.1f}",
         f"  thirst  mean {v['thirst_mean']:5.1f}  highest now "

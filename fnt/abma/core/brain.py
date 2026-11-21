@@ -248,6 +248,42 @@ class Brain:
     def name(self) -> str:
         return str(self.meta.get("name", "brain"))
 
+    def command_units(self, n: int = 3) -> dict:
+        """The recurrent units wired most directly to each motor output.
+
+        ``{"turn": [(unit, weight), ...], "speed": [...]}``, strongest first.
+        A positive turn weight steers the animal left, a negative one right; a
+        positive speed weight speeds it up. These are the units to try first
+        in a twin experiment (``rnn:<unit>=1@0~10``): the closest thing a
+        learned brain has to command neurons, because they are one synapse
+        from the muscles. They are not the whole story — a unit can steer
+        through other units — but they are where to start.
+        """
+        wo = self.w["Wo"]
+        out = {}
+        for row, name in ((0, "turn"), (1, "speed")):
+            order = np.argsort(-np.abs(wo[row]))[:n]
+            out[name] = [(int(u), float(wo[row, u])) for u in order]
+        return out
+
+    def unit_labels(self) -> list:
+        """One short phrase per recurrent unit saying what driving it does to
+        the motor output directly, or ``""`` when its direct line is weak."""
+        wo = self.w["Wo"]
+        scale = np.abs(wo).max(axis=1, keepdims=True) + 1e-9
+        rel = np.abs(wo) / scale
+        labels = []
+        for u in range(wo.shape[1]):
+            if rel[:, u].max() < 0.4:
+                labels.append("")
+            elif rel[0, u] >= rel[1, u]:
+                labels.append("turns it left" if wo[0, u] > 0
+                              else "turns it right")
+            else:
+                labels.append("speeds it up" if wo[1, u] > 0
+                              else "slows it down")
+        return labels
+
     def describe(self) -> str:
         m = self.meta
         bits = [f"{self.n_in} senses → {self.n_sensory} sensory → "
@@ -256,6 +292,8 @@ class Brain:
             steps = m.get("agent_steps")
             if steps:
                 bits.append(f"trained on {steps / 1e6:.0f}M animal-ticks")
+            if m.get("about"):
+                bits.append(str(m["about"]))
             if m.get("trained_on"):
                 bits.append(str(m["trained_on"]))
         else:

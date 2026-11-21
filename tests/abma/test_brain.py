@@ -256,3 +256,41 @@ def test_discomfort_is_convex_in_need():
     sim.hunger[:] = 40
     peckish = discomfort(sim)[0]
     assert starving > 3.5 * peckish, "twice as hungry should hurt far more"
+
+
+def test_command_units_are_the_strongest_motor_lines():
+    b = Brain.random(3)
+    b.w["Wo"][:] = 0.0
+    b.w["Wo"][0, 7] = 2.0
+    b.w["Wo"][0, 9] = -1.5
+    b.w["Wo"][1, 4] = -3.0
+    cu = b.command_units(2)
+    assert [u for u, _ in cu["turn"]] == [7, 9]
+    assert cu["speed"][0] == (4, -3.0)
+    labels = b.unit_labels()
+    assert labels[7] == "turns it left" and labels[9] == "turns it right"
+    assert labels[4] == "slows it down" and labels[0] == ""
+
+
+def test_driving_a_turn_unit_turns_the_animal():
+    """The label is a promise: clamp a 'turns it left' unit on and the
+    animal's heading must swing left (counter-clockwise), and the other way
+    for 'right'."""
+    b = Brain.random(3)
+    b.w["Wo"][:] = 0.0
+    b.w["Wo"][0, 7] = 4.0                       # unit 7 -> turn left
+    b.w["bo"][:] = (0.0, 0.0)
+
+    def swing(value):
+        sim = _one_animal(food=(0.3, 0.3), start=(1.5, 1.5))
+        sim.policy = NeuralPolicy(b, stochastic=False)
+        sim.policy.stim = [("rnn", 7, "set", value, np.array([0]))]
+        total, prev = 0.0, float(sim.H[0])
+        for k in range(4):
+            sim.step(k * 2.0, 2.0)
+            total += (float(sim.H[0]) - prev + np.pi) % (2 * np.pi) - np.pi
+            prev = float(sim.H[0])
+        return total
+
+    assert swing(1.0) > 1.0, "driving a left-turn unit turned it left"
+    assert swing(-1.0) < -1.0

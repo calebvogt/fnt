@@ -40,7 +40,12 @@ fnt/fnt/abma/
     biology.py              gene + drug registries -> trait modifications
     rng.py                  per-agent counter-based random streams
     olfaction.py            receptor/signature nose (selective anosmia)
-    policy.py               decision policies + the drive decomposition
+    policy.py               rule-based policy + the drive decomposition
+    senses.py               what an animal can sense, from where it stands
+    brain.py                a learned brain: numpy network, files, stimulation
+    neural.py               NeuralPolicy (a brain in charge) + discomfort
+    twin.py, twin_plot.py   one life lived twice: counterfactual experiments
+    assays.py               bench tests: approach, choice, search, vitals
     simulation.py           Simulation: physics, physiology, combat, events
     scent.py                decaying grid of identity-carrying marks
     sward.py                living grass: trails they wear and share
@@ -54,11 +59,16 @@ fnt/fnt/abma/
     study.py                conditions x replicates, paired seeds, comparison
     runner.py               project folders + multi-trial orchestration
     run_headless.py         CLI: python -m fnt.abma config.json --out DIR
+  learn/                    raising a brain (the only part that needs PyTorch)
+    nursery.py              the randomised worlds a brain grows up in
+    ppo.py                  recurrent PPO; python -m fnt.abma.learn
+  brains/                   brains shipped with ABMA (.npz)
   gui/                      thin PyQt5 wrapper (needs a QApplication)
     abma_canvas.py          2D matplotlib canvas + territory-map overlay
     pg_canvas.py            pyqtgraph OpenGL 3D live run view (PyOpenGL)
     agent_inspector.py      hover stat card
-    science_panel.py        roster, drive bars, traces, coupling diagram
+    science_panel.py        roster, drive bars, traces, brain raster
+    twin_dialog.py          run a twin experiment from the window
     launch.py               open the window on a config and run it
     abma_main_pyqt.py       ABMAWindow: Arena / Population / Experiment / Run
 ```
@@ -71,8 +81,8 @@ schedule**, (d) run and watch it in the 3D view.
 
 **Decision policy.** Movement rules live in `policy.py` as `RuleBasedPolicy` (all
 `k_*` weights). The engine owns physics/physiology/combat; the policy owns "what
-the agent wants to do". Swapping in a learned `RLPolicy` later needs no engine
-change.
+the agent wants to do". A learned brain (`NeuralPolicy`, below) plugs into the
+same seam with no engine change; the rules stay the default.
 
 **Intervention schedule.** Interventions are `(at_day, target, attribute, op,
 value)` applied at run time — e.g. induce anosmia on day 3 with
@@ -650,6 +660,223 @@ The point is not to make free parameters go away; a behaviour model needs some.
 It is that a reader can see, from the run folder alone, how much of a result
 rests on them.
 
+## Learned brains: animals that are not told what to do
+
+The rule-based animal is steered: when it is hungry it is handed the bearing
+of the nearest food and walks there. That is fine for asking where animals end
+up, and useless for asking *how* — take its nose away and it finds food exactly
+as fast as before (`--assay approach` shows this), because the nose was never
+involved.
+
+A **learned brain** replaces the rules with a small recurrent neural network
+that receives only what an animal standing at that spot could sense, and
+outputs only a turn and a speed. Nobody writes its behaviour. It is raised by
+reinforcement in randomised worlds, where the single thing scored is the
+body's own discomfort.
+
+```
+ senses (55 channels, egocentric)                       motor
+ ─────────────────────────────────                      ─────
+ smell: food, water, own marks, others'  ┐
+   marks, male, female, estrous          │   sensory     recurrent
+   (strength + ahead/behind + left/right)├─► layer  ──►  layer    ──► turn
+ whiskers: wall ahead / left / right     │   (64)        (64 GRU)     speed
+ others nearby, taste, grass underfoot   │     ▲
+ place memory: last food, last water     │     │ gain
+ the body: hunger, thirst, bladder,      ┘     │
+   stress, pain, light, time of day ───────────┘  neuromodulators
+```
+
+* **Senses** (`core/senses.py`) are egocentric: food is "ahead and to the
+  left", never "north-east". Every olfactory channel is scaled by the animal's
+  `smell_ability`, so anosmia removes exactly those inputs and nothing else.
+  There is no map and no bearing-to-food; a smell is a strength and a
+  direction of increase that fades with distance.
+* **Neuromodulators.** Hunger, thirst, stress, pain, receptivity, sex, light
+  and the personality traits do not only arrive as inputs; they set the *gain*
+  of each sensory unit, the way a hormone changes how strongly a circuit
+  responds without carrying any message of its own. Each unit starts with its
+  own random sensitivity to each modulator; which sensitivity ends up used for
+  what is learned.
+* **The brain owns speed.** With a learned brain the engine no longer decides
+  when an animal rests or forages. Physiology still applies: a starving animal
+  is slower whatever its brain asks for.
+* **A brain is a file** (`.npz`, in `fnt/abma/brains/` or `~/ABMA_brains/`) and
+  runs in plain numpy. PyTorch is needed only to train one. Sensors are matched
+  by name, so a brain trained before a sense existed still loads, and one that
+  needs a sense the body has lost refuses to.
+
+### How a brain is raised
+
+```bash
+python -m fnt.abma.learn --name my_vole --minutes 20
+python -m fnt.abma.learn --name my_vole --resume my_vole --minutes 10
+```
+
+Training (`learn/`) runs the **real engine** — the same `Simulation`, scent
+marks, contests and walls an experiment uses — in hundreds of small randomised
+worlds (the *nursery*): different enclosure sizes, food and water in different
+places, different numbers of companions, animals arriving at every level of
+hunger and thirst. The reward is the drop in
+
+    discomfort = (hunger/100)² + (thirst/100)² + ½(stress/100)² + 2(injury)²
+
+plus a small bonus for mating. Nothing rewards approaching food, following a
+smell, or avoiding a rival. Eating when hungry lowers discomfort; that is the
+whole lesson, and the animal has to work out the rest.
+
+The log prints, per iteration, how much time hungry and sated animals spend at
+food, thirsty and sated animals at water, and `right`: among animals with one
+need much stronger than the other, in a world offering both, the share of
+their time at a resource spent at the one they needed (0.5 is chance).
+
+Two things about the nursery are there because training failed without them:
+
+* **Some worlds hold only food, or only water.** When every world had both,
+  animals learned to find food, sat on it, and from there never met water
+  often enough to learn what it was for — time at water stayed at chance for
+  eight million animal-ticks, while a world with nothing but water teaches it
+  in about one million.
+* **Needs must have a say from birth.** With neuromodulator weights starting
+  at zero the gains barely moved in training, and a thirsty animal chose food
+  as often as a hungry one. Random initial sensitivities fixed that.
+
+### Putting a brain in an experiment
+
+In the window: **Run tab → Nervous system → Learned brain**. From the command
+line, add `--brain NAME` to any run:
+
+```bash
+python -m fnt.abma --list-brains
+python -m fnt.abma --preset anosmia --brain vole_forager --days 2 --watch
+```
+
+Everything else — arenas, protocol events, treatments, the run record, the
+UWB-schema output — is unchanged. With a learned brain the inspection column
+shows **what is reaching its brain** (smell, touch, taste, memory, body state)
+in place of the drive bars, and two more pages: **Brain activity**, a raster of
+every unit over time for the selected animal, and **Brain output**, the turn
+and speed it asked for.
+
+### Bench assays: does it behave like an animal?
+
+Before trusting a brain in an enclosure, test it the way you would a new line:
+
+```bash
+python -m fnt.abma --assay all --brain vole_forager     # a learned brain
+python -m fnt.abma --assay all                          # the rule-based animal
+python -m fnt.abma --preset anosmia --brain vole_forager --days 2 --assay vitals
+```
+
+| Assay | What it asks |
+|-------|--------------|
+| `approach` | One animal, one food source out of reach. Run hungry, sated and hungry-but-anosmic: does motivation gate it, and does it need its nose? |
+| `choice` | Food one side, water the other, the animal midway. Hungry vs thirsty: does a need pick its own goal? |
+| `search` | It eats for 40 s and the food is removed. Does it stay and search where food was (area-restricted search), compared with the same spot never baited? |
+| `vitals` | Your config, your cohort: does everyone eat and drink, how much, how far do they travel, what do they do to each other? |
+
+#### What the shipped brain does (`vole_forager`, 22M animal-ticks, ~25 min of training)
+
+Forty animals per condition; the rule-based animal alongside.
+
+| | rule-based | `vole_forager` |
+|---|---|---|
+| **Find the food**, hungry | 100% in 16 s, path directness 0.93 | 100% in 34 s, directness 0.81 |
+| … hungry, **no sense of smell** | 100% in 16 s, directness 0.93 — *unchanged* | **55% in 224 s, directness 0.21** |
+| … sated | 28% | 100% — it goes and stays anyway (see below) |
+| **Food or water**, hungry → food first | 100% | 100% |
+| … thirsty → water first | 100% | 100% |
+| … need of only 20/100 | — | 88% (hungry), 72% (thirsty) |
+| … no need at all | — | 68% food, 32% water |
+| **After food is lost**, distance from the spot 3 min later (vs never fed there) | 0.91 m vs 0.97 m | **1.26 m vs 1.94 m**, turning more (0.52 vs 0.45 rad per 2 s) |
+| **Vole cage, 8 animals, 2 days**: lowest energy / highest thirst anyone reached | 34 / 46 | **84 / 27** |
+| … food and water per animal per day | 7.3 g, 1.9 mL | 10.7 g, 4.3 mL |
+| … fights and matings per animal per day | 15.6, 30.5 | 23.9, 40.8 |
+
+What that says:
+
+* **It smells its way to food.** Anosmia halves how often it gets there and
+  turns a direct path into a wander. The rule-based animal cannot show this at
+  all. This is the result the anosmia experiments needed.
+* **A need picks its own goal, and by degree.** Nothing told it water answers
+  thirst; a slightly thirsty animal usually goes to water, a very thirsty one
+  always does.
+* **It lingers where food was** (area-restricted search), where the rule-based
+  animal walks on.
+* **A cohort keeps itself fed and watered** in an enclosure it was not raised
+  in, better than the rule-based cohort does.
+
+And what it does *not* show, which matters as much:
+
+* **Hunger does not decide whether it visits a lone food source.** A sated
+  animal still walks there and camps. Nothing in its world makes anywhere else
+  better, so sitting on the food is what the reward taught.
+* **It lives on the line between water and food.** In the cage the animals
+  shuttle between the two water sources through the feeder and never use a
+  nest. They rest 15% of the time (rule-based: 61%).
+* **Its social behaviour is not to be trusted.** Fights and matings are
+  saturated in the small cage under *both* nervous systems (the engine lets
+  every dyad contest once an hour), and a brain that gathers animals at food
+  and water makes it worse. It has not learned to keep away from a rival:
+  half-hour nursery episodes never let stress build far enough to matter.
+
+### Twin experiments: one life, lived twice
+
+Every random draw an animal makes is a pure function of (seed, animal, step),
+so a world can be copied mid-run and both copies will live the *same* future
+to the last decimal — unless something is changed in one of them. That makes
+a counterfactual exact: run to a chosen moment, fork, change one thing in the
+copy, and whatever differs afterwards was caused by that change.
+
+```bash
+# animal 0 is 30 points less hungry at hour 6; follow both lives for 6 h
+python -m fnt.abma --preset anosmia --twin "hunger-30@0"
+
+# all males lose their sense of smell
+python -m fnt.abma --preset anosmia --twin "smell_ability=0@males"
+
+# drive one unit of animal 0's brain hard for 10 seconds (needs --brain)
+python -m fnt.abma --preset anosmia --brain vole_forager --twin "rnn:12=1@0~10"
+
+# silence a whole sense for ten minutes
+python -m fnt.abma --preset anosmia --brain vole_forager --twin "olfaction*0@0~600"
+```
+
+In the window: **File → Twin Experiment**, or the ⑂ button in the Nervous
+system box. The result (`twin.npz`, `twin.png`) gives the two paths (black =
+as it was, red dashed = with the change), when the lives first parted, how far
+apart they ended, and how many *other* animals' lives changed because of it.
+A twin with no change diverges by exactly 0.0 m; that is tested.
+
+Two examples on the shipped brain, eight voles, forked six hours in. Making
+one animal 40 points hungrier: it is 0.9 m from where it would have been a
+minute later, has eaten its way back to its old hunger within half an hour,
+and is still living a different life six hours on — as are all seven of its
+cage-mates, to whom nothing was done. Driving one unit (36, one synapse from
+the turn output) for ten seconds: the two lives part within 8 s and are 1.4 m
+apart two hours later; again all seven others end up somewhere else.
+
+`python -m fnt.abma --list-brains` prints, for each brain, the units wired
+most directly to turning and to speed — the first ones to try. Hovering a row
+of the Brain activity raster names the same thing for that unit.
+
+Unit stimulation can also be scheduled inside an ordinary experiment
+(`ExperimentConfig.stimulations`: when, how long, which animals, which unit,
+set / add / scale) — the in-silico version of an optogenetics protocol.
+
+### What a learned brain is not (yet)
+
+* It is a **phenomenological** brain, not a model of vole neuroanatomy. Units
+  are not cell types. What it offers is a closed sensory → neural → motor loop
+  whose behaviour was not written by hand, which can be lesioned, driven and
+  recorded completely.
+* It was raised in half-hour episodes. Nothing in the body makes rest pay, so
+  it has no sleep and no daily rhythm of its own beyond what light and the
+  clock inputs teach it. The same short episodes are why it has learned
+  nothing about rivals (above).
+* One diet. Protein, carbohydrate and lipid as separate needs, predators, and
+  a PufferLib adapter for much faster training are not built.
+
 ## Roadmap / not yet done
 
 1. **Absorbing boundary** — currently treated as reflective.
@@ -661,8 +888,16 @@ rests on them.
    nose, identity is read live, so changing `identity_signal` mid-run
    retroactively changes how that animal's old marks read.
 6. **A connectome-backed species** — the framework's sensory → neural → motor →
-   environment loop validated against a published circuit, before trusting the
-   same loop shape for a phenomenological vole brain.
+   environment loop validated against a published circuit. The loop itself now
+   exists (learned brains, above) with a phenomenological brain in it.
+7. **A reason to rest** — a fatigue/sleep need in the physiology, so activity
+   bouts and a daily rhythm can emerge in a learned brain instead of being
+   absent.
+8. **Macronutrients and predators** — separate protein / carbohydrate / lipid
+   needs met by different foods; a predator with a brain of its own.
+9. **Faster training** — a vectorised (PufferLib-style) environment; training
+   currently runs the full engine in worker processes, about 10,000 animal-ticks
+   per second.
 
 See `biology.py`, `olfaction.py`, `policy.py` (the `k_*` weights), and
 `config.py` for the extension points.

@@ -1920,7 +1920,9 @@ class ABMAWindow(QMainWindow):
         else:
             try:
                 from ..core.brain import find_brain
-                self.lbl_brain.setText(Brain.load(find_brain(name)).describe())
+                brain = Brain.load(find_brain(name))
+                self.lbl_brain.setText(brain.describe())
+                self.science.raster.set_unit_labels(brain.unit_labels())
             except Exception as e:
                 self.lbl_brain.setText(f"⚠ {e}")
         self.in_brain_noise.setEnabled(bool(name))

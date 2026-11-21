@@ -60,13 +60,16 @@ class Hyper:
     value_coef: float = 0.5
     max_grad: float = 0.5
     max_turn: float = 1.5        # radians per tick
+    #: spread of the initial neuromodulator weights (see TorchBrain)
+    gain_init: float = 1.5
     seed: int = 0
 
 
 class TorchBrain(nn.Module):
     """The trainable twin of :class:`fnt.abma.core.brain.Brain`."""
 
-    def __init__(self, n_sensory: int = 64, n_rnn: int = 64):
+    def __init__(self, n_sensory: int = 64, n_rnn: int = 64,
+                 gain_init: float = 1.5):
         super().__init__()
         own = {name: i for i, name in enumerate(SENSORS)}
         self.register_buffer(
@@ -80,9 +83,19 @@ class TorchBrain(nn.Module):
         nn.init.orthogonal_(self.W1.weight, math.sqrt(2))
         nn.init.orthogonal_(self.Wo.weight, 0.01)
         nn.init.orthogonal_(self.value.weight, 1.0)
-        nn.init.zeros_(self.Wg.weight)      # every gain starts at exactly 1
         for lin in (self.W1, self.Wg, self.Wo, self.value):
             nn.init.zeros_(lin.bias)
+        # Every sensory unit is born with its own random sensitivity to each
+        # neuromodulator — some are turned up by hunger, some down, some
+        # ignore it — the way a receptor is expressed in some cells and not
+        # others. Which sensitivity ends up *used* for what is learned.
+        # Starting them all at zero instead (every gain exactly 1) left the
+        # body's needs with almost no say: after 4M animal-ticks gains still
+        # varied by a few percent, and a thirsty animal chose food as often
+        # as a hungry one did.
+        nn.init.normal_(self.Wg.weight, 0.0, float(gain_init))
+        with torch.no_grad():               # gain 1 for a middling animal
+            self.Wg.bias.copy_(-0.5 * self.Wg.weight.sum(dim=1))
 
     def forward(self, obs, h0):
         """``obs`` (T, B, n_sensors), ``h0`` (1, B, n_rnn) -> mean motor
@@ -146,7 +159,7 @@ class Trainer:
         self.hp, self.cur, self.out_dir, self.name = hp, cur, out_dir, name
         os.makedirs(out_dir, exist_ok=True)
         torch.manual_seed(hp.seed)
-        self.net = TorchBrain(hp.n_sensory, hp.n_rnn)
+        self.net = TorchBrain(hp.n_sensory, hp.n_rnn, hp.gain_init)
         self.agent_steps = 0
         if resume is not None:
             self.net.load_brain(resume)

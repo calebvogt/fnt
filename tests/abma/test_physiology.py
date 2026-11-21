@@ -118,6 +118,31 @@ def test_satiated_animal_stops_eating():
         f"runaway intake: {sim.food_eaten_g.max():.1f} g in 2 days"
 
 
+def test_a_watered_animal_stops_drinking():
+    """Drinking is capped at what the body is short of, as eating is. An
+    animal that sits on the water for six hours takes in what it lost in six
+    hours — not six hours at the full drinking rate — so resting by the water
+    does not refill the bladder (and the supply of scent marks) for nothing."""
+    from fnt.abma.core.brain import Brain
+    from fnt.abma.core.neural import NeuralPolicy
+    still = Brain.random(2)
+    still.w["Wo"][:] = 0.0
+    still.w["bo"][:] = (0.0, -30.0)                  # commands zero speed
+    cfg = _cfg(n=1)
+    sim = Simulation(cfg, 0, policy=NeuralPolicy(still, stochastic=False))
+    sim.P[0] = (1.1, 0.3)                            # on the water
+    sim.thirst[0] = 0.0
+    hours = 6.0
+    for k in range(int(hours * 3600 / 8.0)):
+        sim.step(k * 8.0, 8.0)
+    p = cfg.physiology
+    assert np.allclose(sim.P[0], (1.1, 0.3)), "it should not have moved"
+    assert sim.thirst[0] < 1.0
+    assert sim.water_drunk_ml[0] == pytest.approx(
+        p.water_loss_ml_h * hours, rel=0.05)
+    assert sim.water_drunk_ml[0] < 0.2 * p.drink_rate_ml_min * 60 * hours
+
+
 def test_finite_pile_depletes_and_stops():
     cfg = _cfg(amount_g=1.5, days=3.0)
     sim = _run(cfg)

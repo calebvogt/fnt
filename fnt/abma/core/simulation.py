@@ -993,10 +993,18 @@ class Simulation:
 
         # ---- water ------------------------------------------------------ #
         drinking = on_water & alive
-        ml_in = np.where(drinking, p.drink_rate_ml_min * (dt / 60.0), 0.0)
+        ml_out = np.where(alive, p.water_loss_ml_h * (dt / 3600.0), 0.0)
+        # an animal stops when it is no longer thirsty, exactly as it stops
+        # eating when full: intake is capped at what the body is short of
+        # (plus what it loses this step). Without the cap an animal resting
+        # beside the water drank at the full rate for as long as it sat there
+        # — ten times a vole's daily intake — and refilled its bladder, and so
+        # its supply of scent marks, for nothing.
+        room_ml = self.thirst / 100.0 * w_cap + ml_out
+        ml_in = np.where(drinking, np.minimum(
+            p.drink_rate_ml_min * (dt / 60.0), room_ml), 0.0)
         ml_in = ml_in + ml_food
         self.water_drunk_ml += ml_in
-        ml_out = np.where(alive, p.water_loss_ml_h * (dt / 3600.0), 0.0)
         self.thirst = np.clip(
             self.thirst + (ml_out - ml_in) / w_cap * 100.0, 0.0, 100.0)
 

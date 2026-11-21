@@ -22,7 +22,7 @@ def figure(res: TwinResult, cfg=None, title: str | None = None):
     fig = Figure(figsize=(12.0, 6.4), dpi=110)
     gs = fig.add_gridspec(3, 2, width_ratios=[1.15, 1.0], hspace=0.42,
                           wspace=0.2, left=0.05, right=0.97, top=0.9,
-                          bottom=0.09)
+                          bottom=0.13)
     ax = fig.add_subplot(gs[:, 0])
     w, h = res.arena
     ax.set_xlim(0, w)
@@ -37,39 +37,54 @@ def figure(res: TwinResult, cfg=None, title: str | None = None):
         seen = set()
         for o in cfg.arena.objects:
             mk, col, lab = marks.get(o.kind, ("x", "gray", o.kind))
-            ax.scatter([o.x], [o.y], marker=mk, s=110, color=col, alpha=0.55,
-                       edgecolors="none", zorder=1,
+            # on top of the paths: where the food is explains most of them
+            ax.scatter([o.x], [o.y], marker=mk, s=120, color=col, alpha=0.95,
+                       edgecolors="black", linewidths=0.8, zorder=7,
                        label=None if lab in seen else lab)
             seen.add(lab)
         for z in getattr(cfg.arena, "resource_zones", []):
             ax.add_patch(_rect(z.x - z.w / 2, z.y - z.d / 2, z.w, z.d,
                                "goldenrod"))
         for t in getattr(cfg.arena, "water_towers", []):
-            ax.scatter([t.x], [t.y], marker="o", s=60, color="dodgerblue",
-                       alpha=0.55, zorder=1)
-    # everyone else, faintly, so the changed animal is read against its world
+            ax.scatter([t.x], [t.y], marker="o", s=70, color="dodgerblue",
+                       alpha=0.95, edgecolors="black", linewidths=0.8,
+                       zorder=7)
+    # Hours of path in one small enclosure are a tangle, so only the stretch
+    # right after the fork is drawn boldly — that is where the two lives can
+    # still be told apart by eye. The rest is kept, faintly, for range.
+    t_rel = res.t - res.t[0]
+    bold_s = min(float(t_rel[-1]), 1200.0)
+    nb = max(2, int(np.searchsorted(t_rel, bold_s, side="right")))
     others = np.setdiff1d(np.arange(res.xy_a.shape[1]), res.rows)
     for i in others:
-        ax.plot(res.xy_a[:, i, 0], res.xy_a[:, i, 1], color="gray", lw=0.4,
-                alpha=0.25, zorder=2)
+        ax.plot(res.xy_a[:nb, i, 0], res.xy_a[:nb, i, 1], color="gray",
+                lw=0.5, alpha=0.35, zorder=2)
     for i in res.rows:
-        ax.plot(res.xy_a[:, i, 0], res.xy_a[:, i, 1], color=AS_IT_WAS, lw=1.1,
-                alpha=0.85, zorder=3, label="as it was")
-        ax.plot(res.xy_b[:, i, 0], res.xy_b[:, i, 1], color=WITH_TWEAK, lw=1.1,
-                alpha=0.85, zorder=4, linestyle="--", label="with the change")
-        ax.scatter(*res.xy_a[0, i], marker="*", s=220, color="white",
-                   edgecolors="black", zorder=6, label="the fork")
-        ax.scatter(*res.xy_a[-1, i], marker="o", s=70, color=AS_IT_WAS,
-                   zorder=6)
-        ax.scatter(*res.xy_b[-1, i], marker="o", s=70, color=WITH_TWEAK,
-                   zorder=6)
+        ax.plot(res.xy_a[:, i, 0], res.xy_a[:, i, 1], color=AS_IT_WAS, lw=0.4,
+                alpha=0.15, zorder=3)
+        ax.plot(res.xy_b[:, i, 0], res.xy_b[:, i, 1], color=WITH_TWEAK, lw=0.4,
+                alpha=0.15, zorder=3)
+        ax.plot(res.xy_a[:nb, i, 0], res.xy_a[:nb, i, 1], color=AS_IT_WAS,
+                lw=1.6, alpha=0.9, zorder=4, label="as it was")
+        ax.plot(res.xy_b[:nb, i, 0], res.xy_b[:nb, i, 1], color=WITH_TWEAK,
+                lw=1.6, alpha=0.9, zorder=5, linestyle="--",
+                label="with the change")
+        ax.scatter(*res.xy_a[0, i], marker="*", s=240, color="white",
+                   edgecolors="black", zorder=8, label="the fork")
+        ax.scatter(*res.xy_a[nb - 1, i], marker="o", s=60, color=AS_IT_WAS,
+                   zorder=8)
+        ax.scatter(*res.xy_b[nb - 1, i], marker="o", s=60, color=WITH_TWEAK,
+                   zorder=8)
     hnd, lab = ax.get_legend_handles_labels()
     keep = dict(zip(lab, hnd))
-    ax.legend(keep.values(), keep.keys(), loc="upper right", fontsize=8,
-              framealpha=0.9)
+    # under the map, never on it: any corner may hold a nest or a feeder
+    ax.legend(keep.values(), keep.keys(), loc="upper center",
+              bbox_to_anchor=(0.5, -0.09), ncol=6, fontsize=8, frameon=False,
+              handletextpad=0.4, columnspacing=1.2)
     who = ", ".join(res.sexids[i] for i in res.rows)
-    ax.set_title(f"{who}: two versions of the next "
-                 f"{res.t[-1] / 3600.0:.1f} h", fontsize=11)
+    ax.set_title(f"{who}: two versions of what came next "
+                 f"(bold: first {bold_s / 60.0:.0f} min of "
+                 f"{t_rel[-1] / 3600.0:.1f} h)", fontsize=11)
 
     hours = res.t / 3600.0
     d = res.divergence()

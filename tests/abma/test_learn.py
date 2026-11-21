@@ -39,6 +39,22 @@ def test_the_numpy_brain_and_the_torch_brain_are_the_same_network():
     assert np.abs(h - hT[0].detach().numpy()).max() < 1e-4
 
 
+def test_a_newborn_brain_already_listens_to_its_body():
+    """Needs must be able to change what a sense does from the first tick:
+    sensory gains differ between units and move when hunger moves."""
+    torch.manual_seed(0)
+    brain = TorchBrain().export(_brain_meta(Hyper(), Curriculum(), "t", {}))
+    obs = np.full((2, len(SENSORS)), 0.5, np.float32)
+    obs[1, SENSORS.index("hunger")] = 0.95
+    mod = [SENSORS.index(m) for m in brain.meta["modulators"]]
+    gain = 2 / (1 + np.exp(-(obs[:, mod] @ brain.w["Wg"].T + brain.w["bg"])))
+    assert np.allclose(gain[0], 1.0, atol=1e-5), \
+        "a middling animal starts with every gain at 1"
+    assert np.abs(gain[1] - 1.0).mean() > 0.15, "hunger changes the gains"
+    assert (gain[1] > 1.05).any() and (gain[1] < 0.95).any(), \
+        "some units are turned up by hunger and some down"
+
+
 def test_weights_survive_export_and_reload():
     net = _random_net(1)
     brain = net.export(_brain_meta(Hyper(), Curriculum(), "t", {}))
