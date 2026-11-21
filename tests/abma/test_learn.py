@@ -54,8 +54,34 @@ def test_worlds_are_reproducible_and_varied():
     sides = {round(nursery.make_world(s, SMALL).arena.width, 3)
              for s in range(8)}
     assert len(sides) > 4, "the nursery should not hand out one world"
-    kinds = {o.kind for o in a.arena.objects}
-    assert kinds == {"food", "water"}
+    kinds = [frozenset(o.kind for o in nursery.make_world(s, SMALL).arena.objects)
+             for s in range(60)]
+    assert set(kinds) == {frozenset({"food"}), frozenset({"water"}),
+                          frozenset({"food", "water"})}, \
+        "some worlds hold one resource only, some both — never neither"
+    both = Curriculum(steps=64, one_resource=0.0)
+    assert all({o.kind for o in nursery.make_world(s, both).arena.objects}
+               == {"food", "water"} for s in range(20))
+
+
+def test_summary_counts_a_resource_only_where_it_exists():
+    """Time at water is averaged over animals whose world had water, and
+    'right choice' is the share of resource time spent at the needed one."""
+    f = nursery.STAT_FIELDS
+    rows = np.zeros((3, len(f)))
+    col = {name: i for i, name in enumerate(f)}
+    # thirsty, both resources, all its resource time at water
+    rows[0, [col["thirst0"], col["has_food"], col["has_water"],
+             col["frac_at_water"]]] = (90, 1, 1, 0.4)
+    # thirsty, in a world with no water at all
+    rows[1, [col["thirst0"], col["has_food"]]] = (90, 1)
+    # hungry, both resources, three quarters of its resource time at food
+    rows[2, [col["hunger0"], col["has_food"], col["has_water"],
+             col["frac_at_food"], col["frac_at_water"]]] = (90, 1, 1, 0.3, 0.1)
+    out = nursery.summarise(rows)
+    assert out["water_time_thirsty"] == pytest.approx(0.4), \
+        "the animal with no water to find must not count against the others"
+    assert out["right_choice"] == pytest.approx(0.7 / 0.8)
 
 
 def test_animals_arrive_in_every_state_of_need():

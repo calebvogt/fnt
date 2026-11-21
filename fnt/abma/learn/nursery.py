@@ -47,6 +47,12 @@ class Curriculum:
     #: target, animals learned to eat first, parked on the food, and then
     #: never wandered far enough to learn that water exists.
     site_radius_m: tuple = (0.15, 0.20)
+    #: fraction of worlds that hold only food, or only water (half each). In
+    #: worlds that always had both, animals learned to find food, sat on it,
+    #: and from there never met water often enough to learn what it is for.
+    #: A world with nothing but water teaches that at full strength; the
+    #: worlds with both then only have to teach *which* one a need calls for.
+    one_resource: float = 0.5
     #: hunger and thirst on arrival, 0-100. An animal has to meet every state
     #: of need, not only the comfortable ones a short episode would otherwise
     #: confine it to — and has to meet them one at a time as well as together,
@@ -92,9 +98,15 @@ def make_world(seed: int, cur: Curriculum) -> ExperimentConfig:
         return rng.uniform(margin, side - margin, 2)
 
     objs = []
+    only = None
+    if rng.random() < cur.one_resource:
+        only = "food" if rng.random() < 0.5 else "water"
     for kind, (lo, hi) in (("food", cur.food_sites),
                            ("water", cur.water_sites)):
-        for k in range(int(rng.integers(lo, hi + 1))):
+        if only is not None and kind != only:
+            continue
+        for k in range(max(int(rng.integers(lo, hi + 1)),
+                           1 if only else 0)):
             x, y = spot()
             objs.append(ResourceObject(
                 kind, float(x), float(y),
@@ -195,6 +207,10 @@ def rollout(weights: dict, meta: dict, seeds: list, cur_d: dict) -> dict:
             at_water / T, speed / T, sim.dist_total, sim.health,
             (sim.fights_won + sim.fights_lost) - fights0, sim.matings,
             sim.stress, np.full(n, n, float),
+            np.full(n, float(any(o.kind == "food"
+                                 for o in sim.cfg.arena.objects))),
+            np.full(n, float(any(o.kind == "water"
+                                 for o in sim.cfg.arena.objects))),
         ], axis=1))
     return {"obs": np.concatenate(obs_l, axis=1),
             "u": np.concatenate(u_l, axis=1),
@@ -205,29 +221,43 @@ def rollout(weights: dict, meta: dict, seeds: list, cur_d: dict) -> dict:
 #: columns of ``rollout()["stats"]``
 STAT_FIELDS = ["hunger0", "hunger1", "thirst0", "thirst1", "frac_at_food",
                "frac_at_water", "mean_speed", "dist_m", "health", "fights",
-               "matings", "stress", "group_size"]
+               "matings", "stress", "group_size", "has_food", "has_water"]
 
 
 def summarise(stats: np.ndarray) -> dict:
-    """The handful of numbers that say whether animals are learning to live."""
+    """The handful of numbers that say whether animals are learning to live.
+
+    Time at food is counted only over animals whose world had food (likewise
+    water). ``right_choice`` is the one that shows a need being *used*: among
+    animals with one need much stronger than the other, in a world offering
+    both, the share of their time-at-a-resource spent at the one they needed.
+    Chance is 0.5.
+    """
     s = {name: stats[:, i] for i, name in enumerate(STAT_FIELDS)}
+    food, water = s["has_food"] > 0, s["has_water"] > 0
     hungry = s["hunger0"] > 50
     thirsty = s["thirst0"] > 50
-    out = {
-        "d_hunger": float((s["hunger1"] - s["hunger0"]).mean()),
-        "d_thirst": float((s["thirst1"] - s["thirst0"]).mean()),
-        "food_time_hungry": float(s["frac_at_food"][hungry].mean())
-        if hungry.any() else 0.0,
-        "food_time_sated": float(s["frac_at_food"][~hungry].mean())
-        if (~hungry).any() else 0.0,
-        "water_time_thirsty": float(s["frac_at_water"][thirsty].mean())
-        if thirsty.any() else 0.0,
-        "water_time_sated": float(s["frac_at_water"][~thirsty].mean())
-        if (~thirsty).any() else 0.0,
+
+    def mean(x, m):
+        return float(x[m].mean()) if m.any() else 0.0
+
+    gap = s["hunger0"] - s["thirst0"]
+    both = food & water & (np.abs(gap) > 30)
+    right = np.where(gap > 0, s["frac_at_food"], s["frac_at_water"])
+    total = s["frac_at_food"] + s["frac_at_water"]
+    used = both & (total > 0.02)
+    return {
+        "d_hunger": mean(s["hunger1"] - s["hunger0"], food),
+        "d_thirst": mean(s["thirst1"] - s["thirst0"], water),
+        "food_time_hungry": mean(s["frac_at_food"], hungry & food),
+        "food_time_sated": mean(s["frac_at_food"], ~hungry & food),
+        "water_time_thirsty": mean(s["frac_at_water"], thirsty & water),
+        "water_time_sated": mean(s["frac_at_water"], ~thirsty & water),
+        "right_choice": float(right[used].sum() / total[used].sum())
+        if used.any() else 0.5,
         "speed": float(s["mean_speed"].mean()),
         "fights": float(s["fights"].mean()),
         "matings": float(s["matings"].mean()),
         "health": float(s["health"].mean()),
         "stress": float(s["stress"].mean()),
     }
-    return out

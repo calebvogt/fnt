@@ -118,6 +118,18 @@ def main(argv=None) -> int:
                         "'hunger-30@0' (animal 0 thirty points less hungry), "
                         "'smell_ability=0@males', 'rnn:12=1@0~10' (clamp unit "
                         "12 on for 10 s; needs --brain). Repeatable.")
+    b.add_argument("--assay", metavar="WHICH",
+                   help="Bench-test the animals instead of running an "
+                        "experiment: 'approach' (find the food: hungry, sated, "
+                        "anosmic), 'choice' (food or water, hungry vs "
+                        "thirsty), 'search' (area-restricted search after "
+                        "food is lost), or 'all'. Needs no config; add "
+                        "--brain to test a learned brain, omit it to test the "
+                        "rule-based animal. 'vitals' runs your config for "
+                        "--days and reports whether the cohort feeds and "
+                        "waters itself.")
+    b.add_argument("--assay-trials", type=int, default=40,
+                   help="Animals per condition in a bench assay (default 40).")
     b.add_argument("--fork-hours", type=float, default=6.0,
                    help="When the two lives part (default 6 h into the run).")
     b.add_argument("--horizon-hours", type=float, default=6.0,
@@ -131,6 +143,22 @@ def main(argv=None) -> int:
             print("No brains yet. Train one with: python -m fnt.abma.learn")
         for name, path in found:
             print(f"{name}\n    {Brain.load(path).describe()}\n    {path}")
+        return 0
+
+    if args.assay and args.assay != "vitals":
+        from .core import assays
+        try:
+            make = assays.policy_factory(args.brain)
+            _, report = assays.bench(make, args.assay,
+                                     trials=args.assay_trials,
+                                     species=args.species,
+                                     seed=args.seed or 0)
+        except (ValueError, FileNotFoundError) as e:
+            p.error(str(e))
+        print(f"{args.species}, "
+              + (f"learned brain '{args.brain}'" if args.brain
+                 else "rule-based") + "\n")
+        print(report)
         return 0
 
     if args.list_presets:
@@ -206,6 +234,12 @@ def main(argv=None) -> int:
 
     print(summary(cfg))
     if args.dry_run:
+        return 0
+
+    if args.assay == "vitals":
+        from .core.assays import format_vitals, vitals
+        print()
+        print(format_vitals(vitals(cfg, days=float(cfg.days))))
         return 0
 
     if args.twin:

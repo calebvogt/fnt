@@ -42,6 +42,8 @@ def main(argv=None) -> int:
                    help="Enclosure side range in metres, min,max.")
     p.add_argument("--solitary", action="store_true",
                    help="No contests or matings: foraging only.")
+    p.add_argument("--one-resource", type=float, default=0.5,
+                   help="Fraction of worlds with only food or only water.")
     p.add_argument("--lr", type=float, default=6e-4)
     p.add_argument("--entropy", type=float, default=0.005)
     p.add_argument("--seed", type=int, default=0)
@@ -51,7 +53,8 @@ def main(argv=None) -> int:
     cur = Curriculum(
         species=a.species, steps=a.steps, social=not a.solitary,
         animals=tuple(int(x) for x in a.animals.split(",")),
-        arena_m=tuple(float(x) for x in a.arena.split(",")))
+        arena_m=tuple(float(x) for x in a.arena.split(",")),
+        one_resource=a.one_resource)
     hp = Hyper(workers=a.workers, worlds=a.worlds, lr=a.lr,
                entropy=a.entropy, seed=a.seed)
     resume = Brain.load(find_brain(a.resume)) if a.resume else None
@@ -68,6 +71,7 @@ def main(argv=None) -> int:
                   f"food|sated {info['food_time_sated']:.2f}  "
                   f"water|thirsty {info['water_time_thirsty']:.2f} "
                   f"water|sated {info['water_time_sated']:.2f}  "
+                  f"right {info['right_choice']:.2f}  "
                   f"dH {info['d_hunger']:+5.1f} dT {info['d_thirst']:+5.1f}  "
                   f"spd {info['speed']:.2f} ev {info['explained_var']:+.2f} "
                   f"kl {info['kl']:.3f} "
