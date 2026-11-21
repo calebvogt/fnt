@@ -82,7 +82,7 @@ def test_vitals_describe_a_cohort():
 def test_bench_report_and_unknown_assay():
     results, text = assays.bench(None, "choice", trials=3)
     assert set(results) == {"choice"} and "FOOD OR WATER" in text
-    with pytest.raises(ValueError, match="approach, choice, search"):
+    with pytest.raises(ValueError, match="approach, choice, search, doorway"):
         assays.bench(None, "maze")
 
 
@@ -90,3 +90,18 @@ def test_headless_assay_needs_no_config(capsys):
     assert headless(["--assay", "choice", "--assay-trials", "3"]) == 0
     out = capsys.readouterr().out
     assert "rule-based" in out and "FOOD OR WATER" in out
+
+
+def test_doorway_assay_puts_the_food_behind_two_doorways():
+    """The rule-based animal is steered to a doorway, so it always gets in —
+    with or without a nose. What the assay is for is a brain, which is not."""
+    r = assays.doorway_battery(None, trials=4, max_s=300)
+    assert r["hungry"]["entered"] == 1.0
+    assert r["hungry, anosmic"]["entered"] == 1.0
+    r = assays.doorway(_random_brain, trials=3, max_s=40)
+    assert 0.0 <= r["entered"] <= 1.0
+
+
+def test_headless_doorway_assay(capsys):
+    assert headless(["--assay", "doorway", "--assay-trials", "2"]) == 0
+    assert "FIND THE BOX" in capsys.readouterr().out

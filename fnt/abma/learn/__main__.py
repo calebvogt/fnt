@@ -44,6 +44,23 @@ def main(argv=None) -> int:
                    help="No contests or matings: foraging only.")
     p.add_argument("--one-resource", type=float, default=0.5,
                    help="Fraction of worlds with only food or only water.")
+    p.add_argument("--boxes", type=float, default=0.5,
+                   help="Fraction of worlds whose food is in walled boxes "
+                        "with doorways.")
+    p.add_argument("--anosmic", type=float, default=0.25,
+                   help="Fraction of animals raised with no sense of smell.")
+    p.add_argument("--born-at-resource", type=float, default=0.2,
+                   help="Fraction of animals put down at food or water. A "
+                        "nose-less animal that starts at water while hungry "
+                        "has to learn to leave it and search.")
+    p.add_argument("--box-water", type=float, default=0.5,
+                   help="Chance that a box holds water as well as food.")
+    p.add_argument("--towers", type=float, default=0.5,
+                   help="Chance that open water is a solid tower rather than "
+                        "a patch to walk over.")
+    p.add_argument("--born-at-door", type=float, default=0.15,
+                   help="Fraction of animals put down just outside a "
+                        "doorway of a box.")
     p.add_argument("--lr", type=float, default=6e-4)
     p.add_argument("--entropy", type=float, default=0.005)
     p.add_argument("--seed", type=int, default=0)
@@ -54,7 +71,9 @@ def main(argv=None) -> int:
         species=a.species, steps=a.steps, social=not a.solitary,
         animals=tuple(int(x) for x in a.animals.split(",")),
         arena_m=tuple(float(x) for x in a.arena.split(",")),
-        one_resource=a.one_resource)
+        one_resource=a.one_resource, boxes=a.boxes, anosmic=a.anosmic,
+        born_at_door=a.born_at_door, born_at_resource=a.born_at_resource,
+        box_water=a.box_water, towers=a.towers)
     hp = Hyper(workers=a.workers, worlds=a.worlds, lr=a.lr,
                entropy=a.entropy, seed=a.seed)
     resume = Brain.load(find_brain(a.resume)) if a.resume else None
@@ -72,6 +91,8 @@ def main(argv=None) -> int:
                   f"water|thirsty {info['water_time_thirsty']:.2f} "
                   f"water|sated {info['water_time_sated']:.2f}  "
                   f"right {info['right_choice']:.2f}  "
+                  f"box nose/none {info['box_found_intact']:.2f}/"
+                  f"{info['box_found_anosmic']:.2f}  "
                   f"dH {info['d_hunger']:+5.1f} dT {info['d_thirst']:+5.1f}  "
                   f"spd {info['speed']:.2f} ev {info['explained_var']:+.2f} "
                   f"kl {info['kl']:.3f} "

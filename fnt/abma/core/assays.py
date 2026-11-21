@@ -26,6 +26,12 @@ an enclosure.
     difference between an animal that wants *something* and one that knows
     what it wants.
 
+``doorway``
+    The food is inside a walled box in a corner of the room, reached through
+    two small doorways. Hungry, with and without a nose: does it get in, and
+    how long does that take? Smell leads straight to a doorway; without it the
+    animal has only its whiskers and the walls.
+
 All work on any policy, so the same assay can be run on the rule-based animal
 for comparison. That comparison is informative in itself: the rule-based
 forager is told where the food is and steers for it, so anosmia does not touch
@@ -36,7 +42,8 @@ from __future__ import annotations
 import numpy as np
 
 from .compose import cohort
-from .config import ArenaConfig, ExperimentConfig, ResourceObject, ScentParams
+from .config import (ArenaConfig, ExperimentConfig, ResourceObject,
+                     ResourceZone, ScentParams)
 from .physiology import preset_params
 from .simulation import Simulation
 
@@ -195,6 +202,76 @@ def choice(make_policy, need: str = "hunger", level: float = 80.0,
 def choice_battery(make_policy, trials: int = 40, **kw) -> dict:
     return {"hungry": choice(make_policy, "hunger", trials=trials, **kw),
             "thirsty": choice(make_policy, "thirst", trials=trials, **kw)}
+
+
+def doorway(make_policy, smell: float = 1.0, hunger: float = 80.0,
+            trials: int = 40, side: float = 2.6, box: float = 0.51,
+            hole: float = 0.0762, min_dist: float = 1.2, max_s: float = 900.0,
+            species: str = "Prairie vole", seed: int = 0) -> dict:
+    """Find-the-box assay: chow inside a ``box`` m walled box in one corner
+    of a ``side`` m room, a doorway in each of the two walls that face the
+    room. One hungry animal starts at least ``min_dist`` from the box.
+    Returns how often it got inside within ``max_s``, how long that took,
+    and how much of the remaining time it then spent inside."""
+    dt = 2.0
+    steps = int(max_s / dt)
+    h = box / 2
+    entered, latency, stay = [], [], []
+    for k in range(trials):
+        rng = np.random.default_rng(seed * 100_000 + k)
+        left, low = rng.random() < 0.5, rng.random() < 0.5
+        cx = h if left else side - h
+        cy = h if low else side - h
+        doors = ("E" if left else "W") + ("N" if low else "S")
+        for _ in range(200):
+            start = rng.uniform(0.3, side - 0.3, 2)
+            if np.linalg.norm(start - (cx, cy)) >= min_dist:
+                break
+        cfg = ExperimentConfig(
+            name="assay",
+            arena=ArenaConfig(width=side, height=side, objects=[],
+                              resource_zones=[ResourceZone(
+                                  x=cx, y=cy, w=box, d=box, entrance=doors,
+                                  hole=hole, label="box")]),
+            groups=[cohort(species, "M", 1)], dt=dt,
+            seed=int(seed * 100_000 + k), days=1.0, n_trials=1,
+            start_datetime="2026-06-15T22:00:00")
+        cfg.physiology = preset_params("Standard")
+        cfg.scent = ScentParams(enabled=True)
+        sim = Simulation(cfg, 0, policy=make_policy() if make_policy else None)
+        _place(sim, start, hunger, smell, rng)
+        hit, inside = None, 0
+        for t in range(steps):
+            sim.step(t * dt, dt)
+            at = bool(sim._food_index()[0] >= 0)
+            if at and hit is None:
+                hit = (t + 1) * dt
+            if hit is not None:
+                inside += at
+        entered.append(hit is not None)
+        if hit is not None:
+            latency.append(hit)
+            stay.append(inside / max(1, steps - int(hit / dt)))
+    return {
+        "trials": trials, "smell": smell, "hunger": hunger,
+        "entered": float(np.mean(entered)),
+        "latency_s": float(np.median(latency)) if latency else float("nan"),
+        "stay_after": float(np.mean(stay)) if stay else float("nan"),
+    }
+
+
+def doorway_battery(make_policy, trials: int = 40, **kw) -> dict:
+    return {"hungry": doorway(make_policy, smell=1.0, trials=trials, **kw),
+            "hungry, anosmic": doorway(make_policy, smell=0.0, trials=trials,
+                                       **kw)}
+
+
+def format_doorway(results: dict) -> str:
+    rows = [f"{'condition':18s} {'got in':>7s} {'latency':>9s} {'stays':>6s}"]
+    for name, r in results.items():
+        rows.append(f"{name:18s} {r['entered'] * 100:6.0f}% "
+                    f"{r['latency_s']:8.0f}s {r['stay_after'] * 100:5.0f}%")
+    return "\n".join(rows)
 
 
 def search_after_loss(make_policy, trials: int = 40, eat_s: float = 40.0,
@@ -371,7 +448,7 @@ def format_battery(results: dict) -> str:
 
 
 #: the bench assays ``bench`` knows, in the order it runs them
-BENCH = ("approach", "choice", "search")
+BENCH = ("approach", "choice", "search", "doorway")
 
 
 def policy_factory(brain_name: str | None, stochastic: bool = True):
@@ -405,6 +482,11 @@ def bench(make_policy, which: str = "all", trials: int = 40,
                                seed=seed)
             text += ["FOOD OR WATER  (one each side, the animal between "
                      "them)", format_choice(r), ""]
+        elif name == "doorway":
+            r = doorway_battery(make_policy, trials=trials, species=species,
+                                seed=seed)
+            text += ["FIND THE BOX  (chow in a walled box in the corner, two "
+                     "doorways, 15 minutes)", format_doorway(r), ""]
         else:
             r = search_after_loss(make_policy, trials=trials, species=species,
                                   seed=seed)

@@ -769,6 +769,27 @@ Two things about the nursery are there because training failed without them:
   at zero the gains barely moved in training, and a thirsty animal chose food
   as often as a hungry one. Random initial sensitivities fixed that.
 
+Four more are there so that a brain can live in an enclosure with structures
+in it, and can lose its nose without losing everything:
+
+* **Walled boxes with doorways** (`--boxes`, default half the worlds that have
+  food). Food is inside one to four boxes — in a corner, against a wall or
+  free-standing — each with one or two doorways and sometimes water. A brain
+  raised only in open worlds meets its first wall in an experiment.
+* **Animals with no nose** (`--anosmic`, default a quarter; a tenth more with
+  a weak one). While every animal can smell, the smell of food always leads
+  to the doorway and nothing else about finding one is ever learned.
+* **Starts at a doorway, and at the edge of a resource** (`--born-at-door`,
+  `--born-at-resource`). A nose-less animal wandering the open floor almost
+  never comes across a 7 cm doorway; putting some down beside one makes "an
+  opening in a wall is worth going through" a common experience, and what is
+  learned there spreads outward to "walls are worth following". Likewise an
+  animal put down at the edge of a water source's reach, with no use for
+  water, can find out what lies beyond it.
+* **Water towers** (`--towers`). Some open water is a solid cylinder to drink
+  beside rather than a patch to walk over. To an animal's whiskers a tower is
+  a wall.
+
 ### Putting a brain in an experiment
 
 In the window: **Run tab → Nervous system → Learned brain**. From the command
@@ -835,6 +856,7 @@ python -m fnt.abma --preset anosmia --brain vole_forager --days 2 --assay vitals
 | `approach` | One animal, one food source out of reach. Run hungry, sated and hungry-but-anosmic: does motivation gate it, and does it need its nose? |
 | `choice` | Food one side, water the other, the animal midway. Hungry vs thirsty: does a need pick its own goal? |
 | `search` | It eats for 40 s and the food is removed. Does it stay and search where food was (area-restricted search), compared with the same spot never baited? |
+| `doorway` | The chow is in a walled box in a corner, behind two small doorways. With and without a nose: does it get in, and how long does it take? |
 | `vitals` | Your config, your cohort: does everyone eat and drink, how much, how far do they travel, what do they do to each other? |
 
 #### What the shipped brain does (`vole_forager`, 22M animal-ticks, ~25 min of training)
@@ -872,9 +894,9 @@ What that says:
   minutes and fed within thirty; of six on methimazole, none finds a doorway
   in the first half hour (they drink at the central tower). Over two days the
   anosmic cohort does get in and everyone eats — lowest energy 64 against 94.
-  The brain was never raised with walls or doorways, so how it finds a doorway
-  without smell is chance, not skill; treat the size of that gap as an upper
-  bound.
+  This brain was never raised with walls or doorways, so how it finds a
+  doorway without smell is chance, not skill; `vole_doorways` (below) was
+  raised with them.
 
 And what it does *not* show, which matters as much:
 
@@ -890,6 +912,56 @@ And what it does *not* show, which matters as much:
   every dyad contest once an hour), and a brain that gathers animals at food
   and water makes it worse. It has not learned to keep away from a rival:
   half-hour nursery episodes never let stress build far enough to matter.
+
+#### A second brain: `vole_doorways`
+
+`vole_forager` raised on for another 28M animal-ticks (about 40 minutes) in
+worlds with boxes, doorways and nose-less animals: first mixed, then a "door
+school" (every food world boxed, most animals nose-less, a third starting at a
+doorway), then a mixed, social consolidation. Same senses, same network; no
+sense was added.
+
+| | `vole_forager` | `vole_doorways` |
+|---|---|---|
+| **Find the box**, with a nose | 100% in 41 s | 100% in 42 s |
+| … **without a nose** | 32% in 370 s | **95% in 214 s** |
+| Find food in the open, with a nose | 100% in 34 s | 100% in 36 s |
+| … without a nose | 55% in 224 s | **5%** |
+| Food or water, by need | 100% / 100% | 100% / 100% |
+| After food is lost, distance 3 min later (vs never fed) | 1.26 vs 1.94 m | 0.06 vs 2.06 m |
+| **VoleCosm, methimazole, released by a wall**: in a box within 10 min | 0 of 24 | **24 of 24** (median 3.4 min) |
+| **VoleCosm, methimazole, released at the centre** (the default): in a box within 60 min | 13 of 24 | **3 of 24** |
+| Open vole cage, methimazole, one day: lowest energy reached | 15 | 53 |
+
+What it learned is to follow walls when it cannot smell: it goes to the
+room's wall, runs along it, and falls into the first doorway. That takes about
+three and a half minutes wherever it starts, which is why a nose is still six
+times quicker. With a nose nothing changed.
+
+Two things it got worse at, both consequences of the same strategy:
+
+* **Food lying in the open, without a nose: 5%.** A wall-follower never
+  crosses the middle of the room. The open-world brain wandered and found it
+  about half the time.
+* **It cannot leave a water tower.** Beside a tower a nose-less animal keeps
+  turning on the spot and pushing at the cylinder — the behaviour it uses at
+  any resource — and never steps out of the water's reach, so training never
+  shows it that leaving pays. Three targeted stages (animals started at
+  water, towers in the worlds, starts at the edge of reach, more exploration
+  noise) did not move this. It matters because **VoleCosm releases its
+  animals in the middle, beside the tower**: from there the methimazole
+  cohort mostly stays put for hours. Released anywhere else, all of them are
+  in a box within ten minutes. The gap is recorded as an expected failure in
+  `tests/abma/test_shipped_brain.py`.
+
+So for a VoleCosm comparison with this brain, either release the animals away
+from the tower (`release_mode="scatter"`) or treat the first hours of the
+methimazole arm as dominated by that artefact. The underlying limit is the
+sensorium, not the training: a nose-less animal here is also blind, with three
+whisker rays. A real anosmic vole sees the boxes.
+
+`vole_forager` stays the default; ask for this one with `--brain
+vole_doorways`.
 
 ### Twin experiments: one life, lived twice
 

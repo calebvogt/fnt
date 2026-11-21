@@ -81,3 +81,86 @@ def test_a_cohort_runs_in_an_enclosure_it_was_not_raised_in(brain):
         sim.step(k * 2.0, 2.0)
     assert np.isfinite(sim.P).all() and sim.alive.all()
     assert (sim.dist_total > 1.0).all(), "every animal should have moved"
+
+
+# --------------------------------------------------------------------------- #
+# vole_doorways: the same animal, raised on with walls, doorways and no nose
+# --------------------------------------------------------------------------- #
+@pytest.fixture(scope="module")
+def doorways():
+    brain = Brain.load(find_brain("vole_doorways"))
+    return lambda: NeuralPolicy(brain)
+
+
+def _volecosm_entries(make, anosmic, start, minutes, seed=0):
+    """Minutes until each of six hungry voles is first inside a box."""
+    from fnt.abma.core import movie
+    from fnt.abma.core.compose import design
+
+    cfg = design(preset="volecosm", seed=seed)
+    if anosmic:
+        cfg = movie.anosmic(cfg)
+    sim = Simulation(cfg, 0, policy=make())
+    sim.energy[:] = 30.0
+    sim.hunger[:] = 70.0
+    sim.thirst[:] = 0.0
+    if start is not None:
+        sim.P[:] = start(np.random.default_rng(seed), sim.n)
+    cx, cy, hw, hd = sim.food_rects.T
+    first = np.full(sim.n, np.inf)
+    for k in range(int(minutes * 30)):
+        sim.step(k * 2.0, 2.0)
+        inside = ((np.abs(sim.P[:, 0][:, None] - cx) <= hw)
+                  & (np.abs(sim.P[:, 1][:, None] - cy) <= hd)).any(axis=1)
+        first = np.where(np.isinf(first) & inside, (k + 1) / 30.0, first)
+    return first
+
+
+def _by_the_south_wall(rng, n):
+    return np.stack([rng.uniform(0.7, 2.1, n), rng.uniform(0.25, 0.45, n)],
+                    axis=1)
+
+
+def test_it_gets_into_a_box_without_a_nose(doorways, make):
+    """Chow behind two doorways. With a nose both brains walk straight in;
+    without one, the brain raised in open worlds mostly never finds the way
+    and the one raised with boxes follows the walls to it."""
+    with_nose = assays.doorway(doorways, smell=1.0, trials=12)
+    without = assays.doorway(doorways, smell=0.0, trials=12)
+    before = assays.doorway(make, smell=0.0, trials=12)
+    assert with_nose["entered"] >= 0.9 and with_nose["latency_s"] < 120
+    assert without["entered"] >= 0.75
+    assert without["entered"] >= before["entered"] + 0.3
+    assert without["latency_s"] > with_nose["latency_s"], \
+        "a nose should still be the quicker way in"
+
+
+def test_it_kept_what_the_forager_knew(doorways):
+    intact = assays.approach(doorways, hunger=80, trials=12, max_s=400)
+    assert intact["found"] >= 0.9 and intact["directness"] > 0.5
+    r = assays.choice_battery(doorways, trials=12, max_s=400)
+    assert r["hungry"]["first_food"] >= 0.8
+    assert r["thirsty"]["first_water"] >= 0.8
+    s = assays.search_after_loss(doorways, trials=10)
+    assert s["dist_after_loss_m"] < 0.75 * s["dist_never_fed_m"]
+
+
+def test_noseless_voles_released_by_a_wall_find_the_mesocosm_boxes(doorways):
+    first = _volecosm_entries(doorways, anosmic=True,
+                              start=_by_the_south_wall, minutes=20)
+    assert (first <= 20).all(), f"not all in a box in 20 min: {first.round(1)}"
+    intact = _volecosm_entries(doorways, anosmic=False,
+                               start=_by_the_south_wall, minutes=20)
+    assert np.median(intact) < np.median(first), \
+        "with a nose they should be quicker still"
+
+
+@pytest.mark.xfail(strict=False, reason=(
+    "Known gap. Beside a water tower a nose-less animal goes on turning on "
+    "the spot and pushing at the cylinder: it never steps out of the water's "
+    "reach, so it never finds out that leaving pays. Three targeted training "
+    "stages did not change this. VoleCosm releases its animals in the middle, "
+    "next to the tower."))
+def test_a_noseless_vole_leaves_the_water_tower_to_look_for_food(doorways):
+    first = _volecosm_entries(doorways, anosmic=True, start=None, minutes=60)
+    assert (first <= 60).sum() >= 4

@@ -26,7 +26,8 @@ import numpy as np
 from ..core.brain import Brain
 from ..core.compose import cohort
 from ..core.config import (ArenaConfig, ExperimentConfig, ResourceObject,
-                           ScentParams)
+                           ResourceZone, ScentParams, WaterTower, zone_doors,
+                           zone_sides)
 from ..core.neural import NeuralPolicy, discomfort
 from ..core.physiology import preset_params
 from ..core.simulation import Simulation
@@ -53,6 +54,30 @@ class Curriculum:
     #: A world with nothing but water teaches that at full strength; the
     #: worlds with both then only have to teach *which* one a need calls for.
     one_resource: float = 0.5
+    #: fraction of worlds whose food is kept in walled boxes with doorways
+    #: (resource zones, as in a mesocosm) rather than lying in the open. A
+    #: brain raised only in open worlds meets its first wall in an experiment.
+    boxes: float = 0.5
+    #: how many boxes such a world has (inclusive range; fewer if they do not
+    #: fit), their side in metres, and the width of a doorway
+    box_count: tuple = (1, 4)
+    box_side_m: tuple = (0.40, 0.55)
+    box_door_m: tuple = (0.07, 0.11)
+    #: in a world with both resources, the chance that a box holds water too
+    box_water: float = 0.5
+    #: chance that a water source in the open is a tower — a solid cylinder
+    #: to drink beside — rather than a patch to walk over. To an animal's
+    #: whiskers a tower is a wall; one that has learned to follow walls and
+    #: has never met a tower circles it indefinitely.
+    towers: float = 0.5
+    tower_radius_m: tuple = (0.06, 0.12)
+    #: fraction of animals raised with no sense of smell, and with a weak one.
+    #: While every animal can smell, the smell of food always leads to the
+    #: doorway and nothing else about finding one is ever learned — so a brain
+    #: that loses its nose in an experiment is left with chance. These animals
+    #: have to learn what walls and whiskers are for.
+    anosmic: float = 0.25
+    hyposmic: float = 0.10
     #: hunger and thirst on arrival, 0-100. An animal has to meet every state
     #: of need, not only the comfortable ones a short episode would otherwise
     #: confine it to — and has to meet them one at a time as well as together,
@@ -61,6 +86,13 @@ class Curriculum:
     #: fraction of animals put down already standing at food or water, so
     #: "I am thirsty and I am at water" is experienced from the first episode
     born_at_resource: float = 0.2
+    #: fraction put down just outside a doorway of a box (where there are
+    #: boxes). An animal with no nose that wanders the open floor almost never
+    #: comes across a 7 cm doorway, so it never learns that an opening in a
+    #: wall is worth going through; starting some of them at one makes that a
+    #: common experience, and what is learned there spreads outward to "walls
+    #: are worth following".
+    born_at_door: float = 0.15
     #: contests and matings happen (False = animals pass through each other
     #: socially, which isolates foraging)
     social: bool = True
@@ -88,29 +120,101 @@ class _NoEvents:
         pass
 
 
+def _place_boxes(rng, cur: Curriculum, side: float, water: bool) -> list:
+    """Walled boxes for one world: in a corner, against a wall, or standing
+    free; one or two doorways each, never in a wall that is against the room.
+    """
+    want = int(rng.integers(cur.box_count[0], cur.box_count[1] + 1))
+    gap = 0.22                        # room for an animal to pass between boxes
+    boxes, rects = [], []
+    for k in range(want):
+        for _ in range(30):
+            s = float(rng.uniform(*cur.box_side_m))
+            h = s / 2
+            style = rng.choice(["corner", "wall", "free"], p=[0.45, 0.25, 0.30])
+            if style == "corner":
+                x = h if rng.random() < 0.5 else side - h
+                y = h if rng.random() < 0.5 else side - h
+            elif style == "wall":
+                along = float(rng.uniform(h + gap, side - h - gap))
+                x, y = [(along, h), (along, side - h), (h, along),
+                        (side - h, along)][int(rng.integers(4))]
+            else:
+                lo, hi = h + gap, side - h - gap
+                if hi <= lo:
+                    continue
+                x, y = (float(v) for v in rng.uniform(lo, hi, 2))
+            if any(abs(x - bx) < h + bh + gap and abs(y - by) < h + bh + gap
+                   for bx, by, bh in rects):
+                continue
+            # a doorway only in a wall that faces the room
+            open_walls = [w for w, flush in (("W", x - h < 1e-6),
+                                             ("E", x + h > side - 1e-6),
+                                             ("S", y - h < 1e-6),
+                                             ("N", y + h > side - 1e-6))
+                          if not flush]
+            n_doors = min(len(open_walls), int(rng.integers(1, 3)))
+            doors = "".join(rng.choice(open_walls, n_doors, replace=False))
+            boxes.append(ResourceZone(
+                x=float(x), y=float(y), w=s, d=s, entrance=doors,
+                hole=float(rng.uniform(*cur.box_door_m)), label=f"box_{k}",
+                water=bool(water and rng.random() < cur.box_water)))
+            rects.append((x, y, h))
+            break
+    return boxes
+
+
 def make_world(seed: int, cur: Curriculum) -> ExperimentConfig:
     """One randomised world, as an ordinary experiment config."""
     rng = np.random.default_rng(seed)
     side = float(rng.uniform(*cur.arena_m))
     margin = 0.25
 
-    def spot():
-        return rng.uniform(margin, side - margin, 2)
-
-    objs = []
     only = None
     if rng.random() < cur.one_resource:
         only = "food" if rng.random() < 0.5 else "water"
+    # food in boxes: any world that has food, part of the time
+    boxes = []
+    if only != "water" and rng.random() < cur.boxes:
+        boxes = _place_boxes(rng, cur, side, water=only is None)
+
+    def spot(radius):
+        """A place in the open: clear of the walls and of every box, by more
+        than the source's own radius — it must not be reachable through a
+        box wall."""
+        for _ in range(200):
+            x, y = rng.uniform(margin, side - margin, 2)
+            if all(abs(x - b.x) > b.w / 2 + radius + 0.05
+                   or abs(y - b.y) > b.d / 2 + radius + 0.05 for b in boxes):
+                break
+        return float(x), float(y)
+
+    objs, towers = [], []
     for kind, (lo, hi) in (("food", cur.food_sites),
                            ("water", cur.water_sites)):
         if only is not None and kind != only:
             continue
-        for k in range(max(int(rng.integers(lo, hi + 1)),
-                           1 if only else 0)):
-            x, y = spot()
-            objs.append(ResourceObject(
-                kind, float(x), float(y),
-                float(rng.uniform(*cur.site_radius_m)), label=f"{kind}_{k}"))
+        if kind == "food" and boxes:
+            continue                      # the boxes are this world's food
+        count = max(int(rng.integers(lo, hi + 1)), 1 if only else 0)
+        if kind == "water" and boxes:
+            # boxes that hold water may be all the water there is, or there
+            # may be a source in the open as well (a tower in the middle)
+            if any(b.water for b in boxes):
+                count = int(rng.integers(0, 2))
+            else:
+                count = max(count, 1)
+        for k in range(count):
+            if kind == "water" and rng.random() < cur.towers:
+                r = float(rng.uniform(*cur.tower_radius_m))
+                # clear of the boxes by its whole drinking reach
+                x, y = spot(r + Simulation._REACH)
+                towers.append(WaterTower(x=x, y=y, radius=r,
+                                         label=f"tower_{k}"))
+                continue
+            r = float(rng.uniform(*cur.site_radius_m))
+            x, y = spot(r)
+            objs.append(ResourceObject(kind, x, y, r, label=f"{kind}_{k}"))
     n = int(rng.choice(cur.animals))
     males = int(rng.integers(0, n + 1))
     groups = [g for g in (
@@ -119,7 +223,8 @@ def make_world(seed: int, cur: Curriculum) -> ExperimentConfig:
         if g is not None]
     cfg = ExperimentConfig(
         name="nursery",
-        arena=ArenaConfig(width=side, height=side, objects=objs),
+        arena=ArenaConfig(width=side, height=side, objects=objs,
+                          resource_zones=boxes, water_towers=towers),
         groups=groups, dt=cur.tick_s, seed=int(seed),
         days=cur.steps * cur.tick_s / 86400.0, n_trials=1,
         release_mode="scatter",
@@ -152,12 +257,55 @@ def spawn(seed: int, cur: Curriculum, brain: Brain,
     sim.energy = 100.0 - hunger
     sim.hunger = hunger
     sim.thirst = thirst
-    objs = [o for o in cfg.arena.objects if o.kind in ("food", "water")]
+    objs = ([o for o in cfg.arena.objects if o.kind in ("food", "water")]
+            + list(cfg.arena.resource_zones) + list(cfg.arena.water_towers))
     if objs and cur.born_at_resource > 0:
         for i in np.nonzero(rng.random(n) < cur.born_at_resource)[0]:
             o = objs[int(rng.integers(len(objs)))]
-            sim.P[i] = (o.x, o.y) + rng.normal(0, 0.03, 2)
+            # Anywhere within reach of it, out to the very edge — not always
+            # at its centre. An animal that has no use for the resource it is
+            # standing at has to learn to walk away from it, and one that
+            # starts a step from the edge finds out what lies beyond; from the
+            # centre, with no smell of anything else, it never did.
+            ang = rng.uniform(0, 2 * np.pi)
+            if isinstance(o, WaterTower):          # beside the cylinder
+                dist = o.radius + rng.uniform(0.04, Simulation._REACH)
+            elif isinstance(o, ResourceZone):      # inside the box
+                dist = abs(rng.normal(0, 0.03))
+            else:                                  # anywhere on the patch
+                dist = o.radius * np.sqrt(rng.random())
+            off = dist * np.array([np.cos(ang), np.sin(ang)])
+            sim.P[i] = np.clip((o.x, o.y) + off, 0.02, cfg.arena.width - 0.02)
             sim.home[i] = sim.P[i]
+    zones = list(cfg.arena.resource_zones)
+    if zones and cur.born_at_door > 0:
+        out = {"N": (0.0, 1.0), "S": (0.0, -1.0), "E": (1.0, 0.0),
+               "W": (-1.0, 0.0)}
+        side = cfg.arena.width
+        for i in np.nonzero(rng.random(n) < cur.born_at_door)[0]:
+            z = zones[int(rng.integers(len(zones)))]
+            k = int(rng.integers(len(zone_sides(z))))
+            ox, oy = out[zone_sides(z)[k]]
+            dx, dy = zone_doors(z)[k]
+            away, along = rng.uniform(0.04, 0.30), rng.uniform(-0.15, 0.15)
+            pos = np.clip((dx + ox * away + oy * along,
+                           dy + oy * away + ox * along), 0.02, side - 0.02)
+            if any(abs(pos[0] - b.x) <= b.w / 2 and abs(pos[1] - b.y) <= b.d / 2
+                   for b in zones):
+                continue                  # that spot is inside another box
+            sim.P[i] = pos
+            sim.home[i] = pos
+            sim.H[i] = rng.uniform(0, 2 * np.pi)
+    # some are raised without a nose, some with a weak one
+    draw = rng.random(n)
+    smell = np.where(draw < cur.anosmic, 0.0,
+                     np.where(draw < cur.anosmic + cur.hyposmic,
+                              rng.uniform(0.2, 0.8, n), 1.0))
+    for i in np.nonzero(smell < 1.0)[0]:
+        sim.smell[i] = smell[i]
+        sim.agents[i].traits.smell_ability = float(smell[i])
+    if (smell < 1.0).any():
+        sim.mark_biology_dirty()
     return sim
 
 
@@ -207,10 +355,10 @@ def rollout(weights: dict, meta: dict, seeds: list, cur_d: dict) -> dict:
             at_water / T, speed / T, sim.dist_total, sim.health,
             (sim.fights_won + sim.fights_lost) - fights0, sim.matings,
             sim.stress, np.full(n, n, float),
-            np.full(n, float(any(o.kind == "food"
-                                 for o in sim.cfg.arena.objects))),
-            np.full(n, float(any(o.kind == "water"
-                                 for o in sim.cfg.arena.objects))),
+            np.full(n, float(len(sim.food) + len(sim.food_rects) > 0)),
+            np.full(n, float(len(sim.water) + len(sim.water_rects) > 0)),
+            sim.smell.astype(float),
+            np.full(n, float(len(sim.food_rects) > 0)),
         ], axis=1))
     return {"obs": np.concatenate(obs_l, axis=1),
             "u": np.concatenate(u_l, axis=1),
@@ -221,7 +369,8 @@ def rollout(weights: dict, meta: dict, seeds: list, cur_d: dict) -> dict:
 #: columns of ``rollout()["stats"]``
 STAT_FIELDS = ["hunger0", "hunger1", "thirst0", "thirst1", "frac_at_food",
                "frac_at_water", "mean_speed", "dist_m", "health", "fights",
-               "matings", "stress", "group_size", "has_food", "has_water"]
+               "matings", "stress", "group_size", "has_food", "has_water",
+               "smell", "has_boxes"]
 
 
 def summarise(stats: np.ndarray) -> dict:
@@ -231,7 +380,9 @@ def summarise(stats: np.ndarray) -> dict:
     water). ``right_choice`` is the one that shows a need being *used*: among
     animals with one need much stronger than the other, in a world offering
     both, the share of their time-at-a-resource spent at the one they needed.
-    Chance is 0.5.
+    Chance is 0.5. ``box_found_*`` is the share of hungry animals, in worlds
+    whose food is in boxes, that got into one and ate — for animals with a
+    nose and for animals without.
     """
     s = {name: stats[:, i] for i, name in enumerate(STAT_FIELDS)}
     food, water = s["has_food"] > 0, s["has_water"] > 0
@@ -242,11 +393,19 @@ def summarise(stats: np.ndarray) -> dict:
         return float(x[m].mean()) if m.any() else 0.0
 
     gap = s["hunger0"] - s["thirst0"]
-    both = food & water & (np.abs(gap) > 30)
+    # (not in box worlds: a box may hold both, and then time in it counts as
+    # time at each, which would read as no preference)
+    both = food & water & (np.abs(gap) > 30) & (s["has_boxes"] == 0)
     right = np.where(gap > 0, s["frac_at_food"], s["frac_at_water"])
     total = s["frac_at_food"] + s["frac_at_water"]
     used = both & (total > 0.02)
+    boxed = hungry & (s["has_boxes"] > 0)
+    ate = s["frac_at_food"] > 0.05
     return {
+        "box_found_intact": mean(ate, boxed & (s["smell"] >= 1.0)),
+        "box_found_anosmic": mean(ate, boxed & (s["smell"] <= 0.0)),
+        "food_time_anosmic": mean(s["frac_at_food"],
+                                  hungry & food & (s["smell"] <= 0.0)),
         "d_hunger": mean(s["hunger1"] - s["hunger0"], food),
         "d_thirst": mean(s["thirst1"] - s["thirst0"], water),
         "food_time_hungry": mean(s["frac_at_food"], hungry & food),
