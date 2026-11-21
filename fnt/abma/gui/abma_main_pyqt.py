@@ -31,6 +31,7 @@ from ..core.config import (
     TraitProfile, ResourceObject, Intervention, Appearance, Coupling,
     default_dynamics, GrassSpec, blank_experiment, default_vole_experiment,
     ScentParams, OlfactionParams, SwardParams, SkyParams,
+    BrainParams,
 )
 from ..core.runner import run_experiment, grid_offsets
 from ..core.sampling import parse_spec
@@ -47,6 +48,7 @@ from ..core.species import get_species, apply_species, by_name as by_species_nam
 from .abma_canvas import ArenaCanvas
 from .agent_inspector import AgentInspector
 from .science_panel import SciencePanel
+from ..core.brain import Brain, list_brains
 from .protocol_timeline import ProtocolTimeline, describe as describe_event
 from .species_picker import SpeciesPicker
 
@@ -1038,6 +1040,8 @@ class ABMAWindow(QMainWindow):
             ("&Save Project", "Ctrl+Shift+S", self._save_project),
             ("Run &Study (compare conditions)…", None, self._run_study_dialog),
             ("Run &Anosmia Dose-Response…", None, self._anosmia_study_dialog),
+            ("&Twin Experiment (one life, lived twice)…", None,
+             self._twin_dialog),
             (None, None, None),
             ("&New (blank experiment)", "Ctrl+N",
              lambda: self._load_config(blank_experiment())),
@@ -1460,6 +1464,41 @@ class ABMAWindow(QMainWindow):
         ess.addRow("Resolution", self.in_fidelity)
         lay.addLayout(ess)
 
+        # ---- nervous system: written rules, or a learned brain -------------
+        brain_box = QGroupBox("Nervous system")
+        bl = QVBoxLayout(brain_box)
+        self.in_brain = QComboBox()
+        self.in_brain.setToolTip(
+            "Instinct: movement is a weighted sum of hand-written drives.\n"
+            "Learned brain: a recurrent network that only receives what the "
+            "body senses, trained by reinforcement on the body's own needs. "
+            "Nothing about its behaviour is written down.")
+        self._fill_brain_combo()
+        bl.addWidget(self.in_brain)
+        self.lbl_brain = QLabel("")
+        self.lbl_brain.setWordWrap(True)
+        self.lbl_brain.setStyleSheet("color:#8a9099; font-size:10px;")
+        bl.addWidget(self.lbl_brain)
+        self.in_brain_noise = QCheckBox(
+            "Motor noise (each animal varies what it does)")
+        self.in_brain_noise.setChecked(True)
+        self.in_brain_noise.setToolTip(
+            "Off: every animal acts on the mean of its policy — tidier to "
+            "read, less like an animal.")
+        bl.addWidget(self.in_brain_noise)
+        brow = QHBoxLayout()
+        b_twin = QPushButton("⑂ Twin experiment…")
+        b_twin.setToolTip(
+            "Fork one animal's life: change one thing about it at one moment "
+            "and compare what happens next against what would have.")
+        b_twin.clicked.connect(self._twin_dialog)
+        brow.addWidget(b_twin)
+        brow.addStretch()
+        bl.addLayout(brow)
+        lay.addWidget(brain_box)
+        self.in_brain.currentIndexChanged.connect(self._on_brain_changed)
+        self.in_brain_noise.toggled.connect(self._on_arena_edit)
+
         # ---- protocol timeline (timed add/remove of animals & resources) ----
         proto_box = QGroupBox("Experiment protocol")
         pl = QVBoxLayout(proto_box)
@@ -1857,6 +1896,58 @@ class ABMAWindow(QMainWindow):
         lay.addStretch(1)
         return w
 
+    # ---- nervous system ----------------------------------------------- #
+    def _fill_brain_combo(self, keep: str = "") -> None:
+        """List the rules and every brain on disk; ``keep`` adds one by path."""
+        self.in_brain.blockSignals(True)
+        self.in_brain.clear()
+        self.in_brain.addItem("Instinct — hand-written rules", "")
+        names = [n for n, _ in list_brains()]
+        for n in names:
+            self.in_brain.addItem(f"Learned brain — {n}", n)
+        if keep and keep not in names:
+            self.in_brain.addItem(f"Learned brain — {os.path.basename(keep)}",
+                                  keep)
+        self.in_brain.blockSignals(False)
+
+    def _on_brain_changed(self, *_):
+        name = self.in_brain.currentData()
+        if not name:
+            self.lbl_brain.setText(
+                "Each animal blends named drives (home, food, others, rival "
+                "scent, exploration). Legible, and every behaviour it shows "
+                "is one it was given.")
+        else:
+            try:
+                from ..core.brain import find_brain
+                self.lbl_brain.setText(Brain.load(find_brain(name)).describe())
+            except Exception as e:
+                self.lbl_brain.setText(f"⚠ {e}")
+        self.in_brain_noise.setEnabled(bool(name))
+        if not getattr(self, "_loading", False):
+            self._on_arena_edit()
+
+    def _brain_from_ui(self) -> BrainParams:
+        name = self.in_brain.currentData() or ""
+        return BrainParams(enabled=bool(name),
+                           name=name or self._brain.name,
+                           stochastic=self.in_brain_noise.isChecked(),
+                           noise_scale=self._brain.noise_scale)
+
+    def _twin_dialog(self):
+        """Fork one animal's life and compare the two (see core/twin.py)."""
+        from ..core.simulation import Simulation
+        from .twin_dialog import TwinDialog
+        try:
+            cfg = self._collect_config()
+            roster = Simulation(cfg, trial_index=0).agents
+        except Exception as e:
+            QMessageBox.warning(self, "Twin experiment", str(e))
+            return
+        animals = [(a.index, f"{a.sexid} · {a.group}") for a in roster]
+        sel = self.science.selected_index() if hasattr(self, "science") else None
+        TwinDialog(cfg, animals, selected=sel, parent=self).exec_()
+
     def _apply_phys_preset(self, name):
         """Stamp a named physiology preset onto the rate fields."""
         if name not in PHYSIOLOGY_PRESETS:
@@ -2128,6 +2219,8 @@ class ABMAWindow(QMainWindow):
             n_workers=self.in_workers.value(),
             trial_prefix="S",
             policy=copy.deepcopy(self._policy),
+            brain=self._brain_from_ui(),
+            stimulations=copy.deepcopy(self._stimulations),
             scent=ScentParams(
                 enabled=self.in_scent_on.isChecked(),
                 cell_size=self.in_scent_cell.value(),
@@ -2184,6 +2277,21 @@ class ABMAWindow(QMainWindow):
         # policy params have no editor widgets (yet) — carry them through so a
         # tuned config's movement weights survive the GUI round-trip
         self._policy = copy.deepcopy(cfg.policy)
+        # which nervous system drives the animals, and any scheduled unit
+        # stimulation (no editor yet, so it rides through like the policy)
+        self._brain = copy.deepcopy(cfg.brain)
+        self._stimulations = copy.deepcopy(cfg.stimulations)
+        if hasattr(self, "in_brain"):
+            want = cfg.brain.name if cfg.brain.enabled else ""
+            self._fill_brain_combo(keep=want)
+            k = self.in_brain.findData(want)
+            self.in_brain.blockSignals(True)
+            self.in_brain.setCurrentIndex(max(0, k))
+            self.in_brain.blockSignals(False)
+            self.in_brain_noise.blockSignals(True)
+            self.in_brain_noise.setChecked(cfg.brain.stochastic)
+            self.in_brain_noise.blockSignals(False)
+            self._on_brain_changed()
         # likewise the scent knobs that aren't on screen (cost/strength/counter)
         self._scent = copy.deepcopy(cfg.scent)
         self._physiology = copy.deepcopy(cfg.physiology)

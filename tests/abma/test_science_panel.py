@@ -185,3 +185,60 @@ def test_scrubbing_rebuilds_the_trace_instead_of_appending(panel, running_sim):
 
     panel.update_frame(buffer[9], buffer=buffer, index=9)   # scrub forward
     assert len(plot.history["energy"]) == 10
+
+
+# --------------------------------------------------------------------------- #
+# A learned brain in the inspection column
+# --------------------------------------------------------------------------- #
+def _neural_frames(count=12):
+    from fnt.abma.core.brain import Brain
+    from fnt.abma.core.neural import NeuralPolicy
+
+    sim = Simulation(vole_anosmia(), 0, policy=NeuralPolicy(Brain.random(4)))
+    frames = []
+    for k in range(count * 5):
+        sim.step(k * 2.0, 2.0)
+        if k % 5 == 4:
+            frames.append(sim._frame((k + 1) * 2.0))
+    return sim, frames
+
+
+def test_a_brain_replaces_the_drive_bars_with_its_senses(app):
+    from fnt.abma.gui.science_panel import SENSE_GROUPS
+
+    sim, frames = _neural_frames()
+    panel = SciencePanel()
+    panel.set_population(sim.agent_static())
+    panel.select(0)
+    for fr in frames:
+        panel.update_frame(fr)
+    assert panel.why.text() == "WHAT IS REACHING ITS BRAIN"
+    labels = [label for label, _, _ in panel.drives.values]
+    assert labels == [label for _, label, _ in SENSE_GROUPS]
+    assert any(v > 0 for _, v, _ in panel.drives.values)
+    # the raster comes forward by itself the first time a brain appears
+    assert panel.picker.currentText() == "Brain activity"
+    assert len(panel.raster.cols) == len(frames)
+    assert panel.raster.cols[-1].shape == (64,)
+    panel.resize(320, 800)
+    panel.grab()                       # paints without raising
+
+
+def test_the_raster_rebuilds_when_scrubbing(app):
+    sim, frames = _neural_frames()
+    panel = SciencePanel()
+    panel.set_population(sim.agent_static())
+    panel.select(1)
+    panel.update_frame(frames[5], buffer=frames, index=5)
+    assert len(panel.raster.cols) == 6, "scrubbing shows the run up to here"
+    panel.update_frame(frames[2], buffer=frames, index=2)
+    assert len(panel.raster.cols) == 3, "...and going back does not append"
+
+
+def test_a_rule_based_run_says_there_is_no_brain(app, running_sim):
+    panel = SciencePanel()
+    panel.set_population(running_sim.agent_static())
+    panel.select(0)
+    panel.update_frame(running_sim._frame(0.0))
+    assert panel.why.text() == "WHY IT IS MOVING THAT WAY"
+    assert len(panel.raster.cols) == 0

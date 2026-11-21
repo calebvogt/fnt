@@ -201,3 +201,100 @@ def test_olfaction_settings_survive_the_gui_round_trip(qapp):
     qt_window._load_config(got)
     assert qt_window._collect_config().olfaction == got.olfaction
     assert qt_window.in_olf_ch.isEnabled()
+
+
+# --------------------------------------------------------------------------- #
+# Nervous system: rules or a learned brain
+# --------------------------------------------------------------------------- #
+def _brain_file(tmp_path):
+    from fnt.abma.core.brain import Brain
+    return Brain.random(3).save(str(tmp_path / "test_brain.npz"))
+
+
+def test_rules_stay_the_default_nervous_system(qapp):
+    from fnt.abma.gui.abma_main_pyqt import ABMAWindow
+    from fnt.abma.core.config import default_vole_experiment
+
+    win = ABMAWindow()
+    win._load_config(default_vole_experiment())
+    assert win.in_brain.currentData() == ""
+    assert win._collect_config().brain.enabled is False
+    assert not win.in_brain_noise.isEnabled(), \
+        "motor noise is a brain setting; it has no meaning for the rules"
+
+
+def test_brain_choice_survives_the_gui_round_trip(qapp, tmp_path):
+    """A config that names a brain must still name it after passing through
+    the window — the way PolicyParams once did not."""
+    from fnt.abma.gui.abma_main_pyqt import ABMAWindow
+    from fnt.abma.core.config import (BrainParams, Stimulation,
+                                      default_vole_experiment)
+
+    path = _brain_file(tmp_path)
+    cfg = default_vole_experiment()
+    cfg.brain = BrainParams(enabled=True, name=path, stochastic=False,
+                            noise_scale=0.7)
+    cfg.stimulations = [Stimulation(at_day=1.0, unit=9, op="scale", value=0)]
+    win = ABMAWindow()
+    win._load_config(cfg)
+    out = win._collect_config()
+    assert out.brain == cfg.brain
+    assert out.stimulations == cfg.stimulations, \
+        "scheduled stimulation has no editor yet, so it must ride through"
+    assert "untrained" in win.lbl_brain.text()
+    assert win.in_brain_noise.isEnabled()
+    # the live editor preview is driven by the same brain the run will use
+    assert type(win._preview_sim.policy).__name__ == "NeuralPolicy"
+    # ...and switching back to the rules really switches back
+    win.in_brain.setCurrentIndex(0)
+    assert win._collect_config().brain.enabled is False
+
+
+def test_twin_dialog_offers_only_what_this_run_can_do(qapp, tmp_path):
+    from fnt.abma.gui.twin_dialog import CHANGES, TwinDialog
+    from fnt.abma.core.config import BrainParams, default_vole_experiment
+
+    cfg = default_vole_experiment()
+    animals = [(0, "F9001 · saline_F"), (1, "F9002 · saline_F")]
+    dlg = TwinDialog(cfg, animals, selected=1)
+    assert dlg.in_animal.currentData() == 1
+    tw = dlg.tweak()
+    assert (tw.kind, tw.name, tw.value, tw.target) == \
+        ("state", "hunger", -30.0, "1")
+    model = dlg.in_change.model()
+    for k, (label, needs_brain, *_rest) in enumerate(CHANGES):
+        assert model.item(k).isEnabled() == (not needs_brain), label
+
+    cfg.brain = BrainParams(enabled=True, name=_brain_file(tmp_path))
+    dlg = TwinDialog(cfg, animals)
+    assert all(dlg.in_change.model().item(k).isEnabled()
+               for k in range(len(CHANGES)))
+    dlg.in_change.setCurrentIndex(
+        [c[0] for c in CHANGES].index("One brain unit silenced"))
+    dlg.in_unit.setValue(12)
+    dlg.in_seconds.setValue(30)
+    tw = dlg.tweak()
+    assert (tw.kind, tw.name, tw.op, tw.value, tw.duration_s) == \
+        ("unit", "rnn:12", "scale", 0.0, 30.0)
+    assert not dlg.in_unit.isHidden() and dlg.in_amount.isHidden()
+
+
+def test_twin_dialog_runs_and_reports(qapp):
+    """End to end through the dialog's own worker, on a short horizon."""
+    from PyQt5.QtCore import QEventLoop, QTimer
+    from fnt.abma.gui.twin_dialog import TwinDialog
+    from fnt.abma.core.config import default_vole_experiment
+
+    cfg = default_vole_experiment()
+    dlg = TwinDialog(cfg, [(0, "F9001 · saline_F")])
+    dlg.in_fork.setValue(0.05)
+    dlg.in_horizon.setValue(0.25)
+    loop = QEventLoop()
+    dlg._run()
+    dlg.worker.finished.connect(loop.quit)
+    QTimer.singleShot(60_000, loop.quit)
+    loop.exec_()
+    qapp.processEvents()
+    assert dlg.result is not None, "the twin run did not finish"
+    assert dlg.canvas is not None and dlg.btn_save.isEnabled()
+    assert "F9001" in dlg.verdict.text()

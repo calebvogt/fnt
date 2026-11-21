@@ -31,7 +31,8 @@ from __future__ import annotations
 import math
 from collections import deque
 
-from PyQt5.QtCore import Qt, QSize, pyqtSignal
+import numpy as np
+from PyQt5.QtCore import Qt, QSize, QRectF, pyqtSignal
 from PyQt5.QtGui import QColor, QPainter, QPen, QBrush, QPainterPath, QFont
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QScrollArea,
@@ -88,6 +89,24 @@ SENSED: list[tuple[str, str, str]] = [
     ("detection_mean", "detects others", "#7fb3d5"),
     ("need_food", "needs food", "#e0a23a"),
     ("need_water", "needs water", "#3ab0c4"),
+]
+
+
+#: What a learned brain commanded, and how the body felt about the result.
+BRAIN_OUT: list[tuple[str, str, str]] = [
+    ("brain_speed", "speed (0-1)", "#4a90d9"),
+    ("brain_turn", "turn (left + / right -)", "#e0a23a"),
+    ("discomfort", "discomfort", "#d9534f"),
+]
+
+#: The senses a learned brain receives, grouped, for the "what is reaching its
+#: brain" bars. Colours echo the drive they most resemble on the rules side.
+SENSE_GROUPS: list[tuple[str, str, str]] = [
+    ("olfaction", "smell", "#5ec2a0"),
+    ("touch", "touch / others", "#c58fd6"),
+    ("taste", "taste", "#e0a23a"),
+    ("memory", "place memory", "#7fb3d5"),
+    ("interoception", "body state", "#d9534f"),
 ]
 
 
@@ -270,6 +289,22 @@ class DriveBars(QWidget):
         self.update()
 
     def set_frame(self, frame: dict, idx: int) -> None:
+        obs = frame.get("brain_obs")
+        if obs is not None and idx < len(obs):
+            # A learned brain has no named drives to show. What can be shown is
+            # how strongly each sense is speaking to it right now.
+            from ..core.senses import GROUPS, SENSORS
+            col = {name: i for i, name in enumerate(SENSORS)}
+            row = obs[idx]
+            self.values = [
+                (label, float(math.sqrt(sum(
+                    float(row[col[c]]) ** 2 for c in GROUPS[key])
+                    / max(1, len(GROUPS[key])))), colour)
+                for key, label, colour in SENSE_GROUPS]
+            self.heading = _f(frame, "heading", idx)
+            self.setMinimumHeight(self.ROW_H * len(self.values) + 8)
+            self.update()
+            return
         rows = []
         for key, label, colour in DRIVES:
             v = _f(frame, key, idx)
@@ -461,6 +496,105 @@ class TraceGroup(QWidget):
 
 
 # --------------------------------------------------------------------------- #
+# A learned brain, unit by unit
+# --------------------------------------------------------------------------- #
+class BrainRaster(QWidget):
+    """Every recurrent unit of the selected animal's brain, through time.
+
+    One row per unit, one column per frame, newest at the right: blue is a unit
+    driven negative, red positive, dark near zero. Read down a column for what
+    the whole brain was doing at one moment; read along a row for one unit's
+    history. Units that light up together when the animal turns, or go quiet
+    when it reaches food, show as bands.
+
+    Hover for the unit number — that number is what a twin experiment takes
+    when you ask what would have happened had that unit been driven.
+    """
+
+    def __init__(self, window: int = 240, parent=None):
+        super().__init__(parent)
+        self.window = window
+        self.cols: deque = deque(maxlen=window)
+        self.setMinimumHeight(150)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMouseTracking(True)
+        self._img = None
+        self._plot = (0, 0, 1, 1)
+
+    def clear(self) -> None:
+        self.cols.clear()
+        self._img = None
+        self.update()
+
+    def _take(self, frame: dict, idx: int) -> None:
+        blk = frame.get("brain_rnn")
+        if blk is not None and idx < len(blk):
+            self.cols.append(np.asarray(blk[idx], np.float32))
+
+    def push(self, frame: dict, idx: int) -> None:
+        self._take(frame, idx)
+        self._img = None
+        self.update()
+
+    def rebuild(self, frames, idx: int, upto: int) -> None:
+        self.cols.clear()
+        for frame in frames[max(0, upto - self.window + 1):upto + 1]:
+            self._take(frame, idx)
+        self._img = None
+        self.update()
+
+    def _render(self):
+        """Activity as an RGB image: blue (-1) through near-black (0) to red."""
+        act = np.clip(np.stack(list(self.cols), axis=1), -1.0, 1.0)  # (U, T)
+        pos, neg = np.clip(act, 0, 1), np.clip(-act, 0, 1)
+        rgb = np.zeros(act.shape + (3,), np.uint8)
+        rgb[..., 0] = 26 + 229 * pos + 20 * neg
+        rgb[..., 1] = 26 + 73 * pos + 118 * neg
+        rgb[..., 2] = 26 + 45 * pos + 191 * neg
+        from PyQt5.QtGui import QImage
+        self._buf = np.ascontiguousarray(rgb)
+        h, w = act.shape
+        return QImage(self._buf.data, w, h, 3 * w, QImage.Format_RGB888)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        w, h = self.width(), self.height()
+        if not self.cols:
+            p.setPen(QColor(_DIM))
+            p.drawText(self.rect().adjusted(8, 0, -8, 0),
+                       Qt.AlignCenter | Qt.TextWordWrap,
+                       "These animals follow written rules — there is no "
+                       "brain to record.\nChoose a learned brain under "
+                       "Experiment ▸ Nervous system.")
+            return
+        left, bottom = 30, 14
+        self._plot = (left, 2, max(10, w - left - 4), max(10, h - bottom - 2))
+        if self._img is None:
+            self._img = self._render()
+        x, y, pw, ph = self._plot
+        p.drawImage(QRectF(x, y, pw, ph), self._img)
+        f = p.font()
+        f.setPointSize(7)
+        p.setFont(f)
+        p.setPen(QColor(_DIM))
+        units = len(self.cols[-1])
+        p.drawText(0, y - 2, left - 4, 12, Qt.AlignRight, "0")
+        p.drawText(0, y + ph - 10, left - 4, 12, Qt.AlignRight,
+                   str(units - 1))
+        p.drawText(x, h - bottom, pw, bottom, Qt.AlignVCenter | Qt.AlignRight,
+                   f"unit ↑ · last {len(self.cols)} samples →")
+
+    def mouseMoveEvent(self, ev):
+        if not self.cols:
+            return
+        x, y, pw, ph = self._plot
+        units = len(self.cols[-1])
+        if y <= ev.y() < y + ph and x <= ev.x() < x + pw:
+            u = int((ev.y() - y) / ph * units)
+            self.setToolTip(f"recurrent unit {min(units - 1, max(0, u))}")
+
+
+# --------------------------------------------------------------------------- #
 # The dynamics table, drawn as the graph it already is
 # --------------------------------------------------------------------------- #
 class CouplingDiagram(QWidget):
@@ -597,15 +731,17 @@ class SciencePanel(QWidget):
         self.subtitle.setWordWrap(True)
         lay.addWidget(self.subtitle)
 
-        why = QLabel("WHY IT IS MOVING THAT WAY")
-        why.setStyleSheet("color:#777; font-size:10px; font-weight:bold;")
-        lay.addWidget(why)
+        self.why = QLabel("WHY IT IS MOVING THAT WAY")
+        self.why.setStyleSheet("color:#777; font-size:10px; font-weight:bold;")
+        lay.addWidget(self.why)
+        self._neural = False
         self.drives = DriveBars()
         lay.addWidget(self.drives)
 
         self.picker = QComboBox()
         self.picker.addItems(["Drives over time", "Condition over time",
                               "What it senses", "Sward & sky",
+                              "Brain activity", "Brain output",
                               "Condition dynamics"])
         self.picker.currentIndexChanged.connect(self._show_page)
         lay.addWidget(self.picker)
@@ -615,7 +751,10 @@ class SciencePanel(QWidget):
             TraceGroup("condition", CONDITION, y_range=(0.0, 100.0)),
             TraceGroup("sensed", SENSED),
             TraceGroup("environment", ENVIRONMENT),
+            BrainRaster(),
+            TraceGroup("brain output", BRAIN_OUT),
         ]
+        self.raster = self.pages[4]
         self.coupling = CouplingDiagram()
         for page in self.pages:
             lay.addWidget(page, 4)
@@ -705,6 +844,16 @@ class SciencePanel(QWidget):
         n = len(frame.get("x", ()))
         if idx >= n:
             return
+        neural = frame.get("brain_obs") is not None
+        if neural != self._neural:
+            # a brain has no named drives; the bars show its senses instead,
+            # and the first time one appears the raster is brought forward
+            self._neural = neural
+            self.why.setText("WHAT IS REACHING ITS BRAIN" if neural
+                             else "WHY IT IS MOVING THAT WAY")
+            self.drives.reset()
+            if neural and self.picker.currentIndex() == 0:
+                self.picker.setCurrentIndex(4)
         self.drives.set_frame(frame, idx)
         for page in self.pages:
             if buffer is not None and index is not None:
