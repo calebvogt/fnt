@@ -170,7 +170,11 @@ class Hut:
 class ResourceZone:
     """A ground resource station (box) holding nesting material + food.
 
-    entrance : "N" | "S" | "E" | "W" — side carrying the doorway.
+    entrance : the wall or walls carrying a doorway: "N", "S", "E" or "W", or
+               several together ("NE" = one doorway in the north wall and one
+               in the east wall).
+    water    : the box also holds a water tower, so an animal inside it can
+               drink as well as eat.
     """
     x: float = 0.0
     y: float = 0.0
@@ -180,6 +184,23 @@ class ResourceZone:
     entrance: str = "E"
     hole: float = 0.0762  # 3" entrance hole (diameter, vole-passable)
     label: str = ""
+    water: bool = False
+
+
+def zone_sides(z) -> list:
+    """The walls of a resource zone that carry a doorway, e.g. ``['N', 'E']``."""
+    out = []
+    for c in str(getattr(z, "entrance", "E") or "E").upper():
+        if c in "NSEW" and c not in out:
+            out.append(c)
+    return out or ["E"]
+
+
+def zone_doors(z) -> list:
+    """Centre of each doorway of a resource zone, on its wall line."""
+    at = {"E": (z.x + z.w / 2, z.y), "W": (z.x - z.w / 2, z.y),
+          "N": (z.x, z.y + z.d / 2), "S": (z.x, z.y - z.d / 2)}
+    return [at[s] for s in zone_sides(z)]
 
 
 @dataclass
@@ -699,6 +720,9 @@ class ExperimentConfig:
 
     # Circadian activity
     day_start_hour: float = 6.0        # local hour when 'day' begins
+    #: hours of light per day in a light-cycle room (14 = a 14:10 cycle).
+    #: Ignored when the sky is on: outdoors the sun sets the day length.
+    day_length_hours: float = 12.0
     day_activity: float = 0.7          # activity multiplier during day
     night_activity: float = 1.3        # activity multiplier during night
 
@@ -800,7 +824,8 @@ class ExperimentConfig:
             ))
         known = {
             "name", "days", "dt", "record_interval", "n_trials", "seed",
-            "day_start_hour", "day_activity", "night_activity", "trial_prefix",
+            "day_start_hour", "day_length_hours", "day_activity",
+            "night_activity", "trial_prefix",
             "start_datetime", "parallel", "n_workers",
             "individual_variation", "enable_mortality",
             "energy_speed_coupling", "rest_speed_factor",

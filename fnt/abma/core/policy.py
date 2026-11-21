@@ -160,12 +160,36 @@ class RuleBasedPolicy(Policy):
             inz = ((np.abs(P[:, 0][:, None] - cx[None, :]) <= hw[None, :])
                    & (np.abs(P[:, 1][:, None] - cy[None, :]) <= hd[None, :]))
             leaving = inz.any(axis=1) & (~go_food) & (need_water > 0)
+            j = np.argmax(inz, axis=1)
+            # ...unless the zone holds water itself: then it is already there
+            has_water = getattr(sim, "zone_has_water", None)
+            if has_water is not None and len(has_water):
+                leaving &= ~has_water[j]
             if leaving.any():
-                j = np.argmax(inz, axis=1)
-                to_door = doors[j] - P
+                # the nearest doorway, where the zone has more than one
+                door = (sim.exit_door(P, j) if hasattr(sim, "exit_door")
+                        else doors[j])
+                to_door = door - P
                 dd = np.linalg.norm(to_door, axis=1)[:, None] + 1e-9
                 exit_vec = self.k_resource * (to_door / dd) * need_water[:, None]
                 res_vec = np.where(leaving[:, None], exit_vec, res_vec)
+            # Already inside a box that holds what it is after: the doorway it
+            # was steering for is now behind it, and still pulling. Left
+            # alone, the animal hovers on the threshold, outside the walls
+            # half the time and eating or drinking at half the rate. Settle
+            # toward the middle of the box instead.
+            inside = inz.any(axis=1)
+            wet = (has_water[j] if has_water is not None and len(has_water)
+                   else np.zeros(n, bool))
+            here = inside & ((go_food & (need_food > 0))
+                             | (~go_food & (need_water > 0) & wet))
+            if here.any():
+                to_mid = np.stack([cx[j], cy[j]], axis=1) - P
+                dm = np.linalg.norm(to_mid, axis=1)[:, None]
+                need = np.where(go_food, need_food, need_water)[:, None]
+                settle = (self.k_resource * to_mid / (dm + 1e-9)
+                          * np.clip(dm / 0.10, 0.0, 1.0) * need)
+                res_vec = np.where(here[:, None], settle, res_vec)
         drives["resource"] = res_vec
 
         # --- pairwise social / territorial forces (olfaction-gated) ---

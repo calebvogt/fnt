@@ -124,6 +124,34 @@ analysis. The OFT centre zone (inner 50%) yields `center_time_pct` in the summar
 plus a `zone_occupancy_<trial>.csv` — the classic thigmotaxis / anxiety readout.
 Add a paradigm by writing a factory and appending a `Preset` to `PRESETS`.
 
+**VoleCosm** (`--preset volecosm`) is the indoor prairie-vole mesocosm: a
+2.81 × 2.61 m floor, a walled 0.51 m resource box in each corner (chow, a water
+tower and a hut inside; two floor-level doorways, one in each wall that faces
+the room), a free-standing water tower in the middle, 3 M + 3 F, ten days,
+14:10 light. The floor and the boxes are the measured ones; doorway width, box
+height, the central tower's size and the antenna mounts are approximate (see
+the factory's docstring). Building it needed three things the engine did not
+have, all now general:
+
+* **A zone can have more than one doorway.** `ResourceZone.entrance` takes one
+  wall or several (`"E"`, `"NE"`). An animal inside leaves by the nearer one.
+* **A zone can hold water** (`ResourceZone.water`). Drinking, like feeding,
+  then happens anywhere inside the box, and from outside the way to it is a
+  doorway. A tower *object* placed inside the walls would be drinkable through
+  them.
+* **A light cycle that is not 12:12.** `ExperimentConfig.day_length_hours`
+  (**Light hours** in the Experiment tab) with `day_start_hour`; ignored when
+  the sky is on.
+
+It also exposed two faults. A rule-based animal inside a box was still pulled
+toward the doorway it had come through, so it hovered on the threshold and fed
+or drank at about half the rate; it now settles toward the middle of a box that
+holds what it came for. And a box wall that ended exactly at the room's wall
+could be walked around on the outside: a step overshoots the boundary before it
+is reflected, passes beyond the end of the wall, and is bounced back in on the
+other side. Walls that meet the boundary are now carried on past it. That leak
+affected every preset with a box against a wall.
+
 The engine is fully importable and scriptable without the GUI:
 
 ```python
@@ -783,8 +811,8 @@ The intact-versus-methimazole study takes the same description an ordinary run
 does, and a brain:
 
 ```bash
-# 3 males + 3 females, 5 days; 2 replicates intact, 2 on methimazole
-python -m fnt.abma --preset anosmia --males 3 --females 3 --days 5 \
+# 3 males + 3 females in the VoleCosm, 5 days; 2 replicates intact, 2 on methimazole
+python -m fnt.abma --preset volecosm --males 3 --females 3 --days 5 \
     --anosmia-study --doses 0,1 --replicates 2 --brain vole_forager --name mmz_3m3f
 ```
 
@@ -839,6 +867,14 @@ What that says:
   animal walks on.
 * **A cohort keeps itself fed and watered** in an enclosure it was not raised
   in, better than the rule-based cohort does.
+* **In the VoleCosm, where food is behind doorways, the nose matters far
+  more.** Released hungry, all six intact animals are inside a box within five
+  minutes and fed within thirty; of six on methimazole, none finds a doorway
+  in the first half hour (they drink at the central tower). Over two days the
+  anosmic cohort does get in and everyone eats — lowest energy 64 against 94.
+  The brain was never raised with walls or doorways, so how it finds a doorway
+  without smell is chance, not skill; treat the size of that gap as an upper
+  bound.
 
 And what it does *not* show, which matters as much:
 
@@ -847,7 +883,8 @@ And what it does *not* show, which matters as much:
   better, so sitting on the food is what the reward taught.
 * **It lives on the line between water and food.** In the cage the animals
   shuttle between the two water sources through the feeder and never use a
-  nest. They rest 15% of the time (rule-based: 61%).
+  nest. They rest 15% of the time (rule-based: 61%). In the VoleCosm, where a
+  box holds both, they walk into one and stay: 99% of day one inside a box.
 * **Its social behaviour is not to be trusted.** Fights and matings are
   saturated in the small cage under *both* nervous systems (the engine lets
   every dyad contest once an hour), and a brain that gathers animals at food

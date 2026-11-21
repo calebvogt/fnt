@@ -16,7 +16,7 @@ from matplotlib.patches import Rectangle, Circle
 from matplotlib.collections import LineCollection
 from PyQt5.QtCore import pyqtSignal
 
-from ..core.config import ArenaConfig, ResourceObject
+from ..core.config import ArenaConfig, ResourceObject, zone_sides
 
 
 # Light / dark palettes for the 2D arena model.
@@ -337,19 +337,27 @@ class ArenaCanvas(FigureCanvas):
                     ax.add_patch(Rectangle((x0, y0), z.w, z.d, facecolor=face,
                                            edgecolor="#12224f", lw=1.6, zorder=2))
                     hole = getattr(z, "hole", 0.0762)
-                    side = getattr(z, "entrance", "E")
-                    # doorway: a notch cut through the wall, outlined in white
+                    # doorways: a notch cut through each wall that has one,
+                    # outlined in white
                     gcol = pal["grass"] if getattr(a, "ground", "floor") == "grass" \
                         else pal["face"]
-                    if side in ("E", "W"):
-                        ex = dx + z.x + (z.w / 2 if side == "E" else -z.w / 2)
-                        notch = ((ex - 0.035, dy + z.y - hole / 2), 0.07, hole)
-                    else:
-                        ey = dy + z.y + (z.d / 2 if side == "N" else -z.d / 2)
-                        notch = ((dx + z.x - hole / 2, ey - 0.035), hole, 0.07)
-                    ax.add_patch(Rectangle(notch[0], notch[1], notch[2],
-                                           facecolor=gcol, edgecolor="#ffffff",
-                                           lw=1.2, zorder=4))
+                    for side in zone_sides(z):
+                        if side in ("E", "W"):
+                            ex = dx + z.x + (z.w / 2 if side == "E" else -z.w / 2)
+                            notch = ((ex - 0.035, dy + z.y - hole / 2), 0.07, hole)
+                        else:
+                            ey = dy + z.y + (z.d / 2 if side == "N" else -z.d / 2)
+                            notch = ((dx + z.x - hole / 2, ey - 0.035), hole, 0.07)
+                        ax.add_patch(Rectangle(notch[0], notch[1], notch[2],
+                                               facecolor=gcol,
+                                               edgecolor="#ffffff",
+                                               lw=1.2, zorder=4))
+                    if getattr(z, "water", False):
+                        # the zone's own water tower, in the corner by the chow
+                        ax.add_patch(Circle(
+                            (dx + z.x - z.w / 2 + 0.09, dy + z.y - z.d / 2 + 0.09),
+                            0.06, facecolor="#5aa9e6", edgecolor="#12224f",
+                            lw=1.0, zorder=3))
                     # ~6×6" chow pile in a corner
                     pw = 6 * 0.0254
                     ax.add_patch(Rectangle(

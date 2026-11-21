@@ -24,6 +24,7 @@ be tuned from the GUI or a config extension.
 """
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -32,7 +33,7 @@ import numpy as np
 
 from copy import deepcopy
 
-from .config import ExperimentConfig, AgentGroup
+from .config import ExperimentConfig, AgentGroup, zone_doors, zone_sides
 from .scent import ScentField
 from .sward import SwardField
 from .sky import sky_state, growth_factor
@@ -61,15 +62,35 @@ _FEMALE_RGBA = (0.88, 0.33, 0.60, 1.0)
 
 
 def _zone_door(z):
-    """Outside-facing centre of a resource zone's doorway."""
-    side = getattr(z, "entrance", "E")
-    if side == "E":
-        return (z.x + z.w / 2, z.y)
-    if side == "W":
-        return (z.x - z.w / 2, z.y)
-    if side == "N":
-        return (z.x, z.y + z.d / 2)
-    return (z.x, z.y - z.d / 2)
+    """Outside-facing centre of a resource zone's (first) doorway."""
+    return zone_doors(z)[0]
+
+
+def _run_wall_past_boundary(seg, w, h, far=1.0e3, tol=1e-6):
+    """Carry a wall that ends at the room's boundary on beyond it.
+
+    A step can overshoot a reflective boundary before it is bounced back in.
+    A wall that stopped exactly at the boundary could therefore be walked
+    around on the outside: out past the end of the wall, and back in on the
+    other side of it. That let animals into (and out of) any box set against
+    the room's wall without using a doorway. Only an end that meets the
+    boundary head-on is extended; a wall lying *along* the boundary is left
+    alone, so it does not turn the room's own wall into something to slide on.
+    """
+    x1, y1, x2, y2 = (float(v) for v in seg)
+    length = math.hypot(x2 - x1, y2 - y1)
+    if length <= 0.0:
+        return (x1, y1, x2, y2)
+    dx, dy = (x2 - x1) / length, (y2 - y1) / length
+
+    def end(x, y, sx, sy):              # (sx, sy) points away from the wall
+        head_on = ((x <= tol and sx < -0.5) or (x >= w - tol and sx > 0.5)
+                   or (y <= tol and sy < -0.5) or (y >= h - tol and sy > 0.5))
+        return (x + sx * far, y + sy * far) if head_on else (x, y)
+
+    ax, ay = end(x1, y1, -dx, -dy)
+    bx, by = end(x2, y2, dx, dy)
+    return (ax, ay, bx, by)
 
 
 def _appearance_rgba(appearance, sex):
@@ -252,7 +273,7 @@ class Simulation:
         inside. Seek target and feeding region are therefore separate: aiming
         at the centre would just press the animal against the outside wall.
         """
-        food, food_seek, frects, fdoors = [], [], [], []
+        food, food_seek, frects, fdoors, door_sets = [], [], [], [], []
         # what each food entry is made of, in the same order: circles first,
         # then zone rectangles. Drives energy yield and depletion.
         self._food_meta = []
@@ -266,8 +287,10 @@ class Simulation:
             # rectangle containment test (the old circumscribing circle let
             # animals "feed" through the corners from outside the walls)
             frects.append((z.x, z.y, z.w / 2.0, z.d / 2.0))
-            food_seek.append(_zone_door(z))
-            fdoors.append(_zone_door(z))
+            doors = zone_doors(z)
+            food_seek.extend(doors)            # any doorway is a way in
+            fdoors.append(doors[0])
+            door_sets.append(np.array(doors, float))
             # a resource zone holds the standard provisioned diet, unlimited
             self._food_meta.append((get_food(DEFAULT_FOOD), None))
         water, water_seek = [], []
@@ -281,6 +304,19 @@ class Simulation:
             # reach margin, or there is no reachable annulus at all.
             water.append((t.x, t.y, t.radius + self._REACH))
             water_seek.append((t.x, t.y))
+        # A zone that holds a water tower: drinking, like feeding, happens
+        # anywhere inside the box, and from outside the way to it is a
+        # doorway. (A tower object placed inside the walls would be drinkable
+        # through them — its reach is wider than the gap to the wall.)
+        wrects = []
+        for z in self._res_zones:
+            if getattr(z, "water", False):
+                wrects.append((z.x, z.y, z.w / 2.0, z.d / 2.0))
+                water_seek.extend(zone_doors(z))
+        self.water_rects = np.array(wrects, float).reshape(-1, 4)
+        self.zone_has_water = np.array(
+            [bool(getattr(z, "water", False)) for z in self._res_zones], bool)
+        self._zone_door_sets = door_sets
         self.food = np.array([[x, y] for x, y, _ in food], float).reshape(-1, 2)
         self.water = np.array([[x, y] for x, y, _ in water], float).reshape(-1, 2)
         self.food_r = np.array([r for _, _, r in food], float)
@@ -288,6 +324,7 @@ class Simulation:
         self.food_rects = np.array(frects, float).reshape(-1, 4)  # cx,cy,hw,hd
         # the one gap in each zone's wall — an animal inside can only leave
         # through it, so it has to be steered for explicitly
+        # (the first one, where a zone has several — see ``exit_door``)
         self.zone_doors = np.array(fdoors, float).reshape(-1, 2)
         self.food_seek = np.array(food_seek, float).reshape(-1, 2)
         self.water_seek = np.array(water_seek, float).reshape(-1, 2)
@@ -545,8 +582,9 @@ class Simulation:
         sky = self.sky_at(elapsed_s)
         if sky is not None:
             return sky.is_day
-        # day window is [day_start, day_start + 12); night otherwise
-        return (self._hour(elapsed_s) - self.cfg.day_start_hour) % 24 < 12
+        # day window is [day_start, day_start + day length); night otherwise
+        return ((self._hour(elapsed_s) - self.cfg.day_start_hour) % 24
+                < float(getattr(self.cfg, "day_length_hours", 12.0)))
 
     def _activity(self, elapsed_s: float) -> float:
         """How hard the cohort is working right now.
@@ -726,8 +764,7 @@ class Simulation:
 
         # --- condition dynamics ---
         on_food = self._on_food()
-        on_water = (self._on_resource(self.P, self.water, self.water_r)
-                    if self.water.shape[0] else np.zeros(n, bool))
+        on_water = self._on_water()
         if self._physio_on:
             # a real energy/water budget owns energy, hunger, thirst and the
             # bladder; the rules table is left to stress and health
@@ -805,6 +842,32 @@ class Simulation:
     def _on_resource(self, P, targets, radii):
         d = np.linalg.norm(P[:, None, :] - targets[None, :, :], axis=2)
         return np.any(d < radii[None, :], axis=1)
+
+    def _on_water(self, P=None):
+        """At water: within reach of a water source or tower, or inside a
+        resource zone that holds one."""
+        P = self.P if P is None else P
+        on = (self._on_resource(P, self.water, self.water_r)
+              if self.water.shape[0] else np.zeros(len(P), bool))
+        if len(self.water_rects):
+            cx, cy, hw, hd = self.water_rects.T
+            on = on | ((np.abs(P[:, 0][:, None] - cx[None, :]) <= hw[None, :])
+                       & (np.abs(P[:, 1][:, None] - cy[None, :])
+                          <= hd[None, :])).any(axis=1)
+        return on
+
+    def exit_door(self, P, zone_of):
+        """The doorway each animal should make for to leave zone
+        ``zone_of[i]`` — the nearest one, where the zone has several."""
+        out = self.zone_doors[zone_of].astype(float).copy()
+        for j, doors in enumerate(self._zone_door_sets):
+            if len(doors) > 1:
+                m = zone_of == j
+                if m.any():
+                    d = np.linalg.norm(P[m][:, None, :] - doors[None, :, :],
+                                       axis=2)
+                    out[m] = doors[np.argmin(d, axis=1)]
+        return out
 
     def _on_food(self):
         """At a chow pile: inside a food object's radius or a resource zone's box."""
@@ -1211,19 +1274,21 @@ class Simulation:
             hw = getattr(z, "hole", 0.0762)
             x0, x1 = z.x - z.w / 2, z.x + z.w / 2
             y0, y1 = z.y - z.d / 2, z.y + z.d / 2
-            side = getattr(z, "entrance", "E")
+            sides = zone_sides(z)
             for yw, name in ((y1, "N"), (y0, "S")):        # walls running E-W
-                if name == side:                    # split around the doorway
+                if name in sides:                   # split around the doorway
                     segs += [(x0, yw, z.x - hw / 2, yw),
                              (z.x + hw / 2, yw, x1, yw)]
                 else:
                     segs += [(x0, yw, x1, yw)]
             for xw, name in ((x1, "E"), (x0, "W")):        # walls running N-S
-                if name == side:
+                if name in sides:
                     segs += [(xw, y0, xw, z.y - hw / 2),
                              (xw, z.y + hw / 2, xw, y1)]
                 else:
                     segs += [(xw, y0, xw, y1)]
+        if getattr(a, "boundary", "reflective") != "wrap":
+            segs = [_run_wall_past_boundary(s, a.width, a.height) for s in segs]
         self._obs_circles = np.array(circ, float) if circ else np.zeros((0, 3))
         self._obs_segs = np.array(segs, float) if segs else np.zeros((0, 4))
 

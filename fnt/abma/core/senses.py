@@ -247,8 +247,7 @@ def sense(sim, elapsed_s: float, memory: PlaceMemory, params: SenseParams,
     # ---- where the animal is standing ---------------------------------- #
     food_idx = sim._food_index()
     at_food = (food_idx >= 0) & alive
-    at_water = ((sim._on_resource(P, sim.water, sim.water_r)
-                 if sim.water.shape[0] else np.zeros(n, bool)) & alive)
+    at_water = sim._on_water(P) & alive
     rects = getattr(sim, "food_rects", np.zeros((0, 4)))
     doors = getattr(sim, "zone_doors", np.zeros((0, 2)))
     in_zone = np.zeros(n, bool)
@@ -265,7 +264,7 @@ def sense(sim, elapsed_s: float, memory: PlaceMemory, params: SenseParams,
         doorway — so that is the direction it has."""
         if not in_zone.any():
             return vec
-        to_door = doors[zone_of] - P
+        to_door = sim.exit_door(P, zone_of) - P
         dd = np.linalg.norm(to_door, axis=1)[:, None] + 1e-9
         mag = np.linalg.norm(vec, axis=1)[:, None]
         return np.where(in_zone[:, None], to_door / dd * mag, vec)

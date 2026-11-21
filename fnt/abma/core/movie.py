@@ -21,7 +21,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .config import ExperimentConfig, Treatment
+from .config import ExperimentConfig, Treatment, zone_doors, zone_sides
 from .simulation import Simulation
 
 MALE, FEMALE = "dodgerblue", "tomato"
@@ -125,9 +125,28 @@ def _draw_arena(ax, arena) -> None:
     ax.add_patch(Rectangle((0, 0), w, h, fill=False, edgecolor="black",
                            lw=1.6, zorder=1))
     for z in getattr(arena, "resource_zones", []):
+        has_water = bool(getattr(z, "water", False))
         ax.add_patch(Rectangle((z.x - z.w / 2, z.y - z.d / 2), z.w, z.d,
-                               facecolor=HUNGER, alpha=0.18,
-                               edgecolor=HUNGER, lw=1.0, zorder=1))
+                               facecolor=HUNGER, alpha=0.22,
+                               edgecolor="none", zorder=1))
+        ax.add_patch(Rectangle((z.x - z.w / 2, z.y - z.d / 2), z.w, z.d,
+                               fill=False, edgecolor="black", lw=1.2,
+                               zorder=2))
+        # doorways: a gap in the wall, drawn by painting over it
+        gap = max(float(getattr(z, "hole", 0.0762)), 0.02 * max(w, h))
+        for side, (px, py) in zip(zone_sides(z), zone_doors(z)):
+            if side in ("N", "S"):
+                ax.plot([px - gap / 2, px + gap / 2], [py, py], color="white",
+                        lw=3.0, solid_capstyle="butt", zorder=2.5)
+            else:
+                ax.plot([px, px], [py - gap / 2, py + gap / 2], color="white",
+                        lw=3.0, solid_capstyle="butt", zorder=2.5)
+        if has_water:
+            ax.add_patch(Circle((z.x, z.y), 0.12 * min(z.w, z.d),
+                                facecolor=THIRST, edgecolor="black", lw=0.6,
+                                zorder=2))
+        ax.text(z.x, z.y - 0.17 * z.d, "food + water" if has_water else "food",
+                ha="center", va="top", fontsize=6, color="0.25", zorder=2)
     look = {"food": (HUNGER, 0.75, "food"),
             "water": (THIRST, 0.9, "water"),
             "nest": ("0.88", 1.0, "nest")}
@@ -140,8 +159,11 @@ def _draw_arena(ax, arena) -> None:
         ax.text(o.x, o.y - r - 0.012 * h, word, ha="center", va="top",
                 fontsize=7, color="0.25", zorder=2)
     for tw in getattr(arena, "water_towers", []):
-        ax.add_patch(Circle((tw.x, tw.y), small * 1.5, facecolor=THIRST,
+        r = max(float(tw.radius), small)
+        ax.add_patch(Circle((tw.x, tw.y), r, facecolor=THIRST,
                             edgecolor="black", lw=0.8, zorder=2))
+        ax.text(tw.x, tw.y - r - 0.012 * h, "water", ha="center", va="top",
+                fontsize=7, color="0.25", zorder=2)
 
 
 class _Panel:

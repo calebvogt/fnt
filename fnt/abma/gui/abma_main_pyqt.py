@@ -1784,6 +1784,7 @@ class ABMAWindow(QMainWindow):
         self.in_rec = _dspin(1, 3600, 10.0, 1.0, " s")
         self.in_seed = _ispin(0, 10 ** 6, 0)
         self.in_daystart = _dspin(0, 23.9, 6.0, 0.5, " h")
+        self.in_daylen = _dspin(0.5, 23.5, 12.0, 0.5, " h")
         self.in_dayact = _dspin(0, 3, 0.7, 0.1)
         self.in_nightact = _dspin(0, 3, 1.3, 0.1)
         self.in_start = QLineEdit("2025-11-07T18:00:00")
@@ -1808,6 +1809,9 @@ class ABMAWindow(QMainWindow):
             ("Individual variation", self.in_variation,
              "Per-agent trait jitter SD (0 = identical clones)"),
             ("Day start hour", self.in_daystart, "Local hour the light phase starts"),
+            ("Light hours", self.in_daylen,
+             "Hours of light per day in a light-cycle room (14 = 14:10). "
+             "Ignored when the sky is on: outdoors the sun sets it."),
             ("Day activity ×", self.in_dayact, "Movement multiplier during day"),
             ("Night activity ×", self.in_nightact, "Movement multiplier at night"),
             ("Release datetime", self.in_start, "ISO timestamp for t=0"),
@@ -2210,6 +2214,7 @@ class ABMAWindow(QMainWindow):
             record_interval=self.in_rec.value(),
             n_trials=self.in_trials.value(), seed=self.in_seed.value(),
             day_start_hour=self.in_daystart.value(),
+            day_length_hours=self.in_daylen.value(),
             day_activity=self.in_dayact.value(),
             night_activity=self.in_nightact.value(),
             start_datetime=self.in_start.text().strip(),
@@ -2417,6 +2422,7 @@ class ABMAWindow(QMainWindow):
         self.in_trials.setValue(cfg.n_trials)
         self.in_seed.setValue(cfg.seed)
         self.in_daystart.setValue(cfg.day_start_hour)
+        self.in_daylen.setValue(getattr(cfg, "day_length_hours", 12.0))
         self.in_dayact.setValue(cfg.day_activity)
         self.in_nightact.setValue(cfg.night_activity)
         self.in_start.setText(cfg.start_datetime)

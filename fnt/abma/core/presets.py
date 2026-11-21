@@ -465,6 +465,83 @@ def liddell_echo_t2() -> ExperimentConfig:
         start_datetime="2025-01-01T18:00:00"))
 
 
+def volecosm() -> ExperimentConfig:
+    """VoleCosm: the indoor prairie-vole mesocosm.
+
+    A 2.81 x 2.61 m floor on bedding, a walled resource zone in each corner
+    and a water tower in the middle. Each zone is a 0.51 m box holding a chow
+    pile, a water tower and a dome hut, entered through two floor-level
+    doorways — one in each of the two walls that face the room, so an animal
+    inside can never be cornered behind a single exit. Eight UWB antennas: one
+    over each zone and one at the middle of each wall.
+
+    The standard cohort is three males and three females, dosed with saline
+    (or methimazole) five days before release, then left together for ten
+    days under a 14:10 light cycle. Zones are numbered as in the tracking
+    analysis: Z1 bottom-left, Z2 top-left, Z3 top-right, Z4 bottom-right.
+
+    Measured (from the tracking floor plan): the floor and the four boxes.
+    Approximate (from the design schematic and a photograph): the doorway
+    width, the height of the boxes, the size of the central tower, and where
+    the antennas are mounted. Inside a zone, food and water are available
+    anywhere in the box; where the pile, the tower and the hut sit within it
+    is not modelled.
+    """
+    from .species import by_name, build_group
+
+    W, H = 2.81, 2.61
+    ZS = 0.51                 # the corner boxes, square
+    ZH = 0.60                 # taller than wide in the photograph; not measured
+    c = ZS / 2
+    inset = 0.05
+
+    zones, huts, ants = [], [], []
+    # label, centre, the two walls that face the room, the room corner it is in
+    for tag, x, y, doors, ox, oy in (("Z1", c, c, "NE", 0.0, 0.0),
+                                     ("Z2", c, H - c, "SE", 0.0, H),
+                                     ("Z3", W - c, H - c, "SW", W, H),
+                                     ("Z4", W - c, c, "NW", W, 0.0)):
+        zones.append(ResourceZone(x=x, y=y, w=ZS, d=ZS, h=ZH, entrance=doors,
+                                  hole=3 * IN, label=tag, water=True))
+        # the hut sits against the room's side wall, clear of both doorways
+        # (and of where the views draw the box's chow and water)
+        huts.append(Hut(kind="dome", x=x + 0.45 * (ox - x), y=y + 0.14,
+                        w=5 * IN, h=2.5 * IN, label=f"dome_{tag}"))
+        # an antenna over the outer corner of each box
+        ants.append(AntennaBox(x=ox + (inset if ox == 0 else -inset),
+                               y=oy + (inset if oy == 0 else -inset),
+                               z=ZH + 0.10, w=0.05, d=0.05, h=0.10,
+                               style="bare", label=f"{tag} corner"))
+    for label, x, y in (("south wall", W / 2, inset), ("east wall", W - inset, H / 2),
+                        ("north wall", W / 2, H - inset), ("west wall", inset, H / 2)):
+        ants.append(AntennaBox(x=x, y=y, z=0.50, w=0.05, d=0.05, h=0.10,
+                               style="bare", label=label))
+
+    arena = ArenaConfig(
+        width=W, height=H, boundary="reflective", objects=[], zones=[],
+        water_towers=[WaterTower(x=W / 2, y=H / 2, radius=0.115, height=0.25,
+                                 label="water")],
+        resource_zones=zones, huts=huts, antennas=ants,
+        antenna_layouts=[AntennaLayout("8-antenna", ants, [])],
+        # the room walls are not drawn (they hide the floor); the boundary is
+        # still reflective
+        wall_height=0.0, wall_thickness=4 * IN, ground="floor",
+        oriented=False)
+
+    vole = by_name("Prairie vole")
+    groups = []
+    for sex in ("F", "M"):
+        g = build_group(vole, f"saline_{sex}", sex=sex, count=3)
+        g.treatment = Treatment(drug="saline", dose=0.0, day_offset=-5.0)
+        groups.append(g)
+    return _live_world(ExperimentConfig(
+        name="volecosm", arena=arena, groups=groups,
+        days=10.0, dt=2.0, record_interval=10.0, n_trials=1,
+        # white light 07:00-21:00, red light otherwise; released around midday
+        day_start_hour=7.0, day_length_hours=14.0,
+        start_datetime="2025-01-01T12:30:00"))
+
+
 # Ordered registry of built-in presets shown in the GUI picker.
 PRESETS: list[Preset] = [
     Preset("Blank arena",
@@ -477,6 +554,11 @@ PRESETS: list[Preset] = [
            "2.2 m enclosure, 4M/4F, saline vs methimazole. Scent marking on: "
            "territory emerges from marks, so anosmia degrades it.",
            vole_anosmia, abbr="Vole"),
+    Preset("VoleCosm mesocosm (2.8 × 2.6 m)",
+           "Indoor prairie-vole mesocosm: a walled resource zone in each "
+           "corner (food, water, two doorways), a water tower in the middle; "
+           "3M/3F, 10 days, 14:10 light.",
+           volecosm, abbr="VoleCosm"),
     Preset("VoleTerra enclosure (75×75 ft)",
            "Semi-natural field enclosure: 3 ft walls, 25 support poles (5×5).",
            voleterra, abbr="VoleTerra",

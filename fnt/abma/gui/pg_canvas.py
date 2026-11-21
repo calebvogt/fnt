@@ -20,7 +20,7 @@ from pyqtgraph import Vector
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QVector4D, QFont
 
-from ..core.config import ResourceObject
+from ..core.config import ResourceObject, zone_sides
 
 
 def _install_gl_error_capture():
@@ -628,12 +628,12 @@ class Arena3DView(gl.GLViewWidget):
     def _build_zone(self, cx, cy, z, wall, t, mode):
         w, d, h = z.w, z.d, z.h
         hw = getattr(z, "hole", 0.0762)         # 3" doorway
-        side = getattr(z, "entrance", "E")
+        sides = zone_sides(z)
         self._slab(w, d, t, cx, cy, t / 2, wall)                     # floor
         # north / south walls (run east-west); one may carry the doorway
         for sy, nm in ((d / 2, "N"), (-d / 2, "S")):
             wy = cy + sy
-            if nm == side:                       # split around the hole (in x, z)
+            if nm in sides:                      # split around the hole (in x, z)
                 seg = (w - hw) / 2
                 xoff = (hw + seg) / 2
                 self._slab(seg, t, h, cx + xoff, wy, h / 2, wall)
@@ -649,7 +649,7 @@ class Arena3DView(gl.GLViewWidget):
         # east / west walls (run north-south)
         for sx, xw in ((w / 2, "E"), (-w / 2, "W")):
             wx = cx + sx
-            if xw == side:                       # split around the hole (in y, z)
+            if xw in sides:                      # split around the hole (in y, z)
                 seg = (d - hw) / 2
                 yoff = (hw + seg) / 2
                 self._slab(t, seg, h, wx, cy + yoff, h / 2, wall)

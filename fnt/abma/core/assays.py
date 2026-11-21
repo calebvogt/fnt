@@ -173,7 +173,7 @@ def choice(make_policy, need: str = "hunger", level: float = 80.0,
         for t in range(steps):
             sim.step(t * dt, dt)
             on_food = bool(sim._food_index()[0] >= 0)
-            on_water = bool(sim._on_resource(sim.P, sim.water, sim.water_r)[0])
+            on_water = bool(sim._on_water()[0])
             t_food += on_food
             t_water += on_water
             if got is None and (on_food or on_water):
@@ -284,8 +284,7 @@ def vitals(cfg: ExperimentConfig, days: float = 2.0, policy=None,
             worst_energy = np.concatenate([worst_energy, np.full(pad, 100.0)])
             worst_thirst = np.concatenate([worst_thirst, np.zeros(pad)])
         at_food += sim._food_index() >= 0
-        if sim.water.shape[0]:
-            at_water += sim._on_resource(sim.P, sim.water, sim.water_r)
+        at_water += sim._on_water()
         resting += sim.activity == 0
         worst_energy = np.minimum(worst_energy, sim.energy)
         worst_thirst = np.maximum(worst_thirst, sim.thirst)
