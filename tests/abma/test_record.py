@@ -145,3 +145,57 @@ def test_a_loaded_archive_does_not_thin_itself_on_open(tmp_path):
     assert len(back) == 300
     assert back.decimation == 1
     assert np.allclose(back.times(), rec.times())
+
+
+# --------------------------------------------------------------------------- #
+# Neural activity rides along when a brain drove the run
+# --------------------------------------------------------------------------- #
+def _neural_frame(n, t, units=6, sensors=5):
+    rng = np.random.default_rng(t)
+    return {"x": np.zeros(n), "y": np.zeros(n), "elapsed": float(t),
+            "brain_rnn": rng.uniform(-1, 1, (n, units)).astype(np.float32),
+            "brain_obs": rng.uniform(-1, 1, (n, sensors)).astype(np.float32),
+            "brain_speed": np.full(n, 0.5), "brain_turn": np.zeros(n),
+            "discomfort": np.full(n, 0.25)}
+
+
+def test_brain_blocks_round_trip(tmp_path):
+    rec = RunRecord(n_agents=3)
+    frames = [_neural_frame(3, t) for t in range(5)]
+    for fr in frames:
+        rec.append(fr)
+    assert rec.has_brain()
+    path = rec.save(str(tmp_path / "r.npz"))
+    back = RunRecord.load(path)
+    assert back.has_brain()
+    assert back.block("brain_rnn").shape == (5, 3, 6)
+    assert back.block("brain_rnn", 1).shape == (5, 6)
+    np.testing.assert_allclose(back.block("brain_rnn")[2],
+                               frames[2]["brain_rnn"], atol=2e-3)
+    assert back.frame(4)["brain_obs"].shape == (3, 5)
+    assert back.series(0, "brain_speed")[0] == pytest.approx(0.5)
+    assert back.series(0, "discomfort")[0] == pytest.approx(0.25)
+
+
+def test_a_rule_based_record_has_no_brain(tmp_path):
+    rec = RunRecord(n_agents=2)
+    rec.append({"x": np.zeros(2), "y": np.zeros(2), "elapsed": 0.0})
+    assert not rec.has_brain()
+    back = RunRecord.load(rec.save(str(tmp_path / "r.npz")))
+    assert not back.has_brain() and "brain_rnn" not in back.frame(0)
+
+
+def test_brain_blocks_stay_aligned_through_decimation_and_a_growing_roster():
+    """Thinning the archive must thin the blocks with it, frame for frame —
+    a raster that slid against its own trajectory would be worse than none."""
+    rec = RunRecord(n_agents=2, cap_bytes=1)       # forces decimation at once
+    for t in range(40):
+        fr = _neural_frame(2 if t < 20 else 4, t)
+        fr["x"] = np.full(len(fr["x"]), float(t))  # the frame's own stamp...
+        fr["brain_rnn"][:, 0] = t / 100.0          # ...written into the block
+        rec.append(fr)
+    assert rec.decimation > 1
+    blk = rec.block("brain_rnn")
+    assert blk.shape[0] == len(rec) and blk.shape[1] == 4
+    stamp = rec.series(0, "x")
+    np.testing.assert_allclose(blk[:, 0, 0] * 100.0, stamp, atol=0.2)

@@ -56,6 +56,8 @@ CH_MATE = 4           # mating hazard
 CH_OLFACTION = 5      # receptor / perceptual noise in the olfactory model
 CH_SPARE = 6          # reserved
 CH_CHEW = 7           # whether to stop and clip the sward this step
+CH_ACTION = 8         # motor noise of a learned brain (two normals per tick)
+CH_SENSE = 9          # sensory noise of a learned brain
 
 
 def _splitmix64(x: np.ndarray) -> np.ndarray:

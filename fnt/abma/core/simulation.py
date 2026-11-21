@@ -42,6 +42,7 @@ from .biology import (
 )
 from .sampling import parse_spec
 from .policy import RuleBasedPolicy
+from .neural import make_policy, discomfort
 from .olfaction import OlfactorySystem
 from .rng import (
     AgentRandom, CH_HEADING, CH_MARK, CH_FIGHT, CH_FIGHT_OUTCOME, CH_MATE,
@@ -141,7 +142,9 @@ class Simulation:
         self.arand = AgentRandom(root)
         self._step_k = 0
         self.start_dt = parse_start(config.start_datetime)
-        self.policy = policy if policy is not None else RuleBasedPolicy()
+        # A learned brain when the config asks for one (`brain.enabled`),
+        # otherwise the hand-written rules. An explicit `policy` wins.
+        self.policy = policy if policy is not None else make_policy(config)
         self._build_population()
 
     # ------------------------------------------------------------------ #
@@ -674,7 +677,15 @@ class Simulation:
         at_home = (own_lvl > self.at_home_scent if own_lvl is not None
                    else dist_home < self.home_r)
         satiated = (self.hunger < 50.0) & (self.thirst < 50.0) & at_home
-        spd = np.where(satiated, spd * cfg.rest_speed_factor, spd)
+        speed_frac = perc.get("speed_frac")
+        if speed_frac is not None:
+            # A learned brain emits its own speed, so slowing to a rest is
+            # something the animal decides rather than a rule applied to it.
+            # `spd` is still the ceiling: what this body can do right now.
+            spd = spd * np.clip(speed_frac, 0.0, 1.0)
+            satiated = np.asarray(perc.get("resting", speed_frac < 0.12), bool)
+        else:
+            spd = np.where(satiated, spd * cfg.rest_speed_factor, spd)
         self.P = self._resolve_obstacles(P, P + move_dir * spd[:, None] * dt,
                                          fwd=move_dir)
         self.H = np.arctan2(move_dir[:, 1], move_dir[:, 0])
@@ -1628,12 +1639,17 @@ class Simulation:
             got = self.territory_image()
             if got is not None:
                 extra["scent_rgba"], extra["scent_extent"] = got
+        frame_extra = getattr(self.policy, "frame_extra", None)
+        if frame_extra is not None:
+            # a learned brain's activity: every unit, every animal, this tick
+            extra.update(frame_extra(self.n))
         return {
             **self._drive_magnitudes(),
             **self._perception_summary(),
             **self._environment_summary(elapsed),
             **extra,
             "marks_made": self.marks_made.copy(),
+            "discomfort": discomfort(self),
             "trial": self.trial_id, "elapsed": elapsed,
             "day": int(elapsed // 86400) + 1,
             "hour": self._hour(elapsed), "is_day": self._is_day(elapsed),

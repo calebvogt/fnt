@@ -64,6 +64,9 @@ VALUE_FIELDS: list[str] = [
     # record stays one rectangular table rather than two)
     "sun_elevation", "moon_elevation", "moon_illumination", "daylight",
     "night_light",
+    # how far the body is from content (what a learned animal is rewarded for
+    # lowering), and what a learned brain commanded: turn -1..1, speed 0..1
+    "discomfort", "brain_turn", "brain_speed",
 ]
 
 #: Small integer per-agent, per-frame quantities (stored int16/int32).
@@ -72,6 +75,12 @@ STATE_FIELDS: list[str] = [
     "alive",
     "fights_won", "fights_lost", "matings", "marks_made",
 ]
+
+#: Wide per-agent blocks a learned brain adds: every recurrent unit, every
+#: sensory-layer unit, and the sensory input it was given. Stored only when a
+#: frame carries them (a rule-based run has no brain and pays nothing), as
+#: float16 — activity is bounded and this is for reading, not re-simulating.
+BLOCK_FIELDS: list[str] = ["brain_rnn", "brain_sensory", "brain_obs"]
 
 #: Per-frame scalars shared by the whole cohort.
 FRAME_FIELDS: list[str] = ["elapsed", "day", "hour", "is_day"]
@@ -119,6 +128,8 @@ class RunRecord:
         self._states = np.zeros((0, self._n_agents, len(STATE_FIELDS)),
                                 np.int32)
         self._frames = np.zeros((0, len(FRAME_FIELDS)), np.float64)
+        #: name -> (frames, agents, width) float16, for BLOCK_FIELDS present
+        self._blocks: dict[str, np.ndarray] = {}
         self._n = 0
         #: how many source frames each stored frame now stands for (doubles on
         #: every decimation) — the honest sampling rate of this archive
@@ -192,6 +203,19 @@ class RunRecord:
             if name in frame:
                 put_state(name, frame[name])
 
+        for name in BLOCK_FIELDS:
+            blk = frame.get(name)
+            if blk is None:
+                continue
+            blk = np.asarray(blk)
+            store = self._blocks.get(name)
+            if store is None:
+                store = np.zeros((len(self._values), self._n_agents,
+                                  blk.shape[1]), np.float16)
+                self._blocks[name] = store
+            store[self._n] = 0
+            store[self._n, :len(blk)] = blk
+
         self._frames[self._n] = [
             float(frame.get("elapsed", 0.0)), float(frame.get("day", 0)),
             float(frame.get("hour", 0.0)), float(bool(frame.get("is_day", 1))),
@@ -208,6 +232,9 @@ class RunRecord:
         self._values = np.concatenate([self._values, pad_v])
         self._states = np.concatenate([self._states, pad_s])
         self._frames = np.concatenate([self._frames, pad_f])
+        for name, blk in self._blocks.items():
+            self._blocks[name] = np.concatenate(
+                [blk, np.zeros((grow,) + blk.shape[1:], np.float16)])
 
     def _grow_agents(self, n_agents: int) -> None:
         """Widen the agent axis when a protocol event adds animals mid-run."""
@@ -220,6 +247,10 @@ class RunRecord:
             [self._states,
              np.zeros((len(self._states), extra, len(STATE_FIELDS)),
                       np.int32)], axis=1)
+        for name, blk in self._blocks.items():
+            self._blocks[name] = np.concatenate(
+                [blk, np.zeros((len(blk), extra, blk.shape[2]), np.float16)],
+                axis=1)
         self._n_agents = n_agents
         self._cap_frames = max(8, self.cap_bytes
                                // max(1, self._row_bytes(n_agents)))
@@ -237,6 +268,8 @@ class RunRecord:
         self._values[:kept] = self._values[keep]
         self._states[:kept] = self._states[keep]
         self._frames[:kept] = self._frames[keep]
+        for blk in self._blocks.values():
+            blk[:kept] = blk[keep]
         self._n = kept
         self.decimation *= 2
 
@@ -251,7 +284,20 @@ class RunRecord:
         elapsed, day, hour, is_day = self._frames[i]
         out.update(trial=self.trial_id, elapsed=float(elapsed), day=int(day),
                    hour=float(hour), is_day=bool(is_day), index=i)
+        for name, blk in self._blocks.items():
+            out[name] = blk[i].astype(np.float32)
         return out
+
+    def has_brain(self) -> bool:
+        """Whether this run was driven by a learned brain (activity is kept)."""
+        return "brain_rnn" in self._blocks
+
+    def block(self, name: str, agent: int | None = None) -> np.ndarray:
+        """A wide block over the whole run: ``(frames, agents, width)``, or
+        ``(frames, width)`` for one animal. E.g. ``block("brain_rnn", 0)`` is
+        every recurrent unit of animal 0 through time — a raster."""
+        blk = self._blocks[name][:self._n].astype(np.float32)
+        return blk if agent is None else blk[:, agent]
 
     def view_frame(self, index: int) -> dict:
         """A stored frame plus the display fields the arena views expect.
@@ -303,6 +349,7 @@ class RunRecord:
             path,
             values=self._values[:self._n], states=self._states[:self._n],
             frames=self._frames[:self._n],
+            **{f"block_{k}": v[:self._n] for k, v in self._blocks.items()},
             meta=np.array(json.dumps({
                 "layout": layout(), "trial_id": self.trial_id,
                 "frame_interval_s": self.frame_interval_s,
@@ -315,6 +362,8 @@ class RunRecord:
         with np.load(path, allow_pickle=False) as z:
             meta = json.loads(str(z["meta"]))
             values, states, frames = z["values"], z["states"], z["frames"]
+            blocks = {k[len("block_"):]: z[k] for k in z.files
+                      if k.startswith("block_")}
         got = meta.get("layout", {})
         version = int(got.get("schema_version", 0))
         if version > RECORD_SCHEMA_VERSION:
@@ -339,6 +388,7 @@ class RunRecord:
             if name in _STATE_INDEX:
                 rec._states[:, :, _STATE_INDEX[name]] = states[:, :, src]
         rec._frames = frames.astype(np.float64)
+        rec._blocks = {k: np.asarray(v, np.float16) for k, v in blocks.items()}
         rec._n = len(frames)
         rec._n_agents = rec._values.shape[1]
         # A loaded archive must never decimate itself just because it is bigger

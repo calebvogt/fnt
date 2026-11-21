@@ -307,6 +307,47 @@ class OlfactionParams:
 
 
 @dataclass
+class BrainParams:
+    """Whether the animals in this run are driven by a learned brain.
+
+    Off by default, so every existing config keeps the rule-based policy and
+    reproduces exactly. Switched on, movement stops being a weighted sum of
+    hand-written drives and becomes the output of a recurrent network that only
+    receives what the body senses (see :mod:`fnt.abma.core.brain`).
+
+    ``name`` is a brain in the library (``fnt/abma/brains`` or
+    ``~/ABMA_brains``) or a path to a ``.npz``. ``stochastic`` adds the motor
+    noise the brain was trained with; without it every animal acts on the mean
+    of its policy, which is tidier to read and less like an animal.
+    """
+    enabled: bool = False
+    name: str = "vole_forager"
+    stochastic: bool = True
+    noise_scale: float = 1.0
+
+
+@dataclass
+class Stimulation:
+    """Drive, clamp or silence one unit of a learned brain for a while.
+
+    The in-silico version of an optogenetic manipulation: from ``at_day`` and
+    for ``duration_s`` seconds, unit ``unit`` of ``layer`` (``"rnn"`` or
+    ``"sensory"``) in every animal matching ``target`` (a group label, a sexid
+    or ``"all"``) has ``op`` applied — ``set`` it to ``value``, ``add``
+    ``value`` to it, or ``scale`` it by ``value`` (0 silences it). Ignored when
+    the run is not using a brain.
+    """
+    at_day: float = 1.0
+    duration_s: float = 10.0
+    target: str = "all"
+    layer: str = "rnn"
+    unit: int = 0
+    op: str = "set"
+    value: float = 1.0
+    label: str = ""
+
+
+@dataclass
 class PolicyParams:
     """Free parameters of the rule-based movement policy.
 
@@ -688,6 +729,10 @@ class ExperimentConfig:
     olfaction: OlfactionParams = field(default_factory=OlfactionParams)
     sward: SwardParams = field(default_factory=SwardParams)
     sky: SkyParams = field(default_factory=SkyParams)
+    #: a learned nervous system in place of the rule-based policy (off = rules)
+    brain: BrainParams = field(default_factory=BrainParams)
+    #: timed drive / clamp / silencing of single units of that brain
+    stimulations: list[Stimulation] = field(default_factory=list)
 
     #: 1 = condition bars were 0..1; 2 = bars are 0-100 (current). Configs
     #: written before the change carry no version and are migrated on load.
@@ -782,6 +827,10 @@ class ExperimentConfig:
                                     **d.get("olfaction", {})),
                                 sward=SwardParams(**d.get("sward", {})),
                                 sky=SkyParams(**d.get("sky", {})),
+                                brain=BrainParams(**d.get("brain", {})),
+                                stimulations=[
+                                    Stimulation(**x)
+                                    for x in d.get("stimulations", [])],
                                 schema_version=2,
                                 **scalars)
 
