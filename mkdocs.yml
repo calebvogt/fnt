@@ -68,6 +68,7 @@ nav:
       - UWB Tracking: tools/uwb.md
       - RFID Tracking: tools/rfid.md
       - Imaging: tools/imaging.md
+      - ABMA (in silico experiments): tools/abma.md
   - MAD:
       - Overview: mad/overview.md
       - Workflow (step by step): mad/workflow.md
