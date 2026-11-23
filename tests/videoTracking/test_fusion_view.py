@@ -85,6 +85,14 @@ def test_a_correction_in_the_window_is_saved_and_held(tmp_path):
     app.processEvents()
     assert w.scene.names_at.get("cam1", 1, 100) == ("B", False, True)
     assert "correction" in w.targets and w.targets["correction"] == [0]
+    # zoomed in on one camera: drawn at 4K, only that camera decoded; moving onto the other draws it too
+    sc = w.scene
+    for cam in ("cam1", "cam5"):
+        x, y, cw, ch = sc.cells[cam]
+        w.view._set_view(4.0, ((x + cw / 2) / sc.W, (y + ch / 2) / sc.H))
+        assert sc.size == "4k" and set(w._cell_sizes()) == {cam} and cam in w._shown
+    w.view.fit()
+    assert set(w._cell_sizes()) == set(sc.cells)
     w.dirty = False
     w.close()
     shutil.rmtree(tmp_path / "names", ignore_errors=True)
@@ -118,3 +126,68 @@ def test_zooming_keeps_the_point_under_the_pointer_and_clicks_land_on_the_canvas
     assert len(got) == 1 and np.allclose(got[0], v._to_canvas(QPointF(480, 270)))
     v.fit()
     assert v.zoom == 1.0 and np.allclose(v._to_canvas(QPointF(480, 270)), (960, 540))
+
+
+
+class _Counting:
+    """A VideoCapture that notes what it was asked to do."""
+
+    def __init__(self, path):
+        self.cap, self.calls = cv2.VideoCapture(path), []
+
+    def set(self, *a):
+        self.calls.append("seek")
+        return self.cap.set(*a)
+
+    def read(self):
+        self.calls.append("read")
+        return self.cap.read()
+
+    def grab(self):
+        self.calls.append("grab")
+        return self.cap.grab()
+
+    def release(self):
+        self.cap.release()
+
+
+def test_the_player_reads_the_right_frames_from_its_cache_and_after_a_step_back(tmp_path):
+    """Frames from the cache, from a step back (decoded with the frames before it) and at a new cell size are the
+    frames a plain seek gives; a redraw, further steps back and a zoom decode nothing."""
+    from fnt.videoTracking.fusion_view import Player
+    p = str(tmp_path / "count.avi")
+    w = cv2.VideoWriter(p, cv2.VideoWriter_fourcc(*"MJPG"), 30, (160, 90))
+    for i in range(200):
+        fr = np.zeros((90, 160, 3), np.uint8)
+        fr[:, : i % 160] = 255                       # the frame number, as a bar's length
+        fr[:, :, 2] = i
+        w.write(fr)
+    w.release()
+
+    def truth(n, size):
+        cap = cv2.VideoCapture(p)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, n)
+        ok, fr = cap.read()
+        cap.release()
+        return cv2.resize(fr, size, interpolation=cv2.INTER_AREA)
+
+    pl = Player({"cam1": p}, hold=3)
+    pl.caps["cam1"].release()
+    cap = pl.caps["cam1"] = _Counting(p)
+    small, big = {"cam1": (80, 45)}, {"cam1": (120, 68)}
+    for n in (0, 3, 6, 150):                                          # in order, then a jump
+        assert np.array_equal(pl.read(n, small)["cam1"], truth(n, (80, 45)))
+    cap.calls.clear()
+    assert np.array_equal(pl.read(150, small)["cam1"], truth(150, (80, 45)))      # a redraw
+    assert np.array_equal(pl.read(150, big)["cam1"], truth(150, (120, 68)))       # zoomed: a resize
+    assert not cap.calls
+    assert np.array_equal(pl.read(147, small)["cam1"], truth(147, (80, 45)))      # a step back
+    assert cap.calls.count("seek") == 1
+    cap.calls.clear()
+    for n in range(144, 147 - 3 * Player.FILL - 1, -3):                           # further steps back
+        assert np.array_equal(pl.read(n, small)["cam1"], truth(n, (80, 45)))
+    assert np.array_equal(pl.read(141, big)["cam1"], truth(141, (120, 68)))       # and zooming there
+    assert not cap.calls
+    pl.prefetch(30, small)                                                        # decoded ahead
+    assert np.array_equal(pl.read(30, small)["cam1"], truth(30, (80, 45)))
+    pl.close()

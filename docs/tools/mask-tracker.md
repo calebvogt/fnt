@@ -139,6 +139,11 @@ python -m fnt.videoTracking.mask_tracker_gui --project <project> --focus <list.t
     --copy-paste 0.5 --post-infer --post-infer-conf 0.25
 ```
 
+With `--training-window-only` only the training window shows, and it closes
+itself when the run is over (after the post-training inference, if any). The
+model, `training_log.csv` and `training_summary.json` are in the run folder. If
+the run fails, the window stays up with the error.
+
 - `--imgsz`: input size. 640 is fine for large animals; small mice in a wide
   view want 1280-1600 (and an ROI). On a 3 GB card, 1600 needs `--batch 2`.
 - `--augment --aug-rotation 180`: flips, rotation, scale and brightness; 180 for
@@ -236,8 +241,8 @@ Folders are searched recursively. The project is the one the model folder is in
 (`--project` for a model kept elsewhere). Every Inference setting has a flag
 (`--masks`/`--no-masks`, `--tracked-video`/`--no-tracked-video`,
 `--save-masks`, `--preview`, `--infer-device`, `--resolution`, `--max-disappear`,
-`--frame-step`, `--iou`, `--matching`, `--classifier` and its four settings); one
-not given keeps the tab's value.
+`--frame-step`, `--linker` and its settings, `--iou`, `--matching`, `--classifier`
+and its four settings); one not given keeps the tab's value.
 
 **Analyse every Nth frame** (`--frame-step N`, default 1) detects and tracks
 only every Nth frame: 3 on 30 fps video gives 10 positions per second at about a
@@ -246,15 +251,61 @@ third of the model time (every frame is still decoded). Frame numbers and
 analysed frames, and the tracked video shows the analysed frames at fps / N, so it
 keeps the source's length. **Max disappear** then counts analysed frames.
 
-How detections join tracks: each frame, detections are matched to the tracks by
-centroid distance (Hungarian or greedy); a pair further apart than the match
-distance (15% of the frame diagonal) never matches and does not sway the
-others. A detection left over starts a new track; once there are **Max objects**
-tracks it is taken as one of those animals seen again and continues the nearest
-track that got no detection on that frame. A track that already has one is
-never taken over, and a detection beyond the limit with every track taken is
-left out (until 2026-11-18 it could take over a matched track, putting two
-animals under one ID).
+How detections join tracks (**Linker**, `--linker`):
+
+- **ByteTrack** (default since 2026-11-20). Each analysed frame, a detection's
+  cost to a track is its centroid's distance from where the track is predicted
+  to be (a constant-velocity Kalman filter, `--motion kalman`) divided by the
+  gate, plus `--iou-weight` (1) x (1 - the overlap of its mask with the track's
+  last mask moved to that prediction; boxes when there are no masks). Pairs
+  beyond the gate never match. Confident detections are matched first and may
+  start tracks; detections below `--two-pass-conf` then only continue a track
+  that got none, and one that continues none keeps an id of its own (from
+  1000001 up), so no detection is lost and a doubtful one never starts a
+  track. A track ends after 5 missed analysed frames (**Max disappear: Auto**),
+  so an animal lost in a huddle comes back as a new track piece rather than as
+  someone else; joining the pieces into animals is the names step's job (see
+  Names across cameras). Autos: the gate (`--gate-px`, per video frame, x frame
+  step) is half the median animal size (square root of the mask area), at
+  least 1.2% of the frame diagonal; the two-pass split is 0.8 x the median
+  confidence, at most 0.5. With **Max objects** 1 every detection is the one
+  animal (one id for the whole video, as before). On the VC-T005 drop day
+  (mesocosm, 6 voles, every 3rd frame) it cut the zone cameras' track pieces in
+  the crowded box from 306 to 150 and the frames where one vole is named twice
+  at once from 71 to 14, with no more swaps (`--no-takeover`/`--takeover`: at
+  Max objects tracks an unmatched detection continues the nearest free track;
+  on by default only with Max objects 1).
+- **Centroid**: the linker before 2026-11-20, kept to repeat older runs (a run
+  recorded without a linker setting repeats with it under `--settings-from`).
+  Detections are matched to tracks by centroid distance (Hungarian or greedy,
+  **Matching**); a pair further apart than 15% of the frame diagonal never
+  matches. Tracks never end by default. A detection left over starts a new
+  track; once there are **Max objects** tracks it continues the nearest track
+  that got no detection on that frame, wherever it is, and a detection beyond
+  the limit with every track taken is left out. Where animals crowd, the few
+  ids jump between animals.
+
+`run_settings.json` records the linker settings as given and, under
+`linker_resolved`, as used (the autos worked out).
+
+**Linking a finished run again.** The linker only joins detections, so a run
+can be relinked from its saved detections without the model:
+
+```bash
+python -m fnt.videoTracking.mask_tracker_cli relink <MaskTracker folders, folders holding them or a .txt list>
+```
+
+It reads each folder's mask store (`*_tracks.h5`; `trajectories.csv` for
+box-only runs), links again with the current linker (linker flags as for
+`track`; the run's frame step, object limit and model stay), and writes
+`trajectories.csv`, the mask store with the new ids, `run_settings.json` (with
+`relinked` and the previous settings) and `inference.log` (the old log, then the
+relink's). What the run wrote before moves to
+`_TO_DELETE_tracking/<folder>/` beside it, as with `--redo`. The tracked video
+showed the old ids, so it moves aside too; `--tracked-video` draws a new one
+from the source video. A progress window closes itself when every folder
+succeeded (it stays up on a failure); `--no-window` prints instead. The drop
+day's four zone cameras (56,000 detections) relinked in under a minute.
 
 Videos that already have a track in their `<video>_MaskTracker` folder are
 left out; `--redo` tracks them again, first moving the files tracking wrote to
@@ -426,7 +477,11 @@ along the tracks:
 
 - **Tracklets**: each camera's tracks, cut where they jump faster than an
   animal moves or are lost for long; an overhead camera's positions go to floor
-  metres through its floor map (`mtt_floor`).
+  metres through its floor map (`mtt_floor`). On the overhead camera a second
+  mask on an animal already detected in that frame (two masks overlapping,
+  typically the whole body and the head alone) is left out first; the larger
+  mask is kept, since the higher-confidence one is often the head. Set
+  `"dedupe": true` or `false` on a camera to change this (off for zone cameras).
 - **Anchors**: a zone camera that sees one animal while UWB has exactly one
   animal in that box and all others clear of it; an overhead animal whose
   nearest UWB animal is close, the next one far, and no other animal near it.
@@ -434,21 +489,37 @@ along the tracks:
 - **Links**: handoffs (a zone tracklet ends in one of its camera's exits, from
   the Exits window, and an overhead tracklet starts by that box within a few
   seconds, or the reverse) and bridges (a tracklet ends and another starts close
-  by soon after in the same camera: mask flicker).
+  by soon after in the same camera: mask flicker), plus doorway links: in a
+  frame where exactly one zone detection touches an exit and exactly one
+  overhead detection is at that exit's door on the floor (within 0.15 m), the
+  two are one animal seen twice, and their tracklets get a strong link. The
+  door positions are taken from the data (the overhead position of the one
+  animal by the box while one zone detection touches the exit) and saved as
+  `doors.json` in the output folder; a later run reads that file, so a door
+  can be moved by hand, and `--derive-doors` places them again.
 - **Names**: one integer programme names all tracklets at once. Anchors decide,
   the plain UWB distance breaks ties, and a link whose two ends get different
   names costs its weight, so a name travels along a chain. No animal is on two
-  tracklets at once (except the two views of an animal in a doorway) or in two
-  places further apart than it could run in the time between. A tracklet nothing
-  anchors or links stays unnamed; a chain whose evidence barely favours its name
-  is marked unsure.
+  tracklets at once (except the two views of an animal in a doorway: the
+  overhead view stays within 0.5 m of the box for 90% of the shared frames) or
+  in two places further apart than it could run in the time between. A tracklet
+  nothing anchors or links stays unnamed; a chain whose evidence barely favours
+  its name is marked unsure.
+- **Conflicts**: when one of those rules leaves a tracklet unnamed that its
+  anchors or UWB name, because the animal is already on another tracklet for
+  part of that time, the tracklet is cut around that stretch (widened by the
+  time the animal would need to get between the two places) and the names are
+  solved again, up to 3 rounds. Only the stretch in conflict stays unnamed,
+  not the whole tracklet (a long zone tracklet once lost all its names to a
+  short overhead one).
 
 `identity.json` gives the clock time of frame 0 (`start`), the frame count,
 the UWB CSV and its columns, the UWB clock offset (`uwb_offset_s`: UWB second =
 video clock second + offset), the zones CSV (box corners in metres) and, per
 camera, its Mask Tracker folder plus either its `zone` and `exits` or its
 `floor_map`. It writes `identities.csv` (one row per tracklet: camera,
-object_id, first and last frame, animal, unsure, anchors) and `links.csv`.
+object_id, first and last frame, animal, unsure, anchors), `links.csv`,
+`doors.json`, and `duplicates.csv` / `door_links.csv` when there are any.
 On a VoleCosm minute it named 83% of tracked detections, 4% of them unsure; a
 box holding several animals at once is never anchored, so its tracks take their
 names from the doorway handoffs.
@@ -504,6 +575,35 @@ the camera grid drawn live with each animal's mask, keypoints and name.
   Corrections are saved at once; **Re-solve names** runs the naming again with
   them held (about half a minute for a 35-minute test) and redraws. Corrected
   names are drawn in a white frame.
+- **USV lane** (when the trial's microphones are found): under the grid, a
+  spectrogram strip (15-125 kHz) of the microphone around the playhead, MAD's
+  detected calls drawn as boxes (fundamentals bright, harmonics faint) and call
+  bouts as an orange band. Mic N belongs to the zone camera of zone N: on
+  **Auto** the strip follows the zone camera under the pointer (or the animal
+  last clicked); choose a mic, or **All mics** stacked. The wheel over the strip
+  shows more or fewer seconds (2-60; ±5 s to start); drag it to scrub, click it
+  to go to that moment. **Bout** buttons and `[` / `]` step to the previous or
+  next bout (on Auto the strip moves to that bout's mic); "USV call bout" is
+  also a **Go to** kind. **Audio = video clock +** sets the clock offset in
+  seconds (the PC's clock, which Avisoft and UWB share, minus the video's:
+  -121 in VoleCosm, the same as `uwb_offset_s`, which is the default); fine-tune
+  it with a sound you can see. Bouts come from the trial's bout table
+  (`<trial>/usv_bouts/*_usv_bouts.csv`: `mic`, `start_utc_s`, `end_utc_s` in PC
+  time), or, without one, from the calls themselves (fundamentals no more than
+  the **Bout gap** apart). The microphones are found from identity.json's
+  `usv` entry, else guessed from the trial folder the cameras sit in
+  (`.../Video_MesocosmCameras/<trial>/` -> `.../UltrasonicVocalizations_proc/<trial>/`):
+
+  ```json
+  "usv": {"dir": ".../UltrasonicVocalizations_proc/VC-T005_prairie_anosmic-saline",
+          "offset_s": -121, "bouts": ".../usv_bouts/VC-T005_usv_bouts.csv",
+          "tz": "America/Denver"}
+  ```
+
+  The wav names are the PC's local clock; `tz` names its time zone (default:
+  the zone of identity.json's `start`). The strip is made off screen a few
+  seconds at a time (Avisoft's compressed wavs are cut exactly, without
+  decoding them from the start) and kept, so playing on is smooth.
 
 Jumping far takes up to a second (the clips have a keyframe every ~8 s);
 playing on and stepping are quick.

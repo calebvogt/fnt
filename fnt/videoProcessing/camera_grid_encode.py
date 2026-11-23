@@ -467,24 +467,34 @@ def build_chunk_command(tracks, layout, settings, window_start, window_end,
 
     cmd = ["ffmpeg", "-y", "-nostdin", "-hwaccel", "none"]
     for i, run in enumerate(placements):
-        # Fast seek to just before the cut, then trim precisely in the graph:
-        # a bare -ss lands on the previous keyframe and would desynchronise
-        # this cell from the others.
-        pre = max(0.0, run["seek"] - seek_pad)
-        src, pre_args = run["path"], []
         if len(run["paths"]) > 1 and work_dir:
+            # A concat input gets no -ss. The concat demuxer cannot seek, and
+            # with -ss (even -ss 0) ffmpeg dropped the first ~8.3 s of the
+            # list: every multi-file run showed its footage 8.3 s late and
+            # lost its last 8.3 s. The list is read from its start and the
+            # trim filter makes the whole cut; _split_late_start keeps that
+            # skipped head under 30 s.
             src = write_concat_list(
                 run["paths"], os.path.join(work_dir, f"run{i:03d}.txt"))
-            pre_args = ["-f", "concat", "-safe", "0"]
-        cmd += pre_args + ["-ss", f"{pre:.3f}",
-                           "-t", f"{run['duration'] + seek_pad * 2:.3f}",
-                           "-i", src]
+            run["fine"] = run["seek"]
+            cmd += ["-f", "concat", "-safe", "0",
+                    "-t", f"{run['seek'] + run['duration'] + seek_pad:.3f}",
+                    "-i", src]
+        else:
+            # Fast seek to just before the cut, then trim precisely in the
+            # graph: a bare -ss lands on the previous keyframe and would
+            # desynchronise this cell from the others.
+            pre = max(0.0, run["seek"] - seek_pad)
+            run["fine"] = run["seek"] - pre
+            cmd += ["-ss", f"{pre:.3f}",
+                    "-t", f"{run['duration'] + seek_pad * 2:.3f}",
+                    "-i", run["path"]]
 
     parts = [f"color=black:s={settings.width}x{settings.height}"
              f":r={settings.fps}:d={duration:.3f}[bg]"]
 
     for i, run in enumerate(placements):
-        fine = min(seek_pad, run["seek"])
+        fine = run["fine"]
         if run.get("corr"):
             # Clock-synced: each frame moves by the camera's measured clock
             # error at that point, so its burnt-in clock lands on the grid's
@@ -555,7 +565,7 @@ def _append_audio(parts, placements, settings, seek_pad):
 
     labels = []
     for i, run in runs:
-        fine = min(seek_pad, run["seek"])
+        fine = run["fine"]
         delay = int(round(run["offset"] * 1000))
         parts.append(
             f"[{i}:a]atrim=start={fine:.3f}:duration={run['duration']:.3f},"

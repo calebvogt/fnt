@@ -493,25 +493,8 @@ def trajectories_dataframe(
         df[name] = values[keep]
     df = df.sort_values(["object_id", "frame"]).reset_index(drop=True)
 
-    if categories:
-        cat_map = {int(k): v for k, v in categories.items()}
-        counters: Dict[str, int] = {}
-        names: Dict[int, str] = {}
-        for o in sorted(df["object_id"].unique()):
-            lab = int(df.loc[df["object_id"] == o, "label"].iloc[0])
-            cname = cat_map.get(lab, f"class{lab}")
-            counters[cname] = counters.get(cname, 0) + 1
-            names[o] = f"{cname}_{counters[cname]}"
-        df["object_name"] = df["object_id"].map(names)
-
-    for o in df["object_id"].unique():
-        m = df["object_id"] == o
-        dt = df.loc[m, "time_s"].diff().replace(0, np.nan)
-        dx = df.loc[m, "x"].diff()
-        dy = df.loc[m, "y"].diff()
-        df.loc[m, "vx"] = (dx / dt).round(2)
-        df.loc[m, "vy"] = (dy / dt).round(2)
-        df.loc[m, "speed"] = (np.sqrt(dx**2 + dy**2) / dt).round(2)
+    from .mask_tracker_inference import add_names_and_velocities
+    add_names_and_velocities(df, categories or None)
 
     order = ["frame", "time_s", "object_id", "object_name", "label",
              "x", "y", "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2",

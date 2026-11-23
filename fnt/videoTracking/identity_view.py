@@ -13,6 +13,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -121,6 +122,9 @@ class Scene:
         self.layout = parse_layout(cfg.get("layout", MESOCOSM_LAYOUT), cfg.get("centre_scale", 1.2))
         self.set_size(size)
         self.readers = {c: TrackMaskReader(v["store"]) for c, v in self.cams.items() if v["store"]}
+        self._blocks: "OrderedDict[tuple, np.ndarray]" = OrderedDict()   # (cam, k) -> a block of RLE runs
+        self._dets: "OrderedDict[tuple, list]" = OrderedDict()            # (cam, frame) -> detections
+        self._rle_ds: Dict[str, object] = {}
         self.size_of = {c: ((r.width, r.height) if r.width else (1920, 1080)) for c, r in self.readers.items()}
         # keypoints, as arrays sorted by frame
         self.kp = {}
@@ -255,9 +259,44 @@ class Scene:
         return dict(zip(self.idn.animals, (float(v) for v in self.idn.uwb_cost(tr))))
 
     # ---------------------------------------------------------------- detections
+    BLOCKS = 256            # blocks of RLE runs kept (one compressed chunk each, 256 kB)
+    DETS = 256              # frames of decoded detections kept
+
+    def _runs(self, cam, a, b) -> np.ndarray:
+        """rle_counts[a:b] of a camera's store, read a whole compressed chunk at a time and kept: the store is
+        gzip-chunked, so reading each detection's few runs on its own unpacks the same chunk over and over."""
+        ds = self._rle_ds.get(cam)
+        if ds is None:
+            ds = self._rle_ds[cam] = self.readers[cam]._f["rle_counts"]
+        B = int(ds.chunks[0]) if ds.chunks else 1 << 16
+        parts = []
+        for k in range(a // B, (b - 1) // B + 1):
+            blk = self._blocks.get((cam, k))
+            if blk is None:
+                blk = ds[k * B:(k + 1) * B]
+                self._blocks[(cam, k)] = blk
+                if len(self._blocks) > self.BLOCKS:
+                    self._blocks.popitem(last=False)
+            else:
+                self._blocks.move_to_end((cam, k))
+            parts.append(blk[max(a - k * B, 0):min(b - k * B, B)])
+        return parts[0] if len(parts) == 1 else np.concatenate(parts)
+
     def detections(self, cam, frame) -> List[Dict]:
         """A frame's detections, each with its mask cut to its box (``mask``, at ``origin``): decoding only what
-        is drawn keeps playback quick."""
+        is drawn keeps playback quick, and the last frames' are kept for redrawing."""
+        key = (cam, int(frame))
+        got = self._dets.get(key)
+        if got is not None:
+            self._dets.move_to_end(key)
+            return got
+        got = self._detections(cam, frame)
+        self._dets[key] = got
+        if len(self._dets) > self.DETS:
+            self._dets.popitem(last=False)
+        return got
+
+    def _detections(self, cam, frame) -> List[Dict]:
         r = self.readers.get(cam)
         if r is None:
             return []
@@ -269,7 +308,7 @@ class Scene:
             mask = None
             n = int(r._rle_len[row])
             if n and x1 > x0 and y1 > y0:
-                counts = r._f["rle_counts"][int(r._rle_start[row]):int(r._rle_start[row]) + n].astype(np.int64)
+                counts = self._runs(cam, int(r._rle_start[row]), int(r._rle_start[row]) + n).astype(np.int64)
                 pos = np.concatenate([[0], np.cumsum(np.maximum(counts, 0))])
                 lo, hi = x0 * r.height, x1 * r.height         # column-major RLE: only the box's columns
                 st, en = pos[1:-1:2], pos[2::2]               # the runs of mask pixels
@@ -284,12 +323,15 @@ class Scene:
 
     # ---------------------------------------------------------------- drawing
     def compose(self, frames: Dict[str, np.ndarray]) -> np.ndarray:
+        """The grid of one frame per camera (frames already at their cell's size are pasted as they are)."""
         import cv2
         img = np.zeros((self.H, self.W, 3), np.uint8)
         for c, fr in frames.items():
             if c in self.cells and fr is not None:
                 x, y, w, h = self.cells[c]
-                img[y:y + h, x:x + w] = cv2.resize(fr, (w, h), interpolation=cv2.INTER_AREA)
+                if fr.shape[0] != h or fr.shape[1] != w:
+                    fr = cv2.resize(fr, (w, h), interpolation=cv2.INTER_AREA)
+                img[y:y + h, x:x + w] = fr
         return img
 
     def _label(self, img, text, x, y, colour, scale, boxed=False):

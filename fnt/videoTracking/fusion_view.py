@@ -15,11 +15,14 @@ nothing rendered first:
   stretch (or from here on, or up to here) as an animal or as not an animal. Corrections are saved to
   ``corrections.csv`` beside ``identities.csv``; **Re-solve names** runs ``mtt_identity`` again with them held (a
   correction carries along whatever its chain links to) and redraws.
+* **USV lane** (``usv_lane``), when the trial's microphones are found: the spectrogram of the mic of the zone under
+  the pointer (or a chosen mic, or all four) around the playhead, MAD's calls as boxes, bouts as a band; step from
+  bout to bout; the audio-to-video clock offset is a setting.
 
     python -m fnt.videoTracking.fusion_view <identity.json>
 
 Keys: Space play/pause; Left/Right step; Shift+Left/Right 1 s; Ctrl+Left/Right 10 s; N / P next / previous moment
-of the chosen kind.
+of the chosen kind; ] / [ next / previous USV call bout.
 """
 from __future__ import annotations
 
@@ -45,43 +48,154 @@ from .mtt_identity import NOT_ANIMAL, corrections_path, read_corrections
 
 CAM_COLOURS = [(90, 160, 255), (255, 170, 60), (120, 210, 120), (230, 110, 200), (200, 200, 90), (110, 220, 230)]
 JUMPS = ["unsure name", "name change on a track", "handoff between cameras", "long unnamed track", "correction"]
+USV_JUMP = "USV call bout"
+MIC_AUTO, MIC_ALL = "Auto: zone under the pointer", "All mics"
 
 
-def _qimage(bgr: np.ndarray) -> QImage:
-    h, w = bgr.shape[:2]
-    rgb = np.ascontiguousarray(bgr[:, :, ::-1])
-    return QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()
+def _bgra(bgr: np.ndarray):
+    """(QImage, buffer): the picture as Qt's native 32-bit format, on the buffer (keep it while the QImage is
+    used); converting once here is far cheaper than an RGB888 copy and lets Qt paint it without converting."""
+    import cv2
+    buf = cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA)
+    h, w = buf.shape[:2]
+    return QImage(buf.data, w, h, 4 * w, QImage.Format_RGB32), buf
+
+
+class _Kept:
+    """Pictures kept by key up to a size in MB, the least recently used dropped first (thread-safe)."""
+
+    def __init__(self, mb: float):
+        import threading
+        from collections import OrderedDict
+        self.max, self.bytes = mb * 2 ** 20, 0
+        self.items: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
+        self.lock = threading.Lock()
+
+    def get(self, key):
+        with self.lock:
+            img = self.items.get(key)
+            if img is not None:
+                self.items.move_to_end(key)
+            return img
+
+    def put(self, key, img):
+        with self.lock:
+            if key in self.items:
+                return
+            self.items[key] = img
+            self.bytes += img.nbytes
+            while self.bytes > self.max and len(self.items) > 1:
+                _, old = self.items.popitem(last=False)
+                self.bytes -= old.nbytes
+
+    def clear(self):
+        with self.lock:
+            self.items.clear()
+            self.bytes = 0
 
 
 class Player:
-    """Frame n of every camera's clip; reads on in order while playing, seeks otherwise (cameras in parallel)."""
+    """Frame n of every camera's clip, each scaled to its cell.
 
-    def __init__(self, clips: Dict[str, str]):
+    One reader thread per camera, so the cameras decode side by side. Decoded frames are kept whole (``WHOLE_MB``)
+    and scaled to their cells (``CELL_MB``): redrawing a frame (an overlay toggled) decodes nothing and zooming (a
+    new cell size) is only a resize. Reads on in order going forward; a short step back decodes the analysed
+    frames before it in the same pass (the decoder has to start from an earlier key frame anyway), so the next
+    steps back are instant; ``prefetch`` decodes the next frame while this one is drawn."""
+    WHOLE_MB = 1200
+    CELL_MB = 600
+    AHEAD = 45              # frames: read on instead of seeking
+    FILL = 24               # analysed frames decoded before a step back
+    BACK = 301              # a step back of up to this many frames fills; a longer jump only seeks
+
+    def __init__(self, clips: Dict[str, str], hold: int = 1):
         import cv2
         self.cv2 = cv2
         self.caps = {c: cv2.VideoCapture(p) for c, p in clips.items()}
         self.pos = {c: 0 for c in clips}
-        self.pool = ThreadPoolExecutor(max_workers=max(1, len(clips)))
+        self.hold = max(1, int(hold))
+        self.pools = {c: ThreadPoolExecutor(max_workers=1) for c in clips}     # one decoder per camera
+        self.whole = _Kept(self.WHOLE_MB)                                        # (cam, n) -> frame
+        self.cells = _Kept(self.CELL_MB)                                         # (cam, n, w, h) -> cell
+        self.pending: Dict[tuple, object] = {}
 
-    def _one(self, cam, n):
-        cap = self.caps[cam]
-        if not (self.pos[cam] <= n <= self.pos[cam] + 45):
-            cap.set(self.cv2.CAP_PROP_POS_FRAMES, n)
-            self.pos[cam] = n
-        while self.pos[cam] < n:
-            cap.grab()
-            self.pos[cam] += 1
-        ok, fr = cap.read()
-        self.pos[cam] = n + 1 if ok else -10 ** 9
-        return cam, fr if ok else None
+    def _fit(self, fr, size):
+        w, h = size
+        if fr.shape[1] == w and fr.shape[0] == h:
+            return fr
+        return self.cv2.resize(fr, (w, h), interpolation=self.cv2.INTER_AREA)
 
-    def read(self, n) -> Dict[str, np.ndarray]:
-        return dict(self.pool.map(lambda c: self._one(c, n), list(self.caps)))
+    # decoding (on the camera's own thread)
+    def _decode(self, cam, n, size):
+        key = (cam, n) + tuple(size)
+        img = self.cells.get(key)
+        if img is not None:
+            return img
+        fr = self.whole.get((cam, n))
+        if fr is None:
+            cap, pos, fill = self.caps[cam], self.pos[cam], ()
+            if not (pos <= n <= pos + self.AHEAD):
+                start = n
+                if 0 < pos - n <= self.BACK:                    # a step back: the frames before it too
+                    start = max(0, n - self.FILL * self.hold)
+                    fill = set(range(n - self.hold, start - 1, -self.hold))
+                cap.set(self.cv2.CAP_PROP_POS_FRAMES, start)
+                self.pos[cam] = start
+            while self.pos[cam] < n:
+                p = self.pos[cam]
+                if p in fill:
+                    ok, f = cap.read()
+                    if ok:
+                        self.whole.put((cam, p), f)
+                else:
+                    cap.grab()
+                self.pos[cam] = p + 1
+            ok, fr = cap.read()
+            self.pos[cam] = n + 1 if ok else -10 ** 9
+            if not ok:
+                return None
+            self.whole.put((cam, n), fr)
+        img = self._fit(fr, size)
+        self.cells.put(key, img)
+        return img
+
+    def _submit(self, cam, n, size):
+        key = (cam, n) + tuple(size)
+        fut = self.pending.get(key)
+        if fut is None:
+            fut = self.pools[cam].submit(self._decode, cam, n, size)
+            self.pending[key] = fut
+            fut.add_done_callback(lambda _f, k=key: self.pending.pop(k, None))
+        return fut
+
+    def read(self, n, sizes: Dict[str, tuple]) -> Dict[str, np.ndarray]:
+        """{camera: frame n scaled to sizes[camera] (w, h)} for the cameras in sizes."""
+        out, futs = {}, {}
+        for cam, size in sizes.items():
+            if cam not in self.caps:
+                continue
+            img = self.cells.get((cam, n) + tuple(size))
+            if img is not None:
+                out[cam] = img
+            else:
+                futs[cam] = self._submit(cam, n, size)
+        for cam, fut in futs.items():
+            out[cam] = fut.result()
+        return out
+
+    def prefetch(self, n, sizes: Dict[str, tuple]):
+        """Start decoding frame n (playing: the next frame while this one is drawn)."""
+        for cam, size in sizes.items():
+            if cam in self.caps and self.cells.get((cam, n) + tuple(size)) is None:
+                self._submit(cam, n, size)
 
     def close(self):
-        self.pool.shutdown(wait=False)
+        for p in self.pools.values():
+            p.shutdown(wait=True, cancel_futures=True)
         for c in self.caps.values():
             c.release()
+        self.whole.clear()
+        self.cells.clear()
 
 
 class GridView(QWidget):
@@ -89,6 +203,7 @@ class GridView(QWidget):
     pointer; drag (or two-finger scroll on a trackpad) to move about; a click without dragging picks an animal."""
     clicked = pyqtSignal(float, float, QPoint)            # canvas x, y; global position
     zoomed = pyqtSignal(float)
+    hovered = pyqtSignal(float, float)                    # canvas x, y under the pointer (not dragging)
     MAX_ZOOM = 12.0
 
     def __init__(self, parent=None):
@@ -98,6 +213,7 @@ class GridView(QWidget):
         self.centre = (0.5, 0.5)                           # the middle of the view, as a share of the canvas
         self._press = None
         self._dragged = False
+        self.setMouseTracking(True)
         self.setMinimumSize(640, 360)
         self.setStyleSheet("background: black;")
         self.setFocusPolicy(Qt.StrongFocus)
@@ -105,6 +221,11 @@ class GridView(QWidget):
 
     def set_image(self, img: QImage):
         self.img = img
+        self.update()
+
+    def set_frame(self, bgr: np.ndarray):
+        """Show a BGR picture (kept as Qt's native format; the buffer lives as long as the image shown)."""
+        self.img, self._buf = _bgra(bgr)
         self.update()
 
     # geometry: the fitted rectangle on screen, and the part of the canvas shown in it
@@ -164,7 +285,7 @@ class GridView(QWidget):
         p = QPainter(self)
         p.fillRect(self.rect(), Qt.black)
         if self.img is not None:
-            p.setRenderHint(QPainter.SmoothPixmapTransform)
+            p.setRenderHint(QPainter.SmoothPixmapTransform, not self._dragged)     # smooth once the drag stops
             p.drawImage(self._target(), self.img, self._source())
 
     # input
@@ -195,6 +316,8 @@ class GridView(QWidget):
 
     def mouseMoveEvent(self, e):
         if self._press is None:
+            if self.img is not None and self._target().contains(e.pos()):
+                self.hovered.emit(*self._to_canvas(e.pos()))
             return
         d = e.pos() - self._press
         if self._dragged or abs(d.x()) + abs(d.y()) > 4:
@@ -207,6 +330,8 @@ class GridView(QWidget):
         press, dragged = self._press, self._dragged
         self._press, self._dragged = None, False
         self.unsetCursor()
+        if dragged:
+            self.update()
         if press is None or dragged or e.button() != Qt.LeftButton:
             return
         r = self._target()
@@ -290,6 +415,152 @@ class Timeline(QWidget):
         self.seek.emit(f)
 
 
+class UsvLane(QWidget):
+    """The microphones under the grid: a spectrogram strip per mic shown (one, or all stacked) over a window around
+    the playhead, MAD's detections as boxes (fundamentals yellow, harmonics dim), bouts as a band on top. Wheel:
+    a shorter or longer window; drag: scrub; click: go there."""
+    seek = pyqtSignal(float)                              # PC time to go to
+    _ready = pyqtSignal(object)
+    LABEL_W = 64
+
+    def __init__(self, source, parent=None):
+        from .usv_lane import TileCache
+        super().__init__(parent)
+        self.source = source
+        self.cache = TileCache(source, self._ready.emit)
+        self._ready.connect(lambda _key: self.update())
+        self.mics: List[int] = source.mics[:1]
+        self.t = 0.0                                      # PC time at the playhead
+        self.span = 10.0                                  # seconds shown
+        self.calls = pd.DataFrame(columns=["mic", "t0", "t1", "f_lo", "f_hi", "fundamental"])
+        self.bouts = pd.DataFrame(columns=["mic", "t0", "t1", "n_calls"])
+        self.labels: Dict[int, str] = {}
+        self._press = None
+        self._dragged = False
+        self._keep = []
+        self.setMinimumHeight(150)
+
+    def set_mics(self, mics: List[int]):
+        mics = [m for m in mics if m in self.source.recordings] or self.source.mics[:1]
+        if mics != self.mics:
+            self.mics = mics
+            self.setMinimumHeight(150 if len(mics) == 1 else 56 * len(mics))
+            self.update()
+
+    def set_time(self, t: float):
+        self.t = float(t)
+        self.update()
+
+    def _x(self, t) -> float:
+        w = max(self.width() - self.LABEL_W, 1)
+        return self.LABEL_W + (t - (self.t - self.span / 2)) / self.span * w
+
+    def _t(self, x) -> float:
+        w = max(self.width() - self.LABEL_W, 1)
+        return self.t - self.span / 2 + (x - self.LABEL_W) / w * self.span
+
+    def paintEvent(self, _):
+        from .usv_lane import F_HI, F_LO, PX_PER_S, ROWS, TILE_S
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(12, 12, 12))
+        if not self.mics:
+            return
+        rh = self.height() / len(self.mics)
+        a, b = self.t - self.span / 2, self.t + self.span / 2
+        self._keep = []
+        for i, mic in enumerate(self.mics):
+            top = i * rh
+            k0, k1 = int(np.floor(a / TILE_S)), int(np.floor(b / TILE_S))
+            for k in range(k0, k1 + 2):                   # one past the end: the next tile, made ahead
+                img = self.cache.get(mic, k)
+                if img is None or k > k1:
+                    continue
+                q = QImage(img.data, img.shape[1], img.shape[0], img.shape[1], QImage.Format_Grayscale8)
+                self._keep.append(img)
+                x0, x1 = self._x(k * TILE_S), self._x((k + 1) * TILE_S)
+                p.drawImage(QRectF(x0, top + 1, x1 - x0, rh - 2), q,
+                            QRectF(0, 0, TILE_S * PX_PER_S, ROWS))
+            if self.source.recording_at(mic, self.t) is None:
+                p.setPen(QColor(150, 150, 150))
+                p.drawText(QRectF(self.LABEL_W, top, self.width() - self.LABEL_W, rh), Qt.AlignCenter,
+                           "no recording here")
+
+            def fy(f):
+                return top + 1 + (1 - (np.clip(f, F_LO, F_HI) - F_LO) / (F_HI - F_LO)) * (rh - 2)
+            bt = self.bouts[(self.bouts.mic == mic) & (self.bouts.t1 > a) & (self.bouts.t0 < b)] if len(
+                self.bouts) else self.bouts
+            for r in bt.itertuples():
+                p.fillRect(QRectF(self._x(r.t0), top + 1, max(self._x(r.t1) - self._x(r.t0), 2), 4),
+                           QColor(255, 140, 0, 220))
+            cs = self.calls[(self.calls.mic == mic) & (self.calls.t1 > a) & (self.calls.t0 < b)] if len(
+                self.calls) else self.calls
+            for r in cs.itertuples():
+                col = QColor(255, 225, 40) if r.fundamental else QColor(255, 225, 40, 110)
+                p.setPen(QPen(col, 1))
+                x0, x1 = self._x(r.t0), self._x(r.t1)
+                p.drawRect(QRectF(x0, fy(r.f_hi), max(x1 - x0, 2), max(fy(r.f_lo) - fy(r.f_hi), 2)))
+            p.fillRect(QRectF(0, top, self.LABEL_W - 2, rh), QColor(30, 30, 30))
+            p.setPen(QColor(220, 220, 220))
+            p.drawText(QRectF(4, top + 2, self.LABEL_W - 6, rh - 4), Qt.AlignLeft | Qt.AlignTop,
+                       self.labels.get(mic, f"mic {mic}"))
+            p.setPen(QPen(QColor(70, 70, 70), 1))
+            p.drawLine(0, int(top + rh) - 1, self.width(), int(top + rh) - 1)
+        # second ticks along the bottom, the playhead, the clock
+        p.setPen(QPen(QColor(160, 160, 160), 1))
+        for s in range(int(np.ceil(a)), int(np.floor(b)) + 1):
+            x = int(self._x(s))
+            p.drawLine(x, self.height() - 4, x, self.height())
+        p.setPen(QPen(QColor(255, 60, 60), 2))
+        xp = int(self._x(self.t))
+        p.drawLine(xp, 0, xp, self.height())
+        p.setPen(QColor(200, 200, 200))
+        p.drawText(4, self.height() - 4, f"{self.source.local(self.t):%H:%M:%S}  ±{self.span / 2:g} s")
+
+    def wheelEvent(self, e):
+        steps = e.angleDelta().y() / 120.0
+        if steps:
+            self.span = float(np.clip(self.span * 1.25 ** (-steps), 2.0, 60.0))
+            self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._press, self._dragged = e.pos(), False
+
+    def mouseMoveEvent(self, e):
+        if self._press is None:
+            return
+        dx = e.pos().x() - self._press.x()
+        if self._dragged or abs(dx) > 4:
+            self._dragged = True
+            w = max(self.width() - self.LABEL_W, 1)
+            self._press = e.pos()
+            self.seek.emit(self.t - dx / w * self.span)
+
+    def mouseReleaseEvent(self, e):
+        press, dragged = self._press, self._dragged
+        self._press, self._dragged = None, False
+        if press is not None and not dragged and e.button() == Qt.LeftButton and e.pos().x() > self.LABEL_W:
+            self.seek.emit(self._t(e.pos().x()))
+
+    def close_workers(self):
+        self.cache.close()
+
+
+class _CallLoader(QThread):
+    """Reads every mic's MAD detections over the run, off the GUI thread."""
+    done = pyqtSignal(object)
+
+    def __init__(self, source, t0, t1, parent=None):
+        super().__init__(parent)
+        self.source, self.t0, self.t1 = source, t0, t1
+
+    def run(self):
+        parts = [self.source.calls(m, self.t0, self.t1) for m in self.source.mics]
+        parts = [p for p in parts if len(p)]
+        self.done.emit(pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(
+            columns=["mic", "t0", "t1", "f_lo", "f_hi", "score", "fundamental", "blob"]))
+
+
 class Solver(QThread):
     done = pyqtSignal(object, object, str)
     failed = pyqtSignal(str)
@@ -314,16 +585,20 @@ class ReviewWindow(QMainWindow):
         super().__init__()
         self.cfg_path = cfg_path
         self.scene = Scene(cfg_path, "1080")
-        self.player = Player({c: v["clip"] for c, v in self.scene.cams.items() if c in self.scene.cells})
+        self.player = Player({c: v["clip"] for c, v in self.scene.cams.items() if c in self.scene.cells},
+                             hold=self.scene.hold)
         self.corr_path = corrections_path(self.scene.cfg, cfg_path)
         self.corrections = read_corrections(self.corr_path)
         lp = os.path.join(self.scene.out_dir, "links.csv")
         self.links = pd.read_csv(lp) if os.path.exists(lp) else pd.DataFrame()
         self.n = 0
+        self._want: Optional[int] = None
+        self._shown: set = set()
         self.playing = False
         self.dirty = False
         self.solver: Optional[Solver] = None
         self.setWindowTitle(f"Fusion View - {self.scene.title or os.path.basename(cfg_path)}")
+        self._init_usv()
         self._build()
         self._refresh_names()
         self.timer = QTimer(self)
@@ -335,7 +610,7 @@ class ReviewWindow(QMainWindow):
         self.view = GridView()
         self.view.clicked.connect(self._clicked)
         self.timeline = Timeline()
-        self.timeline.seek.connect(self.show_frame)
+        self.timeline.seek.connect(self.request_frame)
         self.slider = QSlider(Qt.Horizontal)
         self.slider.setRange(0, self.scene.n_frames - 1)
         self.slider.sliderReleased.connect(lambda: self.show_frame(self.slider.value()))
@@ -374,6 +649,13 @@ class ReviewWindow(QMainWindow):
         lv = QVBoxLayout(left)
         lv.setContentsMargins(0, 0, 0, 0)
         lv.addWidget(self.view, 1)
+        if self.usv is not None:
+            self.lane = UsvLane(self.usv)
+            self.lane.labels = {m: f"mic {m}" + (f"\n{self._mic_zone.get(m)}" if m in self._mic_zone else "")
+                                for m in self.usv.mics}
+            self.lane.seek.connect(lambda t: self.request_frame(self.frame_of_pc(t)))
+            self.view.hovered.connect(self._hovered)
+            lv.addWidget(self.lane)
         lv.addWidget(self.timeline)
         lv.addLayout(bar)
 
@@ -422,6 +704,9 @@ class ReviewWindow(QMainWindow):
         self.jump_lbl = QLabel()
         jl.addWidget(self.jump_lbl)
         sv.addWidget(jg)
+        if self.usv is not None:
+            self.jump_kind.addItem(USV_JUMP)
+            sv.addWidget(self._usv_panel())
 
         ig = QGroupBox("Selected track (click an animal)")
         il = QVBoxLayout(ig)
@@ -461,20 +746,212 @@ class ReviewWindow(QMainWindow):
         m.addAction(a)
         self._fill_corrections()
 
+    # ---------------------------------------------------------------- USV
+    def _init_usv(self):
+        """The trial's microphones, if its USV folder is found (identity.json "usv", else guessed)."""
+        from .usv_lane import UsvSource, locate_usv, mic_of_zone
+        self.usv = None
+        self.calls = pd.DataFrame(columns=["mic", "t0", "t1", "f_lo", "f_hi", "score", "fundamental", "blob"])
+        self.bout_table = pd.DataFrame(columns=["mic", "t0", "t1", "n_calls"])
+        self._bout_src = ""
+        u = self.scene.cfg.get("usv") or {}
+        self.usv_offset = float(u.get("offset_s", self.scene.cfg.get("uwb_offset_s", 0)))
+        self._cam_mic = {c: mic_of_zone(v.get("zone")) for c, v in (self.scene.cfg.get("cameras") or {}).items()
+                         if v.get("zone")}
+        self._mic_zone = {m: (self.scene.cfg["cameras"][c].get("zone")) for c, m in self._cam_mic.items() if m}
+        self._auto_mic: Optional[int] = None
+        usv_dir, bouts = locate_usv(self.scene.cfg, self.scene.cams)
+        if not usv_dir or not os.path.isdir(usv_dir):
+            return
+        src = UsvSource.scan(usv_dir, u.get("tz") or self.scene.start.tzinfo, bouts)
+        if not src.mics:
+            return
+        self.usv = src
+        self.loader = _CallLoader(src, self.pc_of_frame(0) - 60, self.pc_of_frame(self.scene.n_frames) + 60, self)
+        self.loader.done.connect(self._calls_loaded)
+        self.loader.start()
+
+    def pc_of_frame(self, n) -> float:
+        """The PC's clock (audio, UWB; epoch seconds) at video frame n."""
+        return self.scene.start.timestamp() + n / self.scene.fps + self.usv_offset
+
+    def frame_of_pc(self, t) -> int:
+        return int(round((t - self.usv_offset - self.scene.start.timestamp()) * self.scene.fps))
+
+    def _usv_panel(self) -> QGroupBox:
+        g = QGroupBox("USV (microphones)")
+        gl = QVBoxLayout(g)
+        self.mic_mode = QComboBox()
+        self.mic_mode.addItems([MIC_AUTO] + [f"Mic {m}" + (f" ({self._mic_zone[m]})" if m in self._mic_zone else "")
+                                             for m in self.usv.mics] + [MIC_ALL])
+        self.mic_mode.currentTextChanged.connect(lambda _: self._apply_mics())
+        gl.addWidget(self.mic_mode)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Audio = video clock +"))
+        self.offset_spin = QDoubleSpinBox()
+        self.offset_spin.setRange(-3600, 3600)
+        self.offset_spin.setDecimals(2)
+        self.offset_spin.setSingleStep(0.05)
+        self.offset_spin.setSuffix(" s")
+        self.offset_spin.setValue(self.usv_offset)
+        self.offset_spin.setToolTip("The PC's clock (audio, UWB) minus the video's. VoleCosm: -121 (the recorder ran "
+                                    "121 s ahead); fine-tune it with a sound you can see.")
+        self.offset_spin.valueChanged.connect(self._offset_changed)
+        row.addWidget(self.offset_spin)
+        gl.addLayout(row)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Bout gap"))
+        self.gap_spin = QDoubleSpinBox()
+        self.gap_spin.setRange(0.1, 60)
+        self.gap_spin.setValue(2.0)
+        self.gap_spin.setSuffix(" s")
+        self.gap_spin.setToolTip("Calls no more than this apart make one bout (when there is no bout table)")
+        self.gap_spin.valueChanged.connect(lambda _: self._update_bouts())
+        row.addWidget(self.gap_spin)
+        gl.addLayout(row)
+        row = QHBoxLayout()
+        pb, nb = QPushButton("< Bout ( [ )"), QPushButton("Bout ( ] ) >")
+        pb.clicked.connect(lambda: self.jump_bout(-1))
+        nb.clicked.connect(lambda: self.jump_bout(1))
+        row.addWidget(pb)
+        row.addWidget(nb)
+        gl.addLayout(row)
+        self.bout_lbl = QLabel("reading the detections...")
+        self.bout_lbl.setWordWrap(True)
+        gl.addWidget(self.bout_lbl)
+        return g
+
+    def _shown_mics(self) -> List[int]:
+        t = self.mic_mode.currentText()
+        if t == MIC_ALL:
+            return list(self.usv.mics)
+        if t == MIC_AUTO:
+            return [self._auto_mic or self.usv.mics[0]]
+        return [int(t.split()[1])]
+
+    def _apply_mics(self):
+        self.lane.set_mics(self._shown_mics())
+        self._update_jump_label()
+        same = self.mic_mode.currentText() in (MIC_AUTO, MIC_ALL)       # bouts numbered over all mics
+        self._update_bout_label(getattr(self, "_bout_i", None) if same else None)
+
+    def _hovered(self, x, y):
+        """Auto: the lane follows the zone camera under the pointer."""
+        m = self._cam_mic.get(self.scene.cell_at(x, y))
+        if m and m != self._auto_mic:
+            self._auto_mic = m
+            if self.mic_mode.currentText() == MIC_AUTO:
+                self._apply_mics()
+
+    def _offset_changed(self, v):
+        self.usv_offset = float(v)
+        self._update_bouts()
+        self.show_frame(self.n)
+
+    def _calls_loaded(self, calls):
+        self.calls = calls
+        self.lane.calls = calls
+        self._update_bouts()
+
+    def _update_bouts(self):
+        if self.usv is None:
+            return
+        t0, t1 = self.pc_of_frame(0), self.pc_of_frame(self.scene.n_frames)
+        self.bout_table, self._bout_src = self.usv.bouts(self.calls, t0, t1, self.gap_spin.value())
+        self.lane.bouts = self.bout_table
+        self.lane.update()
+        self._refresh_bout_targets()
+        self._update_bout_label()
+
+    def _refresh_bout_targets(self):
+        if self.usv is None:
+            return
+        self.targets[USV_JUMP] = sorted(self.frame_of_pc(t) for t in self.bout_table.t0) if len(
+            self.bout_table) else []
+        self._update_jump_label()
+
+    def _bouts_in_view(self) -> pd.DataFrame:
+        b = self.bout_table
+        if not len(b) or self.mic_mode.currentText() in (MIC_ALL, MIC_AUTO):
+            return b
+        return b[b.mic.isin(self._shown_mics())]
+
+    def jump_bout(self, d):
+        """The next (d > 0) or previous bout of the mics shown (any mic on Auto, which then shows that mic)."""
+        b = self._bouts_in_view()
+        if self.usv is None or not len(b):
+            return
+        here = self.pc_of_frame(self.n)
+        fr = b.t0.to_numpy()
+        if d > 0:
+            nxt = np.flatnonzero(fr > here + 1e-3)
+            i = int(nxt[0]) if len(nxt) else 0
+        else:
+            prv = np.flatnonzero(fr < here - 1e-3)
+            i = int(prv[-1]) if len(prv) else len(fr) - 1
+        r = b.iloc[i]
+        if self.mic_mode.currentText() == MIC_AUTO:
+            self._auto_mic = int(r.mic)
+            self.lane.set_mics([int(r.mic)])
+        self.show_frame(self.frame_of_pc(float(r.t0)))
+        self._bout_i = i
+        self._update_bout_label(i)
+
+    def _update_bout_label(self, i=None):
+        if self.usv is None or not hasattr(self, "bout_lbl"):
+            return
+        b = self._bouts_in_view()
+        n_calls = int(self.calls.fundamental.astype(bool).sum()) if len(self.calls) else 0
+        txt = f"{n_calls} calls, {len(b)} bouts here (from {self._bout_src})"
+        if i is not None and 0 <= i < len(b):
+            r = b.iloc[i]
+            n = "" if pd.isna(r.n_calls) else f", {int(r.n_calls)} calls"
+            txt = (f"bout {i + 1} of {len(b)}: mic {int(r.mic)}{n}, {r.t1 - r.t0:.1f} s, "
+                   f"{self.usv.local(r.t0):%H:%M:%S}\n" + txt)
+        self.bout_lbl.setText(txt)
+
     # ---------------------------------------------------------------- frames
     def overlays(self) -> Overlays:
         return Overlays(**{k: cb.isChecked() for k, cb in self.checks.items()}, tail_s=self.tail.value())
 
+    def _cell_sizes(self) -> Dict[str, tuple]:
+        """{camera: cell (w, h)} for the cameras in view: zoomed in, the others are not decoded."""
+        v, sc = self.view, self.scene
+        cells = sc.cells
+        if v.zoom > 1.0:
+            hw = hh = 0.5 / v.zoom
+            x0, x1 = (v.centre[0] - hw) * sc.W, (v.centre[0] + hw) * sc.W
+            y0, y1 = (v.centre[1] - hh) * sc.H, (v.centre[1] + hh) * sc.H
+            cells = {c: r for c, r in cells.items() if r[0] < x1 and r[0] + r[2] > x0 and r[1] < y1 and r[1] + r[3] > y0}
+        return {c: (w, h) for c, (_, _, w, h) in cells.items()}
+
+    def request_frame(self, n):
+        """Show frame n once the events waiting now are handled: dragging along the timeline draws the latest
+        position only, not every position passed."""
+        first = self._want is None
+        self._want = int(n)
+        if first:
+            QTimer.singleShot(0, self._show_wanted)
+
+    def _show_wanted(self):
+        n, self._want = self._want, None
+        if n is not None:
+            self.show_frame(n)
+
     def show_frame(self, n):
         n = int(np.clip(n, 0, self.scene.n_frames - 1))
         self.n = n
-        img = self.scene.draw(self.scene.compose(self.player.read(n)), n, self.overlays())
-        self.view.set_image(_qimage(img))
+        sizes = self._cell_sizes()
+        self._shown = set(sizes)
+        img = self.scene.draw(self.scene.compose(self.player.read(n, sizes)), n, self.overlays())
+        self.view.set_frame(img)
         self.timeline.set_playhead(n)
         self.slider.blockSignals(True)
         self.slider.setValue(n)
         self.slider.blockSignals(False)
         self.time_lbl.setText(f"{self.scene.clock(n):%H:%M:%S}  frame {n}")
+        if self.usv is not None:
+            self.lane.set_time(self.pc_of_frame(n))
 
     def _zoomed(self, z):
         """Draw at 4K once zoomed in, so the cameras and labels stay sharp (1080 whole, for speed)."""
@@ -482,6 +959,8 @@ class ReviewWindow(QMainWindow):
         size = "4k" if z > 1.4 else "1080"
         if size != self.scene.size:
             self.scene.set_size(size)
+            self.show_frame(self.n)
+        elif not set(self._cell_sizes()) <= self._shown:          # moved onto a camera not drawn yet
             self.show_frame(self.n)
 
     def _slider_moved(self, v):
@@ -517,6 +996,11 @@ class ReviewWindow(QMainWindow):
             return
         if target > self.n:
             self.show_frame(target)
+            # the nearest frame that can come next, decoded while this one is on screen (never one beyond it: a
+            # later frame than the one asked for would mean going back)
+            nxt = target + (self.scene.hold if self.analysed_only.isChecked() else 1)
+            if nxt < self.scene.n_frames:
+                self.player.prefetch(nxt, self._cell_sizes())
 
     # ---------------------------------------------------------------- names and moments
     def _refresh_names(self):
@@ -537,6 +1021,9 @@ class ReviewWindow(QMainWindow):
             h = self.links[self.links.kind.str.startswith("handoff") & self.links.kept.astype(bool)]
             self.targets["handoff between cameras"] = sorted(h.frame_b)
         self.targets["correction"] = sorted(self.corrections.frame_first.astype(int)) if len(self.corrections) else []
+        if self.usv is not None:
+            self.targets[USV_JUMP] = sorted(self.frame_of_pc(t) for t in self.bout_table.t0) if len(
+                self.bout_table) else []
         self.timeline.set_data(self.scene, self.targets["name change on a track"])
         self._update_jump_label()
 
@@ -546,6 +1033,10 @@ class ReviewWindow(QMainWindow):
         self.jump_lbl.setText(f"{before} of {len(t)} before here")
 
     def jump(self, d):
+        if self.jump_kind.currentText() == USV_JUMP:
+            self.jump_bout(d)
+            self._update_jump_label()
+            return
         t = self.targets.get(self.jump_kind.currentText(), [])
         if not t:
             return
@@ -564,6 +1055,10 @@ class ReviewWindow(QMainWindow):
         if not hit:
             return
         cam, obj, nd = hit["cam"], hit["obj"], hit["frame"]
+        if self.usv is not None and self._cam_mic.get(cam):              # Auto: the selected animal's box
+            self._auto_mic = self._cam_mic[cam]
+            if self.mic_mode.currentText() == MIC_AUTO:
+                self._apply_mics()
         f0, f1 = hit["tracklet"] or (nd, nd)
         d = self.scene.uwb_distances(cam, obj, f0, f1)
         row = self.scene.ids[(self.scene.ids.camera == cam) & (self.scene.ids.object_id == obj)
@@ -675,6 +1170,10 @@ class ReviewWindow(QMainWindow):
             self.view.zoom_by(0.8)
         elif k == Qt.Key_0:
             self.view.fit()
+        elif k == Qt.Key_BracketRight and self.usv is not None:
+            self.jump_bout(1)
+        elif k == Qt.Key_BracketLeft and self.usv is not None:
+            self.jump_bout(-1)
         else:
             super().keyPressEvent(e)
 
@@ -693,6 +1192,10 @@ class ReviewWindow(QMainWindow):
             return
         self.timer.stop()
         self.player.close()
+        if self.usv is not None:
+            self.lane.close_workers()
+            if self.loader.isRunning():
+                self.loader.wait(5000)
         super().closeEvent(e)
 
 

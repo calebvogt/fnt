@@ -319,6 +319,13 @@ def run_window(jobs, title, watch_pid=None, interval_ms=10000):
             if job.stage == "reading clocks" and job.readings[1]:
                 bars[i].setValue(int(1000 * job.readings[0] / job.readings[1]))
             table.item(i, 3).setText(detail(job))
+        # A finished run closes its window by itself (after a short look); one with a
+        # failed or stopped day stays up so the failure is seen.
+        failed = any(j.stage in ("failed", "stopped") for j in jobs)
+        if not failed and (state == "finished" or (watch_pid is not None and not alive and not running)):
+            if not getattr(win, "_closing", False):
+                win._closing = True
+                QTimer.singleShot(15000, win.close)
         foot.setText(f"updated {datetime.datetime.now():%H:%M:%S} · reads each trial's grid/clock logs "
                      f"every {interval_ms // 1000} s; closing this window does not stop the encodes")
 

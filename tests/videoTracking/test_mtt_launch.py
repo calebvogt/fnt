@@ -64,6 +64,17 @@ def test_focus_items_from_names_paths_and_lists(tmp_path):
                      "CAM15_c_frame_000030.jpg"]
 
 
+def test_a_list_by_name_is_found_in_the_projects_focus_folder(tmp_path, monkeypatch):
+    """--focus focus_round6.txt from another folder: the project's focus/ list,
+    not a frame called focus_round6.txt (which made a silent 0-frame session)."""
+    (tmp_path / "focus").mkdir()
+    (tmp_path / "focus" / "round.txt").write_text("﻿CAM1_a_frame_000001.png\r\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path.parent)
+    assert G.expand_focus_items(["round.txt"], str(tmp_path)) == ["CAM1_a_frame_000001.png"]
+    with pytest.raises(FileNotFoundError):
+        G.expand_focus_items(["nope.txt"], str(tmp_path))
+
+
 # ----------------------------------------------------------------------
 # extract-frames
 # ----------------------------------------------------------------------
@@ -309,6 +320,21 @@ def test_window_only_closing_quits_once_no_run_is_going(monkeypatch):
     assert not ev.isAccepted() and len(quit_calls) == 1      # still open, no quit
     del w._train_worker
     w._window_only = False
+    w.close()
+
+
+def test_window_only_quits_when_the_run_is_over(monkeypatch):
+    """--training-window-only: the window closes itself once training is over,
+    but waits for post-training inference when that follows."""
+    quit_calls = []
+    monkeypatch.setattr(G.QTimer, "singleShot", lambda ms, fn: quit_calls.append(fn))
+    w = window()
+    w._window_only = True
+    assert not w._quit_if_asked(run_over=False) and not quit_calls     # inference still to come
+    assert w._quit_if_asked() and len(quit_calls) == 1                 # run over: quits
+    w._window_only = False
+    quit_calls.clear()
+    assert not w._quit_if_asked() and not quit_calls                   # normal GUI stays open
     w.close()
 
 

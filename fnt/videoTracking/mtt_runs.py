@@ -42,15 +42,21 @@ def move_tracking_aside(video: str) -> Optional[str]:
     """Before re-tracking: move what tracking wrote in the video's output folder to
     ``_TO_DELETE_tracking/<video>_MaskTracker/`` beside the video (nothing is deleted); the folder and the other
     tools' files in it (the ROI Tool's drawing) stay. Returns where the files went, or None when there was nothing."""
+    return move_tracking_aside_dir(output_dir_for(video))
+
+
+def move_tracking_aside_dir(out: str) -> Optional[str]:
+    """``move_tracking_aside`` for an output folder: what tracking wrote in ``out`` goes to
+    ``_TO_DELETE_tracking/<folder>/`` beside it (where the video is). Returns where, or None."""
     import shutil
     from datetime import datetime
-    out = output_dir_for(video)
+    out = os.path.normpath(out)
     if not os.path.isdir(out):
         return None
     files = [n for n in os.listdir(out) if is_tracking_file(n)]
     if not files:
         return None
-    dest = os.path.join(os.path.dirname(video), "_TO_DELETE_tracking", os.path.basename(out))
+    dest = os.path.join(os.path.dirname(out), "_TO_DELETE_tracking", os.path.basename(out))
     if os.path.exists(dest):
         dest += datetime.now().strftime("_%Y%m%d_%H%M%S")
     os.makedirs(dest)
