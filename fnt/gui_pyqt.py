@@ -591,15 +591,20 @@ class FNTMainWindow(QMainWindow):
         info_group = QGroupBox("About ABMA")
         info_layout = QVBoxLayout()
         info_label = QLabel(
-            "<b>Run animal-behavior experiments in silico.</b><br>"
-            "1. <b>Arena</b> — set dimensions/boundary and place nests, food, water<br>"
-            "2. <b>Population</b> — define founder cohorts with sex, genotype "
-            "(e.g. OXTR:KO), and treatment (e.g. methimazole for anosmia)<br>"
-            "3. <b>Experiment</b> — set duration, replicates, circadian activity, seed<br>"
-            "4. <b>Run</b> — watch agents live, then export data<br><br>"
+            "<b>Run animal-behavior experiments in silico.</b> "
+            "<i>Experimental: results are a model's, not an animal's.</i><br><br>"
+            "1. <b>Arena</b> — start from a preset (vole cage, VoleCosm, VoleTerra, "
+            "Liddell, open field) or draw your own<br>"
+            "2. <b>Population</b> — cohorts from species cards, with genotype "
+            "(e.g. OXTR:KO) and treatment (e.g. methimazole for anosmia)<br>"
+            "3. <b>Experiment</b> — duration, light cycle, replicates, and a "
+            "protocol timeline (add or remove animals and resources mid-run)<br>"
+            "4. <b>Run</b> — choose a nervous system (hand-written rules, or a "
+            "brain trained by reinforcement), watch it live, export<br><br>"
             "<b>Key design:</b> output <code>uwb_&lt;trial&gt;_processed.csv</code> "
-            "matches FNT's UWB preprocessing schema exactly, so the UWB Proximity/"
-            "Network tools and your R pipeline run unchanged on simulated animals."
+            "matches FNT's UWB preprocessing schema exactly, so the UWB tools and "
+            "your R pipeline run unchanged on simulated animals.<br><br>"
+            "Command line: <code>python -m fnt.abma --help</code>"
         )
         info_label.setTextFormat(Qt.RichText)
         info_label.setStyleSheet("color: #cccccc; background-color: #1e1e1e; padding: 15px; border: 1px solid #3f3f3f; border-radius: 4px;")

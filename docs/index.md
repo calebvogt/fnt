@@ -47,6 +47,10 @@ FNT bundles GUI tools for the common data types of field and laboratory neuroeth
 
     Zeiss CZI microscopy viewing, processing and cell quantification.
 
+- :material-rodent: **[ABMA](tools/abma.md)** *(experimental)*
+
+    Animal Behavior Modeling Arena: run enclosure experiments on simulated animals, with rules or a trained neural-network brain, and get UWB-format tracks out.
+
 </div>
 
 ## Quick start

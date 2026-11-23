@@ -18,6 +18,8 @@ hiddenimports += collect_submodules('fnt')
 datas = []
 datas += [('icons', 'icons')]
 datas += [('fnt/fed3/ui/fed3.svg', 'fnt/fed3/ui')]
+# ABMA's learned brains are data files read from beside the package
+datas += [('fnt/abma/brains/*.npz', 'fnt/abma/brains')]
 datas += collect_data_files('ultralytics')
 datas += collect_data_files('sam2')
 datas += collect_data_files('segmentation_models_pytorch')
