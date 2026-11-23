@@ -575,6 +575,35 @@ the camera grid drawn live with each animal's mask, keypoints and name.
   Corrections are saved at once; **Re-solve names** runs the naming again with
   them held (about half a minute for a 35-minute test) and redraws. Corrected
   names are drawn in a white frame.
+- **USV lane** (when the trial's microphones are found): under the grid, a
+  spectrogram strip (15-125 kHz) of the microphone around the playhead, MAD's
+  detected calls drawn as boxes (fundamentals bright, harmonics faint) and call
+  bouts as an orange band. Mic N belongs to the zone camera of zone N: on
+  **Auto** the strip follows the zone camera under the pointer (or the animal
+  last clicked); choose a mic, or **All mics** stacked. The wheel over the strip
+  shows more or fewer seconds (2-60; ±5 s to start); drag it to scrub, click it
+  to go to that moment. **Bout** buttons and `[` / `]` step to the previous or
+  next bout (on Auto the strip moves to that bout's mic); "USV call bout" is
+  also a **Go to** kind. **Audio = video clock +** sets the clock offset in
+  seconds (the PC's clock, which Avisoft and UWB share, minus the video's:
+  -121 in VoleCosm, the same as `uwb_offset_s`, which is the default); fine-tune
+  it with a sound you can see. Bouts come from the trial's bout table
+  (`<trial>/usv_bouts/*_usv_bouts.csv`: `mic`, `start_utc_s`, `end_utc_s` in PC
+  time), or, without one, from the calls themselves (fundamentals no more than
+  the **Bout gap** apart). The microphones are found from identity.json's
+  `usv` entry, else guessed from the trial folder the cameras sit in
+  (`.../Video_MesocosmCameras/<trial>/` -> `.../UltrasonicVocalizations_proc/<trial>/`):
+
+  ```json
+  "usv": {"dir": ".../UltrasonicVocalizations_proc/VC-T005_prairie_anosmic-saline",
+          "offset_s": -121, "bouts": ".../usv_bouts/VC-T005_usv_bouts.csv",
+          "tz": "America/Denver"}
+  ```
+
+  The wav names are the PC's local clock; `tz` names its time zone (default:
+  the zone of identity.json's `start`). The strip is made off screen a few
+  seconds at a time (Avisoft's compressed wavs are cut exactly, without
+  decoding them from the start) and kept, so playing on is smooth.
 
 Jumping far takes up to a second (the clips have a keyframe every ~8 s);
 playing on and stepping are quick.
