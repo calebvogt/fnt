@@ -60,6 +60,22 @@ def pytest_sessionfinish(session, exitstatus):
     finish (bounded, never terminated mid-import), close each window so its
     closeEvent runs, and flush the deferred deletes while Qt can still
     process them.
+
+    The deletes the tests already asked for are carried out first. Outside a
+    running event loop ``processEvents()`` does not run deferred deletes, so a
+    test ending ``w.deleteLater(); app.processEvents()`` leaves its window
+    alive with the delete still queued -- and Qt runs a delete queued before
+    any event loop the moment anything pumps events inside an event handler.
+    MAD's closeEvent pumps them (it waits for audio loads to land), so closing
+    such a window destroyed it under its own closeEvent: the next attribute
+    access raised "wrapped C/C++ object ... has been deleted", and PyQt turns
+    an exception escaping a virtual into ``Fatal Python error: Aborted`` after
+    every test had passed. Flushing first destroys those windows the way an
+    event loop would have, in the order the tests queued them (pyqtgraph's
+    teardown depends on that order: re-queueing the deletes behind the
+    hook's segfaults the fiberPhotometry tests). Every window still standing
+    is then closed before any is deleted, so no closeEvent runs with a delete
+    pending.
     """
     if QtCore is None:
         return
@@ -74,11 +90,17 @@ def pytest_sessionfinish(session, exitstatus):
     mad = sys.modules.get("fnt.usv.mad_pyqt")
     if mad is not None and hasattr(mad, "_join_mad_threads_at_exit"):
         mad._join_mad_threads_at_exit()
-    for w in list(app.topLevelWidgets()):
+    QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+    windows = list(app.topLevelWidgets())
+    for w in windows:
         try:
             w.close()
-            w.deleteLater()
         except RuntimeError:            # its C++ side is already gone
+            pass
+    for w in windows:
+        try:
+            w.deleteLater()
+        except RuntimeError:
             pass
     for _ in range(3):
         app.processEvents()
