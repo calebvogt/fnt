@@ -415,6 +415,21 @@ def test_multi_file_run_uses_the_concat_demuxer(tmp_path):
     assert listed[0].read_text().count("file ") == 12
 
 
+def test_concat_input_is_not_seeked_and_trims_the_whole_cut(tmp_path):
+    """-ss on a concat input (even -ss 0) made ffmpeg drop ~8.3 s of the
+    list, so every multi-file run showed its footage 8.3 s late."""
+    w0 = MID + datetime.timedelta(seconds=7200 + 20)
+    tracks = {"cam1": track("cam1", n=12)}
+    cmd, _ = build_chunk_command(
+        tracks, GridLayout(1, 1, {(0, 0): "cam1"}), EncodeSettings(), w0,
+        w0 + datetime.timedelta(hours=5), "/o.mp4", work_dir=str(tmp_path))
+    i = cmd.index("concat")
+    assert "-ss" not in cmd[:cmd.index("-filter_complex")]
+    assert float(cmd[cmd.index("-t", i) + 1]) == pytest.approx(20 + 5 * 3600 + 2, abs=0.01)
+    graph = cmd[cmd.index("-filter_complex") + 1]
+    assert "trim=start=20.000:" in graph
+
+
 def test_without_work_dir_falls_back_to_the_first_file(tmp_path):
     """Previews and samples sit inside one segment, so no list file is needed."""
     tracks = {"cam1": track("cam1", n=12)}

@@ -250,6 +250,9 @@ def encode_day(job, layout, reader, args):
     return True
 
 
+ABS_ERROR_WARN_S = 0.5      # median clock error (s) in a finished grid that is flagged
+
+
 def check(tag, video, tracks, layout, reader, clock_dir, args, start, fallback=False):
     geo = EncodeSettings(width=args.width, height=args.height)
     cells = {cam: geo.cell_rect(layout, r, c) for (r, c), cam in layout.assignments.items()
@@ -259,7 +262,7 @@ def check(tag, video, tracks, layout, reader, clock_dir, args, start, fallback=F
          "csv=p=0", video], capture_output=True, text=True).stdout.strip())
     times = [t for t in range(5, int(dur) - 2, int(args.check_every))]
     log(f"{tag}: checking the clocks in the grid at {len(times)} times")
-    rows, spreads = [], []
+    rows, spreads, all_errs = [], [], []
     if True:
         for t, res in cc.check_grid_many(video, cells, reader, times, workers=args.workers):
             errs = {}
@@ -272,6 +275,7 @@ def check(tag, video, tracks, layout, reader, clock_dir, args, start, fallback=F
                 err = cc.grid_error(clock, start, grid_t, fallback=fallback)
                 if err is not None:
                     errs[cam] = err
+                    all_errs.append(err)
             row = {"grid_s": t, **{c: (round(e, 3) if c in errs else "") for c, e in
                                     ((c, errs.get(c)) for c in cells)}}
             if len(errs) >= 2:
@@ -293,6 +297,16 @@ def check(tag, video, tracks, layout, reader, clock_dir, args, start, fallback=F
             f"{sum(f <= 3 for f in fr) / len(fr):.1%} within 3, worst {max(fr)} frames")
     else:
         log(f"{tag}: no clock could be read back from the grid")
+    if all_errs:
+        # The spread only says the cells agree with each other; all of them
+        # can still be off together (concat inputs once put every cell 8.3 s
+        # late at a spread of 0-1 frames). The median error catches that.
+        med = sorted(all_errs)[len(all_errs) // 2]
+        if abs(med) > ABS_ERROR_WARN_S:
+            log(f"{tag}: WARNING every clock is off: median error {med:+.2f} s "
+                f"(more than {ABS_ERROR_WARN_S} s); the grid is not on its clock")
+        else:
+            log(f"{tag}: median clock error {med:+.2f} s")
 
 
 
