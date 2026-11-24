@@ -1048,9 +1048,10 @@ body:
   below it, and takes the sprint away as it fills. A chase therefore ends, and
   who gives up first is an outcome. Fatigue is felt, and counts (mildly) in
   the discomfort a brain is raised to reduce, which gives rest a value.
-* **Cover.** A hut shields its occupant from bites from outside; two animals
-  under the same hut can still bite each other. A wall or a pole between two
-  animals stops a bite.
+* **Cover.** A hut shields its occupant from bites from outside, and holds
+  only `refuge_capacity` animals (one by default): a full hut cannot be
+  entered, so its occupant cannot simply be followed in. Two animals under one
+  hut can bite each other. A wall or a pole between two animals stops a bite.
 * **Death** from injury, when `enable_mortality` is on.
 
 New senses, silent unless contest physics is on: `hurt` (+ where from),
@@ -1073,10 +1074,9 @@ bite output and never bite. The rule-based animal does not bite either, so
 with contest physics on it does not fight at all; it is a foraging baseline
 there, nothing more.
 
-Known limits. A bite is resolved once per step from where the animals are at
-the end of it, so at a coarse step a fast animal can pass another without
-either being in reach; use a step of half a second or less for contests until
-bites are resolved along the path. How far an animal notices another is still
+Known limits. A bite is resolved along the paths of the step, so a coarse
+step does not let animals run through each other, but a brain still decides
+only once per tick (2 s by default), which is slow for a fight. How far an animal notices another is still
 `policy.perception_r`, set by hand per arena. Animals cannot yet tell one
 individual from another through the brain's senses, and nothing is limited
 enough to be worth excluding a rival from except a receptive female.

@@ -367,7 +367,9 @@ class ContestParams:
     faster than that pace, drains while it goes slower, and takes the sprint
     away as it fills. So a chase ends, and who gives up first is an outcome.
 
-    *Cover* is a hut. An animal inside one cannot be bitten from outside.
+    *Cover* is a hut. An animal inside one cannot be bitten from outside, and
+    a hut holds only so many: a full one cannot be entered, so a hut is a
+    refuge its occupant cannot simply be followed into.
 
     Whether anyone attacks, flees, hides or holds its ground is left to the
     animals. All values are free parameters (not measured on any animal).
@@ -387,6 +389,7 @@ class ContestParams:
     recover_per_s: float = 0.5       # fatigue lost per second standing still
     # --- cover ----------------------------------------------------------- #
     refuge_huts: bool = True         # huts shield their occupant from outside
+    refuge_capacity: int = 1         # animals one hut holds (0 = no limit)
 
 
 @dataclass

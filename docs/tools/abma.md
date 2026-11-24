@@ -161,7 +161,8 @@ contest is made of, and leaves the rest to the animals:
 - **Sprint and fatigue**: speed runs from rest to `sprint_factor` times the
   easy pace; running faster than that pace tires the animal and takes the
   sprint away, so chases end.
-- **Cover**: an animal under a hut cannot be bitten from outside.
+- **Cover**: an animal under a hut cannot be bitten from outside, and a full hut
+  (`refuge_capacity`, one by default) cannot be entered.
 
 Raise a brain with `python -m fnt.abma.learn --contest`. Brains raised without
 it, and the rule-based animal, never bite. Every value in `ContestParams` is a

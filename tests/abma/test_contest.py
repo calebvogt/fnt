@@ -126,8 +126,9 @@ def test_a_hut_shields_its_occupant():
     assert list(sim.cover_of()) == [-1, 0]
     run(sim, 3)
     assert sim.health[1] == 100.0
-    # both under it: no shelter from each other
-    sim = make(policy=Script(facing=[0.0, np.pi], bite=[True, False]), huts=[Hut(kind="dome", x=1.05, y=1.0, w=0.3)])
+    # both under it (a hut with room for two): no shelter from each other
+    sim = make(policy=Script(facing=[0.0, np.pi], bite=[True, False]), huts=[Hut(kind="dome", x=1.05, y=1.0, w=0.3)],
+               refuge_capacity=2)
     place(sim, [(1.0, 1.0), (1.1, 1.0)])
     run(sim, 1)
     assert sim.health[1] < 100.0
@@ -136,6 +137,37 @@ def test_a_hut_shields_its_occupant():
     place(sim, [(1.0, 1.0), (1.1, 1.0)])
     run(sim, 1)
     assert sim.health[1] < 100.0
+
+
+def test_a_full_hut_cannot_be_entered():
+    hut = Hut(kind="dome", x=1.5, y=1.0, w=0.2)                               # radius 10 cm
+    # animal 1 sits under it; animal 0 walks straight at it
+    pol = Script(facing=[0.0, 0.0], speed=[0.25, 0.0], bite=[True, False])
+    sim = make(policy=pol, huts=[hut])
+    place(sim, [(1.2, 1.0), (1.5, 1.0)])
+    run(sim, 40)
+    assert list(sim.cover_of()) == [-1, 0]            # still outside, still inside
+    assert sim.health[1] == 100.0                     # and it could not bite in from there
+    assert np.linalg.norm(sim.P[0] - [1.5, 1.0]) > 0.10
+    # with room for two it walks in, and then they can bite each other
+    sim = make(policy=Script(facing=[0.0, 0.0], speed=[0.25, 0.0], bite=[True, False]), huts=[hut],
+               refuge_capacity=2)
+    place(sim, [(1.2, 1.0), (1.5, 1.0)])
+    run(sim, 40)
+    assert sim.cover_of()[0] == 0 or sim.health[1] < 100.0
+    assert sim.health[1] < 100.0
+
+
+def test_a_bite_is_resolved_along_the_path_not_at_the_end_of_the_step():
+    # animal 1 sprints across in front of animal 0; at a 2 s step it starts and
+    # ends the step out of reach, and passes 8 cm from its nose in between
+    pol = Script(facing=[0.0, np.pi / 2], speed=[0.0, 1.0], bite=[True, False])
+    sim = make(policy=pol)
+    sim.cfg.dt = 2.0
+    place(sim, [(1.0, 1.0), (1.08, 0.5)])
+    run(sim, 1)
+    assert np.linalg.norm(sim.P[1] - sim.P[0]) > 0.3                           # it ended up well clear
+    assert sim.bites_taken[1] == 1
 
 
 def test_a_wall_stops_a_bite():

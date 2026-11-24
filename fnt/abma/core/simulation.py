@@ -744,6 +744,8 @@ class Simulation:
                                          fwd=move_dir)
         self.H = np.arctan2(move_dir[:, 1], move_dir[:, 0])
         self._apply_boundary()
+        if ct.enabled and len(self._cover):
+            self._keep_out_of_full_huts(P)
         if not self.alive.all():          # dead animals do not move
             self.P[~self.alive] = P[~self.alive]
 
@@ -1459,6 +1461,37 @@ class Simulation:
             out[inside] = k[inside]
         return out
 
+    def _keep_out_of_full_huts(self, P_old) -> None:
+        """A hut holds ``refuge_capacity`` animals; latecomers stay outside.
+
+        Whoever was already under it keeps its place. Among animals arriving
+        in the same step the ones that end nearest its middle get in. An
+        animal turned away goes back to where it started the step, or to the
+        hut's edge if that was inside too.
+        """
+        cap = int(self.cfg.contest.refuge_capacity)
+        if cap <= 0:
+            return
+        now = self.cover_of(self.P)
+        now[~self.alive] = -1
+        before = self.cover_of(P_old)
+        for k in np.unique(now[now >= 0]):
+            inside = np.nonzero(now == k)[0]
+            if len(inside) <= cap:
+                continue
+            c = self._cover[k]
+            d = np.linalg.norm(self.P[inside] - c[:2], axis=1)
+            # residents first, then by closeness to the middle
+            order = inside[np.lexsort((d, before[inside] != k))]
+            for i in order[cap:]:
+                if before[i] != k:
+                    self.P[i] = P_old[i]
+                else:
+                    v = self.P[i] - c[:2]
+                    nv = np.linalg.norm(v)
+                    v = v / nv if nv > 1e-9 else np.array([1.0, 0.0])
+                    self.P[i] = c[:2] + v * (c[2] + 0.005)
+
     def _tire(self, cruise, spd, dt: float) -> None:
         """Fatigue fills above the easy pace and drains below it."""
         ct = self.cfg.contest
@@ -1473,11 +1506,16 @@ class Simulation:
     def _resolve_bites(self, elapsed_s, dt: float, want, events) -> None:
         """Land the bites the animals asked for.
 
-        A bite goes to the nearest living animal within reach and inside the
-        cone ahead of the biter. It does nothing if a wall stands between
-        them, or if the target is under a hut the biter is not under. Bites
-        issued in the same step all land on the state as it was, so two
-        animals can hurt each other at once.
+        A bite goes to the living animal that came nearest during the step,
+        if that was within reach and inside the cone ahead of the biter. It
+        does nothing if a wall stood between them, or if the target is under a
+        hut the biter is not under. Bites issued in the same step all land on
+        the state as it was, so two animals can hurt each other at once.
+
+        "Came nearest" is measured along the paths of the step, not from where
+        the two ended up: at a coarse step a sprinting animal covers several
+        times the reach, and judged by end points alone it could run straight
+        through another without either being in range.
         """
         ct = self.cfg.contest
         self.bite_wait = np.maximum(0.0, self.bite_wait - dt)
@@ -1489,6 +1527,8 @@ class Simulation:
         if not len(who):
             return
         P, H = self.P, self.H
+        D = self.V * dt                       # this step's displacement
+        P0 = P - D
         reach = self.contact_r + ct.bite_reach_m
         half = np.deg2rad(ct.bite_arc_deg) / 2.0
         cover = self.cover_of(P)
@@ -1499,7 +1539,13 @@ class Simulation:
             self.energy[who] = np.clip(self.energy[who] - 0.2, 0, 100)
         hits = []
         for i in who:
-            d = P - P[i]
+            # closest approach of every other animal to this one during the
+            # step: r(t) = r0 + t * dr, t in [0, 1]
+            r0 = P0 - P0[i]
+            dr = D - D[i]
+            t = np.clip(-(r0 * dr).sum(axis=1)
+                        / np.maximum((dr * dr).sum(axis=1), 1e-12), 0.0, 1.0)
+            d = r0 + t[:, None] * dr
             dist = np.linalg.norm(d, axis=1)
             dist[i] = np.inf
             dist[~self.alive] = np.inf
@@ -1511,7 +1557,9 @@ class Simulation:
                 continue
             if cover[j] >= 0 and cover[i] != cover[j]:
                 continue                               # the target is under cover
-            if self._first_hit(P[i:i + 1], P[j:j + 1])[0] < 1.0:
+            at_i = (P0[i] + t[j] * D[i])[None, :]
+            at_j = (P0[j] + t[j] * D[j])[None, :]
+            if self._first_hit(at_i, at_j)[0] < 1.0:
                 continue                               # a wall is in the way
             dmg = (ct.bite_damage * (self.mass[i] / 25.0)
                    * (0.5 + 0.5 * self.health[i] / 100.0))
