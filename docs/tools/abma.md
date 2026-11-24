@@ -149,6 +149,25 @@ Brains are written to `~/ABMA_brains/` and appear in the window and in
 and thirsty animals spend at food and water and how often a need picks the
 right goal.
 
+## Contest physics (experimental)
+
+By default a same-sex contest is a dice roll made by the engine. Setting
+`contest.enabled` in a config replaces it with a body that can do the things a
+contest is made of, and leaves the rest to the animals:
+
+- **Bite**: a third output of a learned brain. It lands on the nearest animal
+  in reach and ahead, unless a wall is in the way or the target is under a hut.
+  It costs the biter energy and the bitten animal health.
+- **Sprint and fatigue**: speed runs from rest to `sprint_factor` times the
+  easy pace; running faster than that pace tires the animal and takes the
+  sprint away, so chases end.
+- **Cover**: an animal under a hut cannot be bitten from outside.
+
+Raise a brain with `python -m fnt.abma.learn --contest`. Brains raised without
+it, and the rule-based animal, never bite. Every value in `ContestParams` is a
+free parameter. See the ABMA README for the senses that come with it and for
+the known limits.
+
 ## Output
 
 A run folder holds `config.json` (the exact experiment), `provenance.json`

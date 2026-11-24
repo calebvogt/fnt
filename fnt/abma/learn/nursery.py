@@ -27,7 +27,7 @@ from ..core.brain import Brain
 from ..core.compose import cohort
 from ..core.config import (ArenaConfig, ExperimentConfig, ResourceObject,
                            ResourceZone, ScentParams, WaterTower, zone_doors,
-                           zone_sides)
+                           zone_sides, ContestParams, Hut)
 from ..core.neural import NeuralPolicy, discomfort
 from ..core.physiology import preset_params
 from ..core.simulation import Simulation
@@ -97,6 +97,14 @@ class Curriculum:
     #: socially, which isolates foraging)
     social: bool = True
     scent: bool = True
+    #: animals can bite, sprint, tire and hide (``ContestParams``), and die of
+    #: it; the brain gets a third output, the bite. Nothing rewards a bite or
+    #: a retreat: a bite costs energy, being bitten costs health, and what an
+    #: animal makes of that is what is being learned.
+    contest: bool = False
+    #: fraction of contest worlds with huts in them, and how many (inclusive)
+    huts: float = 0.6
+    hut_count: tuple = (1, 4)
     tick_s: float = 2.0
     steps: int = 1024
     #: reward per unit drop in discomfort, and per mating
@@ -221,10 +229,16 @@ def make_world(seed: int, cur: Curriculum) -> ExperimentConfig:
         cohort(cur.species, "M", males) if males else None,
         cohort(cur.species, "F", n - males) if n - males else None)
         if g is not None]
+    huts = []
+    if cur.contest and rng.random() < cur.huts:
+        for k in range(int(rng.integers(cur.hut_count[0], cur.hut_count[1] + 1))):
+            x, y = spot(0.10)
+            huts.append(Hut(kind="dome", x=x, y=y, w=0.127, label=f"hut_{k}"))
     cfg = ExperimentConfig(
         name="nursery",
         arena=ArenaConfig(width=side, height=side, objects=objs,
-                          resource_zones=boxes, water_towers=towers),
+                          resource_zones=boxes, water_towers=towers,
+                          huts=huts),
         groups=groups, dt=cur.tick_s, seed=int(seed),
         days=cur.steps * cur.tick_s / 86400.0, n_trials=1,
         release_mode="scatter",
@@ -235,6 +249,9 @@ def make_world(seed: int, cur: Curriculum) -> ExperimentConfig:
     )
     cfg.physiology = preset_params("Standard")
     cfg.scent = ScentParams(enabled=cur.scent)
+    if cur.contest:
+        cfg.contest = ContestParams(enabled=True)
+        cfg.enable_mortality = True       # an injury can be the end of it
     return cfg
 
 
@@ -325,7 +342,7 @@ def rollout(weights: dict, meta: dict, seeds: list, cur_d: dict) -> dict:
         sim = spawn(int(seed), cur, brain)
         n = sim.n
         obs = np.zeros((T, n, brain.n_in), np.float32)
-        u = np.zeros((T, n, 2), np.float32)
+        u = np.zeros((T, n, brain.n_out), np.float32)
         rew = np.zeros((T, n), np.float32)
         hunger0, thirst0 = sim.hunger.copy(), sim.thirst.copy()
         at_food = np.zeros(n)
@@ -359,6 +376,8 @@ def rollout(weights: dict, meta: dict, seeds: list, cur_d: dict) -> dict:
             np.full(n, float(len(sim.water) + len(sim.water_rects) > 0)),
             sim.smell.astype(float),
             np.full(n, float(len(sim.food_rects) > 0)),
+            sim.bites_given.astype(float), sim.bites_taken.astype(float),
+            sim.alive.astype(float), sim.sex_m.astype(float),
         ], axis=1))
     return {"obs": np.concatenate(obs_l, axis=1),
             "u": np.concatenate(u_l, axis=1),
@@ -370,7 +389,8 @@ def rollout(weights: dict, meta: dict, seeds: list, cur_d: dict) -> dict:
 STAT_FIELDS = ["hunger0", "hunger1", "thirst0", "thirst1", "frac_at_food",
                "frac_at_water", "mean_speed", "dist_m", "health", "fights",
                "matings", "stress", "group_size", "has_food", "has_water",
-               "smell", "has_boxes"]
+               "smell", "has_boxes", "bites_given", "bites_taken", "alive",
+               "male"]
 
 
 def summarise(stats: np.ndarray) -> dict:
@@ -419,4 +439,11 @@ def summarise(stats: np.ndarray) -> dict:
         "matings": float(s["matings"].mean()),
         "health": float(s["health"].mean()),
         "stress": float(s["stress"].mean()),
+        # contest worlds only (zero elsewhere): bites per animal per episode,
+        # by sex of the biter, the share of animals bitten at all, and deaths
+        "bites": float(s["bites_given"].mean()),
+        "bites_male": mean(s["bites_given"], s["male"] > 0),
+        "bites_female": mean(s["bites_given"], s["male"] <= 0),
+        "bitten": float((s["bites_taken"] > 0).mean()),
+        "died": float(1.0 - s["alive"].mean()),
     }

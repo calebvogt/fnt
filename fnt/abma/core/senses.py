@@ -72,6 +72,12 @@ SENSORS: list[str] = [
     "aggression", "boldness", "sociability", "exploration",
     # --- efference copy: what it just did ------------------------------------
     "last_speed", "last_turn",
+    # --- contest (appended; silent unless ContestParams is on) ---------------
+    "hurt", "hurt_fwd", "hurt_lat",          # the sting of a bite, and from where
+    "fatigue",
+    "in_cover", "cover", "cover_fwd", "cover_lat",   # under a hut; the nearest hut
+    "other_closing",                         # the nearest animal is coming at it
+    "other_size",                            # ...and is bigger (+) or smaller (-)
 ]
 
 #: The interoceptive channels that also act as neuromodulators — they gate the
@@ -79,6 +85,7 @@ SENSORS: list[str] = [
 MODULATORS: list[str] = [
     "hunger", "thirst", "stress", "pain", "receptive", "male", "light",
     "aggression", "boldness", "sociability", "exploration",
+    "hurt", "fatigue",
 ]
 
 #: Channel groups, for display and for ablating a whole sense at once.
@@ -93,6 +100,8 @@ GROUPS: dict[str, list[str]] = {
                       "receptive", "male", "light", "clock_sin", "clock_cos"],
     "disposition": ["aggression", "boldness", "sociability", "exploration"],
     "efference": ["last_speed", "last_turn"],
+    "contest": ["hurt", "hurt_fwd", "hurt_lat", "fatigue", "in_cover", "cover",
+                "cover_fwd", "cover_lat", "other_closing", "other_size"],
 }
 
 _IDX = {name: i for i, name in enumerate(SENSORS)}
@@ -102,17 +111,19 @@ class SenseParams:
     """Reach of each sense. Stored with a brain: it was trained on these."""
 
     def __init__(self, plume_m: float = 0.5, whisker_m: float = 0.6,
-                 half_level: float = 0.05):
+                 half_level: float = 0.05, sight_m: float = 1.5):
         #: length scale over which a food or water smell fades (m)
         self.plume_m = float(plume_m)
         #: how far ahead a wall is felt / seen (m)
         self.whisker_m = float(whisker_m)
         #: odour level at which the direction is half as reliable as at source
         self.half_level = float(half_level)
+        #: how far away a hut can be seen (m)
+        self.sight_m = float(sight_m)
 
     def to_dict(self) -> dict:
         return {"plume_m": self.plume_m, "whisker_m": self.whisker_m,
-                "half_level": self.half_level}
+                "half_level": self.half_level, "sight_m": self.sight_m}
 
     @staticmethod
     def from_dict(d: dict | None) -> "SenseParams":
@@ -322,6 +333,34 @@ def sense(sim, elapsed_s: float, memory: PlaceMemory, params: SenseParams,
         near = np.clip(1.0 - dj / reach, 0.0, 1.0)
         near = np.where(np.isfinite(dj), near, 0.0)
         put_vec("other", near, unit[np.arange(n), j] * (near > 0)[:, None])
+        # how fast that animal is coming at this one (its own velocity along
+        # the line between them; this one's own running is not counted), and
+        # how its size compares. Both are things an eye and an ear deliver.
+        V = getattr(sim, "V", None)
+        if V is not None and len(V) == n:
+            seen = near > 0
+            toward = -np.einsum("ik,ik->i", V[j], unit[np.arange(n), j])
+            top = np.maximum(1e-6, sim.speed * float(sim.cfg.contest.sprint_factor))
+            put("other_closing", np.where(seen, np.clip(toward / top, -1.0, 1.0), 0.0))
+            put("other_size", np.where(
+                seen, np.tanh(2.0 * (sim.mass[j] - sim.mass) / np.maximum(1e-6, sim.mass)), 0.0))
+
+    # ---- contest: the sting of a bite, tiredness, cover ----------------- #
+    hurt = getattr(sim, "hurt", None)
+    if hurt is not None and len(hurt) == n:
+        put_vec("hurt", hurt, sim.hurt_dir * hurt[:, None])
+        put("fatigue", sim.fatigue / 100.0)
+    cover = getattr(sim, "_cover", None)
+    if cover is not None and len(cover):
+        dc = np.linalg.norm(P[:, None, :] - cover[None, :, :2], axis=2)
+        k = np.argmin(dc, axis=1)
+        dk = dc[np.arange(n), k]
+        inside = dk <= cover[k, 2]
+        put("in_cover", inside.astype(float))
+        vc = cover[k, :2] - P
+        seen = np.clip(1.0 - dk / max(1e-6, params.sight_m), 0.0, 1.0)
+        put_vec("cover", np.where(inside, 1.0, seen),
+                vc / (dk[:, None] + 1e-9) * ((seen > 0) & ~inside)[:, None])
 
     # ---- walls, taste, grass ------------------------------------------- #
     rays = _wall_rays(sim, P, H, params.whisker_m)

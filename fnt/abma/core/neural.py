@@ -33,7 +33,7 @@ import numpy as np
 
 from .brain import Brain, find_brain
 from .policy import Policy
-from .rng import CH_ACTION
+from .rng import CH_ACTION, CH_BITE
 from .senses import PlaceMemory, sense
 
 
@@ -44,10 +44,16 @@ def discomfort(sim) -> np.ndarray:
     more than a peckish one. Injury is weighted most heavily: it is the one
     deficit that does not come back on its own.
     """
-    return ((sim.hunger / 100.0) ** 2
-            + (sim.thirst / 100.0) ** 2
-            + 0.5 * (sim.stress / 100.0) ** 2
-            + 2.0 * ((100.0 - sim.health) / 100.0) ** 2)
+    d = ((sim.hunger / 100.0) ** 2
+         + (sim.thirst / 100.0) ** 2
+         + 0.5 * (sim.stress / 100.0) ** 2
+         + 2.0 * ((100.0 - sim.health) / 100.0) ** 2)
+    # tiredness (zero unless ContestParams is on) is the mildest of them: it
+    # is what makes rest worth something
+    fatigue = getattr(sim, "fatigue", None)
+    if fatigue is not None:
+        d = d + 0.25 * (fatigue / 100.0) ** 2
+    return d
 
 
 class NeuralPolicy(Policy):
@@ -91,7 +97,7 @@ class NeuralPolicy(Policy):
     def _ensure(self, n: int) -> None:
         if self.h is None:
             self.h = self.brain.initial_state(n)
-            self.u = np.zeros((n, 2), np.float32)
+            self.u = np.zeros((n, self.brain.n_out), np.float32)
             self.last_speed = np.zeros(n)
             self.last_turn = np.zeros(n)
             self.memory = PlaceMemory(n)
@@ -100,7 +106,8 @@ class NeuralPolicy(Policy):
         if n > have:                              # the roster grew mid-run
             pad = n - have
             self.h = np.vstack([self.h, self.brain.initial_state(pad)])
-            self.u = np.vstack([self.u, np.zeros((pad, 2), np.float32)])
+            self.u = np.vstack([self.u, np.zeros((pad, self.brain.n_out),
+                                                 np.float32)])
             self.last_speed = np.concatenate([self.last_speed, np.zeros(pad)])
             self.last_turn = np.concatenate([self.last_turn, np.zeros(pad)])
             self.memory.resize(n)
@@ -138,8 +145,12 @@ class NeuralPolicy(Policy):
             self._clock = 0.0
             stim = list(self.stim) + self._scheduled_stim(sim, elapsed_s)
             motor, self.h, sensory = brain.forward(obs, self.h, stim or None)
-            noise = (sim.arand.normal_2d(sim.uid, sim._step_k, CH_ACTION)
-                     if self.stochastic else None)
+            noise = None
+            if self.stochastic:
+                noise = sim.arand.normal_2d(sim.uid, sim._step_k, CH_ACTION)
+                if brain.n_out > 2:       # the bite command has its own stream
+                    noise = np.column_stack(
+                        [noise, sim.arand.normal(sim.uid, sim._step_k, CH_BITE)])
             _, _, self.u = brain.act(motor, noise, self.noise_scale)
             self.last_obs, self.last_sensory = obs, sensory
             self.last_motor = motor
@@ -156,6 +167,10 @@ class NeuralPolicy(Policy):
             resting=speed < self.REST_FRAC,
             drives={}, want_chew=np.zeros(n, bool),
         )
+        if brain.n_out > 2:
+            # issued once, on the tick it was decided; the engine holds the
+            # refractory period
+            perc["bite"] = brain.bite(self.u) & self.ticked & sim.alive
         return desired, perc
 
     # ---- recording ------------------------------------------------------ #

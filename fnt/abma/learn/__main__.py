@@ -61,6 +61,14 @@ def main(argv=None) -> int:
     p.add_argument("--born-at-door", type=float, default=0.15,
                    help="Fraction of animals put down just outside a "
                         "doorway of a box.")
+    p.add_argument("--contest", action="store_true",
+                   help="Raise it in worlds where animals can bite, sprint, "
+                        "tire, hide under huts and die of their injuries. The "
+                        "brain gets a third output, the bite. Resuming a brain "
+                        "raised without it is fine: it starts out not biting.")
+    p.add_argument("--huts", type=float, default=0.6,
+                   help="With --contest: fraction of worlds that have huts "
+                        "(cover an animal cannot be bitten under).")
     p.add_argument("--lr", type=float, default=6e-4)
     p.add_argument("--entropy", type=float, default=0.005)
     p.add_argument("--seed", type=int, default=0)
@@ -73,7 +81,8 @@ def main(argv=None) -> int:
         arena_m=tuple(float(x) for x in a.arena.split(",")),
         one_resource=a.one_resource, boxes=a.boxes, anosmic=a.anosmic,
         born_at_door=a.born_at_door, born_at_resource=a.born_at_resource,
-        box_water=a.box_water, towers=a.towers)
+        box_water=a.box_water, towers=a.towers,
+        contest=a.contest, huts=a.huts)
     hp = Hyper(workers=a.workers, worlds=a.worlds, lr=a.lr,
                entropy=a.entropy, seed=a.seed)
     resume = Brain.load(find_brain(a.resume)) if a.resume else None
@@ -94,7 +103,11 @@ def main(argv=None) -> int:
                   f"box nose/none {info['box_found_intact']:.2f}/"
                   f"{info['box_found_anosmic']:.2f}  "
                   f"dH {info['d_hunger']:+5.1f} dT {info['d_thirst']:+5.1f}  "
-                  f"spd {info['speed']:.2f} ev {info['explained_var']:+.2f} "
+                  f"spd {info['speed']:.2f} "
+                  + (f"bites m/f {info['bites_male']:.1f}/{info['bites_female']:.1f} "
+                     f"bitten {info['bitten']:.2f} died {info['died']:.3f} "
+                     f"health {info['health']:.0f}  " if a.contest else "")
+                  + f"ev {info['explained_var']:+.2f} "
                   f"kl {info['kl']:.3f} "
                   f"[{info['sec_collect']:.0f}s+{info['sec_update']:.0f}s]",
                   flush=True)

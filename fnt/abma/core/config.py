@@ -348,6 +348,48 @@ class BrainParams:
 
 
 @dataclass
+class ContestParams:
+    """Bodies that can hurt each other, tire, and hide.
+
+    Off by default, and then nothing here exists: same-sex contests stay the
+    engine's dice roll and every earlier run reproduces. Switched on, the dice
+    roll is gone. What replaces it is not a rule about fighting but the means
+    to fight, to chase and to get away:
+
+    *A bite* is something an animal does (a policy's ``bite`` output). It lands
+    on the nearest animal within reach and ahead of the biter, unless a wall
+    stands between them or the target is under cover the biter is not in. It
+    costs the biter energy and a moment before it can bite again, and costs
+    the bitten animal health, in proportion to the biter's size and condition.
+
+    *Sprinting* lets a learned brain move at up to ``sprint_factor`` times its
+    easy pace, and *fatigue* is what that costs: it fills while the animal runs
+    faster than that pace, drains while it goes slower, and takes the sprint
+    away as it fills. So a chase ends, and who gives up first is an outcome.
+
+    *Cover* is a hut. An animal inside one cannot be bitten from outside.
+
+    Whether anyone attacks, flees, hides or holds its ground is left to the
+    animals. All values are free parameters (not measured on any animal).
+    """
+    enabled: bool = False
+    # --- a bite ---------------------------------------------------------- #
+    bite_reach_m: float = 0.05       # beyond the contact radius, nose to flank
+    bite_arc_deg: float = 120.0      # the target must be inside this cone ahead
+    bite_damage: float = 3.0         # health points from a 25 g biter in full health
+    bite_refractory_s: float = 2.0   # shortest time between two bites
+    bite_kj: float = 0.02            # energy spent on a bite, landed or not
+    bite_stress: float = 8.0         # stress added to the bitten animal
+    hurt_tau_s: float = 20.0         # how fast the sting of a bite fades
+    # --- sprinting and fatigue ------------------------------------------- #
+    sprint_factor: float = 4.0       # top speed / easy pace, when fresh
+    fatigue_per_s: float = 2.0       # fatigue (0-100) gained per second flat out
+    recover_per_s: float = 0.5       # fatigue lost per second standing still
+    # --- cover ----------------------------------------------------------- #
+    refuge_huts: bool = True         # huts shield their occupant from outside
+
+
+@dataclass
 class Stimulation:
     """Drive, clamp or silence one unit of a learned brain for a while.
 
@@ -755,6 +797,8 @@ class ExperimentConfig:
     sky: SkyParams = field(default_factory=SkyParams)
     #: a learned nervous system in place of the rule-based policy (off = rules)
     brain: BrainParams = field(default_factory=BrainParams)
+    #: bites, sprinting, fatigue and cover in place of dice-roll contests
+    contest: ContestParams = field(default_factory=ContestParams)
     #: timed drive / clamp / silencing of single units of that brain
     stimulations: list[Stimulation] = field(default_factory=list)
 
@@ -853,6 +897,7 @@ class ExperimentConfig:
                                 sward=SwardParams(**d.get("sward", {})),
                                 sky=SkyParams(**d.get("sky", {})),
                                 brain=BrainParams(**d.get("brain", {})),
+                                contest=ContestParams(**d.get("contest", {})),
                                 stimulations=[
                                     Stimulation(**x)
                                     for x in d.get("stimulations", [])],

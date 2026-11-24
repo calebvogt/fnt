@@ -69,7 +69,7 @@ class TorchBrain(nn.Module):
     """The trainable twin of :class:`fnt.abma.core.brain.Brain`."""
 
     def __init__(self, n_sensory: int = 64, n_rnn: int = 64,
-                 gain_init: float = 1.5):
+                 gain_init: float = 1.5, n_out: int = 2):
         super().__init__()
         own = {name: i for i, name in enumerate(SENSORS)}
         self.register_buffer(
@@ -77,14 +77,19 @@ class TorchBrain(nn.Module):
         self.W1 = nn.Linear(len(SENSORS), n_sensory)
         self.Wg = nn.Linear(len(MODULATORS), n_sensory)
         self.gru = nn.GRU(n_sensory, n_rnn)
-        self.Wo = nn.Linear(n_rnn, 2)
+        # turn, speed and, for a brain raised where animals can hurt each
+        # other, a bite
+        self.Wo = nn.Linear(n_rnn, n_out)
         self.value = nn.Linear(n_rnn, 1)
-        self.log_std = nn.Parameter(torch.full((2,), -0.5))
+        self.log_std = nn.Parameter(torch.full((n_out,), -0.5))
         nn.init.orthogonal_(self.W1.weight, math.sqrt(2))
         nn.init.orthogonal_(self.Wo.weight, 0.01)
         nn.init.orthogonal_(self.value.weight, 1.0)
         for lin in (self.W1, self.Wg, self.Wo, self.value):
             nn.init.zeros_(lin.bias)
+        if n_out > 2:
+            with torch.no_grad():           # biting starts rare, not half the time
+                self.Wo.bias[2:] = -1.0
         # Every sensory unit is born with its own random sensitivity to each
         # neuromodulator — some are turned up by hunger, some down, some
         # ignore it — the way a receptor is expressed in some cells and not
@@ -99,7 +104,7 @@ class TorchBrain(nn.Module):
 
     def forward(self, obs, h0):
         """``obs`` (T, B, n_sensors), ``h0`` (1, B, n_rnn) -> mean motor
-        command (T, B, 2), value (T, B), final state."""
+        command (T, B, n_out), value (T, B), final state."""
         gain = 2.0 * torch.sigmoid(self.Wg(obs[..., self.mod_idx]))
         s = torch.tanh(self.W1(obs)) * gain
         out, hT = self.gru(s, h0)
@@ -122,16 +127,37 @@ class TorchBrain(nn.Module):
         return Brain({k: v.detach().cpu().numpy() for k, v in w.items()}, meta)
 
     def load_brain(self, brain: Brain) -> None:
+        """Take up an existing brain's weights, matched by name.
+
+        The body may have gained senses, neuromodulators or a motor output
+        since that brain was raised. Its own inputs go to the columns that now
+        carry them; a sense it never had starts unconnected (zero weights), so
+        it behaves as it did until it learns otherwise; an output it never had
+        keeps this network's fresh, quiet initialisation.
+        """
         w = {k: torch.as_tensor(v) for k, v in brain.w.items()}
+        s_now = {name: i for i, name in enumerate(SENSORS)}
+        m_now = {name: i for i, name in enumerate(MODULATORS)}
+        s_cols = [s_now[s] for s in brain.sensors]
+        gone = [m for m in brain.modulators if m not in m_now]
+        if gone:
+            raise ValueError(f"this brain uses neuromodulators the body no longer has: {gone}")
+        m_cols = [m_now[m] for m in brain.modulators]
+        k = min(w["Wo"].shape[0], self.Wo.out_features)
         with torch.no_grad():
-            self.W1.weight.copy_(w["W1"]); self.W1.bias.copy_(w["b1"])
-            self.Wg.weight.copy_(w["Wg"]); self.Wg.bias.copy_(w["bg"])
+            self.W1.weight.zero_()
+            self.W1.weight[:, s_cols] = w["W1"]
+            self.W1.bias.copy_(w["b1"])
+            self.Wg.weight.zero_()
+            self.Wg.weight[:, m_cols] = w["Wg"]
+            self.Wg.bias.copy_(w["bg"])
             self.gru.weight_ih_l0.copy_(w["W_ih"])
             self.gru.weight_hh_l0.copy_(w["W_hh"])
             self.gru.bias_ih_l0.copy_(w["b_ih"])
             self.gru.bias_hh_l0.copy_(w["b_hh"])
-            self.Wo.weight.copy_(w["Wo"]); self.Wo.bias.copy_(w["bo"])
-            self.log_std.copy_(w["log_std"])
+            self.Wo.weight[:k] = w["Wo"][:k]
+            self.Wo.bias[:k] = w["bo"][:k]
+            self.log_std[:k] = w["log_std"][:k]
             if "Wv" in w:
                 self.value.weight.copy_(w["Wv"]); self.value.bias.copy_(w["bv"])
 
@@ -159,7 +185,8 @@ class Trainer:
         self.hp, self.cur, self.out_dir, self.name = hp, cur, out_dir, name
         os.makedirs(out_dir, exist_ok=True)
         torch.manual_seed(hp.seed)
-        self.net = TorchBrain(hp.n_sensory, hp.n_rnn, hp.gain_init)
+        self.net = TorchBrain(hp.n_sensory, hp.n_rnn, hp.gain_init,
+                              n_out=3 if cur.contest else 2)
         self.agent_steps = 0
         if resume is not None:
             self.net.load_brain(resume)
@@ -223,7 +250,7 @@ class Trainer:
         with torch.no_grad():
             h = torch.zeros(1, A, hp.n_rnn)
             h_start = torch.zeros(n_chunks, A, hp.n_rnn)
-            mu = torch.zeros(T, A, 2)
+            mu = torch.zeros(T, A, net.Wo.out_features)
             val = torch.zeros(T, A)
             for c in range(n_chunks):
                 h_start[c] = h[0]

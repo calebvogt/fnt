@@ -46,7 +46,8 @@ fnt/fnt/abma/
     neural.py               NeuralPolicy (a brain in charge) + discomfort
     twin.py, twin_plot.py   one life lived twice: counterfactual experiments
     assays.py               bench tests: approach, choice, search, vitals
-    simulation.py           Simulation: physics, physiology, combat, events
+    simulation.py           Simulation: physics, physiology, combat (dice-roll
+                            contests, or bites / sprint / fatigue / cover), events
     scent.py                decaying grid of identity-carrying marks
     sward.py                living grass: trails they wear and share
     sky.py                  sun, moon and season for a real site
@@ -1021,6 +1022,64 @@ set / add / scale) — the in-silico version of an optogenetics protocol.
   nothing about rivals (above).
 * One diet. Protein, carbohydrate and lipid as separate needs, predators, and
   a PufferLib adapter for much faster training are not built.
+
+## Contest physics: the means to fight, chase and get away
+
+Off by default (`ExperimentConfig.contest`, `ContestParams`). Until now a
+same-sex contest was a dice roll the engine made when two animals touched: the
+engine decided there was an attack, picked a winner and moved the loser twelve
+centimetres. Nobody chose to fight, nobody was chased, cornered or escaped, so
+the size of the enclosure could only matter through how often animals bumped
+into each other. That is the wrong place for the engine to be making decisions
+if the question is why the same animals form a hierarchy in a small arena and
+territories in a large one.
+
+With `contest.enabled` the dice roll is gone and nothing replaces it but a
+body:
+
+* **A bite is something an animal does.** A learned brain raised with it has a
+  third motor output beside turn and speed. A bite lands on the nearest animal
+  within reach and inside a cone ahead of the biter. It costs the biter energy
+  and a refractory moment; it costs the bitten animal health, in proportion to
+  the biter's mass and condition, and it stings (`hurt`, with a direction).
+  Bites are written to the event table (`bite`: actor, target, damage).
+* **Sprinting and fatigue.** A brain's speed output now spans rest to
+  `sprint_factor` times the easy pace. Fatigue fills above that pace, drains
+  below it, and takes the sprint away as it fills. A chase therefore ends, and
+  who gives up first is an outcome. Fatigue is felt, and counts (mildly) in
+  the discomfort a brain is raised to reduce, which gives rest a value.
+* **Cover.** A hut shields its occupant from bites from outside; two animals
+  under the same hut can still bite each other. A wall or a pole between two
+  animals stops a bite.
+* **Death** from injury, when `enable_mortality` is on.
+
+New senses, silent unless contest physics is on: `hurt` (+ where from),
+`fatigue`, `in_cover`, the nearest hut (`cover` + bearing), whether the
+nearest animal is coming at it (`other_closing`) and whether it is bigger or
+smaller (`other_size`). `hurt` and `fatigue` also act as neuromodulators.
+
+Nothing rewards a bite, a retreat or a win. Whether anyone attacks, flees,
+hides or holds its ground has to come from what those acts do to the body.
+
+```bash
+# raise a brain in worlds where animals can hurt each other
+python -m fnt.abma.learn --name my_mouse --contest --minutes 60
+# an older brain can be raised on: it starts out exactly as it was, not biting
+python -m fnt.abma.learn --name forager_plus --resume vole_forager --contest
+```
+
+Brains raised without contest physics keep working everywhere: they have no
+bite output and never bite. The rule-based animal does not bite either, so
+with contest physics on it does not fight at all; it is a foraging baseline
+there, nothing more.
+
+Known limits. A bite is resolved once per step from where the animals are at
+the end of it, so at a coarse step a fast animal can pass another without
+either being in reach; use a step of half a second or less for contests until
+bites are resolved along the path. How far an animal notices another is still
+`policy.perception_r`, set by hand per arena. Animals cannot yet tell one
+individual from another through the brain's senses, and nothing is limited
+enough to be worth excluding a rival from except a receptive female.
 
 ## Roadmap / not yet done
 

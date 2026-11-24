@@ -198,6 +198,7 @@ class Simulation:
                          [cfg.arena.width - 0.02, cfg.arena.height - 0.02])
         self.mass0 = self.mass.copy()      # release mass, for drift reporting
         self._build_obstacles()
+        self._build_cover()
         self._cur_day = 1
 
         # ---- scent-mark field (territoriality emerges from this) ----
@@ -447,6 +448,14 @@ class Simulation:
             "dist_total": np.zeros(m),
             # 0 rest, 1 forage, 2 roam, 3 flee, 4 mate, 5 dead
             "activity": np.zeros(m, int),
+            # ---- contest physics (these only move under ContestParams) ----
+            "fatigue": np.zeros(m),             # 0-100; sprinting fills it
+            "hurt": np.zeros(m),                # the sting of a bite, 0-1
+            "hurt_dir": np.zeros((m, 2)),       # where the last bite came from
+            "bite_wait": np.zeros(m),           # seconds until it can bite again
+            "bites_given": np.zeros(m, int),
+            "bites_taken": np.zeros(m, int),
+            "V": np.zeros((m, 2)),              # last step's velocity (m/s)
             # ---- trait vectors ----
             "sex_m": np.array([1.0 if a.sex == "M" else 0.0 for a in metas]),
             "aggr": np.array([a.traits.aggression for a in metas]),
@@ -715,11 +724,18 @@ class Simulation:
         at_home = (own_lvl > self.at_home_scent if own_lvl is not None
                    else dist_home < self.home_r)
         satiated = (self.hunger < 50.0) & (self.thirst < 50.0) & at_home
+        ct = cfg.contest
+        cruise = spd                       # this body's easy pace right now
         speed_frac = perc.get("speed_frac")
         if speed_frac is not None:
             # A learned brain emits its own speed, so slowing to a rest is
             # something the animal decides rather than a rule applied to it.
             # `spd` is still the ceiling: what this body can do right now.
+            if ct.enabled:
+                # ...and with contests on the ceiling is a sprint, as much of
+                # one as the animal has left in it
+                spd = spd * (1.0 + (ct.sprint_factor - 1.0)
+                             * (1.0 - self.fatigue / 100.0))
             spd = spd * np.clip(speed_frac, 0.0, 1.0)
             satiated = np.asarray(perc.get("resting", speed_frac < 0.12), bool)
         else:
@@ -733,6 +749,9 @@ class Simulation:
 
         # distance bookkeeping (per-day resets at midnight)
         step_dist = np.linalg.norm(self.P - P, axis=1)
+        self.V = (self.P - P) / dt
+        if ct.enabled:
+            self._tire(cruise, spd, dt)
         self.dist_today += step_dist
         self.dist_total += step_dist
         day = int(elapsed_s // 86400) + 1
@@ -787,6 +806,10 @@ class Simulation:
         if chewing.any():
             self.activity = np.where(chewing, 6, self.activity)
         self.activity[~self.alive] = 5
+
+        # --- bites: the animals' own doing, resolved by the body's physics ---
+        if ct.enabled:
+            self._resolve_bites(elapsed_s, dt, perc.get("bite"), events)
 
         # --- mortality (starvation or fatal injury drive health to 0) ---
         if cfg.enable_mortality:
@@ -1412,6 +1435,99 @@ class Simulation:
         # a bounce can land an animal inside a pole or tower — undo that
         self._push_out_solids(self.P)
 
+    # ------------------------------------------------------------------ #
+    # Contest physics (ContestParams): tiring, cover, bites
+    # ------------------------------------------------------------------ #
+    def _build_cover(self) -> None:
+        """Huts as cover: ``(x, y, radius)`` per hut, or none."""
+        ct = self.cfg.contest
+        huts = self.cfg.arena.huts if (ct.enabled and ct.refuge_huts) else []
+        # a tube is a rectangle; a circle of its half-length is close enough
+        # for "is this animal under it"
+        self._cover = np.array(
+            [(h.x, h.y, 0.5 * max(h.w, h.d if h.kind == "tube" else h.w))
+             for h in huts], float).reshape(-1, 3)
+
+    def cover_of(self, P=None) -> np.ndarray:
+        """Index of the hut each animal is under, or -1."""
+        P = self.P if P is None else P
+        out = np.full(len(P), -1, int)
+        if len(self._cover):
+            d = np.linalg.norm(P[:, None, :] - self._cover[None, :, :2], axis=2)
+            k = np.argmin(d, axis=1)
+            inside = d[np.arange(len(P)), k] <= self._cover[k, 2]
+            out[inside] = k[inside]
+        return out
+
+    def _tire(self, cruise, spd, dt: float) -> None:
+        """Fatigue fills above the easy pace and drains below it."""
+        ct = self.cfg.contest
+        effort = np.where(cruise > 1e-9, spd / np.maximum(cruise, 1e-9), 0.0)
+        over = np.clip((effort - 1.0) / max(1e-6, ct.sprint_factor - 1.0), 0, 1)
+        rest = np.clip(1.0 - effort, 0.0, 1.0)
+        self.fatigue = np.clip(
+            self.fatigue + dt * (ct.fatigue_per_s * over
+                                 - ct.recover_per_s * rest), 0.0, 100.0)
+        self.fatigue[~self.alive] = 0.0
+
+    def _resolve_bites(self, elapsed_s, dt: float, want, events) -> None:
+        """Land the bites the animals asked for.
+
+        A bite goes to the nearest living animal within reach and inside the
+        cone ahead of the biter. It does nothing if a wall stands between
+        them, or if the target is under a hut the biter is not under. Bites
+        issued in the same step all land on the state as it was, so two
+        animals can hurt each other at once.
+        """
+        ct = self.cfg.contest
+        self.bite_wait = np.maximum(0.0, self.bite_wait - dt)
+        self.hurt = self.hurt * np.exp(-dt / max(1e-6, ct.hurt_tau_s))
+        if want is None:
+            return
+        who = np.nonzero(np.asarray(want, bool) & self.alive
+                         & (self.bite_wait <= 0.0))[0]
+        if not len(who):
+            return
+        P, H = self.P, self.H
+        reach = self.contact_r + ct.bite_reach_m
+        half = np.deg2rad(ct.bite_arc_deg) / 2.0
+        cover = self.cover_of(P)
+        self.bite_wait[who] = ct.bite_refractory_s
+        if self._physio_on:
+            self._spend_energy_kj(tuple(who), ct.bite_kj)
+        else:
+            self.energy[who] = np.clip(self.energy[who] - 0.2, 0, 100)
+        hits = []
+        for i in who:
+            d = P - P[i]
+            dist = np.linalg.norm(d, axis=1)
+            dist[i] = np.inf
+            dist[~self.alive] = np.inf
+            ang = np.arctan2(d[:, 1], d[:, 0]) - H[i]
+            ang = np.abs((ang + np.pi) % (2.0 * np.pi) - np.pi)
+            dist[ang > half] = np.inf
+            j = int(np.argmin(dist))
+            if not dist[j] < reach:
+                continue
+            if cover[j] >= 0 and cover[i] != cover[j]:
+                continue                               # the target is under cover
+            if self._first_hit(P[i:i + 1], P[j:j + 1])[0] < 1.0:
+                continue                               # a wall is in the way
+            dmg = (ct.bite_damage * (self.mass[i] / 25.0)
+                   * (0.5 + 0.5 * self.health[i] / 100.0))
+            hits.append((int(i), j, float(dmg)))
+        for i, j, dmg in hits:
+            self.health[j] = max(0.0, self.health[j] - dmg)
+            self.stress[j] = min(100.0, self.stress[j] + ct.bite_stress)
+            self.hurt[j] = min(1.0, self.hurt[j] + dmg / 10.0)
+            back = P[i] - P[j]
+            self.hurt_dir[j] = back / (np.linalg.norm(back) + 1e-9)
+            self.bites_given[i] += 1
+            self.bites_taken[j] += 1
+            if events is not None:
+                events.record(elapsed_s, "bite", self.agents[i], self.agents[j],
+                              P[j, 0], P[j, 1], round(dmg, 4))
+
     def _fight_power(self, i) -> float:
         """Resource-holding potential: bigger, healthier, bolder, calmer wins."""
         return float(self.aggr[i] * np.sqrt(self.mass[i])
@@ -1459,6 +1575,8 @@ class Simulation:
                             self.energy[[i, j]] - 1.0, 0, 100)
             else:
                 # --- same-sex contest -> winner/loser, damage, dominance ---
+                if self.cfg.contest.enabled:
+                    continue     # a contest is then bites the animals choose
                 # A contest is about ground, not about walking. The thing that
                 # must NOT register as a fight is an affiliative huddle — and a
                 # huddle is *both* animals settled together, so that is what

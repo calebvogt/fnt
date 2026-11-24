@@ -27,13 +27,16 @@ do, it changes how loudly each sensory pathway speaks.
 *Recurrent layer.* A GRU. It is what gives the animal a present that depends on
 its past — it can keep turning after the smell that started the turn has gone.
 
-*Motor output.* Two numbers. Turn is squashed to ±``max_turn`` radians per
+*Motor output.* Two numbers, or three. Turn is squashed to ±``max_turn`` radians per
 tick; speed to a 0–1 fraction of what the body can currently manage (the engine
 still owns top speed, fatigue and the drag of long grass). Motor noise is added
 before the squash and comes from the animal's own counter-based random stream,
 so two runs of the same animal from the same moment are identical until
 something is changed — which is what makes a counterfactual a counterfactual
-(:mod:`fnt.abma.core.twin`).
+(:mod:`fnt.abma.core.twin`). A brain raised in worlds where animals can hurt
+each other (``ContestParams``) has a third output, a bite: the command is
+issued when its squashed value passes one half. A brain without that output
+never bites.
 
 Inference is plain numpy and needs nothing but this file: a brain is a few
 hundred kilobytes of weights in an ``.npz`` and runs inside the ordinary
@@ -114,6 +117,8 @@ class Brain:
         self.n_in = len(self.sensors)
         self.n_sensory = int(self.w["W1"].shape[0])
         self.n_rnn = int(self.w["W_hh"].shape[1])
+        #: motor outputs: 2 = turn, speed; 3 = turn, speed, bite
+        self.n_out = int(self.w["Wo"].shape[0])
         self.senses = SenseParams.from_dict(self.meta.get("senses"))
         # Match this brain's inputs to the body's current sensor list BY NAME:
         # a sensor added to the body after this brain was trained is simply not
@@ -132,7 +137,7 @@ class Brain:
     @staticmethod
     def random(seed: int = 0, n_sensory: int = 64, n_rnn: int = 64,
                tick_s: float = 2.0, max_turn: float = 1.5,
-               senses: SenseParams | None = None) -> "Brain":
+               senses: SenseParams | None = None, n_out: int = 2) -> "Brain":
         """An untrained brain. It moves, and that is all that can be said."""
         rng = np.random.default_rng(seed)
         n_in, n_mod = len(SENSORS), len(MODULATORS)
@@ -149,9 +154,11 @@ class Brain:
             "W_hh": init(3 * n_rnn, n_rnn),
             "b_ih": np.zeros(3 * n_rnn, np.float32),
             "b_hh": np.zeros(3 * n_rnn, np.float32),
-            "Wo": init(2, n_rnn, 0.1), "bo": np.zeros(2, np.float32),
-            "log_std": np.full(2, -0.5, np.float32),
+            "Wo": init(n_out, n_rnn, 0.1), "bo": np.zeros(n_out, np.float32),
+            "log_std": np.full(n_out, -0.5, np.float32),
         }
+        if n_out > 2:
+            w["bo"][2:] = -1.0            # biting starts out rare, not half the time
         meta = {
             "format": BRAIN_FORMAT, "name": "random", "sensors": list(SENSORS),
             "modulators": list(MODULATORS), "tick_s": tick_s,
@@ -223,6 +230,13 @@ class Brain:
     def squash(self, u: np.ndarray):
         return np.tanh(u[:, 0]) * self.max_turn, _sigmoid(u[:, 1])
 
+    def bite(self, u: np.ndarray) -> np.ndarray:
+        """Whether each animal's command includes a bite (never, without the
+        third output)."""
+        if u.shape[1] < 3:
+            return np.zeros(len(u), bool)
+        return u[:, 2] > 0.0              # squashed value above one half
+
     # ---- persistence ---------------------------------------------------- #
     def save(self, path: str) -> str:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -287,7 +301,8 @@ class Brain:
     def describe(self) -> str:
         m = self.meta
         bits = [f"{self.n_in} senses → {self.n_sensory} sensory → "
-                f"{self.n_rnn} recurrent → turn, speed"]
+                f"{self.n_rnn} recurrent → turn, speed"
+                + (", bite" if self.n_out > 2 else "")]
         if m.get("trained"):
             steps = m.get("agent_steps")
             if steps:
