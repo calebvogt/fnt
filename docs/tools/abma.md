@@ -250,6 +250,22 @@ released and each area's receptor level, where each sense enters, and the
 evidence each connection rests on (a paper, or an idea with its author and
 date).
 
+### The skeleton
+
+The **Skeleton** button beside the 3D views swaps the schematic body for a
+jointed skeleton built from published measurements:
+
+    python -m fnt.abma --skeleton
+    python -m fnt.abma --skeleton --skeleton-plot skeleton.png
+
+The first command prints every bone length with the paper it comes from and
+how much of each printed joint range a walk uses. Ten of the fifteen lengths
+are printed in a paper and one is worked out from printed numbers. The other
+four (neck, chest, loin, sacrum) have no printed length, so the printed body
+length is split along the spine by our own guess. Posture and stepping are
+also our own. It is geometry only: the network sets speed and turning, and
+the legs step in a fixed trot inside the printed joint ranges.
+
 ## Output
 
 A run folder holds `config.json` (the exact experiment), `provenance.json`

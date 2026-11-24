@@ -1228,6 +1228,44 @@ Known limits: only the first animal's brain is shown; arena furniture (zones,
 huts, food) is not drawn; Qt 5's web engine is an old browser and redraws about
 15-30 times a second, less smoothly than a current browser.
 
+### The skeleton: `--skeleton`
+
+The page's Skeleton button swaps the schematic body for a jointed skeleton
+(`fnt/abma/core/skeleton.py`, spec `fnt/abma/bodies/c57_male.json`). It is
+built from numbers printed in papers and from nothing else: no file of any
+published model is used.
+
+    python -m fnt.abma --skeleton                       # every length, its source, the joint ranges
+    python -m fnt.abma --skeleton --skeleton-plot skeleton.png
+
+Each length in the spec carries a `basis`:
+
+- `published`: printed in a paper. Body, tail and long bones are from 7 to 8
+  month old male C57BL/6J (Skop et al. 2020); shoulder blade, hip bone and
+  radius from older males on the same background (Groenke et al. 2026); the
+  foot from CD-1-background mice (Sparrow et al. 2017).
+- `derived`: arithmetic on printed numbers (the skull, as a sum of four
+  skull-roof bones, which is a lower bound).
+- `layout`: our own. No paper prints the length of the neck, chest, loin or
+  sacrum, so the printed snout-to-tail-base length less the skull is split
+  along the spine by a guessed weight per vertebra.
+
+Posture, where bones attach, bone thickness and the stepping pattern are also
+our own (`layout`, `gait`, `radius_mm` in the spec). Joint ranges are the
+ones printed by Tata Ramalingasetty et al. 2021 (Table 1) and, for the hind
+limb, measured by Charles et al. 2016; each entry in `joints` says how the
+angle is measured here and what had to be assumed to read the printed range,
+because the papers give the zero posture only as a picture. The legs are
+placed by choosing where each foot is in its step and solving the joints above
+it; `--skeleton` reports how much of each printed range a full walk uses (all
+seven limb joints stay inside).
+
+It is geometry only: no mass, no muscle. The network does not move these
+joints. It sets speed and turning, and the legs step in a fixed trot. Left
+out: ribs, any movement of the shoulder blade, a usable toe range, and
+anything for wild-derived mice or voles. A copy of the spec in `~/ABMA_bodies`
+shadows the shipped one; an anatomy spec names its skeleton as `"body"`.
+
 ## Roadmap / not yet done
 
 1. **Absorbing boundary** — currently treated as reflective.

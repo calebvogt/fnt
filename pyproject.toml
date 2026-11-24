@@ -109,5 +109,5 @@ Issues = "https://github.com/calebvogt/fnt/issues"
 include = ["fnt*"]
 
 [tool.setuptools.package-data]
-fnt = ["../icons/*.ico", "../icons/*.png", "fed3/ui/*.svg", "abma/brains/*.npz", "abma/brains/anatomy/*.json",
+fnt = ["../icons/*.ico", "../icons/*.png", "fed3/ui/*.svg", "abma/brains/*.npz", "abma/brains/anatomy/*.json", "abma/bodies/*.json",
        "abma/gui/brain_map_page/*"]

@@ -1,0 +1,486 @@
+{
+ "name": "c57_male",
+ "title": "Male C57BL/6J skeleton",
+ "draft": 1,
+ "compiled": "2026-11-24",
+ "subject": "Body and long bones: 7 to 8 month old male C57BL/6J, about 32 g (skop2020). Shoulder blade, hip bone and radius: 15 month old, 37 to 46 g males on a C57BL/6J background (groenke2026).",
+ "body": {
+  "mass_g": 31.5,
+  "snout_to_tail_base_mm": 96.0,
+  "tail_mm": 80,
+  "source": "skop2020",
+  "vertebrae": {
+   "cervical": 7,
+   "thoracic": 13,
+   "lumbar": 6,
+   "sacrum": 4,
+   "caudal": 27
+  }
+ },
+ "lengths": {
+  "pelvis": {
+   "mm": 18.83,
+   "basis": "published",
+   "source": "groenke2026 (length); charles2018 (mass)",
+   "note": "length: innominate length, groenke2026 Table 1 (per-specimen linear measurements, mm); the value is the arithmetic mean of the three wild-type male rows, which are listed in raw_values_mm; mass: charles2018 Table 2, row \"Pelvis\" (0.38 g)"
+  },
+  "scapula": {
+   "mm": 10.8,
+   "basis": "published",
+   "source": "groenke2026",
+   "note": "scapular length, Table 1 (per-specimen linear measurements, mm); the value is the arithmetic mean of the three wild-type male rows, which are listed in raw_values_mm"
+  },
+  "humerus": {
+   "mm": 12.2,
+   "basis": "published",
+   "source": "skop2020",
+   "note": "Table 2, row \"Humerus length, mm\", Control column (12.2 +/- 0.1)"
+  },
+  "forearm": {
+   "mm": 11.5,
+   "basis": "published",
+   "source": "groenke2026",
+   "note": "Radius length, used as the elbow-to-wrist distance. The ulna (14.8 mm, skop2020) is longer because it runs behind the elbow. From 15-month, 37-46 g males."
+  },
+  "forepaw": {
+   "mm": 7.9,
+   "basis": "published",
+   "source": "skop2020",
+   "note": "Table 2, row \"Front paw length, mm\", Control column (7.9 +/- 0.2); the landmarks are not described in the Methods"
+  },
+  "femur": {
+   "mm": 15.6,
+   "basis": "published",
+   "source": "skop2020 (length); charles2018 (mass)",
+   "note": "length: skop2020 Table 2, row \"Femur length, mm\", Control column (15.6 +/- 0.3); mass: charles2018 Table 2, row \"Thigh\" (0.44 g, whole thigh segment with soft tissue)"
+  },
+  "tibia": {
+   "mm": 19.1,
+   "basis": "published",
+   "source": "skop2020 (length); charles2018 (mass)",
+   "note": "length: skop2020 Table 2, row \"Tibia length, mm\", Control column (19.1 +/- 0.4); mass: charles2018 Table 2, row \"Lower Leg\" (0.21 g)"
+  },
+  "foot": {
+   "mm": 9.7,
+   "basis": "published",
+   "source": "sparrow2017 (length); charles2018 (mass)",
+   "note": "Tarsus plus metatarsus, from CD-1-background mice (not C57)."
+  },
+  "toes": {
+   "mm": 4.0,
+   "basis": "published",
+   "source": "charles2018",
+   "note": "A passing remark in the paper's Discussion, not a table."
+  },
+  "tail": {
+   "mm": 80.0,
+   "basis": "published",
+   "source": "skop2020",
+   "note": "Whole tail. It is drawn as 8 equal pieces; real tail bones are not equal."
+  },
+  "skull": {
+   "mm": 22.83,
+   "basis": "derived",
+   "source": "kawakami2008",
+   "note": "Sum of four published skull-roof bone lengths; it leaves out the occipital bone, so it is a lower bound."
+  },
+  "cervical": {
+   "mm": 8.4,
+   "basis": "layout",
+   "source": "skop2020",
+   "note": "No published length. The published snout-to-tail-base length (96 mm) less the skull is split along the spine with one cervical vertebra counted as 1 (our own guess)."
+  },
+  "thoracic": {
+   "mm": 31.19,
+   "basis": "layout",
+   "source": "skop2020",
+   "note": "No published length. The published snout-to-tail-base length (96 mm) less the skull is split along the spine with one thoracic vertebra counted as 2 (our own guess)."
+  },
+  "lumbar": {
+   "mm": 21.59,
+   "basis": "layout",
+   "source": "skop2020",
+   "note": "No published length. The published snout-to-tail-base length (96 mm) less the skull is split along the spine with one lumbar vertebra counted as 3 (our own guess)."
+  },
+  "sacrum": {
+   "mm": 12.0,
+   "basis": "layout",
+   "source": "skop2020",
+   "note": "No published length. The published snout-to-tail-base length (96 mm) less the skull is split along the spine with one sacrum vertebra counted as 2.5 (our own guess)."
+  }
+ },
+ "spine": [
+  {
+   "id": "lumbar",
+   "count": 6,
+   "pitch_deg": [
+    18.0,
+    14.0,
+    10.0,
+    6.0,
+    2.0,
+    -2.0
+   ],
+   "flex_limit_deg": [
+    -6.0,
+    6.0
+   ],
+   "bend_limit_deg": [
+    -5.0,
+    5.0
+   ],
+   "limit_basis": "per joint between two vertebrae, tata2021 Table 1: bending up and down, Table 1 cites dewan2010 (mouse); sideways, no source cited in the table (modellers' value)"
+  },
+  {
+   "id": "thoracic",
+   "count": 13,
+   "pitch_deg": [
+    -4.0,
+    -7.0,
+    -10.0,
+    -13.0,
+    -16.0,
+    -19.0,
+    -22.0,
+    -24.0,
+    -24.0,
+    -22.0,
+    -18.0,
+    -14.0,
+    -10.0
+   ],
+   "flex_limit_deg": [
+    -5.0,
+    5.0
+   ],
+   "bend_limit_deg": [
+    -5.0,
+    5.0
+   ],
+   "limit_basis": "per joint between two vertebrae, tata2021 Table 1: bending up and down, Table 1 cites dewan2010 (mouse); sideways, no source cited in the table (modellers' value)"
+  },
+  {
+   "id": "cervical",
+   "count": 7,
+   "pitch_deg": [
+    -4.0,
+    2.0,
+    8.0,
+    12.0,
+    12.0,
+    9.0,
+    5.0
+   ],
+   "flex_limit_deg": [
+    -9.0,
+    9.0
+   ],
+   "bend_limit_deg": [
+    -5.0,
+    5.0
+   ],
+   "limit_basis": "per joint between two vertebrae, tata2021 Table 1: bending up and down, Table 1 cites shahrokni2012 and labels it \"Mouse\"; that study is on the rat cervical spine; sideways, no source cited in the table (modellers' value)"
+  }
+ ],
+ "tail": {
+  "pieces": 8,
+  "vertebrae": 27,
+  "vertebrae_source": "hankenson2008",
+  "pitch_deg": [
+   -20.0,
+   -14.0,
+   -8.0,
+   -2.0,
+   2.0,
+   4.0,
+   4.0,
+   4.0
+  ],
+  "limit_deg": [
+   -33.8,
+   33.8
+  ],
+  "limit_basis": "tata2021 Table 1 prints -10 to 10 degrees per tail joint (no source cited in the table (modellers' value)); one drawn piece stands for 27/8 joints, so it is allowed that many times the range"
+ },
+ "head": {
+  "pitch_deg": -42.0,
+  "sniff_pitch_deg": -3.0,
+  "limit_deg": [
+   -50.0,
+   50.0
+  ],
+  "limit_basis": "tata2021 Table 1: no source cited in the table (modellers' value)"
+ },
+ "joints": [
+  {
+   "id": "hip_flex",
+   "min_deg": -30.0,
+   "max_deg": 50.0,
+   "measure": "thigh bone against the line square to the hip bone, seen from the side; knee forwards is positive",
+   "basis": "measured on a skeletonised C57BL/6 hindlimb (charles2016_janat)",
+   "source": "tata2021; charles2016_janat",
+   "assumed": "The papers give the zero posture only as a picture. Zero is taken as the thigh bone square to the hip bone.",
+   "enforced": true
+  },
+  {
+   "id": "hip_out",
+   "min_deg": -20.0,
+   "max_deg": 40.0,
+   "measure": "thigh bone out of the fore-aft plane; knee outwards is positive",
+   "basis": "rat; taken by charles2016_janat from Johnson et al. 2008 (J Biomech 41:610-619, doi:10.1016/j.jbiomech.2007.10.004)",
+   "source": "tata2021; charles2016_janat",
+   "assumed": "Printed as -40 to 20 without saying which way is outwards; outwards is taken as the larger side.",
+   "enforced": true
+  },
+  {
+   "id": "knee",
+   "min_deg": 40.0,
+   "max_deg": 145.0,
+   "measure": "bend of the knee away from a straight leg",
+   "basis": "measured on a skeletonised C57BL/6 hindlimb (charles2016_janat)",
+   "source": "tata2021; charles2016_janat",
+   "assumed": "None: charles2018 says positive is knee extension, so -145 to -40 is 40 to 145 degrees of bend.",
+   "enforced": true
+  },
+  {
+   "id": "ankle",
+   "min_deg": -50.0,
+   "max_deg": 50.0,
+   "measure": "angle between shin and foot, less 90; pointing the foot is positive",
+   "basis": "measured on a skeletonised C57BL/6 hindlimb",
+   "source": "charles2016_janat",
+   "assumed": "Zero is taken as the foot square to the shin. Range from charles2016 (tata2021 prints -50 to -50).",
+   "enforced": true
+  },
+  {
+   "id": "shoulder",
+   "min_deg": -45.0,
+   "max_deg": 45.0,
+   "measure": "angle between shoulder blade and upper arm bone, less 90",
+   "basis": "no source cited in the table (modellers' value)",
+   "source": "tata2021",
+   "assumed": "The zero posture is not given; zero is taken as the upper arm square to the shoulder blade.",
+   "enforced": true
+  },
+  {
+   "id": "elbow",
+   "min_deg": 60.0,
+   "max_deg": 153.0,
+   "measure": "angle between upper arm and forearm (180 is a straight arm)",
+   "basis": "Table 1 cites bonnan2016 (rat)",
+   "source": "tata2021",
+   "assumed": "Read as the angle between the two bones.",
+   "enforced": true
+  },
+  {
+   "id": "wrist",
+   "min_deg": -20.0,
+   "max_deg": 50.0,
+   "measure": "paw against the line of the forearm, seen from the side; paw bent back (towards the top of the forearm) is positive",
+   "basis": "Table 1 cites bonnan2016 (rat), but that paper's Table 1 has no wrist values",
+   "source": "tata2021",
+   "assumed": "Printed as -20 to 50 without a sign convention; bent back is taken as positive.",
+   "enforced": true
+  }
+ ],
+ "layout": {
+  "hip_height_mm": 28.0,
+  "pelvis_pitch_deg": 21.3,
+  "acetabulum_at": 0.6,
+  "lumbosacral_dx_mm": -2.0,
+  "lumbosacral_dy_mm": 1.0,
+  "hip_half_width_mm": 5.5,
+  "sacrum_pitch_deg": -15.0,
+  "tail_pitch_deg": [
+   -20.0,
+   -14.0,
+   -8.0,
+   -2.0,
+   2.0,
+   4.0,
+   4.0,
+   4.0
+  ],
+  "lumbar_pitch_deg": [
+   18.0,
+   14.0,
+   10.0,
+   6.0,
+   2.0,
+   -2.0
+  ],
+  "thoracic_pitch_deg": [
+   -4.0,
+   -7.0,
+   -10.0,
+   -13.0,
+   -16.0,
+   -19.0,
+   -22.0,
+   -24.0,
+   -24.0,
+   -22.0,
+   -18.0,
+   -14.0,
+   -10.0
+  ],
+  "cervical_pitch_deg": [
+   -4.0,
+   2.0,
+   8.0,
+   12.0,
+   12.0,
+   9.0,
+   5.0
+  ],
+  "skull_pitch_deg": -42.0,
+  "sniff_pitch_deg": -3.0,
+  "scapula_on_thoracic": 10,
+  "scapula_drop_mm": 2.9,
+  "scapula_half_width_mm": 6.0,
+  "scapula_pitch_deg": -56.6,
+  "shoulder_half_width_mm": 7.5,
+  "hind_track_half_width_mm": 7.4,
+  "fore_track_half_width_mm": 7.5,
+  "note": "Our own choices; none of this is in a paper."
+ },
+ "gait": {
+  "note": "A fixed trot (diagonal legs together) used to draw the body. It is not produced by the network: the network sets speed and turning only.",
+  "stride_mm": 50.0,
+  "duty": 0.6,
+  "clearance_mm": 4.0,
+  "hind_neutral_x_mm": 2.9,
+  "fore_neutral_x_mm": -1.7,
+  "foot_pitch_deg": {
+   "stand": 56.5,
+   "touch_down": 14.3,
+   "toe_off": 45.5
+  },
+  "paw_pitch_deg": {
+   "stand": 11.9,
+   "touch_down": 23.8,
+   "toe_off": 36.7
+  }
+ },
+ "radius_mm": {
+  "skull": [
+   5.0,
+   1.6
+  ],
+  "cervical": [
+   1.1,
+   1.1
+  ],
+  "thoracic": [
+   1.2,
+   1.2
+  ],
+  "lumbar": [
+   1.4,
+   1.4
+  ],
+  "sacrum": [
+   1.5,
+   1.1
+  ],
+  "tail": [
+   1.0,
+   0.3
+  ],
+  "pelvis": [
+   1.3,
+   1.0
+  ],
+  "scapula": [
+   2.2,
+   0.9
+  ],
+  "humerus": [
+   0.85,
+   0.8
+  ],
+  "forearm": [
+   0.7,
+   0.6
+  ],
+  "forepaw": [
+   0.9,
+   0.5
+  ],
+  "femur": [
+   0.95,
+   0.9
+  ],
+  "tibia": [
+   0.8,
+   0.6
+  ],
+  "foot": [
+   0.8,
+   0.6
+  ],
+  "toes": [
+   0.6,
+   0.35
+  ]
+ },
+ "sources": {
+  "tata2021": {
+   "cite": "Tata Ramalingasetty S, Danner SM, Arreguit J, Markin SN, Rodarie D, Kathe C, Courtine G, Rybak IA, Ijspeert AJ. A Whole-Body Musculoskeletal Model of the Mouse. IEEE Access 2021;9:163861-163881.",
+   "id": "doi:10.1109/ACCESS.2021.3133078; PMC8865483"
+  },
+  "charles2016_janat": {
+   "cite": "Charles JP, Cappellari O, Spence AJ, Wells DJ, Hutchinson JR. Muscle moment arms and sensitivity analysis of a mouse hindlimb musculoskeletal model. J Anat 2016;229(4):514-535.",
+   "id": "doi:10.1111/joa.12461; PMC5013061"
+  },
+  "charles2018": {
+   "cite": "Charles JP, Cappellari O, Hutchinson JR. A dynamic simulation of musculoskeletal function in the mouse hindlimb during trotting locomotion. Front Bioeng Biotechnol 2018;6:61.",
+   "id": "doi:10.3389/fbioe.2018.00061; PMC5964171"
+  },
+  "skop2020": {
+   "cite": "Skop V, Liu N, Guo J, Gavrilova O, Reitman ML. The contribution of the mouse tail to thermoregulation is modest. Am J Physiol Endocrinol Metab 2020;319(2):E438-E446.",
+   "id": "doi:10.1152/ajpendo.00133.2020; PMC7473913"
+  },
+  "groenke2026": {
+   "cite": "Groenke JR, Liu H, Lach G, Wajpe A, Berryman D, Kopchick JJ, Zhu S, O'Connor PM. Cumulative effects of lifelong systemic excess growth hormone on postcranial skeletal morphology in adult mice. J Anat 2026.",
+   "id": "doi:10.1111/joa.70198; PMC13399552"
+  },
+  "sparrow2017": {
+   "cite": "Sparrow LM, Pellatt E, Yu SS, Raichlen DA, Pontzer H, Rolian C. Gait changes in a line of mice artificially selected for longer limbs. PeerJ 2017;5:e3008.",
+   "id": "doi:10.7717/peerj.3008; PMC5324776"
+  },
+  "hankenson2008": {
+   "cite": "Hankenson FC, Garzel LM, Fischer DD, Nolan B, Hankenson KD. Evaluation of tail biopsy collection in laboratory mice (Mus musculus): vertebral ossification, DNA quantity, and acute behavioral responses. J Am Assoc Lab Anim Sci 2008;47(6):10-18.",
+   "id": "PMC2687139 (PMID 19049247; no DOI)"
+  },
+  "ibarrasoria2026": {
+   "cite": "Ibarra-Soria X, Webb E, Mulley JF. Large-scale mouse mutagenesis identifies novel genes affecting vertebral anatomy. Mamm Genome 2026;37(1):34.",
+   "id": "doi:10.1007/s00335-025-10189-x; PMC12876460"
+  },
+  "kawakami2008": {
+   "cite": "Kawakami M, Yamamura K. Cranial bone morphometric study among mouse strains. BMC Evol Biol 2008;8:73.",
+   "id": "doi:10.1186/1471-2148-8-73; PMC2287174"
+  },
+  "bonnan2016": {
+   "cite": "Bonnan MF, Shulman J, Varadharajan R, Gilbert C, Wilkes M, Horner A, Brainerd E. Forelimb kinematics of rats using XROMM, with implications for small eutherians and their fossil relatives. PLoS ONE 2016;11(3):e0149377.",
+   "id": "doi:10.1371/journal.pone.0149377; PMC4775064"
+  },
+  "dewan2010": {
+   "cite": "Dewan AK, Dewan RA, Calderon N, Fuentes A, Lazard Z, Davis AR, Heggeness M, Hipp JA, Olmsted-Davis EA. Assessing mechanical integrity of spinal fusion by in situ endochondral osteoinduction in the murine model. J Orthop Surg Res 2010;5:58.",
+   "id": "doi:10.1186/1749-799X-5-58; PMC2933711"
+  },
+  "shahrokni2012": {
+   "cite": "Shahrokni M, Zhu Q, Liu J, Tetzlaff W, Oxland TR. Design and biomechanical evaluation of a rodent spinal fixation device. Spinal Cord 2012;50(7):543-547.",
+   "id": "doi:10.1038/sc.2011.185; PMC5025282"
+  }
+ },
+ "left_out": [
+  "Lengths of the neck, chest, loin and sacrum, and of single vertebrae: the papers plot them but print no numbers.",
+  "Ribs, breastbone, collar bones, kneecap, fibula and the single bones of the paws.",
+  "Any joint for the shoulder blade: it is fixed to the chest here, as in Gilmer et al. 2025. In a real mouse it swings with every step.",
+  "A usable range for the toe joint (tata2021 prints -5 to -5) and twist of the neck, trunk and tail.",
+  "Mouse-measured ranges for the fore limb: the printed ones are rat values or the modellers' own.",
+  "Masses, centres of mass and muscles. This skeleton is geometry only.",
+  "Anything for wild-derived mice or voles."
+ ]
+}

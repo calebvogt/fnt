@@ -169,6 +169,16 @@ def main(argv=None) -> int:
                         "where the spec has a projection. Untrained: the "
                         "weights are random draws inside the wiring. With no "
                         "--preset, the open field test is used.")
+    b.add_argument("--skeleton", metavar="NAME", nargs="?", const="c57_male",
+                   help="Print a skeleton spec and exit: every bone length "
+                        "with the paper it comes from (or a note that it is "
+                        "our own), and how much of each printed joint range "
+                        "a walk uses. NAME is a skeleton in fnt/abma/bodies "
+                        "or ~/ABMA_bodies, or a path (default c57_male).")
+    b.add_argument("--skeleton-plot", metavar="PNG",
+                   help="With --skeleton, also save a picture of it: from "
+                        "the side through one step, from above, and the "
+                        "joint ranges.")
     b.add_argument("--list-anatomies", action="store_true",
                    help="Print the anatomy specs that can be asked for, and "
                         "exit.")
@@ -276,6 +286,17 @@ def main(argv=None) -> int:
         if not os.path.isfile(args.brain_replay):
             p.error(f"no such recording: {args.brain_replay}")
         print("brain map ->", open_replay(args.brain_replay, where=args.brain_map or "auto"))
+        return 0
+
+    if args.skeleton or args.skeleton_plot:
+        from .core import skeleton
+        try:
+            sk_spec = skeleton.load_spec(args.skeleton or "c57_male")
+        except (FileNotFoundError, ValueError) as e:
+            p.error(str(e))
+        print(skeleton.describe(sk_spec))
+        if args.skeleton_plot:
+            print("picture ->", skeleton.plot(sk_spec, args.skeleton_plot))
         return 0
 
     if args.list_anatomies:

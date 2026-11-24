@@ -37,7 +37,7 @@ from __future__ import annotations
 import json
 import os
 
-from . import anatomy
+from . import anatomy, skeleton as _skeleton
 
 _CDN = '<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>'
 _FONTS = '<link rel="stylesheet" href="https://fonts.googleapis.com'
@@ -101,13 +101,34 @@ def replay_payload(rec: dict, animal: int = 0) -> tuple[dict, dict]:
     }
 
 
+def skeleton_payload(spec: dict, skeleton="auto") -> dict | None:
+    """The skeleton the page can draw in place of the schematic body: the
+    one the anatomy names as its ``body`` (``"auto"``), a named one, a
+    skeleton spec, or none."""
+    if skeleton is None or skeleton is False:
+        return None
+    if isinstance(skeleton, dict):
+        return _skeleton.Skeleton(skeleton).page_payload()
+    name = str(spec.get("body") or "") if skeleton == "auto" else str(skeleton)
+    if not name:
+        return None
+    try:
+        return _skeleton.Skeleton(name).page_payload()
+    except FileNotFoundError:
+        if skeleton == "auto":
+            return None
+        raise
+
+
 def build_page(spec: dict, hosted: bool = False, bridge_js: str = "", ws_url: str = "",
-               replay: dict | None = None) -> str:
+               replay: dict | None = None, skeleton="auto") -> str:
     anatomy.check_spec(spec)
     html = _read("brain_map_template.html")
-    if html.count("__SPEC__") != 1 or html.count(_CDN) != 1:
+    if html.count("__SPEC__") != 1 or html.count("__SKEL__") != 1 or html.count(_CDN) != 1:
         raise ValueError("the brain map template has lost its placeholders")
     html = html.replace("__SPEC__", json.dumps(spec, ensure_ascii=True).replace("</", "<\\/"))
+    html = html.replace("__SKEL__", json.dumps(skeleton_payload(spec, skeleton), ensure_ascii=True,
+                                               separators=(",", ":")).replace("</", "<\\/"))
     extra = ""
     if bridge_js:
         extra += "<script>" + bridge_js.replace("</script", "<\\/script") + "</script>"

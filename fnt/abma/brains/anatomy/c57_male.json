@@ -1,5 +1,6 @@
 {
   "name": "House mouse, male, C57BL/6J",
+  "body": "c57_male",
   "draft": 2,
   "date": "2026-11-24",
   "status": "Draft for review. Projection strengths and most receptor levels are seeded from the Allen mouse atlases; every sign, and the oxytocin and vasopressin levels, are still a first guess.",

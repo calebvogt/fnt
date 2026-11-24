@@ -175,6 +175,7 @@ details summary{cursor:pointer;font-family:var(--f-display);font-weight:600;font
       <div class="card">
         <div class="cardhead"><h3 id="arenatitle">Open field, 50 &times; 50 cm</h3><span class="tag" id="drawtag">Sandbox, untrained, draw 5</span></div>
         <div class="seg" role="group" aria-label="View of the box" id="viewseg" hidden><button id="v-close" aria-pressed="true">3D close-up</button><button id="v-3d" aria-pressed="false">3D box</button><button id="v-top" aria-pressed="false">Top view</button></div>
+        <button class="btn" id="v-skel" aria-pressed="false" hidden>Skeleton</button>
         <canvas id="box3" role="img" aria-label="A black mouse with jointed legs, spine and tail walking in an open field box" hidden></canvas>
         <canvas id="box" role="img" aria-label="One virtual mouse in an open field box, with its path and urine marks"></canvas>
         <div class="transport"><button class="btn" id="play">Play</button><button class="btn" id="restart">Restart</button><button class="btn" id="rewire">New random wiring</button>
@@ -222,6 +223,7 @@ details summary{cursor:pointer;font-family:var(--f-display);font-weight:600;font
   f.appendChild(document.createElement('div'));f.appendChild(document.createElement('div'));document.body.appendChild(f);
   if(f.scrollHeight!==1)document.documentElement.classList.add('oldweb');document.body.removeChild(f);})();
 const SPEC=__SPEC__;
+const SKEL=__SKEL__;
 const R=SPEC.regions,byId={},CLS={},EV=SPEC.evidence||{},MODS=SPEC.modulators,MOD={};
 SPEC.classes.forEach(c=>{CLS[c.id]=c.label;});MODS.forEach(m=>{MOD[m.id]=m;});
 let off=0;
@@ -502,21 +504,48 @@ function pose(B,ph,amp,bend,sniff,go){
   B.chest.rotation.y=bend;B.head.rotation.y=bend*0.9;B.head.rotation.z=sniff?-0.4:0;
   B.tail.forEach((g,i)=>{g.rotation.y=-bend*0.35+0.05*Math.sin(ph*0.5+i*0.6);g.rotation.z=i===0?0.22:-0.03;});
 }
-let GAL=null;
+/* ---- the skeleton: bone lengths from published measurements (see SKEL.note); the legs come as a table over the
+   stepping cycle worked out by fnt.abma.core.skeleton, and the spine and tail are bent here for a turn ---- */
+function makeSkel(T3,K){
+  const mat=new T3.MeshStandardMaterial({color:0xe6dfcc,roughness:0.55}),M=new T3.Group(),u=K.unit_mm*0.001,n=K.pts.length;
+  const cyl=K.bones.map(b=>{const m=new T3.Mesh(new T3.CylinderGeometry(b[3]*u,b[2]*u,1,8),mat);M.add(m);return m;});
+  const balls=K.balls.map(b=>{const m=new T3.Mesh(new T3.SphereGeometry(b[1]*u,10,8),mat);M.add(m);return m;});
+  return {M:M,K:K,cyl:cyl,balls:balls,O:new Float32Array(n*3),P:new Float32Array(n*3),up:new T3.Vector3(0,1,0),d:new T3.Vector3()};
+}
+function poseSkel(S,ph,amp,bend,sniff){
+  const K=S.K,O=S.O,P=S.P,n=K.pts.length,u=K.unit_mm*0.001,F=K.frames,na=F.length,np=F[0].length;
+  for(let i=0;i<n;i++)for(let c=0;c<3;c++)O[i*3+c]=K.rest[i][c];
+  const af=clamp(amp,0,1)*(na-1),a0=Math.min(na-2,Math.floor(af)),aw=af-a0,pf=((ph/6.2832)%1+1)%1*np,p0=Math.floor(pf)%np,p1=(p0+1)%np,pw=pf-Math.floor(pf);
+  K.moving.forEach((pi,j)=>{for(let c=0;c<3;c++){const q=j*3+c,lo=F[a0][p0][q]*(1-pw)+F[a0][p1][q]*pw,hi=F[a0+1][p0][q]*(1-pw)+F[a0+1][p1][q]*pw;O[pi*3+c]=lo*(1-aw)+hi*aw;}});
+  if(sniff&&K.sniff){const a=K.skull[0]*3,b=K.skull[1]*3,dx=O[b]-O[a],dy=O[b+1]-O[a+1],c=Math.cos(K.sniff),s=Math.sin(K.sniff);O[b]=O[a]+dx*c-dy*s;O[b+1]=O[a+1]+dx*s+dy*c;}
+  P.set(O);
+  const turn=(pt,on,th)=>{const c=Math.cos(th),s=Math.sin(th),dx=O[pt*3]-O[on*3],dz=O[pt*3+2]-O[on*3+2];P[pt*3]=P[on*3]+dx*c+dz*s;P[pt*3+1]=P[on*3+1]+O[pt*3+1]-O[on*3+1];P[pt*3+2]=P[on*3+2]-dx*s+dz*c;};
+  const run=(ch,per)=>{for(let i=1;i<ch.length;i++)turn(ch[i],ch[i-1],i*per);};
+  const per=clamp(1.9*bend/(K.chain.length-1),-K.yaw_lim,K.yaw_lim);
+  if(bend){run(K.chain,per);K.ride.forEach(pt=>turn(pt,K.chain[K.ride_on],K.ride_on*per));run(K.tail,clamp(-0.35*bend,-K.tail_yaw_lim,K.tail_yaw_lim));}
+  K.bones.forEach((b,i)=>{const m=S.cyl[i],a=b[0]*3,e=b[1]*3;S.d.set((P[e]-P[a])*u,(P[e+1]-P[a+1])*u,(P[e+2]-P[a+2])*u);const len=S.d.length()||1e-6;
+    m.position.set((P[a]+P[e])*0.5*u,(P[a+1]+P[e+1])*0.5*u,(P[a+2]+P[e+2])*0.5*u);m.scale.set(1,len,1);m.quaternion.setFromUnitVectors(S.up,S.d.multiplyScalar(1/len));});
+  K.balls.forEach((b,i)=>{const a=b[0]*3;S.balls[i].position.set(P[a]*u,P[a+1]*u,P[a+2]*u);});
+}
+let GAL=null,showSkel=false;
 function initGallery(){
   if(!window.THREE)return;
   try{
     const T3=window.THREE,cvs=document.getElementById('gal'),ren=new T3.WebGLRenderer({canvas:cvs,antialias:true,alpha:true}),scene=new T3.Scene(),cam=new T3.PerspectiveCamera(13.5,4.5,0.01,10);
     scene.add(new T3.HemisphereLight(0xffffff,0x50545c,0.95));const sun=new T3.DirectionalLight(0xffffff,0.75);sun.position.set(0.4,1,0.6);scene.add(sun);
     const floorM=new T3.MeshStandardMaterial({color:0xdfe3e8,roughness:0.95}),floor=new T3.Mesh(new T3.PlaneGeometry(0.72,0.24),floorM);floor.rotation.x=-Math.PI/2;scene.add(floor);
-    const bodies=BODIES.map((o,i)=>{const B=makeBody(T3,o);pose(B,0.9,0.2,0,false,0);B.M.position.set((i-1.5)*0.165,0,0);scene.add(B.M);return B;});
-    cam.position.set(0,0.2,0.74);cam.lookAt(0,0.012,0);
+    const nb=BODIES.length+(SKEL?1:0),mid=(nb-1)/2,gap=SKEL?0.15:0.165;
+    const bodies=BODIES.map((o,i)=>{const B=makeBody(T3,o);pose(B,0.9,0.2,0,false,0);B.M.position.set((i-mid)*gap,0,0);scene.add(B.M);return B;});
+    if(SKEL){const S=makeSkel(T3,SKEL);poseSkel(S,0.9,0.4,0,false);S.M.position.set((nb-1-mid)*gap,0,0);scene.add(S.M);bodies.push(S);floor.scale.x=1.2;}
+    cam.position.set(0,SKEL?0.235:0.2,SKEL?0.87:0.74);cam.lookAt(0,0.012,0);
     GAL={cvs:cvs,ren:ren,scene:scene,cam:cam,floorM:floorM,bodies:bodies,az:-0.65,S:0,dpr:0};
     let d=null;
     cvs.addEventListener('pointerdown',ev=>{cvs.setPointerCapture(ev.pointerId);d=ev.clientX;});
     cvs.addEventListener('pointermove',ev=>{if(d===null)return;GAL.az+=(ev.clientX-d)*0.012;d=ev.clientX;drawGallery();});
     const end=()=>{d=null;};cvs.addEventListener('pointerup',end);cvs.addEventListener('pointercancel',end);
-    document.getElementById('gallab').innerHTML=BODIES.map(o=>'<div><b>'+esc(o.label)+'</b><br><span class="note">'+esc(o.note)+'</span></div>').join('');
+    const labs=BODIES.map(o=>[o.label,o.note]);if(SKEL)labs.push([SKEL.title,SKEL.note]);
+    document.getElementById('gallab').style.gridTemplateColumns='repeat('+labs.length+',minmax(0,1fr))';
+    document.getElementById('gallab').innerHTML=labs.map(q=>'<div><b>'+esc(q[0])+'</b><br><span class="note">'+esc(q[1])+'</span></div>').join('');
     document.getElementById('galcard').hidden=false;
   }catch(e){GAL=null;}
 }
@@ -542,7 +571,8 @@ function init3(){
     const trailP=new Float32Array(480*3),trailG=new T3.BufferGeometry();trailG.setAttribute('position',new T3.BufferAttribute(trailP,3));
     const trail=new T3.Line(trailG,new T3.LineBasicMaterial({color:0x6450c0}));trail.frustumCulled=false;scene.add(trail);
     const B=makeBody(T3,BODIES[0]);scene.add(B.M);
-    const v={cvs:cvs,ren:ren,scene:scene,cam:cam,floor:floor,walls:walls,zone:zone,oth:oth,floorM:floorM,markPool:markPool,trail:trail,trailP:trailP,B:B,M:B.M,az:-0.75,el:0.5,rad:0.98,radC:0.21,follow:true,S:0,dpr:0};
+    const SK=SKEL?makeSkel(T3,SKEL):null;if(SK){SK.M.visible=false;scene.add(SK.M);}
+    const v={SK:SK,cvs:cvs,ren:ren,scene:scene,cam:cam,floor:floor,walls:walls,zone:zone,oth:oth,floorM:floorM,markPool:markPool,trail:trail,trailP:trailP,B:B,M:B.M,az:-0.75,el:0.5,rad:0.98,radC:0.21,follow:true,S:0,dpr:0};
     let dragP=null;
     cvs.addEventListener('pointerdown',ev=>{cvs.setPointerCapture(ev.pointerId);dragP=[ev.clientX,ev.clientY];});
     cvs.addEventListener('pointermove',ev=>{if(!dragP)return;v.az+=(ev.clientX-dragP[0])*0.01;v.el=clamp(v.el+(ev.clientY-dragP[1])*0.01,0.12,1.5);dragP=[ev.clientX,ev.clientY];ask();});
@@ -560,7 +590,9 @@ function draw3(){
   v.walls.forEach((m,i)=>{if(i<2){m.scale.x=AW;m.position.set(0,0.06,(i?1:-1)*AH/2);}else{m.scale.x=AH;m.position.set((i===3?1:-1)*AW/2,0.06,0);}});
   v.oth.forEach((m,i)=>{const o=others[i];m.visible=!!o;if(o){m.position.set(o[0]-AW/2,0.014,-(o[1]-AH/2));m.rotation.y=o[2]||0;}});
   v.M.position.set(world.x-AW/2,0,-(world.y-AH/2));v.M.rotation.y=world.h;
-  pose(v.B,ph,amp,clamp(tn*0.14,-0.45,0.45),world.contact,go);
+  const bones=showSkel&&!!v.SK;v.M.visible=!bones;if(v.SK)v.SK.M.visible=bones;
+  if(bones){v.SK.M.position.copy(v.M.position);v.SK.M.rotation.y=world.h;poseSkel(v.SK,ph,go,clamp(tn*0.14,-0.45,0.45),world.contact);}
+  else pose(v.B,ph,amp,clamp(tn*0.14,-0.45,0.45),world.contact,go);
   v.markPool.forEach((m,i)=>{const q=marks[i];m.visible=!!q;if(q){const s=0.003+Math.sqrt(q.v)*0.016;m.scale.set(s,s,1);m.position.set(q.x-AW/2,0.0004+i*2e-6,-(q.y-AH/2));}});
   const n=Math.min(steps,480);for(let i=0;i<n;i++){const hi=((steps-n+i)%HN+HN)%HN;v.trailP[i*3]=hPos[hi*3]-AW/2;v.trailP[i*3+1]=0.0008;v.trailP[i*3+2]=-(hPos[hi*3+1]-AH/2);}
   v.trail.geometry.setDrawRange(0,n);v.trail.geometry.attributes.position.needsUpdate=true;
@@ -568,7 +600,7 @@ function draw3(){
   v.cam.position.set(cx+cr*Math.cos(v.el)*Math.cos(v.az),0.015+cr*Math.sin(v.el),cz+cr*Math.cos(v.el)*Math.sin(v.az));v.cam.lookAt(cx,0.015,cz);
   v.ren.render(v.scene,v.cam);
 }
-function setView3(name){use3=name!=='top'&&!!V3;if(V3)V3.follow=name==='close';document.getElementById('box3').hidden=!use3;document.getElementById('box').hidden=use3;
+function setView3(name){use3=name!=='top'&&!!V3;if(V3)V3.follow=name==='close';document.getElementById('box3').hidden=!use3;document.getElementById('box').hidden=use3;document.getElementById('v-skel').hidden=!(use3&&V3&&V3.SK);
   [['v-close','close'],['v-3d','3d'],['v-top','top']].forEach(q=>{document.getElementById(q[0]).setAttribute('aria-pressed',use3?q[1]===name:q[1]==='top');});ask();}
 let galDirty=true;
 function retheme(){galDirty=true;ask();}
@@ -831,6 +863,7 @@ document.getElementById('mup-wd').addEventListener('click',()=>{mup('wd');});
 startStore();wire(5);rebuildW();rebuildDens();SK=buildSK();restart();
 document.getElementById('rewire').addEventListener('click',()=>{if(EXT){EXT.restart(wiring+1);return;}wire(wiring+1);rebuildW();restart();document.getElementById('drawtag').textContent='Sandbox, untrained, draw '+wiring;panel();paint();});
 V3=init3();
+document.getElementById('v-skel').addEventListener('click',()=>{showSkel=!showSkel;document.getElementById('v-skel').setAttribute('aria-pressed',showSkel);ask();});
 initGallery();
 if(V3){document.getElementById('viewseg').hidden=false;[['v-close','close'],['v-3d','3d'],['v-top','top']].forEach(q=>{document.getElementById(q[0]).addEventListener('click',()=>{setView3(q[1]);});});setView3('close');}
 window.brainMap={step:step,world:()=>world,marks:()=>marks};
