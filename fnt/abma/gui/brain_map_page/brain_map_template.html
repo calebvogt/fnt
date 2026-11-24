@@ -144,7 +144,7 @@ details summary{cursor:pointer;font-family:var(--f-display);font-weight:600;font
 <div class="wrap">
   <div class="head">
     <h1>Male C57 Neural Network Map</h1>
-    <p class="lede">A reduced brain of a male C57BL/6J house mouse for ABMA, running live. Hover over an area for its name. Click an area for its inputs, outputs and evidence, and to make a connection stronger or weaker. Click a neuron to trace its firing.</p>
+    <p class="lede">A reduced brain of a male C57BL/6J house mouse for ABMA, <span id="ledemode">running live</span>. Hover over an area for its name. Click an area for its inputs, outputs and evidence, and to make a connection stronger or weaker. Click a neuron to trace its firing.</p>
     <p class="status" id="status"></p>
   </div>
 
@@ -840,7 +840,7 @@ function attach(eng){
   setInterval(()=>{EXT.report(extDraws);extDraws=0;},2000);
 }
 function connectEngine(){
-  if(window.ABMA_REPLAY){attach(replayEngine(window.ABMA_REPLAY));return;}
+  if(window.ABMA_REPLAY){document.getElementById('ledemode').textContent='played back from a recorded run';attach(replayEngine(window.ABMA_REPLAY));return;}
   if(!window.QWebChannel)return;
   const go=tr=>new window.QWebChannel(tr,ch=>{attach(ch.objects.engine);});
   if(window.qt&&window.qt.webChannelTransport)go(window.qt.webChannelTransport);

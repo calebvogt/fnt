@@ -76,6 +76,13 @@ def study_base(args) -> ExperimentConfig | None:
 
 
 def main(argv=None) -> int:
+    # a console in a legacy code page (Windows cp1252) cannot print every
+    # character a spec or brain description holds; show "?" instead of failing
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     p = argparse.ArgumentParser(
         prog="python -m fnt.abma",
         description="Run an ABMA in-silico experiment from the command line.")
