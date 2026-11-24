@@ -185,7 +185,45 @@ def main(argv=None) -> int:
                    help="When the two lives part (default 6 h into the run).")
     b.add_argument("--horizon-hours", type=float, default=6.0,
                    help="How long both lives are followed (default 6 h).")
+    s = p.add_argument_group(
+        "social structure",
+        "Hierarchy or territories: the same readouts for real and simulated "
+        "animals, from zone visits (see core/structure.py).")
+    s.add_argument("--structure", metavar="PATH",
+                   help="A visit table (CSV with animal, zone, start, stop in "
+                        "seconds; optionally day, sex, trial, ...) or a "
+                        "finished ABMA run folder. Writes one row of readouts "
+                        "per group and exits.")
+    s.add_argument("--structure-by", default="trial,sex", metavar="COLS",
+                   help="Grouping columns, comma-separated (default trial,sex).")
+    s.add_argument("--structure-days", metavar="A-B",
+                   help="Keep only these days, e.g. 1-5.")
+    s.add_argument("--structure-out", metavar="CSV",
+                   help="Where to write the table (default: next to the input).")
     args = p.parse_args(argv)
+
+    if args.structure:
+        import pandas as pd
+        from .core import structure as st
+        src = os.path.expanduser(args.structure)
+        if os.path.isdir(src):
+            visits = st.bouts_from_run(src)
+            out = args.structure_out or os.path.join(src, "data", "structure.csv")
+        else:
+            visits = pd.read_csv(src)
+            out = args.structure_out or os.path.splitext(src)[0] + "_structure.csv"
+        missing = [c for c in st.BOUT_COLS if c not in visits.columns]
+        if missing:
+            p.error(f"{src} lacks the column(s) {', '.join(missing)}")
+        days = None
+        if args.structure_days:
+            d0, _, d1 = args.structure_days.partition("-")
+            days = (int(d0), int(d1 or d0))
+        tab = st.structure_table(
+            visits, by=[c.strip() for c in args.structure_by.split(",") if c.strip()], days=days)
+        tab.to_csv(out, index=False)
+        print(f"{len(tab)} group(s) -> {out}")
+        return 0
 
     if args.list_brains:
         from .core.brain import Brain, list_brains

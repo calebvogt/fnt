@@ -155,3 +155,48 @@ A run folder holds `config.json` (the exact experiment), `provenance.json`
 (a hash of the config and the source class of every parameter: measured,
 literature, estimated or free), `data/` with the UWB-format tracks, condition
 and event tables per trial, and, if asked, an analysis summary.
+
+## Hierarchy or territories: the same readouts for real and simulated animals
+
+`fnt/abma/core/structure.py` measures the social structure of one sex from a
+table of **zone visits** (`animal`, `zone`, `start`, `stop` in seconds, and
+optionally `day`). An RFID antenna at a resource zone gives that table for
+real animals; `bouts_from_run(project_dir)` derives it from a finished ABMA
+trial. Both then go through the same functions.
+
+```python
+from fnt.abma.core import structure as st
+
+bouts = st.bouts_from_run("~/ABMA_Projects/my_run")     # or a real RFID visit table
+males = bouts[bouts.sex == "M"]
+st.structure_summary(males, animals=roster, zones=zone_list)
+```
+
+From the command line, on a visit table or on a finished run folder (one row
+of readouts per group, written next to the input unless `--structure-out` says
+otherwise):
+
+```bash
+python -m fnt.abma --structure visits.csv --structure-by arena,trial,sex --structure-days 1-5
+python -m fnt.abma --structure ~/ABMA_Projects/my_run
+```
+
+| Readout | Meaning |
+|---------|---------|
+| `owner_share` | Share of the time at each zone taken by that zone's top animal (1 = exclusive). |
+| `poles` | Effective number of animals that own zones: 1 = one animal owns every zone, Z = each of Z zones has a different owner. |
+| `landless` | Share of animals that own no zone. |
+| `owner_stays` | How often a zone has the same owner the next day. |
+| `shared` | Share of the occupied time with two or more animals present. |
+| `access_gini` | How unequal the animals' time at the zones is. |
+| `landau_h`, `ttri`, `dci` | How linear, transitive and one-sided the displacement matrix is. |
+| `resident_win`, `owner_win` | How often the animal that was there first, or yesterday's owner, stays. |
+| `rank_transfer` | How often an animal's record at the other zones predicts who stays at this one. |
+
+A **displacement** is read from the visits, not scored from a fight: one
+animal is alone at a zone, a second joins it, then one of the two is alone
+again; the one that stays is the winner (the sequence used for the field mice
+in Vogt et al. 2024). With RFID visits this mostly records animals passing
+through, so treat the displacement readouts as weak evidence of dominance and
+prefer scored fights where they exist. Ownership is decided per day, and
+`owner_win` uses the previous day's owner.

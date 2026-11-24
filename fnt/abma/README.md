@@ -53,6 +53,8 @@ fnt/fnt/abma/
     physiology.py           energy/water budget in real units
     compose.py              describe a run in one line -> ExperimentConfig
     analysis.py             built-in socio-spatial + dominance analysis
+    structure.py            hierarchy or territories: readouts from zone visits,
+                            the same for real RFID data and simulated runs
     recorder.py             streaming writers for the canonical CSV schema
     record.py               replayable per-frame archive (drives + sensing)
     provenance.py           config hash + where every number came from
