@@ -32,7 +32,13 @@ an enclosure.
     how long does that take? Smell leads straight to a doorway; without it the
     animal has only its whiskers and the walls.
 
-All work on any policy, so the same assay can be run on the rule-based animal
+``chase``
+    Not a test of a brain at all, but of the body it lives in (contest
+    physics): a scripted chaser and a scripted fleer, identical bodies, in
+    arenas of different sizes, with and without a hut. It asks what the
+    physics lets space and cover do, with behaviour held fixed.
+
+The first four work on any policy, so the same assay can be run on the rule-based animal
 for comparison. That comparison is informative in itself: the rule-based
 forager is told where the food is and steers for it, so anosmia does not touch
 its foraging at all. A learned brain has to smell its way there.
@@ -42,10 +48,11 @@ from __future__ import annotations
 import numpy as np
 
 from .compose import cohort
-from .config import (ArenaConfig, ExperimentConfig, ResourceObject,
-                     ResourceZone, ScentParams)
+from .config import (ArenaConfig, ContestParams, ExperimentConfig, Hut,
+                     ResourceObject, ResourceZone, ScentParams)
 from .physiology import preset_params
 from .simulation import Simulation
+from .species import build_group, by_name
 
 
 def _world(seed: int, side: float, min_dist: float, species: str,
@@ -449,6 +456,113 @@ def format_battery(results: dict) -> str:
 
 #: the bench assays ``bench`` knows, in the order it runs them
 BENCH = ("approach", "choice", "search", "doorway")
+
+
+# --------------------------------------------------------------------------- #
+# A check of the body, not of a brain: can a chased animal get away?
+# --------------------------------------------------------------------------- #
+class _ChaseAndFlee:
+    """Animal 0 runs at animal 1 and bites; animal 1 runs for the reachable
+    spot farthest from animal 0, or for the hut when there is one. Scripted on
+    purpose: the question is what the contest physics allows, with behaviour
+    held fixed."""
+
+    def __init__(self, side: float, hut=None):
+        self.side, self.hut, self.memory = side, hut, None
+        a = np.linspace(0.0, 2.0 * np.pi, 48, endpoint=False)
+        self.cand = np.stack([np.cos(a), np.sin(a)], axis=1)
+
+    def decide(self, sim, elapsed_s: float, dt: float):
+        from .senses import PlaceMemory, SenseParams, sense
+        if self.memory is None:
+            self.memory = PlaceMemory(sim.n)
+        _, perc = sense(sim, elapsed_s, self.memory, SenseParams())
+        P = sim.P
+        to = P[1] - P[0]
+        chase = to / (np.linalg.norm(to) + 1e-9)
+        if self.hut is not None:
+            th = np.asarray(self.hut) - P[1]
+            dh = np.linalg.norm(th)
+            flee = th / (dh + 1e-9)
+            fspeed = 1.0 if dh > 0.02 else 0.0
+        else:
+            ahead = np.clip(P[1] + self.cand * 0.4, 0.02, self.side - 0.02)
+            flee = self.cand[np.argmax(np.linalg.norm(ahead - P[0], axis=1))]
+            fspeed = 1.0
+        perc.update(speed_frac=np.array([1.0, fspeed]),
+                    resting=np.array([False, fspeed < 0.12]), drives={},
+                    want_chew=np.zeros(2, bool), bite=np.array([True, False]))
+        return np.stack([chase, flee]), perc
+
+
+class _BiteCount:
+    def __init__(self):
+        self.n = 0
+
+    def record(self, t, kind, *a, **k):
+        self.n += int(kind == "bite")
+
+
+def chase(side: float, hut: bool = False, minutes: float = 5.0, seed: int = 0,
+          species: str = "House mouse", dt: float = 0.25,
+          contest: ContestParams | None = None) -> dict:
+    """One scripted chase in a square arena: bites landed and the fled
+    animal's health. Two identical bodies; the chaser starts 40 cm away."""
+    sp = by_name(species)
+    huts = [Hut(kind="dome", x=side * 0.8, y=side * 0.8, w=0.127)] if hut else []
+    cfg = ExperimentConfig(
+        name="chase", arena=ArenaConfig(width=side, height=side, huts=huts),
+        groups=[build_group(sp, "m", sex="M", count=2)], days=1.0, dt=dt,
+        n_trials=1, seed=int(seed))
+    cfg.contest = contest or ContestParams()
+    cfg.contest.enabled = True
+    sim = Simulation(cfg, policy=_ChaseAndFlee(
+        side, (side * 0.8, side * 0.8) if hut else None))
+    sim.mass[:] = sim.mass.mean()
+    sim.speed[:] = sim.speed.mean()
+    rng = np.random.default_rng(seed)
+    c = np.array([side / 2.0, side / 2.0])
+    a = rng.uniform(0.0, 2.0 * np.pi)
+    sim.P[1] = c
+    sim.P[0] = np.clip(c + 0.4 * np.array([np.cos(a), np.sin(a)]),
+                       0.05, side - 0.05)
+    ev = _BiteCount()
+    for k in range(int(minutes * 60.0 / dt)):
+        sim.step(k * dt, dt, events=ev)
+    return {"side_m": side, "hut": bool(hut), "bites_per_min": ev.n / minutes,
+            "health": float(sim.health[1])}
+
+
+def chase_battery(sides=(0.6, 1.2, 2.4, 5.0, 10.0, 20.0, 38.0), starts: int = 3,
+                  minutes: float = 5.0, species: str = "House mouse",
+                  seed: int = 0, **kw) -> list:
+    """The chase across arena sizes, on an open floor and with one hut to
+    reach. One row per size and condition, averaged over ``starts``."""
+    rows = []
+    for hut in (False, True):
+        for side in sides:
+            runs = [chase(side, hut, minutes, seed + s, species, **kw)
+                    for s in range(starts)]
+            b = [r["bites_per_min"] for r in runs]
+            rows.append({"side_m": side, "hut": hut, "starts": starts,
+                         "minutes": minutes,
+                         "bites_per_min": float(np.mean(b)),
+                         "bites_min": float(np.min(b)),
+                         "bites_max": float(np.max(b)),
+                         "health": float(np.mean([r["health"] for r in runs]))})
+    return rows
+
+
+def format_chase(rows: list) -> str:
+    out = ["  arena side     open floor                  one hut to reach",
+           "                 bites/min   health after    bites/min   health after"]
+    by = {(r["side_m"], r["hut"]): r for r in rows}
+    for side in sorted({r["side_m"] for r in rows}):
+        o, h = by[(side, False)], by[(side, True)]
+        out.append(f"  {side:6.1f} m      {o['bites_per_min']:7.2f}      "
+                   f"{o['health']:6.1f}        {h['bites_per_min']:7.2f}      "
+                   f"{h['health']:6.1f}")
+    return "\n".join(out)
 
 
 def policy_factory(brain_name: str | None, stochastic: bool = True):

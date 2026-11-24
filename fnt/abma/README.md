@@ -1074,6 +1074,16 @@ bite output and never bite. The rule-based animal does not bite either, so
 with contest physics on it does not fight at all; it is a foraging baseline
 there, nothing more.
 
+`python -m fnt.abma --assay chase` checks the body itself, with behaviour
+held fixed: a scripted chaser and a scripted fleer with identical bodies, in
+square arenas from 0.6 to 38 m, on an open floor and with one hut to reach
+(`--structure-out table.csv` writes the table). Measured with the default
+values: on an open floor the fleer takes about 29 bites a minute at 0.6 m, 2.6
+at 1.2 m, almost none at 2.4 m and none beyond; with a hut it takes under one a
+minute at every size. So for equal bodies a chase by itself stops mattering at
+a couple of metres, and one refuge nearly removes its cost. Whatever makes a
+small arena different has to come from what an animal must come back for.
+
 Known limits. A bite is resolved along the paths of the step, so a coarse
 step does not let animals run through each other, but a brain still decides
 only once per tick (2 s by default), which is slow for a fight. How far an animal notices another is still

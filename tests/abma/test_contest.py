@@ -333,3 +333,15 @@ def test_an_older_brain_resumes_into_contest_worlds_unchanged(tmp_path):
     m_new, _, _ = new.forward(obs, h)
     assert m_new[:, :2] == pytest.approx(m_old, abs=1e-5)
     assert (m_new[:, 2] < 0).all()                    # and it starts out not biting
+
+
+def test_chase_check_space_and_cover_decide_whether_the_fleer_is_hurt():
+    from fnt.abma.core import assays
+    tight = assays.chase(0.6, minutes=1.0)
+    roomy = assays.chase(5.0, minutes=1.0)
+    hut = assays.chase(0.6, hut=True, minutes=1.0)
+    assert tight["bites_per_min"] > 5.0 and tight["health"] < 100.0
+    assert roomy["bites_per_min"] == 0.0 and roomy["health"] == 100.0
+    assert hut["bites_per_min"] < tight["bites_per_min"] / 5.0
+    text = assays.format_chase(assays.chase_battery(sides=(0.6, 5.0), starts=1, minutes=0.5))
+    assert "open floor" in text and "0.6 m" in text

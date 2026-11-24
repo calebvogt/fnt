@@ -174,7 +174,9 @@ def main(argv=None) -> int:
                         "anosmic), 'choice' (food or water, hungry vs "
                         "thirsty), 'search' (area-restricted search after "
                         "food is lost), 'doorway' (chow in a walled box: "
-                        "with and without a nose), or 'all'. Needs no config; add "
+                        "with and without a nose), or 'all'. 'chase' checks the "
+                        "contest physics instead: a scripted chaser and "
+                        "fleer across arena sizes. Needs no config; add "
                         "--brain to test a learned brain, omit it to test the "
                         "rule-based animal. 'vitals' runs your config for "
                         "--days and reports whether the cohort feeds and "
@@ -240,6 +242,24 @@ def main(argv=None) -> int:
                   + "; speed: "
                   + ", ".join(f"{u} ({'faster' if w > 0 else 'slower'})"
                               for u, w in cu["speed"]))
+        return 0
+
+    if args.assay == "chase":
+        # a check of the body, not of a brain: scripted chaser and fleer
+        from .core import assays
+        starts = 3 if args.assay_trials == 40 else max(1, args.assay_trials)
+        species = ("House mouse" if args.species == "Prairie vole"
+                   else args.species)
+        rows = assays.chase_battery(starts=starts, species=species,
+                                    seed=args.seed or 0)
+        print(f"CAN A CHASED ANIMAL GET AWAY?  ({species}; a scripted chaser "
+              f"and a scripted fleer with identical bodies, "
+              f"{rows[0]['minutes']:g} min, mean of {starts} starts)")
+        print(assays.format_chase(rows))
+        if args.structure_out:
+            import pandas as pd
+            pd.DataFrame(rows).to_csv(args.structure_out, index=False)
+            print(f"table -> {args.structure_out}")
         return 0
 
     if args.assay and args.assay != "vitals":
