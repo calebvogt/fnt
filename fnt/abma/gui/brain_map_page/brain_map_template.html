@@ -594,12 +594,18 @@ function hitUnit(sx,sy){if(mode==='sankey')return -1;const x=(sx-view.tx)/view.k
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function pips(d){return '●'.repeat(d)+'○'.repeat(3-d);}
 function paperLink(text){const t=String(text).trim();return /^\d{6,9}$/.test(t)?'<a href="https://pubmed.ncbi.nlm.nih.gov/'+t+'/" target="_blank" rel="noopener">PubMed '+t+'</a>':esc(t);}
+/* a projection still needs a person until a paper or the reader's own note stands behind it;
+   the atlas can say a projection exists and how strong it is, never its sign */
+function needs(p){return !p.ev.some(key=>EV[key]&&EV[key].kind==='paper')&&!(VER[p.key]||[]).length;}
 function evLine(p){
-  const tags=p.ev.map(key=>{const e=EV[key];if(!e)return '';return e.kind==='paper'?'<a class="ev" href="https://pubmed.ncbi.nlm.nih.gov/'+esc(e.pmid)+'/" target="_blank" rel="noopener">'+esc(e.cite)+'</a>':'<span class="ev idea">idea</span>';}).filter(Boolean);
+  const tags=p.ev.map(key=>{const e=EV[key];if(!e)return '';
+    if(e.kind==='paper')return '<a class="ev" href="https://pubmed.ncbi.nlm.nih.gov/'+esc(e.pmid)+'/" target="_blank" rel="noopener">'+esc(e.cite)+'</a>';
+    if(e.kind==='atlas')return '<span class="ev" title="'+esc(e.finding)+'">'+esc(e.cite)+'</span>';
+    return '<span class="ev idea">idea</span>';}).filter(Boolean);
   const mine=VER[p.key]||[];
   if(mine.length)tags.push('<span class="ev ok">verified by you ('+mine.length+')</span>');
-  const need=!p.ev.some(key=>EV[key]&&EV[key].kind==='paper')&&!mine.length;
-  return (need?'<span class="ev none">needs verification</span>':'')+tags.join(' ')+' <button class="mini" data-v="'+p.i+'">'+(need?'Verify':'Add')+'</button>';
+  const need=needs(p),seen=p.ev.indexOf('allen_conn')>=0;
+  return (need?'<span class="ev none">'+(seen?'sign needs verification':'needs verification')+'</span>':'')+tags.join(' ')+' <button class="mini" data-v="'+p.i+'">'+(need?'Verify':'Add')+'</button>';
 }
 function connRows(list,other,total){return list.map(p=>{const o=p[other],g=gainOf(p);
   let h='<div class="conn"><button class="link" data-r="'+o+'" title="'+esc(R[o].name)+'"><span class="sq" style="background:var('+signVar(p.sign)+')"></span>'+esc(R[o].id)+'</button>'+
@@ -624,25 +630,26 @@ function panel(){
     if(insp>=0&&regOf[insp]===sel)h+=inspect(insp);
     h+='<div class="list"><span class="rowlab">Receives from · share of input · strength</span>'+(ins.length?connRows(ins,'a',inTot(sel)):'<p class="note">Nothing in the brain: this is where the body and the world come in.</p>')+'</div>';
     h+='<div class="list"><span class="rowlab">Sends to · share of output · strength</span>'+(outs.length?connRows(outs,'b',outTot(sel)):'<p class="note">'+(g.class==='output'?'The body.':'No wired projection: it acts through the signal it releases.')+'</p>')+'</div>';
-    if(g.class!=='sense'&&g.class!=='output')h+='<div class="list"><span class="rowlab">Receptors here (draft)</span><div class="lev">'+MODS.map(m=>{const l=recOf(m,g.id),k=m.id+'@'+g.id;
+    if(g.class!=='sense'&&g.class!=='output')h+='<div class="list"><span class="rowlab">Receptors here</span><div class="lev">'+MODS.map(m=>{const l=recOf(m,g.id),k=m.id+'@'+g.id;
       return '<span>'+esc(m.name)+'</span><span class="step"><button data-rec="'+esc(k)+',-1" aria-label="Fewer '+esc(m.name)+' receptors">−</button><span class="pips'+((k in ED.rec)?' ed':'')+'">'+pips(l)+'</span><button data-rec="'+esc(k)+',1" aria-label="More '+esc(m.name)+' receptors">+</button></span>';}).join('')+'</div></div>';
     const src=MODS.filter(m=>m.source===g.id);
     if(src.length)h+='<p class="note">Releases '+esc(src.map(m=>m.name.toLowerCase()).join(', '))+'.</p>';
     const keys=[];(g.evidence||[]).concat.apply(g.evidence||[],ins.concat(outs).map(p=>p.ev)).forEach(x=>{if(keys.indexOf(x)<0)keys.push(x);});
     let cites=keys.map(key=>{const e=EV[key];if(!e)return '';
+      if(e.kind==='atlas')return '<p><a href="'+esc(e.url)+'" target="_blank" rel="noopener">'+esc(e.cite)+'</a>. '+esc(e.finding)+'</p>';
       return e.kind==='paper'?'<p><a href="https://pubmed.ncbi.nlm.nih.gov/'+esc(e.pmid)+'/" target="_blank" rel="noopener">'+esc(e.cite)+', '+esc(e.journal)+'</a>. '+esc(e.finding)+'</p>':'<p><span class="ev idea">Idea, '+esc(e.by)+', '+esc(e.date)+'.</span> '+esc(e.finding)+'</p>';}).join('');
     ins.concat(outs).forEach(p=>{(VER[p.key]||[]).forEach((e,xi)=>{cites+='<p><span class="ev ok">'+esc(R[p.a].id)+' to '+esc(R[p.b].id)+', verified '+esc(e.at)+' ('+(e.kind==='paper'?'paper':'note')+').</span> '+(e.kind==='paper'?paperLink(e.text):esc(e.text))+' <button class="mini" data-vdel="'+p.i+','+xi+'">Remove</button></p>';});});
     if(cites)h+='<div class="list"><span class="rowlab">Evidence</span><div class="cites">'+cites+'</div></div>';
   }else if(mod){const m=MOD[mod],rows=R.filter(g=>recOf(m,g.id)).sort((a,b)=>recOf(m,b.id)-recOf(m,a.id));
     h+='<span class="kind"><span class="dot" style="background:var(--mod)"></span>Receptor map</span><h2>'+esc(m.name)+'</h2><p class="note">Source: '+esc(m.source_note)+'</p>';
     h+='<div class="lev">'+rows.map(g=>'<button class="link" data-r="'+g.i+'" title="'+esc(g.name)+'">'+esc(g.id)+'</button><span class="pips">'+pips(recOf(m,g.id))+'</span>').join('')+'</div>';
-    h+='<p class="note">Levels are a first guess, to be replaced from receptor maps. Click an area to raise or lower a level. This table is where strains and species are meant to differ.</p>';
+    h+='<p class="note">'+esc(m.basis||'Levels are a first guess, to be replaced from receptor maps.')+'</p><p class="note">Click an area to raise or lower a level. This table is where strains and species are meant to differ.</p>';
   }else{
-    const nPaper=P.filter(p=>p.ev.some(k=>EV[k]&&EV[k].kind==='paper')).length,nMine=P.filter(p=>(VER[p.key]||[]).length).length,nNeed=P.filter(p=>!p.ev.some(k=>EV[k]&&EV[k].kind==='paper')&&!(VER[p.key]||[]).length).length;
+    const nPaper=P.filter(p=>p.ev.some(k=>EV[k]&&EV[k].kind==='paper')).length,nMine=P.filter(p=>(VER[p.key]||[]).length).length,nNeed=P.filter(needs).length,nAtlas=P.filter(p=>p.ev.indexOf('allen_conn')>=0).length;
     const nEd=Object.keys(ED.proj).length+Object.keys(ED.rec).length;
     h+='<h2>'+R.length+' areas, '+N+' model neurons</h2><p class="note">'+P.length+' projections between areas: '+SK.fwd.length+' run forwards through the stages and '+SK.loop.length+' run within a stage or backwards (dashed arcs in the ribbon view).</p>';
     h+='<div class="list"><span class="rowlab">How a projection ends</span><div class="lev"><span><span class="sq" style="background:var(--exc)"></span> Arrow: excites</span><span></span><span><span class="sq" style="background:var(--inh)"></span> Bar: inhibits</span><span></span><span><span class="sq" style="background:var(--mix)"></span> Dot: mixed cell types</span><span></span></div></div>';
-    h+='<p class="note">'+nPaper+' projections are tied to a paper, '+nMine+' are verified by you, and '+nNeed+' need verification.</p>';
+    h+='<p class="note">'+nAtlas+' projections are in the Allen atlas, which gives their strength but not their sign. '+nPaper+' are tied to a paper, '+nMine+' are verified by you, and '+nNeed+' still need a person to check them.</p>';
     h+='<p class="note">'+(nEd?nEd+' of your changes to strengths and receptor levels are in force. <button class="mini" data-resetedits="1">Undo them all</button>':'Strengths and receptor levels are as drafted. Click an area to change one.')+'</p>';
     h+='<p class="note">Left out on purpose: '+esc(SPEC.left_out.charAt(0).toLowerCase()+SPEC.left_out.slice(1))+'</p>';
   }

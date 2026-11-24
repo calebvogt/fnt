@@ -1097,7 +1097,10 @@ enough to be worth excluding a rival from except a receptive female.
 two anonymous layers: one block of units per brain area, connected only where
 the spec lists a projection, with the sign the spec gives it. The first spec is
 `fnt/abma/brains/anatomy/c57_male.json`, a reduced male C57BL/6J house mouse
-(44 areas, 311 units, 114 projections, 7 neuromodulators). A spec is plain
+(44 areas, 311 units, 126 projections, 7 neuromodulators). Its projection
+strengths and most receptor levels are seeded from the Allen mouse atlases;
+every sign, and the oxytocin and vasopressin levels, are still a first guess.
+A spec is plain
 JSON:
 
 - `regions`: each area's id, name, class (sense organ, sensory area, internal
@@ -1107,9 +1110,10 @@ JSON:
 - `modulators`: where each neuromodulator is released and a receptor level
   0-3 per area. This table is where strains and species are meant to differ.
 - `entry`: which engine sensor channels enter at which sense organ or area.
-- `evidence`: what each projection or area rests on, either a paper (with its
-  PubMed id) or an idea (with its author and date). A projection with no
-  evidence is one that still needs verifying.
+- `evidence`: what each projection or area rests on: a paper (with its PubMed
+  id), an atlas (which can say a projection exists and how strong it is, never
+  its sign) or an idea (with its author and date). A projection with no paper
+  behind it still needs a person to check it.
 
 **It is untrained.** The weights are random draws inside the wiring
 (`--anatomy-seed` picks the draw), so the behaviour means nothing yet: a given
