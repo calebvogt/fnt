@@ -237,7 +237,7 @@ class AnatomicalBrain:
     """
 
     def __init__(self, spec: dict, seed: int = 0, tick_s: float = 0.25,
-                 tau_s: float = 0.6, g_proj: float = 1.6, g_local: float = 0.5,
+                 tau_s: float = 0.6, g_proj: float = 2.6, g_local: float = 0.5,
                  bias: float = 0.25, noise: float = 0.15, k_inh: float = 3.0,
                  mod_gain: float = 0.5, max_turn_rad_s: float = 2.5,
                  strengths: dict | None = None, receptors: dict | None = None,
@@ -282,11 +282,18 @@ class AnatomicalBrain:
             np.fill_diagonal(w, 0.0)
             W[s, s] = w
             local[s, s] = ~np.eye(r["n"], dtype=bool)
+        # An area's inputs share one budget: a projection's weight is its strength as a
+        # share of all the strengths arriving at its target. Listing another input to an
+        # area therefore redistributes that area's drive instead of adding to it, so a
+        # spec with many projections does not saturate where one with few does not.
+        budget = {}
+        for a, b, sign, strength, *_ in spec["projections"]:
+            budget[b] = budget.get(b, 0.0) + strength
         for a, b, sign, strength, *_ in spec["projections"]:
             sa, sb = self.sl[a], self.sl[b]
             na, nb = sa.stop - sa.start, sb.stop - sb.start
             w = np.abs(rng.standard_normal((nb, na))) * (rng.random((nb, na)) < 0.6)
-            w *= g_proj * strength / 3.0 / np.sqrt(0.6 * na)
+            w *= g_proj * strength / budget[b] / np.sqrt(0.6 * na)
             sgn = np.ones(na)
             if sign == "-":
                 sgn = -sgn

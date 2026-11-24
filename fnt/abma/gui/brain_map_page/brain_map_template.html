@@ -276,7 +276,7 @@ function buildSK(){
 let SK=buildSK();
 
 /* ---- the network: same construction as anatomical_brain.py ---- */
-const DT=0.25,ALPHA=DT/0.6,G_PROJ=1.6,G_LOC=0.5,BIAS=0.25,NOISE=0.15,K_INH=3,MOD_GAIN=0.5,MAX_TURN=2.5,TOP=0.2,LOCI=12;
+const DT=0.25,ALPHA=DT/0.6,G_PROJ=2.6,G_LOC=0.5,BIAS=0.25,NOISE=0.15,K_INH=3,MOD_GAIN=0.5,MAX_TURN=2.5,TOP=0.2,LOCI=12;
 let AW=0.5,AH=0.5,others=[];
 const C57=[1,1,0,1,0,1,1,0,1,0,0,1];
 const Wloc=new Float32Array(N*N),W=new Float32Array(N*N),biasv=new Float32Array(N),regOf=new Int16Array(N);
@@ -291,9 +291,10 @@ const signed=n=>/(_fwd|_lat)$/.test(n)||['last_turn','clock_sin','clock_cos','ot
 function wire(seed){
   const wr=rng(seed);wiring=seed;Wloc.fill(0);Win.fill(0);
   R.forEach(g=>{for(let i=0;i<g.n;i++)for(let j=0;j<g.n;j++)if(i!==j)Wloc[(g.off+i)*N+g.off+j]=gauss(wr)*G_LOC/Math.sqrt(g.n);});
+  const budget={};P.forEach(p=>{budget[p.b]=(budget[p.b]||0)+p.w;});
   Wblk=P.map(p=>{const A=R[p.a],B=R[p.b],blk=new Float32Array(A.n*B.n),src=new Float32Array(A.n);
     for(let j=0;j<A.n;j++)src[j]=p.sign==='+'?1:(p.sign==='-'?-1:(wr()<0.5?1:-1));
-    for(let i=0;i<B.n;i++)for(let j=0;j<A.n;j++)if(wr()<0.6)blk[i*A.n+j]=Math.abs(gauss(wr))*G_PROJ*p.w/3/Math.sqrt(0.6*A.n)*src[j];
+    for(let i=0;i<B.n;i++)for(let j=0;j<A.n;j++)if(wr()<0.6)blk[i*A.n+j]=Math.abs(gauss(wr))*G_PROJ*p.w/budget[p.b]/Math.sqrt(0.6*A.n)*src[j];
     return blk;});
   Object.keys(SPEC.entry).forEach(org=>{const g=byId[org],ch=[];CH.forEach((c,ci)=>{if(c[1]===org)ch.push(ci);});
     for(let j=0;j<g.n;j++)ch.forEach((ci,c)=>{let w=((c%g.n)===j?1.6:0.15)*Math.abs(gauss(wr));if(signed(CH[ci][0])&&wr()<0.5)w=-w;Win[(g.off+j)*S+ci]=w;});});
