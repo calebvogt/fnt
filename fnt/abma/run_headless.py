@@ -191,9 +191,16 @@ def main(argv=None) -> int:
                         "--anatomy c57_male unless another is given.")
     b.add_argument("--brain-recording", type=float, metavar="MINUTES",
                    help="With --anatomy: run one trial for this many minutes "
-                        "and keep every unit's activity at every step, "
+                        "and keep every unit's activity at every step (the "
+                        "engine is stepped at the network's own 0.25 s), "
                         "written to <out>/<name>/brain_recording.npz with a "
-                        "table of mean firing per area (brain_areas.csv).")
+                        "table of mean firing per area (brain_areas.csv) and "
+                        "brain_recording.html, the brain map playing the run "
+                        "back: one file, viewable on any computer.")
+    b.add_argument("--brain-replay", metavar="NPZ",
+                   help="Play a brain_recording.npz back on the brain map (in "
+                        "an FNT window if Qt's web engine is installed, else "
+                        "in your browser), and exit.")
     b.add_argument("--twin", action="append", metavar="TWEAK",
                    help="Live one life twice: run to --fork-hours, copy the "
                         "world, apply TWEAK to the copy, and compare. E.g. "
@@ -257,6 +264,13 @@ def main(argv=None) -> int:
             visits, by=[c.strip() for c in args.structure_by.split(",") if c.strip()], days=days)
         tab.to_csv(out, index=False)
         print(f"{len(tab)} group(s) -> {out}")
+        return 0
+
+    if args.brain_replay:
+        from .gui.brain_map import open_replay
+        if not os.path.isfile(args.brain_replay):
+            p.error(f"no such recording: {args.brain_replay}")
+        print("brain map ->", open_replay(args.brain_replay, where=args.brain_map or "auto"))
         return 0
 
     if args.list_anatomies:
@@ -442,7 +456,10 @@ def main(argv=None) -> int:
     if args.brain_recording:
         import csv
 
+        from .core import brainmap
+
         out_dir = os.path.join(args.out, cfg.name)
+        cfg.dt = min(float(cfg.dt), 0.25)          # every network tick is kept
         rec = anatomy.record(cfg, args.brain_recording * 60.0)
         path = anatomy.save_recording(rec, os.path.join(out_dir, "brain_recording.npz"))
         rows = anatomy.area_table(rec, spec)
@@ -464,6 +481,12 @@ def main(argv=None) -> int:
                   + ", ".join(rec["meta"]["unwired"]))
         print("wrote", path)
         print("wrote", table)
+        if rec["rates"].nbytes / max(1, rec["rates"].shape[1]) < 40e6:
+            _, payload = brainmap.replay_payload(rec)
+            print("wrote", brainmap.write_page(os.path.join(out_dir, "brain_recording.html"),
+                                               spec, replay=payload))
+        else:
+            print("too long to pack into one page; open it with --brain-replay instead")
         return 0
 
     if args.movie:

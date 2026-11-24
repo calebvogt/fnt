@@ -34,6 +34,8 @@ from PyQt5.QtWidgets import QApplication, QLabel, QMainWindow
 
 from ..core import anatomy, brainmap
 
+_VNO = __import__("fnt.abma.core.senses", fromlist=["SENSORS"]).SENSORS.index("vno_contact")
+
 #: the network's own tick; the engine is stepped at this grain so the page
 #: sees every tick
 STEP_S = 0.25
@@ -86,6 +88,7 @@ class Engine(QObject):
         self.cfg = copy.deepcopy(cfg)
         self.cfg.dt, self.cfg.days, self.cfg.n_trials = STEP_S, max(float(cfg.days), 1.0), 1
         self.cfg.brain.enabled = True
+        self.cfg.scent.enabled = True              # urine has to land somewhere
         self.name = self.cfg.brain.anatomy
         self.spec = anatomy.load_spec(self.name)
         self.save = bool(save)
@@ -126,6 +129,10 @@ class Engine(QObject):
             "x": float(sim.P[0, 0]), "y": float(sim.P[0, 1]), "h": float(sim.H[0]),
             "t": self.k * STEP_S, "dt": STEP_S, "turn": float(pol.turn[0]),
             "bladder": float(sim.bladder[0]) / 100.0,
+            "contact": float(pol.last_obs[0, _VNO]),
+            "voids": [[x, y, v] for a, x, y, v in sim.last_voids if a == 0],
+            "others": [[float(sim.P[j, 0]), float(sim.P[j, 1]), float(sim.H[j])]
+                       for j in range(1, min(sim.n, 17)) if sim.alive[j]],
             "rates": base64.b64encode(rates.tobytes()).decode("ascii")}))
         self.sent += 1
 
@@ -134,6 +141,8 @@ class Engine(QObject):
     def hello(self) -> str:
         return json.dumps({"seed": int(self.cfg.brain.anatomy_seed), "units": self.sim.policy.brain.n,
                            "arena": [self.cfg.arena.width, self.cfg.arena.height],
+                           "title": brainmap.arena_title(self.cfg.name, self.cfg.arena.width,
+                                                         self.cfg.arena.height),
                            "notes": brainmap.load_notes(self.name) if self.save else None})
 
     @pyqtSlot(result=str)
@@ -213,6 +222,40 @@ def _temp_page(html: str) -> str:
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(html)
     return path
+
+
+def open_replay(path: str, where: str = "auto", exec_: bool = True, open_browser: bool = True,
+                animal: int = 0):
+    """Play a recording (``brain_recording.npz``) back on the brain map.
+
+    The page plays it by itself, so the browser form needs no engine and
+    returns at once; the window form shows it inside FNT. Returns the page's
+    path (browser) or ``(window, page_path)`` with ``exec_=False``.
+    """
+    rec = anatomy.load_recording(path)
+    spec, payload = brainmap.replay_payload(rec, animal=animal)
+    page = _temp_page(brainmap.build_page(spec, replay=payload))
+    inside = webengine_available() if where == "auto" else where == "window"
+    if not inside:
+        if open_browser:
+            import webbrowser
+            webbrowser.open(QUrl.fromLocalFile(page).toString())
+        return page
+    if not webengine_available():
+        raise RuntimeError("showing the map inside FNT needs Qt's web engine: pip install PyQtWebEngine")
+    from PyQt5.QtWebEngineWidgets import QWebEngineView
+
+    app = _app()
+    win, view = QMainWindow(), QWebEngineView()
+    view.load(QUrl.fromLocalFile(page))
+    win.setCentralWidget(view)
+    win.setWindowTitle(f"ABMA brain map \u2014 recording \u2014 {os.path.basename(os.path.dirname(os.path.abspath(path)))}")
+    win.resize(1500, 1000)
+    win.show()
+    if not exec_:
+        return win, page
+    app.exec_()
+    return page
 
 
 def open_brain_map(cfg, where: str = "auto", exec_: bool = True, open_browser: bool = True):

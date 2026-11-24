@@ -194,11 +194,20 @@ python -m fnt.abma --anatomy c57_male --watch
 | `--receptor MOD@AREA=N` | Set one area's receptor level for a neuromodulator, 0 to 3. Repeatable. |
 | `--brain-recording MINUTES` | Run one trial and keep every model neuron at every step. |
 | `--brain-map [window\|browser]` | Open the brain map (below). |
+| `--brain-replay FILE.npz` | Play a brain recording back on the brain map. |
 
-A brain recording writes two files into the run folder: `brain_recording.npz`
-(position, heading, the commands to the muscles, and every model neuron's
-firing rate as a fraction of its maximum) and `brain_areas.csv` (mean, spread
-and peak firing of each area, in percent of maximum).
+A brain recording writes three files into the run folder:
+`brain_recording.npz` (position, heading, the commands to the muscles, bladder,
+urine spots, and every model neuron's firing rate as a fraction of its
+maximum), `brain_areas.csv` (mean, spread and peak firing of each area, in
+percent of maximum) and `brain_recording.html`, the brain map playing that run
+back. The HTML is a single file: copy it to another computer and open it in a
+browser.
+
+With scent marking on, this brain urinates by muscle (bladder wall against
+urethral sphincter) and reads urine with its vomeronasal organ: only when its
+nose is on a spot, and then the spot's MUP barcode. Give a group the genotype
+`MUP: INBRED` to make every animal's barcode the same, as in an inbred strain.
 
 ### The brain map
 
@@ -215,6 +224,8 @@ and model neuron, lit by its firing while one animal walks an open field.
 - **Verify:** a projection with no paper behind it says "needs verification";
   the button takes a paper or a note.
 - **New random wiring** draws the weights again.
+
+The 🧠 button in the ABMA window opens the map on the design you are building.
 
 The map opens inside FNT if Qt's web engine is installed
 (`pip install PyQtWebEngine`), and in your browser if it is not. Either way the

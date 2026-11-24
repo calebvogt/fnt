@@ -173,11 +173,12 @@ details summary{cursor:pointer;font-family:var(--f-display);font-weight:600;font
     </div>
     <div class="col">
       <div class="card">
-        <div class="cardhead"><h3>Open field, 50 &times; 50 cm</h3><span class="tag" id="drawtag">Sandbox, untrained, draw 5</span></div>
+        <div class="cardhead"><h3 id="arenatitle">Open field, 50 &times; 50 cm</h3><span class="tag" id="drawtag">Sandbox, untrained, draw 5</span></div>
         <div class="seg" role="group" aria-label="View of the box" id="viewseg" hidden><button id="v-close" aria-pressed="true">3D close-up</button><button id="v-3d" aria-pressed="false">3D box</button><button id="v-top" aria-pressed="false">Top view</button></div>
         <canvas id="box3" role="img" aria-label="A black mouse with jointed legs, spine and tail walking in an open field box" hidden></canvas>
         <canvas id="box" role="img" aria-label="One virtual mouse in an open field box, with its path and urine marks"></canvas>
         <div class="transport"><button class="btn" id="play">Play</button><button class="btn" id="restart">Restart</button><button class="btn" id="rewire">New random wiring</button>
+          <input type="range" id="scrub" min="0" max="1" value="0" step="1" aria-label="Position in the recording" hidden style="flex:1 1 100%;min-width:0">
           <div class="seg" role="group" aria-label="Speed"><button id="sp-1" aria-pressed="false">1&times;</button><button id="sp-4" aria-pressed="true">4&times;</button><button id="sp-12" aria-pressed="false">12&times;</button></div>
           <span class="clock" id="clock">0:00</span></div>
         <p class="body" id="bodyline"></p>
@@ -275,7 +276,8 @@ function buildSK(){
 let SK=buildSK();
 
 /* ---- the network: same construction as anatomical_brain.py ---- */
-const DT=0.25,ALPHA=DT/0.6,G_PROJ=1.6,G_LOC=0.5,BIAS=0.25,NOISE=0.15,K_INH=3,MOD_GAIN=0.5,MAX_TURN=2.5,TOP=0.2,BOX=0.5,LOCI=12;
+const DT=0.25,ALPHA=DT/0.6,G_PROJ=1.6,G_LOC=0.5,BIAS=0.25,NOISE=0.15,K_INH=3,MOD_GAIN=0.5,MAX_TURN=2.5,TOP=0.2,LOCI=12;
+let AW=0.5,AH=0.5,others=[];
 const C57=[1,1,0,1,0,1,1,0,1,0,0,1];
 const Wloc=new Float32Array(N*N),W=new Float32Array(N*N),biasv=new Float32Array(N),regOf=new Int16Array(N);
 R.forEach(g=>{for(let i=0;i<g.n;i++){regOf[g.off+i]=g.i;biasv[g.off+i]=BIAS+(g.tonic||0);}});
@@ -283,7 +285,6 @@ let Wblk=[],wiring=5;
 function rebuildW(){if(EXT)return;W.set(Wloc);P.forEach((p,pi)=>{const A=R[p.a],B=R[p.b],g=gainOf(p),blk=Wblk[pi];for(let i=0;i<B.n;i++){const row=(B.off+i)*N+A.off;for(let j=0;j<A.n;j++)W[row+j]=blk[i*A.n+j]*g;}});}
 const CH=[],chi={};
 Object.keys(SPEC.entry).forEach(org=>SPEC.entry[org].forEach(n=>{chi[n]=CH.length;CH.push([n,org]);}));
-for(let k=0;k<LOCI;k++){chi['mup_'+k]=CH.length;CH.push(['mup_'+k,'VNO']);}
 const S=CH.length,Win=new Float32Array(N*S),sv=new Float32Array(S);
 const signed=n=>/(_fwd|_lat)$/.test(n)||['last_turn','clock_sin','clock_cos','other_size'].indexOf(n)>=0;
 /* one random draw of every weight, inside the wiring the spec allows */
@@ -303,8 +304,8 @@ function rebuildDens(){MODS.forEach((m,mi)=>{dens[mi].fill(0);R.forEach(g=>{cons
 const HN=1200,TRN=240,r=new Float32Array(N),xn=new Float32Array(N),gainv=new Float32Array(N),meanv=new Float32Array(R.length),hAct=new Uint8Array(HN*N),hPos=new Float32Array(HN*3);
 let nr=rng(99),world=null,marks=[],steps=0;
 function means(){for(let q=0;q<R.length;q++){const g=R[q];let s=0;for(let i=0;i<g.n;i++)s+=r[g.off+i];meanv[q]=s/g.n;}}
-function setv(n,v){sv[chi[n]]=v;}
-function ray(o){const a=world.h+o,dx=Math.cos(a)*0.6,dy=Math.sin(a)*0.6,tx=dx>0?(BOX-world.x)/dx:(dx<0?-world.x/dx:Infinity),ty=dy>0?(BOX-world.y)/dy:(dy<0?-world.y/dy:Infinity);return 1-clamp(Math.min(tx,ty),0,1);}
+function setv(n,v){if(n in chi)sv[chi[n]]=v;}
+function ray(o){const a=world.h+o,dx=Math.cos(a)*0.6,dy=Math.sin(a)*0.6,tx=dx>0?(AW-world.x)/dx:(dx<0?-world.x/dx:Infinity),ty=dy>0?(AH-world.y)/dy:(dy<0?-world.y/dy:Infinity);return 1-clamp(Math.min(tx,ty),0,1);}
 function ego(vx,vy){const c=Math.cos(world.h),s=Math.sin(world.h);return [vx*c+vy*s,-vx*s+vy*c];}
 function sense(){
   sv.fill(0);
@@ -313,7 +314,7 @@ function sense(){
   marks.forEach(m=>{const dx=m.x-world.x,dy=m.y-world.y,d=Math.hypot(dx,dy)+1e-9,w=Math.exp(-d/0.5)*Math.min(1,m.v*8);lev+=w;gx+=w*dx/d;gy+=w*dy/d;if(Math.hypot(m.x-nx,m.y-ny)<0.025)contact=true;});
   lev=Math.min(1,lev);const gm=Math.hypot(gx,gy)+1e-12,conf=lev/(lev+0.05),e=ego(gx/gm*conf,gy/gm*conf);
   setv('olf_own',lev);setv('olf_own_fwd',e[0]);setv('olf_own_lat',e[1]);
-  if(contact)for(let k=0;k<LOCI;k++)sv[chi['mup_'+k]]=C57[k];
+  if(contact){setv('vno_contact',1);for(let k=0;k<LOCI;k++)setv('vno_mup_'+k,C57[k]);}
   world.contact=contact;
   const hx=world.home[0]-world.x,hy=world.home[1]-world.y,hd=Math.hypot(hx,hy)+1e-9,hs=Math.min(1,hd/0.1),he=ego(hx/hd*hs,hy/hd*hs);
   setv('home',1/(1+hd));setv('home_fwd',he[0]);setv('home_lat',he[1]);
@@ -331,7 +332,7 @@ function netStep(){
 function step(){
   sense();netStep();means();
   const T=byId.TURN,sp=meanv[byId.SPEED.i],turn=MAX_TURN*(r[T.off+1]-r[T.off]);
-  world.h+=turn*DT;world.x=clamp(world.x+Math.cos(world.h)*sp*TOP*DT,0.012,BOX-0.012);world.y=clamp(world.y+Math.sin(world.h)*sp*TOP*DT,0.012,BOX-0.012);
+  world.h+=turn*DT;world.x=clamp(world.x+Math.cos(world.h)*sp*TOP*DT,0.012,AW-0.012);world.y=clamp(world.y+Math.sin(world.h)*sp*TOP*DT,0.012,AH-0.012);
   world.lastSpeed=sp;world.lastTurn=turn/MAX_TURN;world.bladder=Math.min(1,world.bladder+DT/300);world.gait+=6.2832*(sp*TOP/0.05)*DT;
   /* urine leaves when the pressure in the bladder (its wall contracting, plus stretch from filling) beats the closure
      of the urethra (the sphincter, plus a passive resistance); once started, a void runs until the bladder is empty */
@@ -426,10 +427,11 @@ function drawBox(){
   const b=box.getBoundingClientRect(),Sz=Math.max(40,b.width),T=tokens();
   if(box.width!==Math.round(Sz*dpr)){box.width=Math.round(Sz*dpr);box.height=Math.round(Sz*dpr);}
   bctx.setTransform(dpr,0,0,dpr,0,0);bctx.clearRect(0,0,Sz,Sz);
-  const m=6,sc=(Sz-2*m)/BOX,X=x=>m+x*sc,Y=y=>Sz-m-y*sc;
-  bctx.strokeStyle=rgba(T['--ink'],0.25);bctx.lineWidth=1;bctx.setLineDash([4,4]);bctx.strokeRect(X(0.125),Y(0.375),0.25*sc,0.25*sc);bctx.setLineDash([]);
+  const m=6,sc=(Sz-2*m)/Math.max(AW,AH),ox=(Sz-AW*sc)/2,oy=(Sz-AH*sc)/2,X=x=>ox+x*sc,Y=y=>Sz-oy-y*sc;
+  if(AW===0.5&&AH===0.5){bctx.strokeStyle=rgba(T['--ink'],0.25);bctx.lineWidth=1;bctx.setLineDash([4,4]);bctx.strokeRect(X(0.125),Y(0.375),0.25*sc,0.25*sc);bctx.setLineDash([]);}
   marks.forEach(q=>{bctx.fillStyle=rgba(T['--mod'],0.55);bctx.beginPath();bctx.arc(X(q.x),Y(q.y),2+Math.sqrt(q.v)*12,0,6.2832);bctx.fill();});
-  bctx.strokeStyle=T['--ink'];bctx.lineWidth=2;bctx.strokeRect(m,m,Sz-2*m,Sz-2*m);
+  bctx.strokeStyle=T['--ink'];bctx.lineWidth=2;bctx.strokeRect(X(0),Y(AH),AW*sc,AH*sc);
+  others.forEach(o=>{bctx.fillStyle=rgba(T['--edge'],0.9);bctx.beginPath();bctx.arc(X(o[0]),Y(o[1]),4,0,6.2832);bctx.fill();});
   const n=Math.min(steps,480),parts=6;
   for(let q=0;q<parts;q++){const a=Math.floor(n*q/parts),z=Math.floor(n*(q+1)/parts);if(z<=a)continue;bctx.beginPath();
     for(let i=a;i<=z&&i<n;i++){const hi=((steps-n+i)%HN+HN)%HN,px=X(hPos[hi*3]),py=Y(hPos[hi*3+1]);if(i===a)bctx.moveTo(px,py);else bctx.lineTo(px,py);}
@@ -526,18 +528,20 @@ function init3(){
   if(!window.THREE)return null;
   try{
     const T3=window.THREE,cvs=document.getElementById('box3'),ren=new T3.WebGLRenderer({canvas:cvs,antialias:true,alpha:true});
-    const scene=new T3.Scene(),cam=new T3.PerspectiveCamera(34,1,0.01,10);
+    const scene=new T3.Scene(),cam=new T3.PerspectiveCamera(34,1,0.01,400);
     scene.add(new T3.HemisphereLight(0xffffff,0x50545c,0.95));const sun=new T3.DirectionalLight(0xffffff,0.75);sun.position.set(0.5,1,0.35);scene.add(sun);
-    const floorM=new T3.MeshStandardMaterial({color:0xdfe3e8,roughness:0.95}),floor=new T3.Mesh(new T3.PlaneGeometry(BOX,BOX),floorM);floor.rotation.x=-Math.PI/2;scene.add(floor);
+    const floorM=new T3.MeshStandardMaterial({color:0xdfe3e8,roughness:0.95}),floor=new T3.Mesh(new T3.PlaneGeometry(1,1),floorM);floor.rotation.x=-Math.PI/2;scene.add(floor);
     const wallM=new T3.MeshStandardMaterial({color:0xffffff,transparent:true,opacity:0.16,side:T3.DoubleSide,depthWrite:false});
-    [[0,-BOX/2,0],[0,BOX/2,0],[-BOX/2,0,1],[BOX/2,0,1]].forEach(w=>{const m=new T3.Mesh(new T3.PlaneGeometry(BOX,0.12),wallM);m.position.set(w[0],0.06,w[1]);if(w[2])m.rotation.y=Math.PI/2;scene.add(m);});
-    scene.add(new T3.Line(new T3.BufferGeometry().setFromPoints([[-1,-1],[1,-1],[1,1],[-1,1],[-1,-1]].map(q=>new T3.Vector3(q[0]*0.125,0.0006,q[1]*0.125))),new T3.LineBasicMaterial({color:0x6f7c8d})));
+    const walls=[0,0,1,1].map(turned=>{const m=new T3.Mesh(new T3.PlaneGeometry(1,0.12),wallM);if(turned)m.rotation.y=Math.PI/2;scene.add(m);return m;});
+    const othM=new T3.MeshStandardMaterial({color:0x5a606b,roughness:0.9}),oth=[];
+    for(let i=0;i<16;i++){const m=new T3.Mesh(new T3.SphereGeometry(1,12,8),othM);m.scale.set(0.036,0.014,0.016);m.visible=false;scene.add(m);oth.push(m);}
+    const zone=new T3.Line(new T3.BufferGeometry().setFromPoints([[-1,-1],[1,-1],[1,1],[-1,1],[-1,-1]].map(q=>new T3.Vector3(q[0]*0.125,0.0006,q[1]*0.125))),new T3.LineBasicMaterial({color:0x6f7c8d}));scene.add(zone);
     const markM=new T3.MeshBasicMaterial({color:0xd98200,transparent:true,opacity:0.7}),markG=new T3.CircleGeometry(1,20),markPool=[];
     for(let i=0;i<80;i++){const m=new T3.Mesh(markG,markM);m.rotation.x=-Math.PI/2;m.visible=false;scene.add(m);markPool.push(m);}
     const trailP=new Float32Array(480*3),trailG=new T3.BufferGeometry();trailG.setAttribute('position',new T3.BufferAttribute(trailP,3));
     const trail=new T3.Line(trailG,new T3.LineBasicMaterial({color:0x6450c0}));trail.frustumCulled=false;scene.add(trail);
     const B=makeBody(T3,BODIES[0]);scene.add(B.M);
-    const v={cvs:cvs,ren:ren,scene:scene,cam:cam,floorM:floorM,markPool:markPool,trail:trail,trailP:trailP,B:B,M:B.M,az:-0.75,el:0.5,rad:0.98,radC:0.21,follow:true,S:0,dpr:0};
+    const v={cvs:cvs,ren:ren,scene:scene,cam:cam,floor:floor,walls:walls,zone:zone,oth:oth,floorM:floorM,markPool:markPool,trail:trail,trailP:trailP,B:B,M:B.M,az:-0.75,el:0.5,rad:0.98,radC:0.21,follow:true,S:0,dpr:0};
     let dragP=null;
     cvs.addEventListener('pointerdown',ev=>{cvs.setPointerCapture(ev.pointerId);dragP=[ev.clientX,ev.clientY];});
     cvs.addEventListener('pointermove',ev=>{if(!dragP)return;v.az+=(ev.clientX-dragP[0])*0.01;v.el=clamp(v.el+(ev.clientY-dragP[1])*0.01,0.12,1.5);dragP=[ev.clientX,ev.clientY];ask();});
@@ -551,12 +555,15 @@ function draw3(){
   if(v.S!==Sz||v.dpr!==dpr){v.ren.setPixelRatio(dpr);v.ren.setSize(Sz,Sz,false);v.S=Sz;v.dpr=dpr;}
   v.floorM.color.set(css('--floor'));v.trail.material.color.set(css('--c-internal'));
   const sp=world.lastSpeed*TOP,tn=world.lastTurn*MAX_TURN,go=Math.min(1,sp/0.02),amp=0.55*go,ph=world.gait;
-  v.M.position.set(world.x-BOX/2,0,-(world.y-BOX/2));v.M.rotation.y=world.h;
+  v.floor.scale.set(AW,AH,1);v.zone.visible=AW===0.5&&AH===0.5;
+  v.walls.forEach((m,i)=>{if(i<2){m.scale.x=AW;m.position.set(0,0.06,(i?1:-1)*AH/2);}else{m.scale.x=AH;m.position.set((i===3?1:-1)*AW/2,0.06,0);}});
+  v.oth.forEach((m,i)=>{const o=others[i];m.visible=!!o;if(o){m.position.set(o[0]-AW/2,0.014,-(o[1]-AH/2));m.rotation.y=o[2]||0;}});
+  v.M.position.set(world.x-AW/2,0,-(world.y-AH/2));v.M.rotation.y=world.h;
   pose(v.B,ph,amp,clamp(tn*0.14,-0.45,0.45),world.contact,go);
-  v.markPool.forEach((m,i)=>{const q=marks[i];m.visible=!!q;if(q){const s=0.003+Math.sqrt(q.v)*0.016;m.scale.set(s,s,1);m.position.set(q.x-BOX/2,0.0004+i*2e-6,-(q.y-BOX/2));}});
-  const n=Math.min(steps,480);for(let i=0;i<n;i++){const hi=((steps-n+i)%HN+HN)%HN;v.trailP[i*3]=hPos[hi*3]-BOX/2;v.trailP[i*3+1]=0.0008;v.trailP[i*3+2]=-(hPos[hi*3+1]-BOX/2);}
+  v.markPool.forEach((m,i)=>{const q=marks[i];m.visible=!!q;if(q){const s=0.003+Math.sqrt(q.v)*0.016;m.scale.set(s,s,1);m.position.set(q.x-AW/2,0.0004+i*2e-6,-(q.y-AH/2));}});
+  const n=Math.min(steps,480);for(let i=0;i<n;i++){const hi=((steps-n+i)%HN+HN)%HN;v.trailP[i*3]=hPos[hi*3]-AW/2;v.trailP[i*3+1]=0.0008;v.trailP[i*3+2]=-(hPos[hi*3+1]-AH/2);}
   v.trail.geometry.setDrawRange(0,n);v.trail.geometry.attributes.position.needsUpdate=true;
-  const cx=v.follow?v.M.position.x:0,cz=v.follow?v.M.position.z:0,cr=v.follow?v.radC:v.rad;
+  const cx=v.follow?v.M.position.x:0,cz=v.follow?v.M.position.z:0,cr=v.follow?v.radC:v.rad*Math.max(AW,AH)/0.5;
   v.cam.position.set(cx+cr*Math.cos(v.el)*Math.cos(v.az),0.015+cr*Math.sin(v.el),cz+cr*Math.cos(v.el)*Math.sin(v.az));v.cam.lookAt(cx,0.015,cz);
   v.ren.render(v.scene,v.cam);
 }
@@ -748,25 +755,54 @@ function b64(t){const bin=atob(t),a=new Uint8Array(bin.length);for(let i=0;i<bin
 function takeWeights(t){if(!t)return;W.set(new Float32Array(b64(t).buffer));panel();}
 function clearRun(){r.fill(0);marks=[];steps=0;hAct.fill(0);world.gait=0;world.contact=false;}
 function onFrame(msg){
-  const f=JSON.parse(msg),a=b64(f.rates),d=Math.hypot(f.x-world.x,f.y-world.y);
+  const f=typeof msg==='string'?JSON.parse(msg):msg,a=f.raw||b64(f.rates),d=Math.hypot(f.x-world.x,f.y-world.y);others=f.others||[];
   for(let i=0;i<N;i++)r[i]=a[i]/255;means();
   world.gait+=steps?6.2832*d/0.05:0;world.lastSpeed=steps?d/f.dt/TOP:0;world.lastTurn=f.turn/MAX_TURN;
-  world.x=f.x;world.y=f.y;world.h=f.h;world.t=f.t;world.bladder=f.bladder;
+  world.x=f.x;world.y=f.y;world.h=f.h;world.t=f.t;world.bladder=f.bladder;world.contact=f.contact>0;
+  (f.voids||[]).forEach(v=>{const m=marks[marks.length-1];if(m&&Math.hypot(m.x-v[0],m.y-v[1])<0.025)m.v+=v[2];else{marks.push({x:v[0],y:v[1],v:v[2]});if(marks.length>80)marks.shift();}});
   const hi=steps%HN;hAct.set(a,hi*N);hPos[hi*3]=f.x;hPos[hi*3+1]=f.y;hPos[hi*3+2]=f.h;steps++;ask();
 }
-function connectEngine(){
-  if(!window.QWebChannel)return;
-  const go=tr=>new window.QWebChannel(tr,ch=>{
-    EXT=ch.objects.engine;playing=false;playBtn.textContent='Play';clearRun();
-    document.getElementById('ofnote').textContent='This animal is run by the ABMA engine in FNT; the page only draws it. The weights are still random draws inside the wiring, and the engine does not yet act on the bladder and sphincter.';
-    setSave('Notes and changes are saved by FNT on this computer.');
-    EXT.frame.connect(onFrame);
-    EXT.cleared.connect(seed=>{wiring=seed;clearRun();document.getElementById('drawtag').textContent='ABMA engine, untrained, draw '+seed;EXT.weights(takeWeights);ask();});
-    EXT.hello(info=>{const o=JSON.parse(info);wiring=o.seed;document.getElementById('drawtag').textContent='ABMA engine, untrained, draw '+o.seed;
+/* a recorded run, played back by the page itself: the same calls an engine answers */
+function replayEngine(Q){
+  const raw=b64(Q.rates),n=Q.frames,byK={},scrub=document.getElementById('scrub');
+  Q.voids.forEach(v=>{(byK[v[0]]=byK[v[0]]||[]).push([v[1],v[2],v[3]]);});
+  let k=0,on=false,rt=4,acc=0,last=0,fcb=null,ccb=null;
+  function emit(){fcb({x:Q.x[k],y:Q.y[k],h:Q.h[k],t:(k+1)*Q.dt,dt:Q.dt,turn:Q.turn[k],bladder:Q.bladder[k],contact:Q.contact[k],voids:byK[k]||[],others:Q.others?Q.others[k]:[],raw:raw.subarray(k*N,(k+1)*N)});k++;}
+  function loop(now){if(!on)return;acc+=(now-last)/1000*rt/Q.dt;last=now;let m=Math.min(60,Math.floor(acc));acc-=m;while(m-->0&&k<n)emit();scrub.value=k;
+    if(k>=n){on=false;playing=false;playBtn.textContent='Play';return;}requestAnimationFrame(loop);}
+  scrub.max=n;scrub.hidden=false;
+  scrub.addEventListener('input',()=>{const to=Number(scrub.value);ccb(Q.seed);k=Math.max(0,to-2*TRN);while(k<to)emit();});
+  return {frame:{connect:f=>{fcb=f;}},cleared:{connect:f=>{ccb=f;}},
+    hello:cb=>cb(JSON.stringify({seed:Q.seed,arena:Q.arena,title:Q.title,notes:null,replay:true})),
+    weights:cb=>cb(Q.weights),
+    setPlaying:v=>{on=v;if(on){if(k>=n){k=0;ccb(Q.seed);}last=performance.now();acc=0;requestAnimationFrame(loop);}},
+    setRate:v=>{rt=v;},restart:()=>{k=0;scrub.value=0;ccb(Q.seed);},setEdits:(t,cb)=>{if(cb)cb(Q.weights);},saveNotes:()=>{},report:()=>{},
+    first:()=>{const to=Math.min(n,2*TRN);while(k<to)emit();scrub.value=k;}};
+}
+let extLabel='ABMA engine';
+function attach(eng){
+  EXT=eng;playing=false;playBtn.textContent='Play';clearRun();
+  EXT.frame.connect(onFrame);
+  EXT.cleared.connect(seed=>{wiring=seed;clearRun();document.getElementById('drawtag').textContent=extLabel+', untrained, draw '+seed;EXT.weights(takeWeights);ask();});
+  EXT.hello(info=>{const o=JSON.parse(info);wiring=o.seed;
+    if(o.arena){AW=o.arena[0];AH=o.arena[1];}
+    if(o.title)document.getElementById('arenatitle').textContent=o.title;
+    if(o.replay){extLabel='Recorded ABMA run';document.getElementById('rewire').hidden=true;
+      document.getElementById('ofnote').textContent='This is a recording of a run in the ABMA engine. The weights were random draws inside the wiring. Changing a strength or a receptor level here does not change what happened.';
+      setSave('A recording: notes and changes made here stay in this browser.');
+    }else{
+      document.getElementById('ofnote').textContent='This animal is run by the ABMA engine in FNT; the page only draws it. The weights are still random draws inside the wiring. Amber spots are urine, left when pressure in the bladder beats the sphincter.';
+      setSave('Notes and changes are saved by FNT on this computer.');
       if(o.notes){ED=cleanED(o.notes.ED);VER={};Object.keys(o.notes.VER||{}).forEach(k=>{if(P.some(p=>p.key===k))VER[k]=cleanVER(o.notes.VER[k]);});}
-      rebuildDens();SK=buildSK();EXT.setEdits(JSON.stringify(ED),takeWeights);panel();ask();});
-    setInterval(()=>{EXT.report(extDraws);extDraws=0;},2000);
-  });
+    }
+    document.getElementById('drawtag').textContent=extLabel+', untrained, draw '+o.seed;
+    rebuildDens();SK=buildSK();EXT.setEdits(JSON.stringify(ED),takeWeights);if(o.replay)EXT.weights(takeWeights);if(EXT.first)EXT.first();panel();ask();});
+  setInterval(()=>{EXT.report(extDraws);extDraws=0;},2000);
+}
+function connectEngine(){
+  if(window.ABMA_REPLAY){attach(replayEngine(window.ABMA_REPLAY));return;}
+  if(!window.QWebChannel)return;
+  const go=tr=>new window.QWebChannel(tr,ch=>{attach(ch.objects.engine);});
   if(window.qt&&window.qt.webChannelTransport)go(window.qt.webChannelTransport);
   else if(window.ABMA_WS){const ws=new WebSocket(window.ABMA_WS);ws.onopen=()=>{go(ws);};ws.onclose=()=>{document.getElementById('drawtag').textContent='ABMA engine stopped';};}
 }

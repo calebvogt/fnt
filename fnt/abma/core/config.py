@@ -225,6 +225,17 @@ class ScentParams:
     mark_strength: float = 0.6   # salience of a fresh mark (0..1)
     counter_mark: float = 2.5    # marking-rate multiplier on foreign scent
     anonymous_weight: float = 0.25   # weight of a signature-less mark
+    # Urination by muscle. Used only when the policy hands the engine the
+    # activity of the bladder wall and of the urethral sphincter (a brain wired
+    # from anatomy does); otherwise marks are laid at random as before. Urine
+    # leaves when pressure in the bladder (the wall contracting, plus stretch
+    # from filling) beats the closure of the urethra (the sphincter, plus a
+    # passive resistance). Once started, a void runs until the bladder is
+    # empty: a stand-in for the reflex that sustains a real one.
+    void_stretch: float = 0.5        # pressure a full bladder adds
+    void_resistance: float = 0.35    # passive closure of the urethra
+    void_flow_s: float = 0.3         # fraction of a full bladder passed per second
+    spot_reach_m: float = 0.025      # how near the nose must be to read a spot
 
 
 @dataclass

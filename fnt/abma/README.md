@@ -1124,9 +1124,23 @@ channels (`aggression`, `boldness`, `sociability`, `exploration`) are not
 wired at all; this brain is meant to replace them. The outputs are muscles:
 neck and trunk (a left and a right unit, read as their difference), limbs
 (speed), jaw (bite), and, for urination, the bladder wall and the urethral
-sphincter. The engine does not obey those last two yet (it urinates by
-itself), and it has no sense of a urine mark's identity on nose contact, so
-the vomeronasal organ has no input.
+sphincter.
+
+**Urine and the nose.** When scent marking is on and a policy hands the engine
+those two muscles, urination is no longer drawn at random: urine leaves when
+pressure in the bladder (the wall contracting, plus stretch from filling)
+beats the closure of the urethra (the sphincter, plus a passive resistance),
+and a void that has started runs until the bladder is empty (`ScentParams`:
+`void_stretch`, `void_resistance`, `void_flow_s`). Urine lands as *spots*
+(`sim.urine_spots`), finer than the scent grid, each carrying its owner. Every
+animal has a MUP barcode (`biology.mup_barcode`, 12 isoforms): its own
+combination for a wild-type animal, one shared barcode for genotype
+`MUP: INBRED` (an inbred strain such as C57BL/6), none for `MUP: KO`. Thirteen
+sensor channels (`vno_contact`, `vno_mup_0..11`) carry the barcode of whatever
+the nose is on, a urine spot within 2.5 cm or another animal's body, and
+nothing otherwise; they enter this brain at the vomeronasal organ. Volatile
+odour at a distance (`olf_*`) still enters at the main olfactory epithelium.
+Nothing tells the animal whose barcode it is reading.
 
 ```
 python -m fnt.abma --list-anatomies
@@ -1175,9 +1189,19 @@ chooses. Nothing is fetched from the internet: the 3D library (three.js, MIT)
 ships with FNT. What you change or verify on the page is kept in
 `~/ABMA_brains/anatomy/<name>.notes.json`; the spec is never rewritten.
 
-Known limits: the map runs the open field with one animal; Qt 5's web engine is
-an old browser and redraws about 15-30 times a second, less smoothly than a
-current browser; a recorded run cannot be replayed on the map yet.
+The map follows the first animal of whatever design it is given, in that
+design's arena (drawn as its outline; the other animals as plain bodies). The
+🧠 button in the ABMA window opens it on the current design, as its own run.
+
+**Replay.** `--brain-recording MINUTES` also writes `brain_recording.html`:
+the map with that run packed into it, which the page plays back by itself
+(play, speed, a slider through the run). It is one file and needs neither FNT
+nor the internet, so a run made on one computer can be watched on another.
+`--brain-replay FILE.npz` opens an existing recording the same way.
+
+Known limits: only the first animal's brain is shown; arena furniture (zones,
+huts, food) is not drawn; Qt 5's web engine is an old browser and redraws about
+15-30 times a second, less smoothly than a current browser.
 
 ## Roadmap / not yet done
 

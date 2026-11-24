@@ -71,8 +71,9 @@ def test_senses_enter_only_at_their_organ(spec):
     # the hand-set dispositions are not wired to this brain at all
     for name in ("aggression", "boldness", "sociability", "exploration"):
         assert not b.Win[:, col[name]].any()
-    # the vomeronasal organ waits for a sense the engine does not have yet
-    assert not b.Win[b.sl["VNO"]].any()
+    # the vomeronasal organ gets the contact channels and nothing else
+    vno = np.flatnonzero(np.abs(b.Win[b.sl["VNO"]]).sum(axis=0) > 0)
+    assert vno.size == 13 and all(SENSORS[i].startswith("vno_") for i in vno)
 
 
 def test_an_edit_changes_what_it_names_and_nothing_else(spec):
@@ -203,3 +204,72 @@ def test_the_spec_ships_with_the_package():
     with open(os.path.join(here, "pyproject.toml"), "rb") as f:
         data = tomllib.load(f)["tool"]["setuptools"]["package-data"]["fnt"]
     assert "abma/brains/anatomy/*.json" in data
+
+
+def _scent_sim(n=1):
+    from fnt.abma.core.simulation import Simulation
+    cfg = _oft()
+    cfg.scent.enabled = True
+    cfg.groups[0].count = n
+    return Simulation(cfg, 0)
+
+
+def test_a_urine_barcode_per_animal():
+    from fnt.abma.core.biology import INBRED_BARCODE, MUP_LOCI, mup_barcode
+    a, b = mup_barcode("WT", 1, 7), mup_barcode("WT", 2, 7)
+    assert a.shape == (MUP_LOCI,) and a.any() and not np.array_equal(a, b)
+    np.testing.assert_array_equal(a, mup_barcode("WT", 1, 7))            # stable for an animal
+    np.testing.assert_array_equal(mup_barcode("INBRED", 1, 7), mup_barcode("INBRED", 99, 3))
+    assert tuple(mup_barcode("inbred", 5, 0)) == INBRED_BARCODE
+    assert not mup_barcode("KO", 1, 7).any() and mup_barcode("HET", 1, 7).max() == 0.5
+
+
+def test_urine_leaves_when_pressure_beats_the_sphincter():
+    sim = _scent_sim()
+    cost = np.full(sim.n, 5.0)
+    sim.bladder[:] = 80.0
+    sim._void_by_muscle(0.25, np.array([0.1]), np.array([0.9]), cost)      # held shut
+    assert sim.bladder[0] == 80.0 and not sim.last_voids and len(sim.urine_spots["t"]) == 0
+    sim._void_by_muscle(0.25, np.array([0.6]), np.array([0.1]), cost)      # wall pushes, sphincter lets go
+    assert sim.bladder[0] < 80.0 and sim.marks_made[0] == 1 and len(sim.urine_spots["t"]) == 1
+    for _ in range(40):                                                    # once started it runs on
+        sim._void_by_muscle(0.25, np.array([0.0]), np.array([1.0]), cost)
+    assert sim.bladder[0] <= 0.5 and sim.marks_made[0] == 1
+    assert sim.scent.strength.max() > 0.0 and abs(sim.urine_spots["vol"].sum() - 0.8) < 0.01
+
+
+def test_the_nose_reads_a_spot_only_when_it_is_on_it():
+    sim = _scent_sim(2)
+    sim.P[:] = [[0.10, 0.10], [0.40, 0.40]]
+    sim.H[:] = 0.0
+    sim._elapsed = 0.0
+    sim._add_spots(np.array([1]), np.array([0.2]))
+    spot = sim.urine_spots["xy"][0].copy()
+    sim.P[1] = [0.45, 0.10]                              # its owner walks off
+    level, code = sim.nose_contact(1.0)
+    assert not level.any() and not code.any()            # 30 cm away: nothing, however strong the smell
+    sim.P[0] = spot - [0.02, 0.0]                        # nose (2 cm ahead) on the spot
+    level, code = sim.nose_contact(1.0)
+    assert level[0] > 0.9 and level[1] == 0.0
+    np.testing.assert_array_equal(code[0], sim.mup_barcodes()[1])
+    from fnt.abma.core.senses import PlaceMemory, SenseParams, sense
+    obs, _ = sense(sim, 1.0, PlaceMemory(sim.n), SenseParams())
+    assert obs[0, SENSORS.index("vno_contact")] > 0.9 and obs[1, SENSORS.index("vno_contact")] == 0.0
+    assert obs[0, SENSORS.index("vno_mup_0")] == pytest.approx(level[0] * sim.mup_barcodes()[1, 0])
+
+
+def test_nose_on_another_animal_reads_its_barcode():
+    sim = _scent_sim(2)
+    sim.P[:] = [[0.20, 0.20], [0.225, 0.20]]
+    sim.H[:] = 0.0
+    level, code = sim.nose_contact(0.0)
+    assert level[0] == 1.0 and level[1] == 0.0           # only the one facing the other
+    np.testing.assert_array_equal(code[0], sim.mup_barcodes()[1])
+
+
+def test_the_anatomy_brain_urinates_in_the_engine():
+    cfg = _oft(seed=0, anatomy_seed=5)
+    cfg.scent.enabled, cfg.dt = True, 0.25
+    rec = anatomy.record(cfg, 600.0)
+    assert len(rec["voids"]) > 0 and rec["bladder"].min() < 0.5
+    assert rec["meta"]["unwired"] == []

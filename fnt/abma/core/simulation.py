@@ -154,6 +154,15 @@ class Simulation:
         self.trial_index = trial_index
         self.trial_id = f"{config.trial_prefix}{trial_index + 1:03d}"
         root = config.seed + trial_index if seed is None else seed
+        self._root_seed = int(root)
+        #: urine spots: where each void landed, whose it was and how much.
+        #: Finer than the scent grid, so a nose can be on one or beside it.
+        self.urine_spots = {"xy": np.zeros((0, 2)), "owner": np.zeros(0, int),
+                            "vol": np.zeros(0), "t": np.zeros(0)}
+        #: voids of the current step, as (agent, x, y, volume): for a viewer
+        self.last_voids: list = []
+        self._voiding = np.zeros(0, bool)
+        self._mup = None
         #: Setup-time draws (founder traits, release scatter, initial condition).
         #: Sequential, and only consumed when the roster is built.
         self.rng = np.random.default_rng(root)
@@ -781,6 +790,7 @@ class Simulation:
 
         # --- scent marking (marks fade, then animals lay new ones) ---
         if self.scent is not None:
+            self._elapsed = float(elapsed_s)
             self._update_scent(dt, perc.get("scent_foreign"))
 
         # --- condition dynamics ---
@@ -1155,6 +1165,12 @@ class Simulation:
             boost = 1.0 + (sp.counter_mark - 1.0) * np.clip(foreign_level, 0, 1)
         # dt-invariant hazard, as elsewhere in the engine
         p_mark = 1.0 - np.exp(-(rate_h / 3600.0) * boost * dt)
+        self.last_voids = []
+        perc = getattr(self, "_last_perc", None) or {}
+        wall, sph = perc.get("bladder_wall"), perc.get("sphincter")
+        if wall is not None and sph is not None and len(wall) == self.n:
+            self._void_by_muscle(dt, np.asarray(wall, float), np.asarray(sph, float), cost)
+            return
         can = self.alive & (reserve >= cost)
         # per-agent stream: whether one animal marks cannot depend on how many
         # other animals happened to draw before it this step
@@ -1165,8 +1181,97 @@ class Simulation:
             return
         self.scent.deposit(idxs, self.P, sp.mark_strength,
                            self.identity[idxs])
+        self._add_spots(idxs, np.minimum(self.bladder[idxs], cost[idxs]) / 100.0)
         self.bladder[idxs] = np.maximum(0.0, self.bladder[idxs] - cost[idxs])
         self.marks_made[idxs] += 1
+
+    def _void_by_muscle(self, dt: float, wall, sph, cost) -> None:
+        """Urination decided by two muscles rather than by chance (see
+        ``ScentParams``): pressure against closure, and a void that runs on
+        once it has started."""
+        sp = self.cfg.scent
+        if len(self._voiding) != self.n:
+            self._voiding = np.concatenate(
+                [self._voiding[:self.n], np.zeros(max(0, self.n - len(self._voiding)), bool)])
+        push = wall + sp.void_stretch * self.bladder / 100.0 - sph - sp.void_resistance
+        start = ~self._voiding & (push > 0.0) & (self.bladder >= cost)
+        self._voiding = self.alive & (self._voiding | start) & (self.bladder > 0.5)
+        out = np.where(self._voiding, np.minimum(self.bladder, sp.void_flow_s * 100.0 * dt), 0.0)
+        idxs = np.nonzero(out > 0.0)[0]
+        if len(idxs) == 0:
+            return
+        amount = sp.mark_strength * np.clip(out[idxs] / np.maximum(cost[idxs], 1e-9), 0.1, 1.0)
+        for k, i in enumerate(idxs):                 # one cell each; amounts differ per animal
+            self.scent.deposit(np.array([i]), self.P, float(amount[k]), self.identity[[i]])
+        self._add_spots(idxs, out[idxs] / 100.0)
+        self.bladder[idxs] -= out[idxs]
+        self.marks_made[idxs[start[idxs]]] += 1      # a void is counted once, when it starts
+
+    def _add_spots(self, idxs, vol) -> None:
+        """Remember where urine landed. A void that carries on within 2.5 cm
+        of the animal's last spot adds to that spot instead of making another."""
+        s, t = self.urine_spots, getattr(self, "_elapsed", 0.0)
+        for i, v in zip(np.atleast_1d(idxs), np.atleast_1d(vol)):
+            x, y = float(self.P[i, 0]), float(self.P[i, 1])
+            mine = np.nonzero(s["owner"] == i)[0]
+            if len(mine) and np.hypot(*(s["xy"][mine[-1]] - (x, y))) < 0.025 and t - s["t"][mine[-1]] < 5.0:
+                s["vol"][mine[-1]] += v
+                s["t"][mine[-1]] = t
+            else:
+                s["xy"] = np.vstack([s["xy"], [x, y]])
+                s["owner"] = np.append(s["owner"], int(i))
+                s["vol"] = np.append(s["vol"], float(v))
+                s["t"] = np.append(s["t"], t)
+            self.last_voids.append((int(i), x, y, float(v)))
+        if len(s["t"]) > 4000:                       # the oldest go first
+            for key in s:
+                s[key] = s[key][-3000:]
+
+    def mup_barcodes(self) -> np.ndarray:
+        """Each animal's urine barcode, ``(n, MUP_LOCI)`` (see
+        :func:`fnt.abma.core.biology.mup_barcode`)."""
+        from .biology import mup_barcode
+        if self._mup is None or len(self._mup) != self.n:
+            self._mup = np.stack([
+                mup_barcode((a.genotype.genes or {}).get("MUP", "WT"),
+                            int(self.uid[a.index]), self._root_seed)
+                for a in self.agents])
+        return self._mup
+
+    def nose_contact(self, elapsed_s: float):
+        """What each animal's nose is on: ``(level, barcode)``.
+
+        ``level`` is 0 unless the nose (2 cm ahead of the body's centre) is
+        within reach of a urine spot or of another animal's body; a spot's
+        level fades with the scent half-life. ``barcode`` is that spot's or
+        animal's MUP barcode. Nothing here says whose it is or whether it is
+        the animal's own: that is for a brain to work out.
+        """
+        from .biology import MUP_LOCI
+        n = self.n
+        level, code = np.zeros(n), np.zeros((n, MUP_LOCI))
+        if n == 0:
+            return level, code
+        sp, codes = self.cfg.scent, self.mup_barcodes()
+        nose = self.P[:n] + 0.02 * np.stack([np.cos(self.H[:n]), np.sin(self.H[:n])], axis=1)
+        s = self.urine_spots
+        if len(s["t"]):
+            fresh = 0.5 ** (np.maximum(0.0, elapsed_s - s["t"]) / max(1.0, sp.half_life_h * 3600.0))
+            d = np.linalg.norm(nose[:, None, :] - s["xy"][None, :, :], axis=2)
+            w = np.where(d < sp.spot_reach_m, fresh[None, :], 0.0)
+            j = w.argmax(axis=1)
+            level = w[np.arange(n), j]
+            code = np.where(level[:, None] > 0.0, codes[np.clip(s["owner"][j], 0, n - 1)], 0.0)
+        if n > 1:                                    # nose on another animal's body
+            d = np.linalg.norm(nose[:, None, :] - self.P[None, :n, :], axis=2)
+            d[np.arange(n), np.arange(n)] = np.inf
+            d[:, ~self.alive[:n]] = np.inf
+            j = d.argmin(axis=1)
+            touch = d[np.arange(n), j] < 0.03
+            level = np.where(touch, 1.0, level)
+            code = np.where(touch[:, None], codes[j], code)
+        level = np.where(self.alive[:n], level, 0.0)
+        return level, code
 
     # ------------------------------------------------------------------ #
     # Olfactory recognition

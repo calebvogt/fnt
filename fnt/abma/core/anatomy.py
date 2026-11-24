@@ -23,14 +23,17 @@ How the nervous system meets the body:
 only at the sense organ, or the area, that the spec's ``entry`` table names. A
 channel the spec does not place is not wired at all (the four hand-set
 "disposition" channels are left out on purpose: this brain is meant to replace
-them). The vomeronasal organ has no channel yet, because the engine has no
-sense of a urine mark's identity on nose contact.
+them). The vomeronasal organ gets the ``vno_*`` channels: nothing unless the
+nose is on a urine spot or on another animal, and then that spot's or animal's
+MUP barcode.
 
 *Out.* The units of class ``output`` are muscles. ``TURN`` is a left and a
 right unit, read as their difference; ``SPEED`` and ``BITE`` are read as the
 mean of their units. Urination is two muscles, as in the animal: the bladder
 wall (``DET``) and the urethral sphincter (``EUS``, tonically active). The
-push ``DET * (1 - EUS)`` is recorded but the engine does not obey it yet.
+engine obeys them when scent marking is on (``ScentParams``): urine leaves when
+pressure in the bladder beats the closure of the urethra, and lands as a spot
+that carries the animal's MUP barcode.
 
 *Slow chemistry.* A neuromodulator's level multiplies the gain of every area
 by that area's receptor level. The level is the mean activity of the area that
@@ -312,13 +315,13 @@ class AnatomicalBrain:
         return r + self.alpha * (np.tanh(np.maximum(x, 0.0)) - r)
 
     def commands(self, r: np.ndarray):
-        """Turn (rad/s), speed (0..1), bite (bool), urine push (0..1)."""
+        """Turn (rad/s), speed (0..1), bite (bool), and the two urination
+        muscles as ``(bladder wall, sphincter)``, each 0..1."""
         t = r[:, self.sl["TURN"]]
         turn = self.max_turn * (t[:, 1] - t[:, 0])
         speed = r[:, self.sl["SPEED"]].mean(axis=1)
         bite = r[:, self.sl["BITE"]].mean(axis=1) > 0.5
-        push = r[:, self.sl["DET"]].mean(axis=1) * (1.0 - r[:, self.sl["EUS"]].mean(axis=1))
-        return turn, speed, bite, push
+        return turn, speed, bite, (r[:, self.sl["DET"]].mean(axis=1), r[:, self.sl["EUS"]].mean(axis=1))
 
 
 class AnatomicalPolicy(Policy):
@@ -339,7 +342,7 @@ class AnatomicalPolicy(Policy):
         self.r = None
         self.last_speed = self.last_turn = None
         self.last_obs = None
-        self.turn = self.speed = self.bite = self.push = None
+        self.turn = self.speed = self.bite = self.wall = self.sphincter = None
         self._clock = np.inf
 
     @staticmethod
@@ -355,14 +358,14 @@ class AnatomicalPolicy(Policy):
             self.memory = PlaceMemory(n)
             self.last_speed, self.last_turn = np.zeros(n), np.zeros(n)
             self.turn, self.speed = np.zeros(n), np.zeros(n)
-            self.bite, self.push = np.zeros(n, bool), np.zeros(n)
+            self.bite, self.wall, self.sphincter = np.zeros(n, bool), np.zeros(n), np.zeros(n)
             return
         have = len(self.r)
         if n > have:                              # the roster grew mid-run
             pad = n - have
             self.r = np.vstack([self.r, self.brain.initial_state(pad)])
             self.memory.resize(n)
-            for name in ("last_speed", "last_turn", "turn", "speed", "push"):
+            for name in ("last_speed", "last_turn", "turn", "speed", "wall", "sphincter"):
                 setattr(self, name, np.concatenate([getattr(self, name), np.zeros(pad)]))
             self.bite = np.concatenate([self.bite, np.zeros(pad, bool)])
 
@@ -379,7 +382,7 @@ class AnatomicalPolicy(Policy):
         bit = np.zeros(n, bool)
         for _ in range(ticks):
             self.r = self.brain.step(self.r, obs, self.rng)
-            self.turn, self.speed, b, self.push = self.brain.commands(self.r)
+            self.turn, self.speed, b, (self.wall, self.sphincter) = self.brain.commands(self.r)
             bit |= b
         if ticks:
             self._clock -= ticks * self.brain.tick_s
@@ -388,7 +391,8 @@ class AnatomicalPolicy(Policy):
         self.last_speed, self.last_turn = self.speed, self.turn / self.brain.max_turn
         perc.update(speed_frac=np.where(sim.alive, self.speed, 0.0), resting=self.speed < self.REST_FRAC,
                     drives={}, want_chew=np.zeros(n, bool),
-                    bite=(self.bite & sim.alive) if ticks else np.zeros(n, bool))
+                    bite=(self.bite & sim.alive) if ticks else np.zeros(n, bool),
+                    bladder_wall=self.wall, sphincter=self.sphincter)
         return np.stack([np.cos(heading), np.sin(heading)], axis=1), perc
 
     def frame_extra(self, n: int) -> dict:
@@ -437,19 +441,25 @@ def record(cfg, seconds: float, trial_index: int = 0) -> dict:
     n, N = sim.n, pol.brain.n
     out = {"t": np.zeros(T), "xy": np.zeros((T, n, 2), np.float32), "heading": np.zeros((T, n), np.float32),
            "speed": np.zeros((T, n), np.float32), "turn": np.zeros((T, n), np.float32),
-           "push": np.zeros((T, n), np.float32), "rates": np.zeros((T, n, N), np.uint8)}
+           "bladder": np.zeros((T, n), np.float32), "contact": np.zeros((T, n), np.float32),
+           "rates": np.zeros((T, n, N), np.uint8)}
+    vno = SENSORS.index("vno_contact")
+    voids = []
     events = _Count()
     for k in range(T):
         sim.step(k * dt, dt, events=events)
         out["t"][k] = (k + 1) * dt
         out["xy"][k], out["heading"][k] = sim.P[:n], sim.H[:n]
-        out["speed"][k], out["turn"][k], out["push"][k] = pol.speed, pol.turn, pol.push
+        out["speed"][k], out["turn"][k], out["bladder"][k] = pol.speed, pol.turn, sim.bladder[:n] / 100.0
+        out["contact"][k] = pol.last_obs[:n, vno]
+        voids += [(k, a, x, y, v) for a, x, y, v in sim.last_voids]
         out["rates"][k] = np.clip(pol.r * 255.0, 0, 255).astype(np.uint8)
+    out["voids"] = np.array(voids, float).reshape(-1, 5)     # step, animal, x, y, fraction of a bladder
     out["meta"] = {
         "anatomy": cfg.brain.anatomy, "anatomy_seed": cfg.brain.anatomy_seed,
         "strengths": dict(cfg.brain.strengths), "receptors": dict(cfg.brain.receptors),
         "dt": dt, "seconds": T * dt, "arena": [cfg.arena.width, cfg.arena.height],
-        "units": pol.brain.unit_names(), "areas": pol.brain.ids, "events": events.kinds,
+        "name": cfg.name, "units": pol.brain.unit_names(), "areas": pol.brain.ids, "events": events.kinds,
         "unwired": pol.brain.unwired, "trained": False,
     }
     return out

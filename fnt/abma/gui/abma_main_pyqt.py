@@ -502,6 +502,14 @@ class ABMAWindow(QMainWindow):
             "(colour = whose marks dominate each patch, opacity = how fresh)")
         self.btn_scent.toggled.connect(self._on_toggle_scent)
         tl.addWidget(self.btn_scent)
+        self.btn_brain_map = QToolButton()
+        self.btn_brain_map.setText("🧠")
+        self.btn_brain_map.setToolTip(
+            "Brain map: put this design's first animal in its arena with a "
+            "brain wired from anatomy and watch every model neuron (its own "
+            "run, separate from the experiment)")
+        self.btn_brain_map.clicked.connect(self._open_brain_map)
+        tl.addWidget(self.btn_brain_map)
         self._trail_state = 2           # index into _TRAIL_LENGTHS
         self.btn_trail = QToolButton()
         self.btn_trail.setText("〰")
@@ -537,6 +545,26 @@ class ABMAWindow(QMainWindow):
         self._inspector_pinned = False
         self._hover_idx = None
         return right
+
+    def _open_brain_map(self):
+        """Open the brain map on the current design.
+
+        The map runs its own copy of the design (one trial, stepped at the
+        network's grain), so it can be opened before, during or after a run
+        without touching it. A design with no anatomy brain gets the shipped
+        C57 male.
+        """
+        try:
+            import copy
+
+            from .brain_map import open_brain_map
+            cfg = copy.deepcopy(self._collect_config())
+            if not getattr(cfg.brain, "anatomy", ""):
+                cfg.brain.anatomy = "c57_male"
+            cfg.brain.enabled = True
+            self._brain_map = open_brain_map(cfg, exec_=False)
+        except Exception as e:           # a view must never take the window down
+            QMessageBox.warning(self, "Brain map", str(e))
 
     def _on_toggle_scent(self, on):
         """Show the emergent territory mosaic under the arena.

@@ -29,6 +29,10 @@ GENE_EFFECTS: dict[str, dict[str, list[tuple[str, str, float]]]] = {
     "MUP": {
         "KO":  [("identity_signal", "set", 0.0)],
         "HET": [("identity_signal", "scale", 0.5)],
+        # an inbred strain (C57BL/6): a normal amount of MUP, but every animal
+        # carries the same set of isoforms, so a mark says "a mouse" and not
+        # which mouse. No trait changes; see :func:`mup_barcode`.
+        "INBRED": [],
     },
     # Oxytocin receptor — social bonding / affiliation (voles).
     "OXTR": {
@@ -98,6 +102,34 @@ _TRAIT_RANGES = {
     "turn_rate": (0.0, 3.0),
     "wander": (0.0, 3.0),
 }
+
+
+#: how many MUP isoforms a urine barcode has
+MUP_LOCI = 12
+#: the one barcode every animal of an inbred strain carries
+INBRED_BARCODE = (1, 1, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1)
+
+
+def mup_barcode(status: str, uid: int, seed: int):
+    """Which MUP isoforms an animal's urine carries, as ``MUP_LOCI`` values.
+
+    Wild-type outbred animals each get their own combination (drawn once from
+    the run's seed and the animal's stable uid, so it does not change when the
+    roster does). ``INBRED`` animals all carry :data:`INBRED_BARCODE`. ``KO``
+    animals carry none; ``HET`` carry their own combination at half strength.
+    """
+    import numpy as np
+
+    status = (status or "WT").upper()
+    if status == "KO":
+        return np.zeros(MUP_LOCI)
+    if status == "INBRED":
+        return np.array(INBRED_BARCODE, float)
+    rng = np.random.default_rng([int(seed) & 0x7FFFFFFF, int(uid) & 0x7FFFFFFF, 0x4D5550])
+    bits = (rng.random(MUP_LOCI) < 0.55).astype(float)
+    if not bits.any():
+        bits[int(rng.integers(MUP_LOCI))] = 1.0
+    return bits * (0.5 if status == "HET" else 1.0)
 
 
 def _apply(traits: TraitProfile, effects: list[tuple[str, str, float]]) -> None:

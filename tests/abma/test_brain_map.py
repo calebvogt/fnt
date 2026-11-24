@@ -162,3 +162,80 @@ def test_the_page_ships_with_the_package():
     assert proj["project"]["optional-dependencies"]["brainmap"] == ["PyQtWebEngine"]
     for name in ("brain_map_template.html", "three.min.js"):
         assert os.path.isfile(os.path.join(brainmap.assets_dir(), name))
+
+
+def _short_recording(tmp_path, n=1):
+    cfg = _cfg()
+    cfg.dt, cfg.scent.enabled = 0.25, True
+    cfg.groups[0].count = n
+    rec = anatomy.record(cfg, 20.0)
+    return rec, anatomy.save_recording(rec, str(tmp_path / "run" / "brain_recording.npz"))
+
+
+def test_a_recording_becomes_a_page_that_plays_itself(tmp_path):
+    rec, path = _short_recording(tmp_path, n=2)
+    spec, payload = brainmap.replay_payload(anatomy.load_recording(path))
+    assert payload["frames"] == 80 and len(payload["x"]) == 80 and payload["arena"] == [0.5, 0.5]
+    assert len(base64.b64decode(payload["rates"])) == 80 * rec["rates"].shape[2]
+    assert len(payload["others"]) == 80 and len(payload["others"][0]) == 1      # the second animal, as a position
+    assert "Open field test" in payload["title"] and "50" in payload["title"]
+    html = brainmap.build_page(spec, replay=payload)
+    assert "window.ABMA_REPLAY=" in html and "https://" not in html.split("window.ABMA_REPLAY=")[0][-400:]
+    hosted = brainmap.build_page(spec, hosted=True, replay=payload)
+    assert "window.ABMA_REPLAY=" in hosted and "cdnjs.cloudflare.com" in hosted
+
+
+def test_replay_opens_without_an_engine(tmp_path):
+    from fnt.abma.gui import brain_map
+    _, path = _short_recording(tmp_path)
+    page = brain_map.open_replay(path, where="browser", open_browser=False)
+    with open(page, encoding="utf-8") as f:
+        assert "window.ABMA_REPLAY=" in f.read()
+
+
+def test_command_line_recording_writes_the_replay_page(tmp_path, capsys):
+    out = str(tmp_path)
+    assert main(["--anatomy", "c57_male", "--brain-recording", "0.1", "--out", out]) == 0
+    assert os.path.isfile(os.path.join(out, "open_field_test_anatomy", "brain_recording.html"))
+    with pytest.raises(SystemExit):
+        main(["--brain-replay", os.path.join(out, "nope.npz")])
+
+
+def test_the_engine_reports_the_arena_and_the_other_animals(tmp_path, monkeypatch):
+    from fnt.abma.gui.brain_map import Engine, _app
+    monkeypatch.setattr(anatomy, "user_dir", lambda: str(tmp_path / "anatomy"))
+    _app()
+    cfg = presets.get_preset(presets.preset_names()[0]) if False else _cfg()
+    cfg.groups[0].count = 3
+    e = Engine(cfg)
+    e.timer.stop()
+    got = []
+    e.frame.connect(got.append)
+    e.step()
+    f = json.loads(got[0])
+    assert len(f["others"]) == 2 and "contact" in f and f["voids"] == []
+    hello = json.loads(e.hello())
+    assert hello["arena"] == [0.5, 0.5] and "cm" in hello["title"]
+    assert e.cfg.scent.enabled
+    e.deleteLater()
+
+
+def test_the_abma_window_has_a_brain_map_button(tmp_path, monkeypatch):
+    import webbrowser
+    from fnt.abma.gui.launch import build_window
+    from fnt.abma.gui.brain_map import _app
+
+    monkeypatch.setattr(anatomy, "user_dir", lambda: str(tmp_path / "anatomy"))
+    monkeypatch.setattr(webbrowser, "open", lambda *a, **k: True)
+    _app()
+    win = build_window(presets.open_field_test())
+    try:
+        assert win.btn_brain_map.toolTip().startswith("Brain map")
+        win._open_brain_map()
+        got = win._brain_map
+        map_win, engine = got[0], got[1]
+        assert engine.name == "c57_male"            # a design with no anatomy brain gets the shipped one
+        engine.timer.stop()
+        map_win.close()
+    finally:
+        win.close()

@@ -78,6 +78,9 @@ SENSORS: list[str] = [
     "in_cover", "cover", "cover_fwd", "cover_lat",   # under a hut; the nearest hut
     "other_closing",                         # the nearest animal is coming at it
     "other_size",                            # ...and is bigger (+) or smaller (-)
+    # --- vomeronasal (appended): involatile cues, read only on nose contact --
+    "vno_contact",                           # the nose is on a urine spot or an animal
+    *[f"vno_mup_{k}" for k in range(12)],    # the MUP barcode of whatever it is on
 ]
 
 #: The interoceptive channels that also act as neuromodulators — they gate the
@@ -102,6 +105,7 @@ GROUPS: dict[str, list[str]] = {
     "efference": ["last_speed", "last_turn"],
     "contest": ["hurt", "hurt_fwd", "hurt_lat", "fatigue", "in_cover", "cover",
                 "cover_fwd", "cover_lat", "other_closing", "other_size"],
+    "vomeronasal": [s for s in SENSORS if s.startswith("vno_")],
 }
 
 _IDX = {name: i for i, name in enumerate(SENSORS)}
@@ -409,6 +413,14 @@ def sense(sim, elapsed_s: float, memory: PlaceMemory, params: SenseParams,
         put("last_speed", last_speed)
     if last_turn is not None:
         put("last_turn", last_turn)
+
+    # ---- vomeronasal: only what the nose is actually on ----------------- #
+    # Not scaled by smell_ability: methimazole strips the main olfactory
+    # epithelium and largely spares the vomeronasal organ.
+    level, code = sim.nose_contact(elapsed_s)
+    put("vno_contact", level)
+    for k in range(code.shape[1]):
+        put(f"vno_mup_{k}", level * code[:, k])
 
     obs[~alive] = 0.0
 

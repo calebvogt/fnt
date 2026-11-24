@@ -53,7 +53,7 @@
     {"id": "TURN", "name": "Neck and trunk", "class": "output", "col": 5, "n": 2, "unit_names": ["right", "left"], "note": "Turning: the left unit minus the right unit. In the engine today."},
     {"id": "SPEED", "name": "Limbs", "class": "output", "col": 5, "n": 2, "note": "Speed. In the engine today."},
     {"id": "BITE", "name": "Jaw", "class": "output", "col": 5, "n": 2, "note": "Biting. In the engine with contest physics on."},
-    {"id": "DET", "name": "Bladder wall", "class": "output", "col": 5, "n": 2, "note": "Contracts to push urine out. New: the engine urinates by itself today."},
+    {"id": "DET", "name": "Bladder wall", "class": "output", "col": 5, "n": 2, "note": "Contracts to push urine out."},
     {"id": "EUS", "name": "Urethral sphincter", "class": "output", "col": 5, "n": 2, "tonic": 1.2, "note": "Held shut by default. Urine leaves when it relaxes while the bladder wall contracts; the mark is what that leaves on the ground."}
   ],
   "projections": [
@@ -183,7 +183,7 @@
   ],
   "entry": {
     "MOE": ["olf_food", "olf_food_fwd", "olf_food_lat", "olf_water", "olf_water_fwd", "olf_water_lat", "olf_own", "olf_own_fwd", "olf_own_lat", "olf_foreign", "olf_foreign_fwd", "olf_foreign_lat", "olf_male", "olf_male_fwd", "olf_male_lat", "olf_female", "olf_female_fwd", "olf_female_lat", "olf_estrous", "olf_estrous_fwd", "olf_estrous_lat"],
-    "VNO": [],
+    "VNO": ["vno_contact", "vno_mup_0", "vno_mup_1", "vno_mup_2", "vno_mup_3", "vno_mup_4", "vno_mup_5", "vno_mup_6", "vno_mup_7", "vno_mup_8", "vno_mup_9", "vno_mup_10", "vno_mup_11"],
     "WHK": ["wall_ahead", "wall_left", "wall_right", "other", "other_fwd", "other_lat"],
     "TST": ["at_food", "at_water", "grass"],
     "VIS": ["hunger", "thirst", "bladder"],
@@ -192,9 +192,6 @@
     "PRO": ["last_speed", "last_turn", "fatigue"],
     "SCN": ["clock_sin", "clock_cos"],
     "HPC": ["home", "home_fwd", "home_lat", "mem_food", "mem_food_fwd", "mem_food_lat", "mem_water", "mem_water_fwd", "mem_water_lat"]
-  },
-  "entry_planned": {
-    "VNO": "The MUP barcode of a urine mark, read only on nose contact. The engine has no such sense yet."
   },
   "evidence": {
     "leroy2018": {"kind": "paper", "cite": "Leroy 2018", "journal": "Nature", "pmid": "30518859", "doi": "10.1038/s41586-018-0772-0", "finding": "CA2 output to the lateral septum promotes aggression by disinhibiting the ventrolateral ventromedial hypothalamus; vasopressin strengthens it."},
