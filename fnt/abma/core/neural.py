@@ -191,6 +191,9 @@ class NeuralPolicy(Policy):
 def make_policy(cfg) -> Policy:
     """The policy a config asks for: a learned brain, or the rules."""
     bp = getattr(cfg, "brain", None)
+    if bp is not None and bp.enabled and getattr(bp, "anatomy", ""):
+        from .anatomy import AnatomicalPolicy
+        return AnatomicalPolicy.from_config(cfg)
     if bp is not None and bp.enabled:
         return NeuralPolicy.from_config(cfg)
     from .policy import RuleBasedPolicy

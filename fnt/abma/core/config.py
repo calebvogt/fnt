@@ -340,11 +340,24 @@ class BrainParams:
     ``~/ABMA_brains``) or a path to a ``.npz``. ``stochastic`` adds the motor
     noise the brain was trained with; without it every animal acts on the mean
     of its policy, which is tidier to read and less like an animal.
+
+    ``anatomy`` asks for a different kind of brain altogether: one wired from
+    an anatomy spec (:mod:`fnt.abma.core.anatomy`; a name from
+    ``fnt/abma/brains/anatomy`` or a path to a ``.json``). Its weights are
+    random draws inside that wiring (``anatomy_seed`` picks the draw), so it
+    is untrained. ``strengths`` multiplies single projections
+    (``{"mPFC>DRN": 1.5}``, 0 cuts one) and ``receptors`` overrides single
+    receptor levels (``{"OT@LS": 3}``). When ``anatomy`` is set, ``name`` is
+    ignored.
     """
     enabled: bool = False
     name: str = "vole_forager"
     stochastic: bool = True
     noise_scale: float = 1.0
+    anatomy: str = ""
+    anatomy_seed: int = 0
+    strengths: dict = field(default_factory=dict)
+    receptors: dict = field(default_factory=dict)
 
 
 @dataclass

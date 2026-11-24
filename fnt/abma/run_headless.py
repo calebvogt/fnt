@@ -162,6 +162,29 @@ def main(argv=None) -> int:
                         "--list-brains, or a path to a .npz).")
     b.add_argument("--list-brains", action="store_true",
                    help="Print the brains that can be asked for, and exit.")
+    b.add_argument("--anatomy", metavar="NAME",
+                   help="Give every animal a brain wired from an anatomy spec "
+                        "(a name from --list-anatomies, or a path to a .json): "
+                        "one block of units per brain area, connected only "
+                        "where the spec has a projection. Untrained: the "
+                        "weights are random draws inside the wiring. With no "
+                        "--preset, the open field test is used.")
+    b.add_argument("--list-anatomies", action="store_true",
+                   help="Print the anatomy specs that can be asked for, and "
+                        "exit.")
+    b.add_argument("--anatomy-seed", type=int, default=0, metavar="N",
+                   help="Which random draw of the weights (default 0).")
+    b.add_argument("--strength", action="append", metavar="A>B=X",
+                   help="Multiply the strength of one projection of the "
+                        "anatomy, e.g. 'mPFC>DRN=1.5'; 0 cuts it. Repeatable.")
+    b.add_argument("--receptor", action="append", metavar="MOD@AREA=N",
+                   help="Set one area's receptor level for a neuromodulator, "
+                        "0-3, e.g. 'OT@LS=3'. Repeatable.")
+    b.add_argument("--brain-recording", type=float, metavar="MINUTES",
+                   help="With --anatomy: run one trial for this many minutes "
+                        "and keep every unit's activity at every step, "
+                        "written to <out>/<name>/brain_recording.npz with a "
+                        "table of mean firing per area (brain_areas.csv).")
     b.add_argument("--twin", action="append", metavar="TWEAK",
                    help="Live one life twice: run to --fork-hours, copy the "
                         "world, apply TWEAK to the copy, and compare. E.g. "
@@ -225,6 +248,15 @@ def main(argv=None) -> int:
             visits, by=[c.strip() for c in args.structure_by.split(",") if c.strip()], days=days)
         tab.to_csv(out, index=False)
         print(f"{len(tab)} group(s) -> {out}")
+        return 0
+
+    if args.list_anatomies:
+        from .core import anatomy
+        found = anatomy.list_anatomies()
+        if not found:
+            print("No anatomy specs found.")
+        for name, path in found:
+            print(f"{name}\n    {anatomy.describe(anatomy.load_spec(path))}\n    {path}")
         return 0
 
     if args.list_brains:
@@ -326,6 +358,8 @@ def main(argv=None) -> int:
         print("  results/comparison.csv     per-metric arm vs reference")
         return 0
 
+    if args.anatomy and not (args.preset or args.config):
+        args.preset = "open field"          # the smallest world to watch a brain in
     described = args.preset or args.males or args.females
     if not args.config and not described:
         p.error("a config JSON is required (or --preset/--males/--females, "
@@ -333,6 +367,8 @@ def main(argv=None) -> int:
 
     from .core.compose import design, summary
 
+    if (args.strength or args.receptor or args.brain_recording) and not args.anatomy:
+        p.error("--strength, --receptor and --brain-recording need --anatomy")
     try:
         cfg = design(
             preset=args.preset,
@@ -345,6 +381,20 @@ def main(argv=None) -> int:
         p.error(str(e))
     if args.parallel:
         cfg.parallel = True
+    if args.anatomy:
+        from .core import anatomy
+        try:
+            spec = anatomy.load_spec(args.anatomy)
+            cfg.brain.strengths = dict(anatomy.parse_strength(s) for s in args.strength or [])
+            cfg.brain.receptors = dict(anatomy.parse_receptor(s) for s in args.receptor or [])
+            cfg.brain.enabled, cfg.brain.anatomy = True, args.anatomy
+            cfg.brain.anatomy_seed = args.anatomy_seed
+            anatomy.AnatomicalBrain(spec, strengths=cfg.brain.strengths,
+                                    receptors=cfg.brain.receptors)   # names checked here
+        except (FileNotFoundError, ValueError) as e:
+            p.error(str(e))
+        if not args.name:
+            cfg.name = f"{cfg.name}_anatomy"
     if args.brain:
         from .core.brain import find_brain
         try:
@@ -364,7 +414,38 @@ def main(argv=None) -> int:
         print(f"Config written to {args.save_config}")
 
     print(summary(cfg))
+    if args.anatomy:
+        print("brain: " + anatomy.describe(spec)
+              + "".join(f"; {k} x{v:g}" for k, v in cfg.brain.strengths.items())
+              + "".join(f"; {k} = {v}" for k, v in cfg.brain.receptors.items()))
     if args.dry_run:
+        return 0
+
+    if args.brain_recording:
+        import csv
+
+        out_dir = os.path.join(args.out, cfg.name)
+        rec = anatomy.record(cfg, args.brain_recording * 60.0)
+        path = anatomy.save_recording(rec, os.path.join(out_dir, "brain_recording.npz"))
+        rows = anatomy.area_table(rec, spec)
+        table = os.path.join(out_dir, "brain_areas.csv")
+        with open(table, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0]))
+            w.writeheader()
+            w.writerows(rows)
+        mv = anatomy.movement_summary(rec)
+        print(f"\n{rec['meta']['seconds'] / 60:g} min at {rec['meta']['dt']:g} s steps: "
+              f"path {mv['path_m']:.1f} m, moving {mv['moving_frac']:.0%} of the time, "
+              f"centre {mv['centre_frac']:.0%}, net turns {mv['turns_left_net']:+.1f} "
+              f"(+ is left), events {mv['events'] or 'none'}")
+        top = sorted(rows, key=lambda r: -r["mean_pct"])[:8]
+        print("most active areas (mean % of maximum): "
+              + ", ".join(f"{r['area']} {r['mean_pct']:.0f}" for r in top))
+        if rec["meta"]["unwired"]:
+            print("not wired (this engine has no such sense): "
+                  + ", ".join(rec["meta"]["unwired"]))
+        print("wrote", path)
+        print("wrote", table)
         return 0
 
     if args.movie:

@@ -169,6 +169,42 @@ it, and the rule-based animal, never bite. Every value in `ContestParams` is a
 free parameter. See the ABMA README for the senses that come with it and for
 the known limits.
 
+## A brain wired from anatomy (experimental)
+
+`--anatomy c57_male` gives every animal a brain built from an anatomy spec: one
+block of model neurons per brain area, connected only where the spec lists a
+projection. The shipped spec is a reduced male C57BL/6J house mouse (44 areas,
+311 model neurons). **It is untrained**: the weights are random draws inside
+the wiring, so the behaviour means nothing yet. It is for seeing where
+activity goes and what changes when one connection or one receptor level is
+changed.
+
+```
+python -m fnt.abma --list-anatomies
+python -m fnt.abma --anatomy c57_male --brain-recording 5
+python -m fnt.abma --anatomy c57_male --strength "SC>TURN=0" --receptor "OT@LS=3" --brain-recording 5
+python -m fnt.abma --anatomy c57_male --watch
+```
+
+| Option | What it does |
+|---|---|
+| `--anatomy NAME` | Use this spec (a name from `--list-anatomies`, or a path to a `.json`). With no `--preset`, the open field test is used. |
+| `--anatomy-seed N` | Which random draw of the weights. A draw usually turns one way; another draw turns the other. |
+| `--strength A>B=X` | Multiply the strength of one projection (0 cuts it). Repeatable. |
+| `--receptor MOD@AREA=N` | Set one area's receptor level for a neuromodulator, 0 to 3. Repeatable. |
+| `--brain-recording MINUTES` | Run one trial and keep every model neuron at every step. |
+
+A brain recording writes two files into the run folder: `brain_recording.npz`
+(position, heading, the commands to the muscles, and every model neuron's
+firing rate as a fraction of its maximum) and `brain_areas.csv` (mean, spread
+and peak firing of each area, in percent of maximum).
+
+The spec is a JSON file you can copy into `~/ABMA_brains/anatomy/` and edit:
+areas, projections with a sign and a strength, where each neuromodulator is
+released and each area's receptor level, where each sense enters, and the
+evidence each connection rests on (a paper, or an idea with its author and
+date).
+
 ## Output
 
 A run folder holds `config.json` (the exact experiment), `provenance.json`

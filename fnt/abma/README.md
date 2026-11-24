@@ -1091,6 +1091,64 @@ only once per tick (2 s by default), which is slow for a fight. How far an anima
 individual from another through the brain's senses, and nothing is limited
 enough to be worth excluding a rival from except a receptive female.
 
+## A brain wired from anatomy
+
+`fnt/abma/core/anatomy.py` builds a network from an *anatomy spec* instead of
+two anonymous layers: one block of units per brain area, connected only where
+the spec lists a projection, with the sign the spec gives it. The first spec is
+`fnt/abma/brains/anatomy/c57_male.json`, a reduced male C57BL/6J house mouse
+(44 areas, 311 units, 114 projections, 7 neuromodulators). A spec is plain
+JSON:
+
+- `regions`: each area's id, name, class (sense organ, sensory area, internal
+  area, motor area, muscle) and number of units.
+- `projections`: `[from, to, sign, strength 1-3, [evidence keys]]`. The sign is
+  `+`, `-` or `±` (mixed cell types: each source cell is one or the other).
+- `modulators`: where each neuromodulator is released and a receptor level
+  0-3 per area. This table is where strains and species are meant to differ.
+- `entry`: which engine sensor channels enter at which sense organ or area.
+- `evidence`: what each projection or area rests on, either a paper (with its
+  PubMed id) or an idea (with its author and date). A projection with no
+  evidence is one that still needs verifying.
+
+**It is untrained.** The weights are random draws inside the wiring
+(`--anatomy-seed` picks the draw), so the behaviour means nothing yet: a given
+draw usually turns one way, because its two turn units are not balanced. What
+is real is the route activity takes, and what changes when one projection or
+one receptor level is changed. Training it is the open problem.
+
+How it meets the body: every engine sensor channel enters at the organ the
+spec names (wall contact at the whiskers, hunger at the viscera, every odour
+the engine has at the main olfactory epithelium). The hand-set disposition
+channels (`aggression`, `boldness`, `sociability`, `exploration`) are not
+wired at all; this brain is meant to replace them. The outputs are muscles:
+neck and trunk (a left and a right unit, read as their difference), limbs
+(speed), jaw (bite), and, for urination, the bladder wall and the urethral
+sphincter. The engine does not obey those last two yet (it urinates by
+itself), and it has no sense of a urine mark's identity on nose contact, so
+the vomeronasal organ has no input.
+
+```
+python -m fnt.abma --list-anatomies
+python -m fnt.abma --anatomy c57_male --brain-recording 5
+python -m fnt.abma --anatomy c57_male --anatomy-seed 3 --strength "SC>TURN=0" --receptor "OT@LS=3" --brain-recording 5
+python -m fnt.abma --anatomy c57_male --watch
+python -m fnt.abma --preset volecosm --anatomy c57_male --movie
+```
+
+`--anatomy` works wherever `--brain` does, because both go through
+`make_policy(cfg)`: a headless run, the live window, a movie. With no
+`--preset` it uses the open field test. `--strength A>B=X` multiplies one
+projection (0 cuts it) and `--receptor MOD@AREA=N` sets one receptor level;
+both are applied on top of the same draw, so two runs that differ only in an
+edit are otherwise identical cell for cell. `--brain-recording MINUTES` runs
+one trial and keeps every unit at every engine step
+(`brain_recording.npz`: positions, heading, muscle commands, and each unit's
+firing rate as a fraction of its maximum) with a table of mean firing per area
+(`brain_areas.csv`). The ordinary run record also carries the activity, at its
+own coarser sampling, under the same names a learned brain uses, so the
+inspection column's activity strip shows it.
+
 ## Roadmap / not yet done
 
 1. **Absorbing boundary** — currently treated as reflective.
