@@ -79,6 +79,11 @@ rfid = [
     # metrics match the R/igraph pipeline this module replaces. networkx was
     # listed here for an earlier implementation and is no longer used.
 ]
+brainmap = [
+    # shows the ABMA brain map inside an FNT window; without it the map opens
+    # in the user's own browser instead
+    "PyQtWebEngine",
+]
 tracking = [
     "torchvision>=0.20.1",
     "pycocotools>=2.0.6",
@@ -104,4 +109,5 @@ Issues = "https://github.com/calebvogt/fnt/issues"
 include = ["fnt*"]
 
 [tool.setuptools.package-data]
-fnt = ["../icons/*.ico", "../icons/*.png", "fed3/ui/*.svg", "abma/brains/*.npz", "abma/brains/anatomy/*.json"]
+fnt = ["../icons/*.ico", "../icons/*.png", "fed3/ui/*.svg", "abma/brains/*.npz", "abma/brains/anatomy/*.json",
+       "abma/gui/brain_map_page/*"]

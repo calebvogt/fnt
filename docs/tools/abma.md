@@ -193,11 +193,33 @@ python -m fnt.abma --anatomy c57_male --watch
 | `--strength A>B=X` | Multiply the strength of one projection (0 cuts it). Repeatable. |
 | `--receptor MOD@AREA=N` | Set one area's receptor level for a neuromodulator, 0 to 3. Repeatable. |
 | `--brain-recording MINUTES` | Run one trial and keep every model neuron at every step. |
+| `--brain-map [window\|browser]` | Open the brain map (below). |
 
 A brain recording writes two files into the run folder: `brain_recording.npz`
 (position, heading, the commands to the muscles, and every model neuron's
 firing rate as a fraction of its maximum) and `brain_areas.csv` (mean, spread
 and peak firing of each area, in percent of maximum).
+
+### The brain map
+
+`python -m fnt.abma --brain-map` opens a live picture of the brain: every area
+and model neuron, lit by its firing while one animal walks an open field.
+
+- **Layouts:** ribbons (projection strength as width), the network left to
+  right, or the network arranged freely.
+- **Click an area** for its inputs and outputs, each one's share and the
+  evidence behind it. `-` and `+` make a projection weaker or stronger, or
+  change a receptor level, in the running brain.
+- **Click a neuron** to trace its firing rate (percent of its maximum) and to
+  see what it listens to and talks to.
+- **Verify:** a projection with no paper behind it says "needs verification";
+  the button takes a paper or a note.
+- **New random wiring** draws the weights again.
+
+The map opens inside FNT if Qt's web engine is installed
+(`pip install PyQtWebEngine`), and in your browser if it is not. Either way the
+animal is run by FNT on your computer and nothing is sent anywhere. Your
+changes and notes are saved in `~/ABMA_brains/anatomy/`.
 
 The spec is a JSON file you can copy into `~/ABMA_brains/anatomy/` and edit:
 areas, projections with a sign and a strength, where each neuromodulator is

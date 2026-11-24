@@ -1149,6 +1149,36 @@ firing rate as a fraction of its maximum) with a table of mean firing per area
 own coarser sampling, under the same names a learned brain uses, so the
 inspection column's activity strip shows it.
 
+### The brain map: `--brain-map`
+
+```
+python -m fnt.abma --brain-map
+python -m fnt.abma --anatomy c57_male --anatomy-seed 3 --brain-map browser
+```
+
+Opens a page that draws the anatomy (as ribbons, as a left-to-right network or
+as a free network of model neurons), with the animal run live by the engine:
+every model neuron lights with its firing, a click on a neuron traces its
+firing rate and lists what it listens to and talks to, a click on an area
+lists its inputs and outputs with the evidence for each, and `-` / `+` on a
+projection or a receptor level changes the running brain. A jointed body walks
+the open field beside it.
+
+The page is only the display (`fnt/abma/gui/brain_map_page/`, built by
+`core/brainmap.py`). The engine side is `gui/brain_map.py`: a bridge object
+sends one frame per engine step and takes the controls back, so the one network
+that runs is the Python one. The page appears **inside an FNT window** when
+Qt's web engine is installed (`pip install fieldneurotoolbox[brainmap]`, about
+130 MB), and **in your own browser** otherwise, talking to the engine over a
+WebSocket on this computer only; `--brain-map window` or `--brain-map browser`
+chooses. Nothing is fetched from the internet: the 3D library (three.js, MIT)
+ships with FNT. What you change or verify on the page is kept in
+`~/ABMA_brains/anatomy/<name>.notes.json`; the spec is never rewritten.
+
+Known limits: the map runs the open field with one animal; Qt 5's web engine is
+an old browser and redraws about 15-30 times a second, less smoothly than a
+current browser; a recorded run cannot be replayed on the map yet.
+
 ## Roadmap / not yet done
 
 1. **Absorbing boundary** — currently treated as reflective.

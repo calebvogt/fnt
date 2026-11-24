@@ -180,6 +180,15 @@ def main(argv=None) -> int:
     b.add_argument("--receptor", action="append", metavar="MOD@AREA=N",
                    help="Set one area's receptor level for a neuromodulator, "
                         "0-3, e.g. 'OT@LS=3'. Repeatable.")
+    b.add_argument("--brain-map", nargs="?", const="auto", metavar="WHERE",
+                   choices=["auto", "window", "browser"],
+                   help="Open the brain map: the anatomy drawn as ribbons or "
+                        "as a network, with the animal run live by the engine "
+                        "and every model neuron's firing on it. In an FNT "
+                        "window when Qt's web engine is installed "
+                        "(pip install PyQtWebEngine), otherwise in your "
+                        "browser; say 'window' or 'browser' to choose. Uses "
+                        "--anatomy c57_male unless another is given.")
     b.add_argument("--brain-recording", type=float, metavar="MINUTES",
                    help="With --anatomy: run one trial for this many minutes "
                         "and keep every unit's activity at every step, "
@@ -358,6 +367,8 @@ def main(argv=None) -> int:
         print("  results/comparison.csv     per-metric arm vs reference")
         return 0
 
+    if args.brain_map and not args.anatomy:
+        args.anatomy = "c57_male"
     if args.anatomy and not (args.preset or args.config):
         args.preset = "open field"          # the smallest world to watch a brain in
     described = args.preset or args.males or args.females
@@ -420,6 +431,13 @@ def main(argv=None) -> int:
               + "".join(f"; {k} = {v}" for k, v in cfg.brain.receptors.items()))
     if args.dry_run:
         return 0
+
+    if args.brain_map:
+        from .gui.brain_map import open_brain_map
+        try:
+            return open_brain_map(cfg, where=args.brain_map)
+        except RuntimeError as e:
+            p.error(str(e))
 
     if args.brain_recording:
         import csv
