@@ -1163,6 +1163,27 @@ firing rate as a fraction of its maximum) with a table of mean firing per area
 own coarser sampling, under the same names a learned brain uses, so the
 inspection column's activity strip shows it.
 
+### Raising it: `python -m fnt.abma.learn --anatomy`
+
+```
+python -m fnt.abma.learn --anatomy c57_male --name c57_forager --workers 2 --worlds 24 --minutes 600
+python -m fnt.abma --anatomy c57_male --anatomy-weights c57_forager --brain-map
+```
+
+`learn/anatomy_ppo.py` trains the weights of an anatomy brain in the nursery's
+randomised worlds, on the real engine, scored only by the change in the body's
+own discomfort (plus the mating bonus), exactly as a learned brain is. What it
+may change is limited by the anatomy: a weight exists only where the spec wires
+two cells and keeps the sign the spec gives that projection; local wiring
+inside an area is free in sign; receptor levels, the areas and the dynamics are
+not trained. While it is trained the inside of the network is quiet and the
+muscle units try things (Gaussian noise on their drive is the action the
+learner scores); at experiment time the usual small noise in every cell is
+back. The critic is a scaffold beside the brain and is not part of the anatomy.
+Weights are written to `~/ABMA_brains/anatomy/<name>.npz` with a log beside
+them, and `--resume <name>` carries on. Ticks are 0.25 s, so an animal-tick is
+an eighth of a learned brain's and a run needs correspondingly more of them.
+
 ### The brain map: `--brain-map`
 
 ```

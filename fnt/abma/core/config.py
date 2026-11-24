@@ -367,6 +367,9 @@ class BrainParams:
     noise_scale: float = 1.0
     anatomy: str = ""
     anatomy_seed: int = 0
+    #: weights raised for that anatomy by ``python -m fnt.abma.learn --anatomy``
+    #: (a name in ``~/ABMA_brains/anatomy`` or a path); empty = the random draw
+    anatomy_weights: str = ""
     strengths: dict = field(default_factory=dict)
     receptors: dict = field(default_factory=dict)
 

@@ -172,6 +172,11 @@ def main(argv=None) -> int:
     b.add_argument("--list-anatomies", action="store_true",
                    help="Print the anatomy specs that can be asked for, and "
                         "exit.")
+    b.add_argument("--anatomy-weights", metavar="NAME",
+                   help="Use weights raised for the anatomy by "
+                        "'python -m fnt.abma.learn --anatomy' (a name in "
+                        "~/ABMA_brains/anatomy, or a path) instead of a "
+                        "random draw.")
     b.add_argument("--anatomy-seed", type=int, default=0, metavar="N",
                    help="Which random draw of the weights (default 0).")
     b.add_argument("--strength", action="append", metavar="A>B=X",
@@ -414,6 +419,10 @@ def main(argv=None) -> int:
             cfg.brain.receptors = dict(anatomy.parse_receptor(s) for s in args.receptor or [])
             cfg.brain.enabled, cfg.brain.anatomy = True, args.anatomy
             cfg.brain.anatomy_seed = args.anatomy_seed
+            trained = None
+            if args.anatomy_weights:
+                _, trained = anatomy.load_weights(args.anatomy_weights)
+                cfg.brain.anatomy_weights = args.anatomy_weights
             anatomy.AnatomicalBrain(spec, strengths=cfg.brain.strengths,
                                     receptors=cfg.brain.receptors)   # names checked here
         except (FileNotFoundError, ValueError) as e:
@@ -440,7 +449,9 @@ def main(argv=None) -> int:
 
     print(summary(cfg))
     if args.anatomy:
-        print("brain: " + anatomy.describe(spec)
+        print("brain: " + (anatomy.describe(spec) if not trained else anatomy.describe(spec).replace(
+                  "untrained", f"weights '{args.anatomy_weights}', raised for "
+                               f"{trained.get('agent_steps', 0) / 1e6:.2f}M animal-ticks"))
               + "".join(f"; {k} x{v:g}" for k, v in cfg.brain.strengths.items())
               + "".join(f"; {k} = {v}" for k, v in cfg.brain.receptors.items()))
     if args.dry_run:

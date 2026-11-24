@@ -26,6 +26,15 @@ def main(argv=None) -> int:
     p.add_argument("--out", default=user_dir(),
                    help="Folder for the brain and its training log.")
     p.add_argument("--resume", help="Start from an existing brain (name or path).")
+    p.add_argument("--anatomy", metavar="SPEC",
+                   help="Train a brain wired from this anatomy spec instead "
+                        "(e.g. c57_male): the wiring and the sign of every "
+                        "projection stay as the spec gives them, and only "
+                        "the weights inside them learn. Ticks are 0.25 s. "
+                        "Use it afterwards with: python -m fnt.abma --anatomy "
+                        "SPEC --anatomy-weights NAME")
+    p.add_argument("--wiring-seed", type=int, default=0,
+                   help="With --anatomy: the random draw training starts from.")
     p.add_argument("--minutes", type=float, default=20.0,
                    help="Wall-clock training budget.")
     p.add_argument("--iterations", type=int, default=0,
@@ -83,6 +92,8 @@ def main(argv=None) -> int:
         born_at_door=a.born_at_door, born_at_resource=a.born_at_resource,
         box_water=a.box_water, towers=a.towers,
         contest=a.contest, huts=a.huts)
+    if a.anatomy:
+        return _raise_anatomy(a, cur)
     hp = Hyper(workers=a.workers, worlds=a.worlds, lr=a.lr,
                entropy=a.entropy, seed=a.seed)
     resume = Brain.load(find_brain(a.resume)) if a.resume else None
@@ -123,6 +134,48 @@ def main(argv=None) -> int:
         path = tr.save()
         tr.close()
     print(f"wrote {path}")
+    return 0
+
+
+
+
+def _raise_anatomy(a, cur) -> int:
+    """Train a brain wired from an anatomy spec (see ``learn/anatomy_ppo``)."""
+    import time
+
+    from ..core import anatomy
+    from .anatomy_ppo import AnatomyHyper, AnatomyTrainer
+
+    cur.tick_s = 0.25                          # the network's own tick
+    if a.species == "Prairie vole":
+        cur.species = "House mouse"
+    out = a.out if a.out != user_dir() else anatomy.user_dir()
+    hp = AnatomyHyper(workers=a.workers, worlds=a.worlds, lr=min(a.lr, 3e-4), entropy=min(a.entropy, 0.002),
+                      seed=a.seed, wiring_seed=a.wiring_seed)
+    tr = AnatomyTrainer(a.anatomy, hp, cur, out, name=a.name, resume=a.resume)
+    print(f"raising '{a.name}' on anatomy '{a.anatomy}' in {out}  ({hp.worlds} worlds x {cur.steps} ticks of "
+          f"{cur.tick_s:g} s, {hp.workers} workers)", flush=True)
+    t0, path = time.time(), None
+    try:
+        while True:
+            info = tr.step()
+            print(f"it {info['iteration']:4d}  {info['agent_steps'] / 1e6:7.2f}M ticks  "
+                  f"return {info['return']:+7.3f}  hungry at food {info.get('food_time_hungry', float('nan')):.3f}  "
+                  f"thirsty at water {info.get('water_time_thirsty', float('nan')):.3f}  kl {info['kl']:.4f}  "
+                  f"collect {info['sec_collect']:.0f}s update {info['sec_update']:.0f}s", flush=True)
+            if info["iteration"] % max(1, a.save_every) == 0:
+                path = tr.save()
+            if a.iterations and info["iteration"] >= a.iterations:
+                break
+            if not a.iterations and (time.time() - t0) / 60.0 >= a.minutes:
+                break
+    except KeyboardInterrupt:
+        print("stopped.")
+    finally:
+        path = tr.save()
+        tr.close()
+    print(f"wrote {path}")
+    print(f"use it: python -m fnt.abma --anatomy {a.anatomy} --anatomy-weights {a.name}")
     return 0
 
 

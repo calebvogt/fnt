@@ -255,11 +255,12 @@ def make_world(seed: int, cur: Curriculum) -> ExperimentConfig:
     return cfg
 
 
-def spawn(seed: int, cur: Curriculum, brain: Brain,
-          stochastic: bool = True) -> Simulation:
-    """A nursery world with a brain already in every animal."""
+def spawn(seed: int, cur: Curriculum, brain: Brain | None,
+          stochastic: bool = True, policy=None) -> Simulation:
+    """A nursery world with a brain already in every animal (or, given a
+    ``policy``, with that driving them)."""
     cfg = make_world(seed, cur)
-    sim = Simulation(cfg, 0, policy=NeuralPolicy(brain, stochastic=stochastic))
+    sim = Simulation(cfg, 0, policy=policy or NeuralPolicy(brain, stochastic=stochastic))
     rng = np.random.default_rng(seed + 7919)
     lo, hi = cur.need_on_arrival
     n = sim.n
@@ -334,15 +335,29 @@ def rollout(weights: dict, meta: dict, seeds: list, cur_d: dict) -> dict:
     it actually issued ``(T, A, 2)``, ``rew`` ``(T, A)``.
     """
     cur = Curriculum.from_dict(cur_d)
-    brain = Brain(weights, meta)
+    anat = None
+    if meta.get("kind") == "anatomy":          # a brain wired from an anatomy spec, being trained
+        from ..core import anatomy
+        from ..core.senses import SENSORS
+        anat = anatomy.AnatomicalBrain(anatomy.load_spec(meta["anatomy"]), seed=int(meta["wiring_seed"]),
+                                       tick_s=cur.tick_s, weights=weights)
+        n_in, n_out, take = len(SENSORS), len(anat.out_units), slice(None)
+        brain = None
+    else:
+        brain = Brain(weights, meta)
+        n_in, n_out, take = brain.n_in, brain.n_out, brain._take
     T, dt = int(cur.steps), float(cur.tick_s)
     obs_l, u_l, rew_l, stat_l = [], [], [], []
     sink = _NoEvents() if cur.social else None
     for seed in seeds:
-        sim = spawn(int(seed), cur, brain)
+        pol0 = None
+        if anat is not None:
+            from ..core.anatomy import AnatomicalPolicy
+            pol0 = AnatomicalPolicy(anat, noise_seed=int(seed), train_std=np.exp(weights["log_std"]))
+        sim = spawn(int(seed), cur, brain, policy=pol0)
         n = sim.n
-        obs = np.zeros((T, n, brain.n_in), np.float32)
-        u = np.zeros((T, n, brain.n_out), np.float32)
+        obs = np.zeros((T, n, n_in), np.float32)
+        u = np.zeros((T, n, n_out), np.float32)
         rew = np.zeros((T, n), np.float32)
         hunger0, thirst0 = sim.hunger.copy(), sim.thirst.copy()
         at_food = np.zeros(n)
@@ -354,7 +369,7 @@ def rollout(weights: dict, meta: dict, seeds: list, cur_d: dict) -> dict:
         for t in range(T):
             sim.step(t * dt, dt, events=sink)
             pol = sim.policy
-            obs[t] = pol.last_obs[:, brain._take]
+            obs[t] = pol.last_obs[:, take]
             u[t] = pol.u
             d_now = discomfort(sim)
             rew[t] = (cur.reward_scale * (d_prev - d_now)

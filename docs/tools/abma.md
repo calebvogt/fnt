@@ -209,6 +209,18 @@ urethral sphincter) and reads urine with its vomeronasal organ: only when its
 nose is on a spot, and then the spot's MUP barcode. Give a group the genotype
 `MUP: INBRED` to make every animal's barcode the same, as in an inbred strain.
 
+### Training it
+
+```
+python -m fnt.abma.learn --anatomy c57_male --name c57_forager --workers 2 --minutes 600
+python -m fnt.abma --anatomy c57_male --anatomy-weights c57_forager --brain-map
+```
+
+Training changes only the strength of connections the spec already has, and
+never a projection's sign. The animal is scored on nothing but its own bodily
+needs. Weights go to `~/ABMA_brains/anatomy/`; `--resume NAME` continues a
+run. Expect hours, not minutes.
+
 ### The brain map
 
 `python -m fnt.abma --brain-map` opens a live picture of the brain: every area

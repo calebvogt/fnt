@@ -162,6 +162,45 @@ def describe(spec: dict) -> str:
             f"{len(spec['modulators'])} neuromodulators · untrained")
 
 
+def find_weights(name: str) -> str:
+    """Trained weights by name (``~/ABMA_brains/anatomy/<name>.npz``) or path."""
+    if name and os.path.isfile(name):
+        return name
+    for d in (user_dir(), package_dir()):
+        p = os.path.join(d, name + ".npz")
+        if os.path.isfile(p):
+            return p
+    raise FileNotFoundError(f"no trained anatomy weights named {name!r} in {user_dir()}")
+
+
+def save_weights(path: str, arrays: dict, meta: dict) -> str:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = path + ".tmp.npz"
+    np.savez_compressed(tmp, meta=np.array(json.dumps(meta)), **arrays)
+    os.replace(tmp, path)
+    return path
+
+
+def load_weights(name_or_path: str) -> tuple[dict, dict]:
+    """``(arrays, meta)``. Sensor columns are matched to the body's current
+    sensor list by name, so weights raised before a sense was added still
+    load (the new sense starts unconnected)."""
+    with np.load(find_weights(name_or_path), allow_pickle=False) as z:
+        meta = json.loads(str(z["meta"]))
+        w = {k: z[k] for k in z.files if k != "meta"}
+    had = meta.get("sensors") or list(SENSORS)
+    if had != list(SENSORS):
+        now = {s: i for i, s in enumerate(SENSORS)}
+        gone = [s for s in had if s not in now]
+        if gone:
+            raise ValueError(f"these weights use senses the body no longer has: {gone}")
+        Win = np.zeros((w["Win"].shape[0], len(SENSORS)), w["Win"].dtype)
+        Win[:, [now[s] for s in had]] = w["Win"]
+        w["Win"] = Win
+        w.pop("c0w", None)                 # the critic no longer fits; it is rebuilt
+    return w, meta
+
+
 def parse_strength(text: str) -> tuple[str, float]:
     """``'mPFC>DRN=1.5'`` -> ``('mPFC>DRN', 1.5)``: multiply that projection."""
     key, sep, val = text.partition("=")
@@ -201,7 +240,8 @@ class AnatomicalBrain:
                  tau_s: float = 0.6, g_proj: float = 1.6, g_local: float = 0.5,
                  bias: float = 0.25, noise: float = 0.15, k_inh: float = 3.0,
                  mod_gain: float = 0.5, max_turn_rad_s: float = 2.5,
-                 strengths: dict | None = None, receptors: dict | None = None):
+                 strengths: dict | None = None, receptors: dict | None = None,
+                 weights: dict | None = None):
         check_spec(spec)
         rng = np.random.default_rng(seed)
         self.spec, self.seed, self.tick_s = spec, int(seed), float(tick_s)
@@ -231,22 +271,34 @@ class AnatomicalBrain:
         self.strengths = {k_: float(v) for k_, v in strengths.items()}
 
         W = np.zeros((self.n, self.n))
+        #: the sign a cell-to-cell weight may have between areas (+1, -1), and
+        #: 0 where the spec wires nothing; what training has to respect
+        S = np.zeros((self.n, self.n))
+        local = np.zeros((self.n, self.n), bool)
+        mult = np.ones((self.n, self.n))
         for r in spec["regions"]:        # local wiring: mixed, weak, no self-connection
             s = self.sl[r["id"]]
             w = rng.standard_normal((r["n"], r["n"])) * g_local / np.sqrt(r["n"])
             np.fill_diagonal(w, 0.0)
             W[s, s] = w
+            local[s, s] = ~np.eye(r["n"], dtype=bool)
         for a, b, sign, strength, *_ in spec["projections"]:
             sa, sb = self.sl[a], self.sl[b]
             na, nb = sa.stop - sa.start, sb.stop - sb.start
             w = np.abs(rng.standard_normal((nb, na))) * (rng.random((nb, na)) < 0.6)
             w *= g_proj * strength / 3.0 / np.sqrt(0.6 * na)
+            sgn = np.ones(na)
             if sign == "-":
-                w = -w
+                sgn = -sgn
             elif sign != "+":            # mixed cell types: each source cell is one or the other
-                w *= np.where(rng.random(na) < 0.5, 1.0, -1.0)[None, :]
-            W[sb, sa] = w * self.strengths.get(f"{a}>{b}", 1.0)
-        self.W = W
+                sgn = np.where(rng.random(na) < 0.5, 1.0, -1.0)
+            W[sb, sa] = w * sgn[None, :]
+            S[sb, sa] = np.broadcast_to(sgn[None, :], (nb, na))
+            mult[sb, sa] = self.strengths.get(f"{a}>{b}", 1.0)
+        self.S, self.local_mask, self._mult = S, local, mult
+        #: the weights before any strength edit; ``W`` is what runs
+        self.W0 = W
+        self.W = W * mult
 
         col = {s: i for i, s in enumerate(SENSORS)}
         Win = np.zeros((self.n, len(SENSORS)))
@@ -265,6 +317,7 @@ class AnatomicalBrain:
                     elif name not in self.unwired:
                         self.unwired.append(name)
         self.Win = Win
+        self.in_mask = Win != 0.0
 
         receptors = dict(receptors or {})
         mod_ids = {m["id"] for m in spec["modulators"]}
@@ -287,6 +340,18 @@ class AnatomicalBrain:
         self._body_col = {mid: col[name] for mid, name in BODY_MODULATORS.items() if name in col}
         self.sense_units = np.concatenate([np.arange(self.sl[r["id"]].start, self.sl[r["id"]].stop)
                                            for r in spec["regions"] if r["class"] == "sense"])
+        #: every muscle unit, in spec order: what a learner treats as the action
+        self.out_units = np.concatenate([np.arange(self.sl[r["id"]].start, self.sl[r["id"]].stop)
+                                         for r in spec["regions"] if r["class"] == "output"])
+        self.trained = weights is not None
+        if weights is not None:
+            W0, Win_t, b = (np.asarray(weights[k], float) for k in ("W", "Win", "bias"))
+            if W0.shape != self.W0.shape or Win_t.shape != self.Win.shape or b.shape != self.bias.shape:
+                raise ValueError("these trained weights were made for a different spec")
+            if (W0[(S == 0) & ~local] != 0).any() or (W0 * S < 0).any():
+                raise ValueError("these trained weights wire cells the spec does not, or flip a projection's sign")
+            self.W0, self.Win, self.bias = W0, Win_t * self.in_mask, b
+            self.W = W0 * mult
 
     def unit_names(self) -> list[str]:
         return [f"{r['id']} {j + 1}" for r in self.spec["regions"] for j in range(r["n"])]
@@ -298,8 +363,13 @@ class AnatomicalBrain:
     def initial_state(self, n: int) -> np.ndarray:
         return np.zeros((n, self.n))
 
-    def step(self, r: np.ndarray, obs: np.ndarray, rng: np.random.Generator):
-        """One tick. Returns the new ``r`` (the old one is not modified)."""
+    def step(self, r: np.ndarray, obs: np.ndarray, rng: np.random.Generator,
+             noise: np.ndarray | None = None, pre: bool = False):
+        """One tick. Returns the new ``r`` (the old one is not modified).
+
+        ``noise`` replaces the usual small noise in every cell (a learner
+        passes noise on the muscle units only); ``pre=True`` also returns the
+        drive every cell had, noise included."""
         obs = np.asarray(obs, float)
         gain = np.ones((len(obs), self.n))
         for mid, source, dens in self.mods:
@@ -311,8 +381,9 @@ class AnatomicalBrain:
                 continue
             gain += level[:, None] * dens[None, :]
         x = r @ self.W.T + obs @ self.Win.T + self.bias - self.k_inh * (r @ self.pool.T)
-        x = gain * x + self.noise * rng.standard_normal(x.shape)
-        return r + self.alpha * (np.tanh(np.maximum(x, 0.0)) - r)
+        x = gain * x + (self.noise * rng.standard_normal(x.shape) if noise is None else noise)
+        new = r + self.alpha * (np.tanh(np.maximum(x, 0.0)) - r)
+        return (new, x) if pre else new
 
     def commands(self, r: np.ndarray):
         """Turn (rad/s), speed (0..1), bite (bool), and the two urination
@@ -335,7 +406,12 @@ class AnatomicalPolicy(Policy):
     REST_FRAC = 0.12
     MAX_SUBSTEPS = 16
 
-    def __init__(self, brain: AnatomicalBrain, noise_seed: int = 0):
+    def __init__(self, brain: AnatomicalBrain, noise_seed: int = 0, train_std=None):
+        #: while being trained: the spread of the noise on each muscle unit's
+        #: drive (the inside of the network is then quiet), and ``u`` holds the
+        #: drive those units actually had on the last tick
+        self.train_std = None if train_std is None else np.asarray(train_std, float)
+        self.u = None
         self.brain, self.params = brain, SenseParams()
         self.rng = np.random.default_rng([int(noise_seed), brain.seed, 7919])
         self.memory: PlaceMemory | None = None
@@ -348,7 +424,13 @@ class AnatomicalPolicy(Policy):
     @staticmethod
     def from_config(cfg, trial_index: int = 0) -> "AnatomicalPolicy":
         bp = cfg.brain
-        brain = AnatomicalBrain(load_spec(bp.anatomy), seed=bp.anatomy_seed,
+        weights, seed = None, bp.anatomy_seed
+        if getattr(bp, "anatomy_weights", ""):
+            weights, meta = load_weights(bp.anatomy_weights)
+            if meta.get("anatomy") not in (bp.anatomy, os.path.splitext(os.path.basename(bp.anatomy))[0]):
+                raise ValueError(f"{bp.anatomy_weights} was raised for {meta.get('anatomy')!r}, not {bp.anatomy!r}")
+            seed = int(meta.get("wiring_seed", seed))        # mixed projections keep the signs they drew
+        brain = AnatomicalBrain(load_spec(bp.anatomy), seed=seed, weights=weights,
                                 strengths=bp.strengths, receptors=bp.receptors)
         return AnatomicalPolicy(brain, noise_seed=int(cfg.seed) + int(trial_index))
 
@@ -381,7 +463,14 @@ class AnatomicalPolicy(Policy):
             ticks, self._clock = self.MAX_SUBSTEPS, self.MAX_SUBSTEPS * self.brain.tick_s
         bit = np.zeros(n, bool)
         for _ in range(ticks):
-            self.r = self.brain.step(self.r, obs, self.rng)
+            if self.train_std is None:
+                self.r = self.brain.step(self.r, obs, self.rng)
+            else:
+                out = self.brain.out_units
+                noise = np.zeros((n, self.brain.n))
+                noise[:, out] = self.train_std * self.rng.standard_normal((n, len(out)))
+                self.r, x = self.brain.step(self.r, obs, self.rng, noise=noise, pre=True)
+                self.u = x[:, out].astype(np.float32)
             self.turn, self.speed, b, (self.wall, self.sphincter) = self.brain.commands(self.r)
             bit |= b
         if ticks:
