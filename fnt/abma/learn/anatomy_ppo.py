@@ -176,6 +176,12 @@ class AnatomyTrainer:
         self.hp, self.cur, self.out_dir, self.name, self.spec_name = hp, cur, out_dir, name, spec_name
         os.makedirs(out_dir, exist_ok=True)
         torch.manual_seed(hp.seed)
+        # Gradients carried back through many ticks of saturated units shrink
+        # to subnormal floats, which the processor handles about ten times
+        # slower than ordinary ones. Treating them as zero changes the
+        # weights by less than 1e-7 and makes the update about nine times
+        # faster (measured 2026-11-25: 46 s -> 5 s).
+        torch.set_flush_denormal(True)
         self.spec = anatomy.load_spec(spec_name)
         self.agent_steps, start = 0, None
         if resume:
