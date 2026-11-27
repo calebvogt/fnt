@@ -62,6 +62,11 @@ class Hyper:
     max_turn: float = 1.5        # radians per tick
     #: spread of the initial neuromodulator weights (see TorchBrain)
     gain_init: float = 1.5
+    #: threads the weight update may use (0 = PyTorch's default, every core).
+    #: On a machine that is busy with other work, every core is too many: the
+    #: update's threads wait on each other and an update that takes seconds
+    #: takes minutes.
+    torch_threads: int = 0
     seed: int = 0
 
 
@@ -126,7 +131,7 @@ class TorchBrain(nn.Module):
         }
         return Brain({k: v.detach().cpu().numpy() for k, v in w.items()}, meta)
 
-    def load_brain(self, brain: Brain) -> None:
+    def load_brain(self, brain: Brain, wake: tuple = ()) -> None:
         """Take up an existing brain's weights, matched by name.
 
         The body may have gained senses, neuromodulators or a motor output
@@ -143,14 +148,26 @@ class TorchBrain(nn.Module):
         if gone:
             raise ValueError(f"this brain uses neuromodulators the body no longer has: {gone}")
         m_cols = [m_now[m] for m in brain.modulators]
+        # ``wake``: neuromodulators this training is about; of those, the ones the brain never had
+        m_new = [i for i, name in enumerate(MODULATORS) if i not in m_cols and name in wake]
         k = min(w["Wo"].shape[0], self.Wo.out_features)
         with torch.no_grad():
             self.W1.weight.zero_()
             self.W1.weight[:, s_cols] = w["W1"]
             self.W1.bias.copy_(w["b1"])
+            fresh = self.Wg.weight.clone()
             self.Wg.weight.zero_()
             self.Wg.weight[:, m_cols] = w["Wg"]
             self.Wg.bias.copy_(w["bg"])
+            if m_new:
+                # A neuromodulator the body has gained since: every sensory
+                # unit gets its own random sensitivity to it, as a new brain's
+                # units do (half strength, and centred so that a middling
+                # level leaves the gains where they were). Left at zero, a new
+                # need has almost no say in what the animal does for millions
+                # of ticks; see the note on ``gain_init`` above.
+                self.Wg.weight[:, m_new] = 0.5 * fresh[:, m_new]
+                self.Wg.bias -= 0.3 * self.Wg.weight[:, m_new].sum(dim=1)
             self.gru.weight_ih_l0.copy_(w["W_ih"])
             self.gru.weight_hh_l0.copy_(w["W_hh"])
             self.gru.bias_ih_l0.copy_(w["b_ih"])
@@ -185,11 +202,17 @@ class Trainer:
         self.hp, self.cur, self.out_dir, self.name = hp, cur, out_dir, name
         os.makedirs(out_dir, exist_ok=True)
         torch.manual_seed(hp.seed)
+        # gradients through many ticks shrink to subnormal floats, which are
+        # about ten times slower to compute with; treat them as zero (as the
+        # anatomy trainer does)
+        torch.set_flush_denormal(True)
+        if hp.torch_threads > 0:
+            torch.set_num_threads(int(hp.torch_threads))
         self.net = TorchBrain(hp.n_sensory, hp.n_rnn, hp.gain_init,
                               n_out=3 if cur.contest else 2)
         self.agent_steps = 0
         if resume is not None:
-            self.net.load_brain(resume)
+            self.net.load_brain(resume, wake=("tired", "cold", "lonely") if cur.life else ())
             self.agent_steps = int(resume.meta.get("agent_steps", 0))
         self.opt = torch.optim.Adam(self.net.parameters(), lr=hp.lr, eps=1e-5)
         self.iteration = 0
@@ -237,6 +260,12 @@ class Trainer:
 
     def update(self, data: dict) -> dict:
         hp, net = self.hp, self.net
+        for key in ("obs", "u", "rew"):
+            if not np.isfinite(data[key]).all():
+                raise FloatingPointError(
+                    f"the nursery returned a non-finite value in '{key}': a "
+                    "sense, a need or the reward is broken, and training on "
+                    "it would silently destroy the brain")
         obs = torch.as_tensor(data["obs"])            # (T, A, I)
         u = torch.as_tensor(data["u"])                # (T, A, 2)
         rew = torch.as_tensor(data["rew"])            # (T, A)

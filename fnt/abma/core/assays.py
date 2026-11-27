@@ -32,6 +32,14 @@ an enclosure.
     how long does that take? Smell leads straight to a doorway; without it the
     animal has only its whiskers and the walls.
 
+``partner``
+    The partner preference test, the standard assay of a prairie vole's pair
+    bond: the animal is free in a long box with a tethered animal at each
+    end, one it is attached to and one it is not, and the measure is whose
+    side it huddles on. Run with a nose, without one, and unattached. Needs
+    a brain raised with ``--life`` (``SocialParams``); the rule-based animal
+    has no attachments.
+
 ``chase``
     Not a test of a brain at all, but of the body it lives in (contest
     physics): a scripted chaser and a scripted fleer, identical bodies, in
@@ -49,7 +57,7 @@ import numpy as np
 
 from .compose import cohort
 from .config import (ArenaConfig, ContestParams, ExperimentConfig, Hut,
-                     ResourceObject, ResourceZone, ScentParams)
+                     ResourceObject, ResourceZone, ScentParams, SocialParams)
 from .physiology import preset_params
 from .simulation import Simulation
 from .species import build_group, by_name
@@ -565,9 +573,153 @@ def format_chase(rows: list) -> str:
     return "\n".join(out)
 
 
-def policy_factory(brain_name: str | None, stochastic: bool = True):
+def partner_preference(make_policy, smell: float = 1.0, vno: float = 1.0,
+                       attached: float = 1.0, trials: int = 40,
+                       minutes: float = 30.0, species: str = "Prairie vole",
+                       focal_sex: str = "F", seed: int = 0,
+                       social: dict | None = None, in_brain: bool = False,
+                       pairing_s: float = 600.0, smell_after: float | None = None) -> dict:
+    """One partner preference test per trial; returns the means.
+
+    A box 1.2 m long and 0.4 m wide. A stimulus animal of the other sex is
+    held at each end: the *partner* (the focal animal is ``attached`` to it,
+    0-1) and a *stranger* (it is not). The focal animal starts in the middle,
+    fed and watered, tired, cold and missing its partner, and is free for
+    ``minutes``. Which end the partner is at alternates between trials.
+
+    ``partner_s`` and ``stranger_s`` are the seconds it spent against each
+    (within the huddling distance); ``preference`` is partner time over the
+    sum (0.5 = none), over trials in which it huddled at all; ``huddled`` is
+    the share of trials in which it did. ``smell`` and ``vno`` are the focal
+    animal's senses; ``social`` overrides ``SocialParams`` values (for one,
+    which nose an attachment needs).
+
+    ``in_brain``: the attachment is not dealt but has to be written by the
+    brain (``SocialParams.bond_in_brain``, an anatomy spec with plastic
+    connections). The trial then begins with ``pairing_s`` seconds beside the
+    partner-to-be, the body reporting a mating if ``attached`` > 0 (0 = they
+    only sat together). ``smell_after`` is the focal animal's sense of smell
+    from the end of the pairing on (methimazole given to a paired animal).
+    """
+    L, Wd, dt = 1.2, 0.4, 2.0
+    steps = int(minutes * 60.0 / dt)
+    other = "M" if focal_sex == "F" else "F"
+    t_partner, t_stranger, pref, moved = [], [], [], []
+    for k in range(trials):
+        cfg = ExperimentConfig(
+            name="assay", arena=ArenaConfig(width=L, height=Wd, objects=[]),
+            groups=[cohort(species, focal_sex, 1), cohort(species, other, 2)],
+            dt=dt, seed=int(seed * 100_000 + k), days=1.0, n_trials=1,
+            start_datetime="2026-06-15T12:00:00")
+        cfg.physiology = preset_params("Standard")
+        cfg.scent = ScentParams(enabled=True)
+        cfg.social = SocialParams(enabled=True, **dict(social or {}))
+        cfg.social.bond_in_brain = bool(in_brain)
+        sim = Simulation(cfg, 0, policy=make_policy() if make_policy else None)
+        rng = np.random.default_rng(seed * 100_000 + k + 1)
+        ends = np.array([[0.12, Wd / 2], [L - 0.12, Wd / 2]])
+        if k % 2:
+            ends = ends[::-1]
+        held = np.array([1, 2])                       # partner, stranger
+        sim.P[0] = (L / 2, Wd / 2)
+        sim.H[0] = rng.uniform(0, 2 * np.pi)
+        sim.P[held] = ends
+        sim.home[:] = sim.P
+        sim.energy[:], sim.hunger[:], sim.thirst[:] = 95.0, 5.0, 5.0
+        sim.smell[0] = smell
+        sim.agents[0].traits.smell_ability = float(smell)
+        sim.vno[0] = vno
+        sim.mark_biology_dirty()
+        soc = sim.soc
+        t_start = 0.0
+        if in_brain:                                  # the pairing, in the partner's end of the box
+            beside = ends[0] + np.array([0.03 if ends[0][0] < L / 2 else -0.03, 0.0])
+            for t in range(int(pairing_s / dt)):
+                sim.P[0] = beside
+                sim.P[held] = ends
+                soc.mated[0] = 1.0 if attached > 0 else 0.0
+                sim.step(t * dt, dt)
+            t_start = int(pairing_s / dt) * dt
+            sim.P[0] = (L / 2, Wd / 2)
+            sim.H[0] = rng.uniform(0, 2 * np.pi)
+            sim.energy[:], sim.hunger[:], sim.thirst[:] = 95.0, 5.0, 5.0
+            if smell_after is not None:
+                sim.smell[0] = smell_after
+                sim.agents[0].traits.smell_ability = float(smell_after)
+                sim.mark_biology_dirty()
+        soc.A[0, 1] = soc.A[1, 0] = attached
+        soc.tired[0], soc.cold[0], soc.lonely[0] = 70.0, 40.0, 60.0 * attached
+        reach = cfg.social.huddle_r_m
+        with_p = with_s = 0
+        path, prev = 0.0, sim.P[0].copy()
+        for t in range(steps):
+            sim.step(t_start + t * dt, dt)
+            sim.P[held] = ends                        # tethered
+            d = np.linalg.norm(sim.P[held] - sim.P[0], axis=1)
+            with_p += d[0] < reach
+            with_s += d[1] < reach
+            path += float(np.linalg.norm(sim.P[0] - prev))
+            prev = sim.P[0].copy()
+        t_partner.append(with_p * dt)
+        t_stranger.append(with_s * dt)
+        if with_p + with_s > 0:
+            pref.append(with_p / (with_p + with_s))
+        moved.append(path)
+    return {
+        "trials": trials, "smell": smell, "vno": vno, "attached": attached,
+        "minutes": minutes,
+        "partner_s": float(np.mean(t_partner)),
+        "stranger_s": float(np.mean(t_stranger)),
+        "preference": float(np.mean(pref)) if pref else float("nan"),
+        "huddled": float(len(pref) / max(1, trials)),
+        "path_m": float(np.mean(moved)),
+    }
+
+
+def partner_battery(make_policy, trials: int = 40, **kw) -> dict:
+    """The conditions that make it an experiment: attached with a nose,
+    attached without one, without a vomeronasal organ, and unattached."""
+    if "in_brain" not in kw:                          # a brain with plastic connections keeps its own
+        probe = make_policy() if make_policy else None
+        kw["in_brain"] = bool(getattr(getattr(probe, "brain", None), "plastic", None))
+    out = {
+        "attached": partner_preference(make_policy, trials=trials, **kw),
+        "attached, no smell": partner_preference(make_policy, smell=0.0,
+                                                 trials=trials, **kw),
+    }
+    if kw["in_brain"]:
+        out["attached, smell lost afterwards"] = partner_preference(
+            make_policy, smell_after=0.0, trials=trials, **kw)
+    out["attached, no vomeronasal organ"] = partner_preference(
+        make_policy, vno=0.0, trials=trials, **kw)
+    out["unattached"] = partner_preference(make_policy, attached=0.0,
+                                           trials=trials, **kw)
+    return out
+
+
+def format_partner(results: dict) -> str:
+    rows = ["  condition                         with partner  with stranger  preference  huddled  path"]
+    for name, r in results.items():
+        rows.append(f"  {name:<33s} {r['partner_s']:8.0f} s   {r['stranger_s']:8.0f} s     "
+                    f"{r['preference']:5.2f}     {r['huddled']:4.0%}   {r['path_m']:5.1f} m")
+    return "\n".join(rows)
+
+
+def policy_factory(brain_name: str | None, stochastic: bool = True,
+                   anatomy: str = "", weights: str = ""):
     """``make_policy`` for the assays: a fresh learned-brain policy each call,
-    or ``None`` (the rule-based animal) when no brain is named."""
+    or ``None`` (the rule-based animal) when no brain is named. ``anatomy``
+    (with trained ``weights``) asks for a brain wired from an anatomy spec."""
+    if anatomy:
+        from . import anatomy as an
+        spec = an.load_spec(anatomy)
+        w, seed = None, 0
+        if weights:
+            w, meta = an.load_weights(weights)
+            seed = int(meta.get("wiring_seed", 0))
+        counter = iter(range(1_000_000))
+        return lambda: an.AnatomicalPolicy(
+            an.AnatomicalBrain(spec, seed=seed, weights=w), noise_seed=next(counter))
     if not brain_name:
         return None
     from .brain import Brain, find_brain

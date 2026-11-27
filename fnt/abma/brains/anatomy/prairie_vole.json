@@ -1,0 +1,2187 @@
+{
+ "name": "Prairie vole (Microtus ochrogaster), either sex",
+ "draft": 3,
+ "date": "2026-11-26",
+ "status": "Draft for review. Areas, projections and their signs are the house-mouse draft 2 (c57_male), whose signs are still largely first guesses. What is changed for the vole: oxytocin and vasopressin receptor levels follow the prairie-vole autoradiography; skin (touch, cold), tiredness, separation distress and the odour of a partner or a stranger are given a way in; the main olfactory epithelium has more units, so a partial lesion can be graded. Draft 2: the engine no longer tells this brain which animal it is attached to. The nose carries the individual odour signatures of the animals nearby, a mating reaches the hypothalamus and the ventral tegmental area, and the first olfactory synapse (epithelium to bulb) is plastic: written while oxytocin and dopamine are both high. The numbers of that rule are ours, not measured.",
+ "classes": [
+  {
+   "id": "sense",
+   "label": "Sense organs"
+  },
+  {
+   "id": "sensory",
+   "label": "Sensory areas"
+  },
+  {
+   "id": "internal",
+   "label": "Internal areas"
+  },
+  {
+   "id": "motor",
+   "label": "Motor areas"
+  },
+  {
+   "id": "output",
+   "label": "Muscles"
+  }
+ ],
+ "regions": [
+  {
+   "id": "MOE",
+   "name": "Main olfactory epithelium",
+   "class": "sense",
+   "col": 0,
+   "n": 48,
+   "note": "Volatile odours carried on the air, so detected at a distance: food, water, a mark, another animal's sex and state, and the individual signatures of the animals nearby (24 components; each animal carries three). That outbred voles smell different is assumed; the carrier is not known (a vole has one MUP gene and an expanded OBP family). Methimazole destroys these cells; they grow back over weeks.",
+   "evidence": [
+    "bergman2002",
+    "williams1992"
+   ]
+  },
+  {
+   "id": "VNO",
+   "evidence": [
+    "curtis2001"
+   ],
+   "name": "Vomeronasal organ",
+   "class": "sense",
+   "col": 0,
+   "n": 8,
+   "note": "Involatile cues, taken up only on contact. Removing it prevents mating-induced partner preference in female prairie voles with main olfaction intact."
+  },
+  {
+   "id": "WHK",
+   "name": "Whiskers",
+   "class": "sense",
+   "col": 0,
+   "n": 6,
+   "note": "Walls, doorways, the body of another animal."
+  },
+  {
+   "id": "SKN",
+   "name": "Skin",
+   "class": "sense",
+   "col": 0,
+   "n": 4,
+   "note": "Another body against this one, and cold. Warmth from a huddle needs no nose.",
+   "evidence": [
+    "nakamura2008"
+   ]
+  },
+  {
+   "id": "NOC",
+   "name": "Nociceptors",
+   "class": "sense",
+   "col": 0,
+   "n": 4,
+   "note": "A bite, and where on the body it landed."
+  },
+  {
+   "id": "VIS",
+   "name": "Viscera and blood",
+   "class": "sense",
+   "col": 0,
+   "n": 6,
+   "note": "Energy stores, hydration, bladder fill."
+  },
+  {
+   "id": "TST",
+   "name": "Mouth",
+   "class": "sense",
+   "col": 0,
+   "n": 3,
+   "note": "Food or water at the mouth."
+  },
+  {
+   "id": "RET",
+   "name": "Retina",
+   "class": "sense",
+   "col": 0,
+   "n": 4,
+   "note": "Light level, day and night."
+  },
+  {
+   "id": "PRO",
+   "name": "Muscle and balance",
+   "class": "sense",
+   "col": 0,
+   "n": 4,
+   "note": "Own speed and turning, tiredness."
+  },
+  {
+   "id": "MOB",
+   "name": "Main olfactory bulb",
+   "class": "sensory",
+   "col": 1,
+   "n": 20,
+   "note": ""
+  },
+  {
+   "id": "AOB",
+   "name": "Accessory olfactory bulb",
+   "class": "sensory",
+   "col": 1,
+   "n": 10,
+   "note": "First brain stage for the MUP barcode."
+  },
+  {
+   "id": "PIR",
+   "name": "Piriform cortex",
+   "class": "sensory",
+   "col": 1,
+   "n": 20,
+   "note": "Learned odour objects. Lateral entorhinal cortex is folded in."
+  },
+  {
+   "id": "S1",
+   "name": "Barrel cortex",
+   "class": "sensory",
+   "col": 1,
+   "n": 8,
+   "note": "Whisker touch. The thalamic relay is folded in."
+  },
+  {
+   "id": "PBN",
+   "name": "Parabrachial nucleus",
+   "class": "sensory",
+   "col": 1,
+   "n": 8,
+   "note": "Pain, taste and gut signals. The nucleus of the solitary tract is folded in."
+  },
+  {
+   "id": "ARC",
+   "name": "Arcuate nucleus",
+   "class": "sensory",
+   "col": 1,
+   "n": 8,
+   "note": "Hunger (AgRP) and satiety (POMC) cells."
+  },
+  {
+   "id": "SFO",
+   "name": "Subfornical organ",
+   "class": "sensory",
+   "col": 1,
+   "n": 6,
+   "note": "Thirst. Median preoptic nucleus is folded in."
+  },
+  {
+   "id": "SCN",
+   "name": "Suprachiasmatic nucleus",
+   "class": "sensory",
+   "col": 1,
+   "n": 4,
+   "note": "The clock."
+  },
+  {
+   "id": "MeA",
+   "evidence": [
+    "hong2014"
+   ],
+   "name": "Medial amygdala",
+   "class": "internal",
+   "col": 2,
+   "n": 12,
+   "note": "Sex and identity of another animal from its odour."
+  },
+  {
+   "id": "BNST",
+   "name": "Bed nucleus of the stria terminalis",
+   "class": "internal",
+   "col": 2,
+   "n": 10,
+   "note": "CRF here rises with pairing; separation distress enters here.",
+   "evidence": [
+    "bosch2009"
+   ]
+  },
+  {
+   "id": "BLA",
+   "name": "Basolateral amygdala",
+   "class": "internal",
+   "col": 2,
+   "n": 8,
+   "note": "Learned value of cues."
+  },
+  {
+   "id": "HPC",
+   "name": "Dorsal hippocampus",
+   "class": "internal",
+   "col": 2,
+   "n": 12,
+   "note": "Place. Medial entorhinal cortex is folded in."
+  },
+  {
+   "id": "CA2",
+   "evidence": [
+    "hitti2014"
+   ],
+   "name": "Hippocampal CA2 and ventral CA1",
+   "class": "internal",
+   "col": 2,
+   "n": 8,
+   "note": "Memory for individuals."
+  },
+  {
+   "id": "PVN",
+   "name": "Paraventricular hypothalamus",
+   "class": "internal",
+   "col": 2,
+   "n": 8,
+   "note": "Oxytocin and vasopressin. A mating reaches it: oxytocin rises in the nucleus accumbens of a female prairie vole while she is with a male.",
+   "evidence": [
+    "ross2009"
+   ]
+  },
+  {
+   "id": "LH",
+   "name": "Lateral hypothalamus",
+   "class": "internal",
+   "col": 2,
+   "n": 8,
+   "note": "Feeding, drinking, arousal."
+  },
+  {
+   "id": "mPFC",
+   "evidence": [
+    "wang2011"
+   ],
+   "name": "Medial prefrontal cortex",
+   "class": "internal",
+   "col": 2,
+   "n": 12,
+   "note": "Rank and effort in contests. Anterior cingulate and secondary motor cortex are folded in."
+  },
+  {
+   "id": "MD",
+   "name": "Mediodorsal thalamus",
+   "class": "internal",
+   "col": 2,
+   "n": 6,
+   "note": "Its input to prefrontal cortex strengthens with a history of winning."
+  },
+  {
+   "id": "MPOA",
+   "name": "Medial preoptic area",
+   "class": "internal",
+   "col": 3,
+   "n": 10,
+   "note": "Mating, parental care, scent marking; also the thermoregulatory centre and where sleep pressure acts."
+  },
+  {
+   "id": "VMHvl",
+   "evidence": [
+    "lin2011"
+   ],
+   "name": "Ventromedial hypothalamus, ventrolateral part",
+   "class": "internal",
+   "col": 3,
+   "n": 10,
+   "note": "Attack."
+  },
+  {
+   "id": "PMv",
+   "name": "Ventral premammillary nucleus",
+   "class": "internal",
+   "col": 3,
+   "n": 6,
+   "note": "Male odour to aggression."
+  },
+  {
+   "id": "LS",
+   "name": "Lateral septum",
+   "class": "internal",
+   "col": 3,
+   "n": 10,
+   "note": "Brakes attack; fed by the hippocampus."
+  },
+  {
+   "id": "CeA",
+   "name": "Central amygdala",
+   "class": "internal",
+   "col": 3,
+   "n": 6,
+   "note": "Defensive output."
+  },
+  {
+   "id": "NAc",
+   "name": "Nucleus accumbens",
+   "class": "internal",
+   "col": 3,
+   "n": 10,
+   "note": "Dense oxytocin receptors in the prairie vole; oxytocin and dopamine here are both needed for a partner preference.",
+   "evidence": [
+    "insel1992",
+    "liu2003",
+    "amadei2017"
+   ]
+  },
+  {
+   "id": "VP",
+   "name": "Ventral pallidum",
+   "class": "internal",
+   "col": 3,
+   "n": 6,
+   "note": "Dense vasopressin V1a receptors in the prairie vole; raising them in a promiscuous vole gives it a partner preference.",
+   "evidence": [
+    "lim2004"
+   ]
+  },
+  {
+   "id": "VTA",
+   "name": "Ventral tegmental area",
+   "class": "internal",
+   "col": 3,
+   "n": 8,
+   "note": "Dopamine. Mating raises extracellular dopamine in the nucleus accumbens by about half.",
+   "evidence": [
+    "gingrich2000"
+   ]
+  },
+  {
+   "id": "LHb",
+   "name": "Lateral habenula",
+   "class": "internal",
+   "col": 3,
+   "n": 6,
+   "note": "Outcomes worse than expected, defeat."
+  },
+  {
+   "id": "DRN",
+   "name": "Dorsal raphe",
+   "class": "internal",
+   "col": 3,
+   "n": 6,
+   "note": "Source of serotonin."
+  },
+  {
+   "id": "PAG",
+   "name": "Periaqueductal grey",
+   "class": "motor",
+   "col": 4,
+   "n": 10,
+   "note": "Bite, flight, freezing."
+  },
+  {
+   "id": "SC",
+   "name": "Superior colliculus",
+   "class": "motor",
+   "col": 4,
+   "n": 8,
+   "note": "Orienting and turning."
+  },
+  {
+   "id": "MLR",
+   "name": "Mesencephalic locomotor region",
+   "class": "motor",
+   "col": 4,
+   "n": 6,
+   "note": "Speed."
+  },
+  {
+   "id": "BAR",
+   "name": "Barrington's nucleus",
+   "class": "motor",
+   "col": 4,
+   "n": 4,
+   "note": "Two cell types: one contracts the bladder wall, one relaxes the urethral sphincter."
+  },
+  {
+   "id": "TURN",
+   "name": "Neck and trunk",
+   "class": "output",
+   "col": 5,
+   "n": 2,
+   "unit_names": [
+    "right",
+    "left"
+   ],
+   "note": "Turning: the left unit minus the right unit. In the engine today."
+  },
+  {
+   "id": "SPEED",
+   "name": "Limbs",
+   "class": "output",
+   "col": 5,
+   "n": 2,
+   "note": "Speed. In the engine today."
+  },
+  {
+   "id": "BITE",
+   "name": "Jaw",
+   "class": "output",
+   "col": 5,
+   "n": 2,
+   "note": "Biting. In the engine with contest physics on."
+  },
+  {
+   "id": "DET",
+   "name": "Bladder wall",
+   "class": "output",
+   "col": 5,
+   "n": 2,
+   "note": "Contracts to push urine out."
+  },
+  {
+   "id": "EUS",
+   "name": "Urethral sphincter",
+   "class": "output",
+   "col": 5,
+   "n": 2,
+   "tonic": 1.2,
+   "note": "Held shut by default. Urine leaves when it relaxes while the bladder wall contracts; the mark is what that leaves on the ground."
+  }
+ ],
+ "projections": [
+  [
+   "MOE",
+   "MOB",
+   "+",
+   3
+  ],
+  [
+   "VNO",
+   "AOB",
+   "+",
+   3,
+   [
+    "chamero2007"
+   ]
+  ],
+  [
+   "WHK",
+   "S1",
+   "+",
+   3
+  ],
+  [
+   "WHK",
+   "SC",
+   "+",
+   2
+  ],
+  [
+   "NOC",
+   "PBN",
+   "+",
+   3
+  ],
+  [
+   "NOC",
+   "PAG",
+   "+",
+   2
+  ],
+  [
+   "VIS",
+   "ARC",
+   "+",
+   3
+  ],
+  [
+   "VIS",
+   "SFO",
+   "+",
+   3
+  ],
+  [
+   "VIS",
+   "PBN",
+   "+",
+   2
+  ],
+  [
+   "VIS",
+   "PAG",
+   "+",
+   1
+  ],
+  [
+   "TST",
+   "PBN",
+   "+",
+   2
+  ],
+  [
+   "RET",
+   "SCN",
+   "+",
+   3
+  ],
+  [
+   "RET",
+   "SC",
+   "+",
+   2
+  ],
+  [
+   "PRO",
+   "HPC",
+   "+",
+   2
+  ],
+  [
+   "PRO",
+   "SC",
+   "+",
+   1
+  ],
+  [
+   "MOB",
+   "PIR",
+   "+",
+   2,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "MOB",
+   "MeA",
+   "+",
+   1,
+   [
+    "allen_absent"
+   ]
+  ],
+  [
+   "AOB",
+   "MeA",
+   "+",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "AOB",
+   "BNST",
+   "+",
+   1,
+   [
+    "allen_absent"
+   ]
+  ],
+  [
+   "PIR",
+   "BLA",
+   "+",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "PIR",
+   "HPC",
+   "+",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "PIR",
+   "CA2",
+   "+",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "PIR",
+   "mPFC",
+   "+",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "S1",
+   "SC",
+   "+",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "S1",
+   "HPC",
+   "+",
+   1,
+   [
+    "allen_absent"
+   ]
+  ],
+  [
+   "PBN",
+   "CeA",
+   "+",
+   2,
+   [
+    "han2015",
+    "allen_conn"
+   ]
+  ],
+  [
+   "PBN",
+   "BNST",
+   "+",
+   2,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "PBN",
+   "PVN",
+   "+",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "PBN",
+   "LH",
+   "+",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "ARC",
+   "PVN",
+   "-",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "ARC",
+   "LH",
+   "±",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "ARC",
+   "PBN",
+   "-",
+   2,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "ARC",
+   "BNST",
+   "-",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "ARC",
+   "MeA",
+   "-",
+   2,
+   [
+    "padilla2016",
+    "allen_conn"
+   ]
+  ],
+  [
+   "SFO",
+   "PVN",
+   "+",
+   2
+  ],
+  [
+   "SFO",
+   "LH",
+   "+",
+   1
+  ],
+  [
+   "SCN",
+   "PVN",
+   "-",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "SCN",
+   "LH",
+   "+",
+   1,
+   [
+    "allen_absent"
+   ]
+  ],
+  [
+   "SCN",
+   "VMHvl",
+   "-",
+   1,
+   [
+    "allen_absent"
+   ]
+  ],
+  [
+   "MeA",
+   "BNST",
+   "±",
+   3,
+   [
+    "padilla2016",
+    "allen_conn"
+   ]
+  ],
+  [
+   "MeA",
+   "MPOA",
+   "±",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "MeA",
+   "VMHvl",
+   "±",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "MeA",
+   "PMv",
+   "±",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "BNST",
+   "MPOA",
+   "-",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "BNST",
+   "VMHvl",
+   "-",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "BNST",
+   "PVN",
+   "-",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "BNST",
+   "VTA",
+   "±",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "BNST",
+   "LH",
+   "-",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "BNST",
+   "PAG",
+   "-",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "BNST",
+   "PBN",
+   "-",
+   2,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "MPOA",
+   "VTA",
+   "-",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "MPOA",
+   "PAG",
+   "-",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "MPOA",
+   "VMHvl",
+   "-",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "MPOA",
+   "BAR",
+   "-",
+   2,
+   [
+    "hou2016",
+    "allen_conn"
+   ]
+  ],
+  [
+   "VMHvl",
+   "PAG",
+   "+",
+   3,
+   [
+    "falkner2020",
+    "allen_conn"
+   ]
+  ],
+  [
+   "VMHvl",
+   "MPOA",
+   "+",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "VMHvl",
+   "BNST",
+   "+",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "VMHvl",
+   "PMv",
+   "+",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "PMv",
+   "VMHvl",
+   "+",
+   3,
+   [
+    "stagkourakis2018",
+    "allen_conn"
+   ]
+  ],
+  [
+   "PMv",
+   "MPOA",
+   "+",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "PVN",
+   "PBN",
+   "+",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "LH",
+   "VTA",
+   "±",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "LH",
+   "PAG",
+   "±",
+   3,
+   [
+    "li2018",
+    "allen_conn"
+   ]
+  ],
+  [
+   "LH",
+   "LHb",
+   "+",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "LH",
+   "MLR",
+   "+",
+   2,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "LH",
+   "DRN",
+   "+",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "LS",
+   "VMHvl",
+   "-",
+   1,
+   [
+    "wong2016",
+    "leroy2018",
+    "allen_conn"
+   ]
+  ],
+  [
+   "LS",
+   "LH",
+   "-",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "LS",
+   "VTA",
+   "-",
+   1,
+   [
+    "allen_absent"
+   ]
+  ],
+  [
+   "LS",
+   "MPOA",
+   "-",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "CA2",
+   "LS",
+   "+",
+   3,
+   [
+    "leroy2018",
+    "allen_conn"
+   ]
+  ],
+  [
+   "CA2",
+   "HPC",
+   "+",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "CA2",
+   "NAc",
+   "+",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "HPC",
+   "LS",
+   "+",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "BLA",
+   "NAc",
+   "+",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "BLA",
+   "CeA",
+   "+",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "BLA",
+   "mPFC",
+   "+",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "BLA",
+   "BNST",
+   "+",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "BLA",
+   "HPC",
+   "+",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "CeA",
+   "PAG",
+   "-",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "CeA",
+   "PBN",
+   "-",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "CeA",
+   "BNST",
+   "-",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "CeA",
+   "LH",
+   "-",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "mPFC",
+   "NAc",
+   "+",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "mPFC",
+   "BLA",
+   "+",
+   2,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "mPFC",
+   "MD",
+   "+",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "mPFC",
+   "PAG",
+   "+",
+   3,
+   [
+    "franklin2017",
+    "allen_conn"
+   ]
+  ],
+  [
+   "mPFC",
+   "DRN",
+   "+",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "mPFC",
+   "LH",
+   "+",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "mPFC",
+   "VTA",
+   "+",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "mPFC",
+   "SC",
+   "+",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "MD",
+   "mPFC",
+   "+",
+   3,
+   [
+    "zhou2017",
+    "allen_conn"
+   ]
+  ],
+  [
+   "NAc",
+   "VP",
+   "-",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "NAc",
+   "VTA",
+   "-",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "NAc",
+   "LH",
+   "-",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "VP",
+   "MD",
+   "-",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "VP",
+   "VTA",
+   "-",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "VP",
+   "LHb",
+   "±",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "VP",
+   "MLR",
+   "-",
+   1,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "VP",
+   "LH",
+   "-",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "LHb",
+   "VTA",
+   "-",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "LHb",
+   "DRN",
+   "-",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "PAG",
+   "MLR",
+   "+",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "PAG",
+   "BAR",
+   "+",
+   2,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "PAG",
+   "BITE",
+   "+",
+   3,
+   [
+    "falkner2020"
+   ]
+  ],
+  [
+   "SC",
+   "PAG",
+   "+",
+   3,
+   [
+    "evans2018",
+    "allen_conn"
+   ]
+  ],
+  [
+   "SC",
+   "MLR",
+   "+",
+   3,
+   [
+    "allen_conn"
+   ]
+  ],
+  [
+   "SC",
+   "TURN",
+   "+",
+   3
+  ],
+  [
+   "MLR",
+   "SPEED",
+   "+",
+   3
+  ],
+  [
+   "BAR",
+   "DET",
+   "+",
+   3,
+   [
+    "hou2016",
+    "idea_muscle"
+   ]
+  ],
+  [
+   "BAR",
+   "EUS",
+   "-",
+   3,
+   [
+    "keller2018",
+    "idea_muscle"
+   ]
+  ],
+  [
+   "CA2",
+   "mPFC",
+   "+",
+   3,
+   [
+    "allen_conn",
+    "sign_by_cell_type"
+   ]
+  ],
+  [
+   "CA2",
+   "BLA",
+   "+",
+   3,
+   [
+    "allen_conn",
+    "sign_by_cell_type"
+   ]
+  ],
+  [
+   "CA2",
+   "PIR",
+   "+",
+   3,
+   [
+    "allen_conn",
+    "sign_by_cell_type"
+   ]
+  ],
+  [
+   "BLA",
+   "VP",
+   "+",
+   3,
+   [
+    "allen_conn",
+    "sign_by_cell_type"
+   ]
+  ],
+  [
+   "PIR",
+   "NAc",
+   "+",
+   3,
+   [
+    "allen_conn",
+    "sign_by_cell_type"
+   ]
+  ],
+  [
+   "MD",
+   "NAc",
+   "+",
+   3,
+   [
+    "allen_conn",
+    "sign_by_cell_type"
+   ]
+  ],
+  [
+   "PIR",
+   "MOB",
+   "+",
+   3,
+   [
+    "allen_conn",
+    "sign_by_cell_type"
+   ]
+  ],
+  [
+   "BLA",
+   "PIR",
+   "+",
+   3,
+   [
+    "allen_conn",
+    "sign_by_cell_type"
+   ]
+  ],
+  [
+   "PIR",
+   "VP",
+   "+",
+   3,
+   [
+    "allen_conn",
+    "sign_by_cell_type"
+   ]
+  ],
+  [
+   "PAG",
+   "SC",
+   "±",
+   3,
+   [
+    "allen_conn",
+    "sign_by_cell_type"
+   ]
+  ],
+  [
+   "VP",
+   "MOB",
+   "±",
+   3,
+   [
+    "allen_conn",
+    "sign_by_cell_type"
+   ]
+  ],
+  [
+   "HPC",
+   "CA2",
+   "+",
+   3,
+   [
+    "allen_conn",
+    "sign_by_cell_type"
+   ]
+  ],
+  [
+   "PBN",
+   "PAG",
+   "+",
+   3,
+   [
+    "allen_conn",
+    "sign_by_cell_type"
+   ]
+  ],
+  [
+   "VP",
+   "PIR",
+   "±",
+   3,
+   [
+    "allen_conn",
+    "sign_by_cell_type"
+   ]
+  ],
+  [
+   "AOB",
+   "PIR",
+   "+",
+   3,
+   [
+    "allen_conn",
+    "sign_by_cell_type"
+   ]
+  ],
+  [
+   "SKN",
+   "S1",
+   "+",
+   2
+  ],
+  [
+   "SKN",
+   "PBN",
+   "+",
+   3,
+   [
+    "nakamura2008"
+   ]
+  ],
+  [
+   "PBN",
+   "MPOA",
+   "+",
+   3,
+   [
+    "nakamura2008"
+   ]
+  ]
+ ],
+ "modulators": [
+  {
+   "id": "OT",
+   "name": "Oxytocin",
+   "source": "PVN",
+   "source_note": "Paraventricular and supraoptic hypothalamus.",
+   "receptors": {
+    "LS": 1,
+    "CA2": 3,
+    "CeA": 3,
+    "MeA": 2,
+    "BNST": 3,
+    "VMHvl": 1,
+    "PIR": 2,
+    "mPFC": 3,
+    "NAc": 3,
+    "VTA": 1,
+    "BLA": 2,
+    "MOB": 1
+   },
+   "basis": "Prairie vole autoradiography (Insel & Shapiro 1992): densest in prelimbic cortex, bed nucleus of the stria terminalis, nucleus accumbens, midline thalamus and lateral amygdala; sparse in lateral septum and ventromedial hypothalamus, where the non-monogamous montane vole has most. Areas that paper does not report keep the mouse draft's level.",
+   "evidence": [
+    "insel1992",
+    "liu2003"
+   ]
+  },
+  {
+   "id": "AVP",
+   "name": "Vasopressin",
+   "source": "PVN",
+   "source_note": "Paraventricular hypothalamus, plus steroid-dependent cells in BNST and medial amygdala that are denser in males.",
+   "receptors": {
+    "LS": 1,
+    "CA2": 3,
+    "BNST": 2,
+    "MD": 3,
+    "LHb": 2,
+    "MeA": 1,
+    "VP": 3,
+    "PAG": 1,
+    "DRN": 1,
+    "mPFC": 1,
+    "AOB": 3,
+    "SC": 3
+   },
+   "basis": "Prairie vole V1a autoradiography (Insel, Wang & Ferris 1994): highest in accessory olfactory bulb, diagonal band, laterodorsal thalamus and superior colliculus, low in lateral septum (high in the montane vole); ventral pallidum from Lim et al. 2004. The thalamic binding is assigned to the one thalamic area this spec has (MD).",
+   "evidence": [
+    "insel1994",
+    "lim2004"
+   ]
+  },
+  {
+   "id": "DA",
+   "name": "Dopamine",
+   "source": "VTA",
+   "source_note": "Ventral tegmental area.",
+   "receptors": {
+    "NAc": 3,
+    "LS": 2,
+    "VP": 2,
+    "VTA": 2,
+    "DRN": 2,
+    "PIR": 1,
+    "BLA": 1,
+    "HPC": 1,
+    "mPFC": 1,
+    "LHb": 1
+   },
+   "basis": "House-mouse levels (c57_male draft 2), not measured in the vole. Levels from Allen in situ expression of Drd1, Drd2 (adult male C57BL/6J). A level the atlas does not see is kept at 1: in situ signal shows where a receptor is made, not where it sits on incoming terminals."
+  },
+  {
+   "id": "5HT",
+   "name": "Serotonin",
+   "source": "DRN",
+   "source_note": "Dorsal raphe.",
+   "receptors": {
+    "PBN": 3,
+    "SFO": 3,
+    "BLA": 3,
+    "mPFC": 3,
+    "LS": 3,
+    "CeA": 3,
+    "VTA": 3,
+    "LHb": 3,
+    "DRN": 3,
+    "PAG": 3,
+    "SC": 3,
+    "MLR": 3,
+    "BAR": 3,
+    "ARC": 2,
+    "BNST": 2,
+    "HPC": 2,
+    "CA2": 2,
+    "LH": 2,
+    "MD": 2,
+    "MPOA": 2,
+    "NAc": 2,
+    "MeA": 1,
+    "VMHvl": 1
+   },
+   "basis": "House-mouse levels (c57_male draft 2), not measured in the vole. Levels from Allen in situ expression of Htr1a, Htr1b, Htr2a, Htr2c (adult male C57BL/6J). A level the atlas does not see is kept at 1: in situ signal shows where a receptor is made, not where it sits on incoming terminals."
+  },
+  {
+   "id": "OP",
+   "name": "Opioids",
+   "source": "ARC",
+   "source_note": "Beta-endorphin from arcuate POMC cells; enkephalin and dynorphin are released locally.",
+   "receptors": {
+    "MD": 3,
+    "PMv": 3,
+    "VTA": 3,
+    "LHb": 3,
+    "BAR": 3,
+    "PBN": 2,
+    "SFO": 2,
+    "BNST": 2,
+    "BLA": 2,
+    "PVN": 2,
+    "MPOA": 2,
+    "CeA": 2,
+    "NAc": 2,
+    "PAG": 1
+   },
+   "basis": "House-mouse levels (c57_male draft 2), not measured in the vole. Levels from Allen in situ expression of Oprd1, Oprk1, Oprm1 (adult male C57BL/6J). A level the atlas does not see is kept at 1: in situ signal shows where a receptor is made, not where it sits on incoming terminals."
+  },
+  {
+   "id": "CRF",
+   "name": "Stress (CRF)",
+   "source": "PVN",
+   "source_note": "Paraventricular hypothalamus, central amygdala and BNST.",
+   "receptors": {
+    "MOB": 3,
+    "AOB": 3,
+    "S1": 2,
+    "mPFC": 2,
+    "LS": 2,
+    "BNST": 1,
+    "BLA": 1,
+    "HPC": 1,
+    "PVN": 1,
+    "CeA": 1,
+    "VTA": 1,
+    "DRN": 1
+   },
+   "basis": "House-mouse levels (c57_male draft 2), not measured in the vole. Levels from Allen in situ expression of Crhr1, Crhr2 (adult male C57BL/6J). A level the atlas does not see is kept at 1: in situ signal shows where a receptor is made, not where it sits on incoming terminals."
+  },
+  {
+   "id": "T",
+   "name": "Gonadal steroids",
+   "source": "",
+   "source_note": "Testes, outside the brain. Acts through androgen receptors and, after conversion to oestradiol, oestrogen receptors.",
+   "receptors": {
+    "PIR": 3,
+    "ARC": 3,
+    "SFO": 3,
+    "MeA": 3,
+    "BNST": 3,
+    "MPOA": 3,
+    "VMHvl": 3,
+    "MOB": 2,
+    "HPC": 2,
+    "mPFC": 2,
+    "PMv": 2,
+    "CeA": 2,
+    "VP": 2,
+    "AOB": 1,
+    "LS": 1,
+    "PAG": 1
+   },
+   "basis": "House-mouse levels (c57_male draft 2), not measured in the vole. Levels from Allen in situ expression of Ar, Esr1 (adult male C57BL/6J). A level the atlas does not see is kept at 1: in situ signal shows where a receptor is made, not where it sits on incoming terminals."
+  }
+ ],
+ "entry": {
+  "MOE": [
+   "olf_food",
+   "olf_food_fwd",
+   "olf_food_lat",
+   "olf_water",
+   "olf_water_fwd",
+   "olf_water_lat",
+   "olf_own",
+   "olf_own_fwd",
+   "olf_own_lat",
+   "olf_foreign",
+   "olf_foreign_fwd",
+   "olf_foreign_lat",
+   "olf_male",
+   "olf_male_fwd",
+   "olf_male_lat",
+   "olf_female",
+   "olf_female_fwd",
+   "olf_female_lat",
+   "olf_estrous",
+   "olf_estrous_fwd",
+   "olf_estrous_lat",
+   "olf_id_0",
+   "olf_id_1",
+   "olf_id_2",
+   "olf_id_3",
+   "olf_id_4",
+   "olf_id_5",
+   "olf_id_6",
+   "olf_id_7",
+   "olf_id_8",
+   "olf_id_9",
+   "olf_id_10",
+   "olf_id_11",
+   "olf_id_12",
+   "olf_id_13",
+   "olf_id_14",
+   "olf_id_15",
+   "olf_id_16",
+   "olf_id_17",
+   "olf_id_18",
+   "olf_id_19",
+   "olf_id_20",
+   "olf_id_21",
+   "olf_id_22",
+   "olf_id_23"
+  ],
+  "VNO": [
+   "vno_contact",
+   "vno_mup_0",
+   "vno_mup_1",
+   "vno_mup_2",
+   "vno_mup_3",
+   "vno_mup_4",
+   "vno_mup_5",
+   "vno_mup_6",
+   "vno_mup_7",
+   "vno_mup_8",
+   "vno_mup_9",
+   "vno_mup_10",
+   "vno_mup_11"
+  ],
+  "WHK": [
+   "wall_ahead",
+   "wall_left",
+   "wall_right",
+   "other",
+   "other_fwd",
+   "other_lat"
+  ],
+  "TST": [
+   "at_food",
+   "at_water",
+   "grass"
+  ],
+  "VIS": [
+   "hunger",
+   "thirst",
+   "bladder"
+  ],
+  "NOC": [
+   "pain",
+   "hurt",
+   "hurt_fwd",
+   "hurt_lat"
+  ],
+  "RET": [
+   "light",
+   "in_cover",
+   "cover",
+   "cover_fwd",
+   "cover_lat",
+   "other_closing",
+   "other_size",
+   "door",
+   "door_fwd",
+   "door_lat",
+   "in_box"
+  ],
+  "PRO": [
+   "last_speed",
+   "last_turn",
+   "fatigue"
+  ],
+  "SCN": [
+   "clock_sin",
+   "clock_cos"
+  ],
+  "HPC": [
+   "home",
+   "home_fwd",
+   "home_lat",
+   "mem_food",
+   "mem_food_fwd",
+   "mem_food_lat",
+   "mem_water",
+   "mem_water_fwd",
+   "mem_water_lat"
+  ],
+  "SKN": [
+   "touch",
+   "cold"
+  ],
+  "MPOA": [
+   "tired"
+  ],
+  "BNST": [
+   "lonely"
+  ],
+  "PVN": [
+   "mating"
+  ],
+  "VTA": [
+   "mating"
+  ]
+ },
+ "evidence": {
+  "leroy2018": {
+   "kind": "paper",
+   "cite": "Leroy 2018",
+   "journal": "Nature",
+   "pmid": "30518859",
+   "doi": "10.1038/s41586-018-0772-0",
+   "finding": "CA2 output to the lateral septum promotes aggression by disinhibiting the ventrolateral ventromedial hypothalamus; vasopressin strengthens it."
+  },
+  "wong2016": {
+   "kind": "paper",
+   "cite": "Wong 2016",
+   "journal": "Curr Biol",
+   "pmid": "26877081",
+   "finding": "The lateral septum's projection to the ventromedial hypothalamus suppresses attack."
+  },
+  "zhou2017": {
+   "kind": "paper",
+   "cite": "Zhou 2017",
+   "journal": "Science",
+   "pmid": "28706064",
+   "doi": "10.1126/science.aak9726",
+   "finding": "Mediodorsal thalamic input to dorsomedial prefrontal cortex carries the lasting effect of a history of winning on rank."
+  },
+  "padilla2016": {
+   "kind": "paper",
+   "cite": "Padilla 2016",
+   "journal": "Nat Neurosci",
+   "pmid": "27019015",
+   "doi": "10.1038/nn.4274",
+   "finding": "AgRP hunger neurons that project to the medial amygdala, and on to the BNST, suppress territorial aggression in the starved state."
+  },
+  "hou2016": {
+   "kind": "paper",
+   "cite": "Hou 2016",
+   "journal": "Cell",
+   "pmid": "27662084",
+   "doi": "10.1016/j.cell.2016.08.073",
+   "finding": "Crh neurons of Barrington's nucleus drive bladder contraction and take input from higher areas, including the medial preoptic area; male marking depends on odour and rank."
+  },
+  "stagkourakis2018": {
+   "kind": "paper",
+   "cite": "Stagkourakis 2018",
+   "journal": "Nat Neurosci",
+   "pmid": "29802391",
+   "doi": "10.1038/s41593-018-0153-x",
+   "finding": "Ventral premammillary neurons trigger attack through their projection to the ventrolateral ventromedial hypothalamus; a brief manipulation switches dominance for weeks."
+  },
+  "han2015": {
+   "kind": "paper",
+   "cite": "Han 2015",
+   "journal": "Cell",
+   "pmid": "26186190",
+   "doi": "10.1016/j.cell.2015.05.057",
+   "finding": "CGRP neurons of the parabrachial nucleus relay pain to the central amygdala."
+  },
+  "lin2011": {
+   "kind": "paper",
+   "cite": "Lin 2011",
+   "journal": "Nature",
+   "pmid": "21307935",
+   "doi": "10.1038/nature09736",
+   "finding": "Stimulating the ventrolateral ventromedial hypothalamus makes a male attack; silencing it stops fighting between males."
+  },
+  "chamero2007": {
+   "kind": "paper",
+   "cite": "Chamero 2007",
+   "journal": "Nature",
+   "pmid": "18064011",
+   "doi": "10.1038/nature05997",
+   "finding": "MUPs activate vomeronasal neurons and promote fighting between males only through the vomeronasal pathway."
+  },
+  "evans2018": {
+   "kind": "paper",
+   "cite": "Evans 2018",
+   "journal": "Nature",
+   "pmid": "29925954",
+   "doi": "10.1038/s41586-018-0244-6",
+   "finding": "A weak excitatory connection from the medial superior colliculus to the dorsal periaqueductal grey sets the threshold for escape."
+  },
+  "wang2011": {
+   "kind": "paper",
+   "cite": "Wang 2011",
+   "journal": "Science",
+   "pmid": "21960531",
+   "doi": "10.1126/science.1209951",
+   "finding": "Raising or lowering synaptic strength in dorsal medial prefrontal cortex moves a mouse up or down in rank."
+  },
+  "hitti2014": {
+   "kind": "paper",
+   "cite": "Hitti 2014",
+   "journal": "Nature",
+   "pmid": "24572357",
+   "doi": "10.1038/nature13028",
+   "finding": "Silencing CA2 abolishes memory for another individual and leaves other hippocampal memory intact."
+  },
+  "li2018": {
+   "kind": "paper",
+   "cite": "Li 2018",
+   "journal": "Neuron",
+   "pmid": "29398361",
+   "doi": "10.1016/j.neuron.2018.01.005",
+   "finding": "Inhibitory lateral hypothalamic cells projecting to the periaqueductal grey drive predatory attack; excitatory ones drive evasion."
+  },
+  "hong2014": {
+   "kind": "paper",
+   "cite": "Hong 2014",
+   "journal": "Cell",
+   "pmid": "25215491",
+   "doi": "10.1016/j.cell.2014.07.049",
+   "finding": "Inhibitory medial amygdala cells promote aggression; neighbouring excitatory cells promote self-grooming."
+  },
+  "falkner2020": {
+   "kind": "paper",
+   "cite": "Falkner 2020",
+   "journal": "Neuron",
+   "pmid": "32164875",
+   "finding": "The ventrolateral ventromedial hypothalamus excites the lateral periaqueductal grey, whose activity is locked to biting."
+  },
+  "franklin2017": {
+   "kind": "paper",
+   "cite": "Franklin 2017",
+   "journal": "Nat Neurosci",
+   "pmid": "28067904",
+   "finding": "Social defeat weakens the prefrontal projection to the dorsal periaqueductal grey; inhibiting it mimics the avoidance defeat produces."
+  },
+  "idea_mup": {
+   "kind": "idea",
+   "cite": "Idea",
+   "by": "Caleb C. Vogt",
+   "date": "2026-11-24",
+   "finding": "Every C57 male carries the same MUP barcode, so his urine marks carry no identity information, with knock-on effects on behaviour."
+  },
+  "keller2018": {
+   "kind": "paper",
+   "cite": "Keller 2018",
+   "journal": "Nat Neurosci",
+   "pmid": "30104734",
+   "finding": "A second cell type in Barrington's nucleus relaxes the urethral sphincter and lets a male urinate at will, as in scent marking."
+  },
+  "idea_muscle": {
+   "kind": "idea",
+   "cite": "Idea",
+   "by": "Caleb C. Vogt",
+   "date": "2026-11-24",
+   "finding": "The output is muscle, not a mark: urine leaves when the sphincter relaxes and the bladder wall presses, and the mark is the physical result left in the environment."
+  },
+  "idea_vno": {
+   "kind": "idea",
+   "cite": "Idea",
+   "by": "Caleb C. Vogt",
+   "date": "2026-11-24",
+   "finding": "The vomeronasal organ should fire only when the animal is on a urine mark and investigating it; volatile odour at a distance belongs to the main olfactory epithelium."
+  },
+  "allen_conn": {
+   "kind": "atlas",
+   "cite": "Allen connectivity atlas",
+   "url": "https://connectivity.brain-map.org",
+   "finding": "A measurable projection in the Allen Mouse Brain Connectivity Atlas (Oh et al. 2014, adult C57BL/6J). Its strength here is the atlas tercile among these areas. The atlas does not give a sign."
+  },
+  "allen_absent": {
+   "kind": "atlas",
+   "cite": "Not seen in the Allen atlas",
+   "url": "https://connectivity.brain-map.org",
+   "finding": "No measurable projection between these areas in the Allen connectivity atlas. Kept from the draft at the lowest strength until someone checks it; a few injections missing a pathway is not proof that it is absent."
+  },
+  "sign_by_cell_type": {
+   "kind": "idea",
+   "cite": "Idea",
+   "by": "Claude, draft 2",
+   "date": "2026-11-24",
+   "finding": "Added because the atlas shows it. Its sign is assigned from the main cell type of the source area and needs checking."
+  },
+  "insel1992": {
+   "kind": "paper",
+   "cite": "Insel & Shapiro 1992",
+   "journal": "Proc Natl Acad Sci U S A",
+   "pmid": "1321430",
+   "doi": "10.1073/pnas.89.13.5981",
+   "finding": "Oxytocin receptors in the monogamous prairie vole are densest in prelimbic cortex, BNST, nucleus accumbens, midline thalamus and lateral amygdala; in the polygamous montane vole they are in lateral septum, ventromedial hypothalamus and cortical amygdala."
+  },
+  "insel1994": {
+   "kind": "paper",
+   "cite": "Insel, Wang & Ferris 1994",
+   "journal": "J Neurosci",
+   "pmid": "8083743",
+   "doi": "10.1523/JNEUROSCI.14-09-05381.1994",
+   "finding": "Vasopressin V1a binding in the prairie vole is highest in accessory olfactory bulb, diagonal band, laterodorsal thalamus and superior colliculus, and low in lateral septum, where the montane vole's is high."
+  },
+  "lim2004": {
+   "kind": "paper",
+   "cite": "Lim et al. 2004",
+   "journal": "Nature",
+   "pmid": "15201909",
+   "finding": "Raising V1a receptor expression in the ventral pallidum of the promiscuous meadow vole is enough to give it a partner preference."
+  },
+  "liu2003": {
+   "kind": "paper",
+   "cite": "Liu & Wang 2003",
+   "journal": "Neuroscience",
+   "pmid": "14568015",
+   "finding": "Oxytocin and dopamine in the nucleus accumbens are both needed for pair bond formation in female prairie voles."
+  },
+  "amadei2017": {
+   "kind": "paper",
+   "cite": "Amadei et al. 2017",
+   "journal": "Nature",
+   "pmid": "28562592",
+   "doi": "10.1038/nature22381",
+   "finding": "Medial prefrontal drive of the nucleus accumbens rises with mating and predicts, and when imposed accelerates, a female prairie vole's huddling with her partner."
+  },
+  "bosch2009": {
+   "kind": "paper",
+   "cite": "Bosch et al. 2009",
+   "journal": "Neuropsychopharmacology",
+   "pmid": "18923404",
+   "doi": "10.1038/npp.2008.154",
+   "finding": "Losing a bonded partner raises passive stress coping in male prairie voles through CRF receptors; pairing raises CRF mRNA in the BNST."
+  },
+  "williams1992": {
+   "kind": "paper",
+   "cite": "Williams et al. 1992",
+   "journal": "Physiol Behav",
+   "pmid": "1409933",
+   "doi": "10.1016/0031-9384(92)90390-n",
+   "finding": "Removing the olfactory bulbs of female prairie voles reduces social contact and prevents partner preference formation."
+  },
+  "curtis2001": {
+   "kind": "paper",
+   "cite": "Curtis, Liu & Wang 2001",
+   "journal": "Brain Res",
+   "pmid": "11368964",
+   "doi": "10.1016/s0006-8993(01)02343-5",
+   "finding": "Removing the vomeronasal organ of female prairie voles leaves main olfaction, mating and social contact intact and prevents mating-induced pair bonding."
+  },
+  "bergman2002": {
+   "kind": "paper",
+   "cite": "Bergman et al. 2002",
+   "journal": "Arch Toxicol",
+   "pmid": "11914780",
+   "doi": "10.1007/s00204-002-0321-2",
+   "finding": "Methimazole destroys the olfactory neuroepithelium of mice; it regenerates, with a surge of immature neurons two weeks on and a restored epithelium by three months."
+  },
+  "nakamura2008": {
+   "kind": "paper",
+   "cite": "Nakamura & Morrison 2008",
+   "journal": "Nat Neurosci",
+   "pmid": "18084288",
+   "doi": "10.1038/nn2027",
+   "finding": "Skin cooling reaches the preoptic thermoregulatory centre through the lateral parabrachial nucleus (rat)."
+  },
+  "ross2009": {
+   "kind": "paper",
+   "cite": "Ross et al. 2009",
+   "journal": "Neuroscience",
+   "pmid": "19482070",
+   "doi": "10.1016/j.neuroscience.2009.05.055",
+   "finding": "Extracellular oxytocin rises in the nucleus accumbens of female prairie voles during unrestricted interaction with a male; the fibres there likely come from paraventricular and supraoptic neurons."
+  },
+  "gingrich2000": {
+   "kind": "paper",
+   "cite": "Gingrich et al. 2000",
+   "journal": "Behav Neurosci",
+   "pmid": "10718272",
+   "doi": "10.1037//0735-7044.114.1.173",
+   "finding": "Mating raises extracellular dopamine in the nucleus accumbens of female prairie voles by about 50%; a D2 antagonist there blocks partner preference formation and a D2 agonist produces it without mating."
+  }
+ },
+ "left_out": "Sensory thalamus, motor cortex, dorsal striatum, cerebellum, locus coeruleus, anterior hypothalamus and the predator-defence nuclei. For the vole: the anterior hypothalamus (vasopressin there drives a bonded male's aggression to strangers), the diagonal band and the laterodorsal thalamus.",
+ "species": "Prairie vole",
+ "dynamics": {
+  "tick_s": 1.0,
+  "tau_s": 1.0,
+  "sweep": true
+ },
+ "lesion": {
+  "MOE": "smell_ability",
+  "VNO": "vno_ability"
+ },
+ "entry_gain": {
+  "PVN": {
+   "mating": 3.0
+  },
+  "VTA": {
+   "mating": 3.0
+  }
+ },
+ "plasticity": [
+  {
+   "projection": "MOE>MOB",
+   "gate": [
+    "OT",
+    "DA"
+   ],
+   "rate_per_s": 0.02,
+   "gate_threshold": 0.5,
+   "pre_threshold": 0.35,
+   "cap": 1.0,
+   "decay_days": 30,
+   "basis": "Oxytocin and dopamine are both needed for a partner preference to form (Liu & Wang 2003; Gingrich et al. 2000) and both rise with mating (Ross et al. 2009; Gingrich et al. 2000). WHERE the change sits is this draft's choice, made for a modelling reason: the first olfactory synapse is the only place in this network where the code for who is near is still clean (bench test 2026-11-26: with the plastic projection at bulb to piriform or piriform to accumbens, what was written did not depend on whose odour was present, because those areas' activity follows the state of the whole network). In the animal a lasting odour memory more plausibly sits deeper (bulb interneurons, piriform cortex), since sensory neurons turn over. Consequence: here the memory dies with the sensory cells and does not return when they grow back. Every number of the rule is ours. Draft 3: only the sensory cells that carry individual signatures are written on; with every olfactory cell plastic, a pairing also wrote the smell of food and of 'a male', and any of those later passed for the partner.",
+   "evidence": [
+    "liu2003",
+    "gingrich2000",
+    "ross2009"
+   ],
+   "pre_channels": "olf_id_"
+  }
+ ]
+}

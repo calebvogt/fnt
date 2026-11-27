@@ -53,6 +53,12 @@ def discomfort(sim) -> np.ndarray:
     fatigue = getattr(sim, "fatigue", None)
     if fatigue is not None:
         d = d + 0.25 * (fatigue / 100.0) ** 2
+    # being tired, cold or apart from the animal it is attached to (zero
+    # unless SocialParams is on)
+    soc = getattr(sim, "soc", None)
+    if soc is not None:
+        soc.resize(len(d))
+        d = d + soc.discomfort()
     return d
 
 

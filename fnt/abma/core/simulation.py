@@ -236,6 +236,11 @@ class Simulation:
         self._sky = None
         self._sky_t = -1e18
 
+        # ---- rest, warmth and attachment (off unless SocialParams is on) ----
+        # Built lazily at the end of construction, once the roster's arrays
+        # exist (see ``_build_population``'s last lines).
+        self.soc = None
+
         # ---- olfactory system (receptors + odour signatures) ----
         # Off by default, in which case recognition stays the scalar product
         # `smell_ability x identity_signal` and old configs reproduce exactly.
@@ -274,6 +279,12 @@ class Simulation:
         self._res_zones = deepcopy(list(getattr(cfg.arena, "resource_zones", [])))
         self._res_towers = deepcopy(list(getattr(cfg.arena, "water_towers", [])))
         self._rebuild_resources()
+        sc = getattr(cfg, "social", None)
+        if sc is not None and sc.enabled:
+            from .social import SocialState
+            self.soc = SocialState(self)
+        #: each animal's speed last step as a fraction of its easy pace
+        self.effort = np.zeros(n)
 
     def _rebuild_resources(self) -> None:
         """(Re)build the food/water target arrays from the sim-local lists.
@@ -473,6 +484,9 @@ class Simulation:
             "explore": np.array([a.traits.exploration for a in metas]),
             "smell": np.array([a.traits.smell_ability for a in metas]),
             "identity": np.array([a.traits.identity_signal for a in metas]),
+            # the vomeronasal organ (contact chemosignals), lost separately
+            "vno": np.array([getattr(a.traits, "vno_ability", 1.0)
+                             for a in metas]),
             # how often it *wants* to mark; whether it *can* is the bladder
             "scent_rate": np.array([getattr(a.traits, "scent_rate", 20.0)
                                     for a in metas]),
@@ -749,6 +763,8 @@ class Simulation:
             satiated = np.asarray(perc.get("resting", speed_frac < 0.12), bool)
         else:
             spd = np.where(satiated, spd * cfg.rest_speed_factor, spd)
+        self.effort = np.where(self.alive & (cruise > 1e-9),
+                               spd / np.maximum(cruise, 1e-9), 0.0)
         self.P = self._resolve_obstacles(P, P + move_dir * spd[:, None] * dt,
                                          fwd=move_dir)
         self.H = np.arctan2(move_dir[:, 1], move_dir[:, 0])
@@ -806,6 +822,10 @@ class Simulation:
         else:
             self._apply_dynamics(dt, step_dist, activity, within.sum(axis=1),
                                  on_food, on_water)
+
+        # --- rest, warmth and attachment ---
+        if self.soc is not None:
+            self.soc.step(self, dt, dist, self.effort)
 
         # --- body mass drifts with energy balance, within a physiological band ---
         self.mass = np.clip(
@@ -1075,6 +1095,12 @@ class Simulation:
 
         # ---- energy out ------------------------------------------------- #
         kj_out = p.basal_kj(mass, self.metabolism, dt)
+        if self.soc is not None:
+            # keeping warm is paid for: a cold animal burns more at rest, so a
+            # huddle saves energy as well as discomfort
+            self.soc.resize(self.n)
+            kj_out = kj_out * (1.0 + self.cfg.social.cold_kj_factor
+                               * self.soc.cold / 100.0)
         kj_out = kj_out + p.locomotion_kj(mass, step_dist)
         if self.sward is not None:
             # Forcing a body through standing grass costs on top of the
@@ -1720,6 +1746,8 @@ class Simulation:
                                   self.P[i, 0], self.P[i, 1], rec_j[fem])
                     self.matings[i] += 1
                     self.matings[j] += 1
+                    if self.soc is not None:
+                        self.soc.on_mating(self, int(i), int(j))
                     self.activity[i] = self.activity[j] = 4
                     if self._physio_on:
                         self._spend_energy_kj((i, j), self.cfg.physiology.mate_kj)

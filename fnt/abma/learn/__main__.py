@@ -78,6 +78,29 @@ def main(argv=None) -> int:
     p.add_argument("--huts", type=float, default=0.6,
                    help="With --contest: fraction of worlds that have huts "
                         "(cover an animal cannot be bitten under).")
+    p.add_argument("--life", action="store_true",
+                   help="Raise it in worlds where animals tire, get cold and "
+                        "become attached to each other (SocialParams): rest, "
+                        "huddling and staying with a partner are then worth "
+                        "something to the body.")
+    p.add_argument("--attached", type=float, default=0.5,
+                   help="With --life: fraction of animals that arrive already "
+                        "attached to another animal of their world.")
+    p.add_argument("--bond-in-brain", action="store_true",
+                   help="With --life and an anatomy spec that has plastic "
+                        "connections: attachments are written by the brain "
+                        "itself. Each life then begins with the dealt pairs "
+                        "held together while the body reports a mating.")
+    p.add_argument("--social-param", action="append", default=[], metavar="NAME=VALUE",
+                   help="With --life: override one SocialParams value "
+                        "(repeatable), e.g. cold_alone=60.")
+    p.add_argument("--critic-warmup", type=int, default=0, metavar="N",
+                   help="With --anatomy: for the first N iterations only the "
+                        "critic learns. Use it when resuming a brain that was "
+                        "taught by example and has no critic yet.")
+    p.add_argument("--torch-threads", type=int, default=0,
+                   help="Threads the weight update may use (0 = every core). "
+                        "Set it to a few on a machine busy with other work.")
     p.add_argument("--lr", type=float, default=6e-4)
     p.add_argument("--entropy", type=float, default=0.005)
     p.add_argument("--seed", type=int, default=0)
@@ -91,11 +114,14 @@ def main(argv=None) -> int:
         one_resource=a.one_resource, boxes=a.boxes, anosmic=a.anosmic,
         born_at_door=a.born_at_door, born_at_resource=a.born_at_resource,
         box_water=a.box_water, towers=a.towers,
-        contest=a.contest, huts=a.huts)
+        contest=a.contest, huts=a.huts,
+        life=a.life, attached=a.attached, bond_in_brain=a.bond_in_brain,
+        social_params={k: float(v) for k, _, v in
+                       (s.partition("=") for s in a.social_param)})
     if a.anatomy:
         return _raise_anatomy(a, cur)
     hp = Hyper(workers=a.workers, worlds=a.worlds, lr=a.lr,
-               entropy=a.entropy, seed=a.seed)
+               entropy=a.entropy, seed=a.seed, torch_threads=a.torch_threads)
     resume = Brain.load(find_brain(a.resume)) if a.resume else None
     tr = Trainer(hp, cur, a.out, name=a.name, resume=resume)
     deadline = time.time() + a.minutes * 60.0
@@ -118,6 +144,11 @@ def main(argv=None) -> int:
                   + (f"bites m/f {info['bites_male']:.1f}/{info['bites_female']:.1f} "
                      f"bitten {info['bitten']:.2f} died {info['died']:.3f} "
                      f"health {info['health']:.0f}  " if a.contest else "")
+                  + (f"rest tired/fresh {info['rest_tired']:.2f}/{info['rest_fresh']:.2f} "
+                     f"touch {info['touch']:.2f} (no nose {info['touch_anosmic']:.2f}) "
+                     f"with partner nose/none {info['partner_share_intact']:.2f}/"
+                     f"{info['partner_share_anosmic']:.2f} "
+                     f"lonely {info['lonely_attached']:.0f}  " if a.life else "")
                   + f"ev {info['explained_var']:+.2f} "
                   f"kl {info['kl']:.3f} "
                   f"[{info['sec_collect']:.0f}s+{info['sec_update']:.0f}s]",
@@ -146,12 +177,15 @@ def _raise_anatomy(a, cur) -> int:
     from ..core import anatomy
     from .anatomy_ppo import AnatomyHyper, AnatomyTrainer
 
-    cur.tick_s = 0.25                          # the network's own tick
-    if a.species == "Prairie vole":
-        cur.species = "House mouse"
+    spec = anatomy.load_spec(a.anatomy)
+    # the network's own tick, and the animal the spec describes (the house
+    # mouse unless the spec says otherwise)
+    cur.tick_s = float(spec.get("dynamics", {}).get("tick_s", 0.25))
+    cur.species = spec.get("species", "House mouse")
     out = a.out if a.out != user_dir() else anatomy.user_dir()
     hp = AnatomyHyper(workers=a.workers, worlds=a.worlds, lr=min(a.lr, 3e-4), entropy=min(a.entropy, 0.002),
-                      seed=a.seed, wiring_seed=a.wiring_seed)
+                      seed=a.seed, wiring_seed=a.wiring_seed, torch_threads=a.torch_threads,
+                      critic_warmup=a.critic_warmup)
     tr = AnatomyTrainer(a.anatomy, hp, cur, out, name=a.name, resume=a.resume)
     print(f"raising '{a.name}' on anatomy '{a.anatomy}' in {out}  ({hp.worlds} worlds x {cur.steps} ticks of "
           f"{cur.tick_s:g} s, {hp.workers} workers)", flush=True)
@@ -161,7 +195,11 @@ def _raise_anatomy(a, cur) -> int:
             info = tr.step()
             print(f"it {info['iteration']:4d}  {info['agent_steps'] / 1e6:7.2f}M ticks  "
                   f"return {info['return']:+7.3f}  hungry at food {info.get('food_time_hungry', float('nan')):.3f}  "
-                  f"thirsty at water {info.get('water_time_thirsty', float('nan')):.3f}  kl {info['kl']:.4f}  "
+                  f"thirsty at water {info.get('water_time_thirsty', float('nan')):.3f}  "
+                  + (f"rest tired/fresh {info['rest_tired']:.2f}/{info['rest_fresh']:.2f}  touch {info['touch']:.2f} "
+                     f"(no nose {info['touch_anosmic']:.2f})  with partner nose/none "
+                     f"{info['partner_share_intact']:.2f}/{info['partner_share_anosmic']:.2f}  " if a.life else "")
+                  + f"box nose/none {info['box_found_intact']:.2f}/{info['box_found_anosmic']:.2f}  kl {info['kl']:.4f}  "
                   f"collect {info['sec_collect']:.0f}s update {info['sec_update']:.0f}s", flush=True)
             if info["iteration"] % max(1, a.save_every) == 0:
                 path = tr.save()

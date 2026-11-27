@@ -27,7 +27,7 @@ from ..core.brain import Brain
 from ..core.compose import cohort
 from ..core.config import (ArenaConfig, ExperimentConfig, ResourceObject,
                            ResourceZone, ScentParams, WaterTower, zone_doors,
-                           zone_sides, ContestParams, Hut)
+                           zone_sides, ContestParams, Hut, SocialParams)
 from ..core.neural import NeuralPolicy, discomfort
 from ..core.physiology import preset_params
 from ..core.simulation import Simulation
@@ -105,6 +105,28 @@ class Curriculum:
     #: fraction of contest worlds with huts in them, and how many (inclusive)
     huts: float = 0.6
     hut_count: tuple = (1, 4)
+    #: animals tire, get cold and become attached to each other
+    #: (``SocialParams``). Nothing rewards resting, huddling or staying with a
+    #: partner: being tired, cold or apart is uncomfortable, and that is all.
+    life: bool = False
+    #: fraction of animals that arrive already attached to another animal of
+    #: the world (mutually; mostly of the other sex). A life of half an hour is
+    #: too short to form an attachment in, so without these nothing about
+    #: having one would ever be experienced.
+    attached: float = 0.5
+    #: among attached animals, the share whose partner is of the same sex
+    attached_same_sex: float = 0.2
+    #: tiredness, cold and (for the attached) separation distress on arrival
+    tired_on_arrival: tuple = (0.0, 95.0)
+    lonely_on_arrival: tuple = (0.0, 90.0)
+    #: overrides of single ``SocialParams`` values, e.g. {"cold_alone": 60}
+    social_params: dict = field(default_factory=dict)
+    #: with ``life``: attachments are kept by the brain (an anatomy spec's
+    #: plastic connections), not dealt from the engine's table. Each dealt
+    #: pair then spends the first ``wedding_s`` seconds of its life side by
+    #: side with the body reporting a mating, and is put apart afterwards.
+    bond_in_brain: bool = False
+    wedding_s: float = 180.0
     tick_s: float = 2.0
     steps: int = 1024
     #: reward per unit drop in discomfort, and per mating
@@ -230,7 +252,7 @@ def make_world(seed: int, cur: Curriculum) -> ExperimentConfig:
         cohort(cur.species, "F", n - males) if n - males else None)
         if g is not None]
     huts = []
-    if cur.contest and rng.random() < cur.huts:
+    if (cur.contest or cur.life) and rng.random() < cur.huts:
         for k in range(int(rng.integers(cur.hut_count[0], cur.hut_count[1] + 1))):
             x, y = spot(0.10)
             huts.append(Hut(kind="dome", x=x, y=y, w=0.127, label=f"hut_{k}"))
@@ -252,6 +274,9 @@ def make_world(seed: int, cur: Curriculum) -> ExperimentConfig:
     if cur.contest:
         cfg.contest = ContestParams(enabled=True)
         cfg.enable_mortality = True       # an injury can be the end of it
+    if cur.life:
+        cfg.social = SocialParams(enabled=True, **dict(cur.social_params or {}))
+        cfg.social.bond_in_brain = bool(cur.bond_in_brain)
     return cfg
 
 
@@ -324,7 +349,67 @@ def spawn(seed: int, cur: Curriculum, brain: Brain | None,
         sim.agents[i].traits.smell_ability = float(smell[i])
     if (smell < 1.0).any():
         sim.mark_biology_dirty()
+    if sim.soc is not None:
+        _arrive_social(sim, cur, rng)
     return sim
+
+
+def _arrive_social(sim, cur: Curriculum, rng) -> None:
+    """Tiredness, cold and attachments on arrival.
+
+    Attachments are dealt in mutual pairs. An animal with no nose can have
+    one: it formed before the nose was lost, and it now cannot be read. That
+    animal's separation distress has no remedy, and what it does about that
+    is learned like everything else.
+    """
+    soc, n = sim.soc, sim.n
+    #: pairs to hold together at the start of the life: (i, j, where each
+    #: arrived, the separation distress each is left with afterwards)
+    sim._wedding = []
+    soc.tired[:] = rng.uniform(*cur.tired_on_arrival, n)
+    soc.cold[:] = rng.uniform(0.0, sim.cfg.social.cold_alone, n)
+    free = list(rng.permutation(n))
+    males = [i for i in free if sim.sex_m[i] > 0.5]
+    females = [i for i in free if sim.sex_m[i] <= 0.5]
+    while len(free) >= 2:
+        i = free.pop()
+        if rng.random() >= cur.attached:
+            continue
+        same = rng.random() < cur.attached_same_sex
+        mine = males if sim.sex_m[i] > 0.5 else females
+        other = females if sim.sex_m[i] > 0.5 else males
+        pool = [j for j in (mine if same else other) if j in free]
+        if not pool:
+            continue
+        j = pool[int(rng.integers(len(pool)))]
+        free.remove(j)
+        a = rng.uniform(0.5, 1.0)
+        soc.A[i, j] = soc.A[j, i] = a
+        lonely = (a * rng.uniform(*cur.lonely_on_arrival), a * rng.uniform(*cur.lonely_on_arrival))
+        if cur.bond_in_brain:
+            sim._wedding.append((int(i), int(j), sim.P[i].copy(), sim.P[j].copy(), lonely))
+        else:
+            soc.lonely[i], soc.lonely[j] = lonely
+
+
+def _wedding(sim, cur: Curriculum, t_s: float) -> None:
+    """Hold each dealt pair side by side while the pairing lasts, with the
+    body reporting a mating; when it ends, put them apart."""
+    pairs = getattr(sim, "_wedding", None)
+    if not pairs:
+        return
+    if t_s < cur.wedding_s:
+        for i, j, at_i, _, _ in pairs:
+            sim.P[i] = at_i
+            sim.P[j] = at_i + np.array([0.02, 0.0])
+            sim.soc.mated[[i, j]] = 1.0
+        return
+    for i, j, at_i, at_j, lonely in pairs:
+        sim.P[i], sim.P[j] = at_i, at_j
+        sim.soc.lonely[i], sim.soc.lonely[j] = lonely
+    sim.soc.touch_s[:] = 0.0                  # what they did while held together is not their doing
+    sim.soc.partner_touch_s[:] = 0.0
+    sim._wedding = []
 
 
 def rollout(weights: dict, meta: dict, seeds: list, cur_d: dict) -> dict:
@@ -347,7 +432,7 @@ def rollout(weights: dict, meta: dict, seeds: list, cur_d: dict) -> dict:
         brain = Brain(weights, meta)
         n_in, n_out, take = brain.n_in, brain.n_out, brain._take
     T, dt = int(cur.steps), float(cur.tick_s)
-    obs_l, u_l, rew_l, stat_l = [], [], [], []
+    obs_l, u_l, rew_l, stat_l, alive_l = [], [], [], [], []
     sink = _NoEvents() if cur.social else None
     for seed in seeds:
         pol0 = None
@@ -366,7 +451,11 @@ def rollout(weights: dict, meta: dict, seeds: list, cur_d: dict) -> dict:
         d_prev = discomfort(sim)
         mat_prev = sim.matings.copy()
         fights0 = (sim.fights_won + sim.fights_lost).copy()
+        bond0 = sim.soc.bond().copy() if sim.soc is not None else np.zeros(n)
+        tired0 = sim.soc.tired.copy() if sim.soc is not None else np.zeros(n)
         for t in range(T):
+            if cur.life and cur.bond_in_brain:
+                _wedding(sim, cur, t * dt)
             sim.step(t * dt, dt, events=sink)
             pol = sim.policy
             obs[t] = pol.last_obs[:, take]
@@ -382,6 +471,9 @@ def rollout(weights: dict, meta: dict, seeds: list, cur_d: dict) -> dict:
         obs_l.append(obs)
         u_l.append(u)
         rew_l.append(rew)
+        if anat is not None:              # which cells each animal had (a lesioned sense organ)
+            cells = getattr(sim.policy, "alive", None)
+            alive_l.append(np.ones((n, anat.n), np.float32) if cells is None else cells.astype(np.float32))
         stat_l.append(np.stack([
             hunger0, sim.hunger, thirst0, sim.thirst, at_food / T,
             at_water / T, speed / T, sim.dist_total, sim.health,
@@ -393,11 +485,27 @@ def rollout(weights: dict, meta: dict, seeds: list, cur_d: dict) -> dict:
             np.full(n, float(len(sim.food_rects) > 0)),
             sim.bites_given.astype(float), sim.bites_taken.astype(float),
             sim.alive.astype(float), sim.sex_m.astype(float),
+            *_social_stats(sim, T * dt, bond0, tired0),
         ], axis=1))
-    return {"obs": np.concatenate(obs_l, axis=1),
+    extra = {"alive": np.concatenate(alive_l, axis=0)} if alive_l else {}
+    return {**extra,
+            "obs": np.concatenate(obs_l, axis=1),
             "u": np.concatenate(u_l, axis=1),
             "rew": np.concatenate(rew_l, axis=1),
             "stats": np.concatenate(stat_l, axis=0)}
+
+
+def _social_stats(sim, seconds: float, bond0, tired0) -> list:
+    """Per-animal: share of the life spent resting, touching anyone, touching
+    its partner; attachment on arrival; tiredness on arrival and at the end;
+    cold and separation distress at the end."""
+    n = sim.n
+    soc = sim.soc
+    if soc is None:
+        return [np.zeros(n)] * 8
+    return [soc.rest_s / seconds, soc.touch_s / seconds, soc.partner_touch_s / seconds,
+            np.asarray(bond0, float), np.asarray(tired0, float), soc.tired.copy(),
+            soc.cold.copy(), soc.lonely.copy()]
 
 
 #: columns of ``rollout()["stats"]``
@@ -405,7 +513,8 @@ STAT_FIELDS = ["hunger0", "hunger1", "thirst0", "thirst1", "frac_at_food",
                "frac_at_water", "mean_speed", "dist_m", "health", "fights",
                "matings", "stress", "group_size", "has_food", "has_water",
                "smell", "has_boxes", "bites_given", "bites_taken", "alive",
-               "male"]
+               "male", "rest", "touch", "partner_touch", "bond0", "tired0",
+               "tired1", "cold1", "lonely1"]
 
 
 def summarise(stats: np.ndarray) -> dict:
@@ -461,4 +570,23 @@ def summarise(stats: np.ndarray) -> dict:
         "bites_female": mean(s["bites_given"], s["male"] <= 0),
         "bitten": float((s["bites_taken"] > 0).mean()),
         "died": float(1.0 - s["alive"].mean()),
+        # life worlds only (zero elsewhere). ``rest_tired`` and ``rest_fresh``:
+        # share of the life spent resting, for animals that arrived tired and
+        # for animals that arrived rested. ``touch``: share spent against
+        # another body (not for animals alone in their world).
+        # ``partner_share_*``: of an attached animal's time against a body,
+        # the share against its partner, with a nose and without.
+        "rest_tired": mean(s["rest"], s["tired0"] > 60),
+        "rest_fresh": mean(s["rest"], s["tired0"] < 30),
+        "touch": mean(s["touch"], s["group_size"] > 1),
+        "touch_anosmic": mean(s["touch"], (s["group_size"] > 1) & (s["smell"] <= 0.0)),
+        "partner_share_intact": _share(s, (s["bond0"] > 0.4) & (s["smell"] >= 1.0) & (s["group_size"] > 2)),
+        "partner_share_anosmic": _share(s, (s["bond0"] > 0.4) & (s["smell"] <= 0.0) & (s["group_size"] > 2)),
+        "cold": float(s["cold1"].mean()),
+        "lonely_attached": mean(s["lonely1"], s["bond0"] > 0.4),
     }
+
+
+def _share(s: dict, m) -> float:
+    tot = s["touch"][m].sum()
+    return float(s["partner_touch"][m].sum() / tot) if tot > 0 else 0.0

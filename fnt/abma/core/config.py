@@ -420,6 +420,100 @@ class ContestParams:
 
 
 @dataclass
+class SocialParams:
+    """What a vole needs besides food and water: rest, warmth and company.
+
+    Off by default, and then none of this exists. Switched on, each animal
+    carries three more needs (every one a 0-100 bar, like hunger), a memory
+    for the odour of the animals it has become attached to, and sight of the
+    doorways of walled boxes. Nothing here says what to do about any of it;
+    the needs enter a learned brain's discomfort (:func:`fnt.abma.core.neural.
+    discomfort`) and its senses (:mod:`fnt.abma.core.senses`), and behaviour is
+    whatever lowers them. See :mod:`fnt.abma.core.social`.
+
+    *Tired.* Rises while the animal is up (faster the harder it moves) and
+    falls only while it rests.
+
+    *Cold.* A small rodent at room temperature is below thermoneutrality
+    whenever it sits still. Cold relaxes toward a level set by what the animal
+    is doing: moving warms it, a shelter (a walled box or a hut) takes some of
+    the cold away, and every animal it is touching takes more. This need does
+    not depend on smell: a body is warm whoever it belongs to.
+
+    *Attachment.* ``A[i, j]`` (0-1) is how attached animal i is to the odour of
+    animal j. It grows while the two are in contact and after they mate, in
+    proportion to how well i can smell and tell apart j
+    (``smell_ability x identity_signal``, or the mechanistic nose), so an
+    animal with no main olfactory input forms no attachment. Growth toward a
+    new individual is held back by an existing attachment to another
+    (``bond_exclusive``), which is what makes a bond selective. An attached
+    animal that cannot smell its partner nearby builds up separation distress
+    (*lonely*), and one that smells an unattached animal at close quarters
+    builds up stress in proportion to its own attachment (selective aversion
+    to strangers). Both act only through what the animal smells.
+
+    Every rate is a free parameter; none is measured on an animal. The
+    literature each mechanism rests on is listed in ``fnt/abma/README.md``.
+    """
+    enabled: bool = False
+    # --- rest ----------------------------------------------------------- #
+    # (with these three an animal that rests when very tired and gets up when
+    # rested cycles every three to four hours, as a vole does)
+    tired_rise_h: float = 30.0       # points per hour while up and still
+    tired_move_h: float = 20.0       # extra points per hour at full easy pace
+    tired_fall_h: float = 16.0       # points per hour recovered while resting
+    rest_speed_frac: float = 0.12    # below this fraction of its pace it rests
+    # --- warmth --------------------------------------------------------- #
+    cold_alone: float = 70.0         # where cold settles: resting, alone, in the open
+    cold_tau_s: float = 600.0        # how fast cold moves toward that level
+    shelter_warmth: float = 0.30     # share of the cold a box or a hut removes
+    huddle_warmth: float = 0.55      # share each touching animal removes of what is left
+    huddle_r_m: float = 0.10         # centre-to-centre distance that counts as touching
+    cold_kj_factor: float = 0.5      # extra basal energy at cold = 100 (x basal)
+    # --- attachment ----------------------------------------------------- #
+    bond_rate_h: float = 0.10        # attachment gained per hour of smelled contact
+    mate_bond: float = 0.30          # attachment gained at a mating
+    peer_bond: float = 0.35          # same-sex contact counts this much (0 = mates only)
+    bond_exclusive: float = 1.0      # how far an existing attachment blocks a new one
+    bond_decay_h: float = 0.002      # attachment lost per hour out of contact
+    partner_reach_m: float = 0.5     # length scale of an animal's body odour
+    lonely_rise_h: float = 15.0      # points per hour, attached and partner not smelled
+    lonely_fall_h: float = 150.0     # points per hour while the partner is smelled close by
+    stranger_stress_h: float = 80.0  # stress per hour: attached, an unattached animal smelled at contact
+    stranger_r_m: float = 0.30       # how near that animal must be
+    #: Where an attachment is kept. False: in the engine's table (``A``), which
+    #: also hands the brain ready-made partner and stranger odours. True: only
+    #: in the brain's own plastic connections (an anatomy spec's
+    #: ``plasticity``); separation distress then follows how much that memory
+    #: holds and how well what the animal smells now matches it. The engine's
+    #: table still runs, as bookkeeping to compare against.
+    bond_in_brain: bool = False
+    #: with ``bond_in_brain``: the brain's match (0-1) at which the partner
+    #: counts as fully there. A partner in contact reads about 0.5-0.57.
+    match_full: float = 0.5
+    #: how long the body goes on signalling a mating to the brain (the
+    #: `mating` sense: 1 at the mating, fading with this time constant)
+    mating_trace_s: float = 600.0
+    # --- which nose an attachment needs ---------------------------------- #
+    # Two chemical senses could carry it, and which one does is not settled
+    # for the prairie vole: removing the olfactory bulbs (both systems)
+    # prevents partner preference, and so does removing the vomeronasal organ
+    # alone with main olfaction intact (Curtis et al. 2001). Methimazole
+    # strips the main olfactory epithelium. These three switches let a run
+    # state a hypothesis and compare it with another.
+    bond_needs_moe: bool = True      # forming one needs main olfaction (smell_ability)
+    bond_needs_vno: bool = False     # forming one needs the vomeronasal organ (vno_ability)
+    read_by_vno: bool = False        # one can also be read by the vomeronasal organ, on contact
+    # --- sight ---------------------------------------------------------- #
+    see_doors: bool = True           # the doorways of walled boxes can be seen
+    sight_m: float = 1.5             # from this far
+    # --- how much each need hurts (weights in the discomfort sum) ------- #
+    w_tired: float = 0.5
+    w_cold: float = 0.5
+    w_lonely: float = 0.5
+
+
+@dataclass
 class Stimulation:
     """Drive, clamp or silence one unit of a learned brain for a while.
 
@@ -563,6 +657,10 @@ class TraitProfile:
     wander: float = 0.5
     # ---- legacy: prescribed home range (pre-scent configs only) --------- #
     home_range_r: float = 0.55
+    # ---- body, added later (kept last so older positional uses still hold)
+    #: the vomeronasal organ: involatile cues read on contact. 0 = none.
+    #: Separate from ``smell_ability`` because the two can be lost separately.
+    vno_ability: float = 1.0
 
 
 @dataclass
@@ -829,6 +927,8 @@ class ExperimentConfig:
     brain: BrainParams = field(default_factory=BrainParams)
     #: bites, sprinting, fatigue and cover in place of dice-roll contests
     contest: ContestParams = field(default_factory=ContestParams)
+    #: rest, warmth, attachment to individuals and sight of doorways
+    social: SocialParams = field(default_factory=SocialParams)
     #: timed drive / clamp / silencing of single units of that brain
     stimulations: list[Stimulation] = field(default_factory=list)
 
@@ -928,6 +1028,7 @@ class ExperimentConfig:
                                 sky=SkyParams(**d.get("sky", {})),
                                 brain=BrainParams(**d.get("brain", {})),
                                 contest=ContestParams(**d.get("contest", {})),
+                                social=SocialParams(**d.get("social", {})),
                                 stimulations=[
                                     Stimulation(**x)
                                     for x in d.get("stimulations", [])],

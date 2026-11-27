@@ -81,6 +81,19 @@ SENSORS: list[str] = [
     # --- vomeronasal (appended): involatile cues, read only on nose contact --
     "vno_contact",                           # the nose is on a urine spot or an animal
     *[f"vno_mup_{k}" for k in range(12)],    # the MUP barcode of whatever it is on
+    # --- rest, warmth, attachment (appended; silent unless SocialParams is on)
+    "olf_partner", "olf_partner_fwd", "olf_partner_lat",      # body odour it is attached to
+    "olf_stranger", "olf_stranger_fwd", "olf_stranger_lat",   # body odour it is not
+    "tired", "cold", "lonely",
+    "touch",                                 # another animal's body against its own
+    "door", "door_fwd", "door_lat",          # the nearest doorway of a walled box, by sight
+    "in_box",                                # inside a walled box or under a hut
+    "vno_partner", "vno_stranger",           # on contact: an animal it is attached to, or is not
+    "mating",                                # a mating just happened to this body (fades over minutes)
+    # the individual odour signatures of the animals nearby, mixed in the air:
+    # twelve components, each animal carrying its own combination
+    *[f"olf_id_{k}" for k in range(12)],
+    *[f"olf_id_{k}" for k in range(12, 24)],   # added later; kept at the end so older weights line up
 ]
 
 #: The interoceptive channels that also act as neuromodulators — they gate the
@@ -89,11 +102,12 @@ MODULATORS: list[str] = [
     "hunger", "thirst", "stress", "pain", "receptive", "male", "light",
     "aggression", "boldness", "sociability", "exploration",
     "hurt", "fatigue",
+    "tired", "cold", "lonely",
 ]
 
 #: Channel groups, for display and for ablating a whole sense at once.
 GROUPS: dict[str, list[str]] = {
-    "olfaction": [s for s in SENSORS if s.startswith("olf_")],
+    "olfaction": [s for s in SENSORS if s.startswith("olf_") and not s.startswith("olf_id_")],
     "touch": ["wall_ahead", "wall_left", "wall_right",
               "other", "other_fwd", "other_lat"],
     "taste": ["at_food", "at_water", "grass"],
@@ -105,7 +119,10 @@ GROUPS: dict[str, list[str]] = {
     "efference": ["last_speed", "last_turn"],
     "contest": ["hurt", "hurt_fwd", "hurt_lat", "fatigue", "in_cover", "cover",
                 "cover_fwd", "cover_lat", "other_closing", "other_size"],
-    "vomeronasal": [s for s in SENSORS if s.startswith("vno_")],
+    "vomeronasal": [s for s in SENSORS if s.startswith("vno_")],   # the organ: an animal with no vno_ability gets none of these
+    "social": ["tired", "cold", "lonely", "touch", "mating"],
+    "identity": [f"olf_id_{k}" for k in range(24)],
+    "sight": ["door", "door_fwd", "door_lat", "in_box"],
 }
 
 _IDX = {name: i for i, name in enumerate(SENSORS)}
@@ -414,10 +431,49 @@ def sense(sim, elapsed_s: float, memory: PlaceMemory, params: SenseParams,
     if last_turn is not None:
         put("last_turn", last_turn)
 
+    # ---- rest, warmth, attachment; sight of doorways -------------------- #
+    soc = getattr(sim, "soc", None)
+    if soc is not None:
+        p_lvl, p_vec, s_lvl, s_vec = soc.odours(sim, dist, unit)
+        put_vec("olf_partner", p_lvl, p_vec, smell)
+        put_vec("olf_stranger", s_lvl, s_vec, smell)
+        put("tired", soc.tired[:n] / 100.0)
+        put("cold", soc.cold[:n] / 100.0)
+        put("lonely", soc.lonely[:n] / 100.0)
+        # a body against its own, by touch: how many, saturating at three
+        touching = (np.where(alive[None, :], dist, np.inf) < sim.cfg.social.huddle_r_m).sum(axis=1)
+        put("touch", np.clip(touching / 3.0, 0.0, 1.0))
+        put("in_box", soc.in_shelter(P).astype(float))
+        v_partner, v_stranger = soc.contact_odours(sim, dist)
+        put("vno_partner", v_partner)
+        put("vno_stranger", v_stranger)
+        put("mating", soc.mated[:n])
+        # who is near, as a mixture of signatures: no name, no "partner"
+        sig = soc.signatures(sim)
+        mix = np.clip(wj @ sig, 0.0, 1.0) * np.asarray(smell, float)[:n, None]
+        for k in range(sig.shape[1]):
+            put(f"olf_id_{k}", mix[:, k])
+        if sim.cfg.social.see_doors and len(doors):
+            # Every doorway of every box, seen from outside: the nearest one
+            # in view. An animal inside a box sees the way out instead.
+            all_doors = np.concatenate(sim._zone_door_sets, axis=0)
+            dd = np.linalg.norm(P[:, None, :] - all_doors[None, :, :], axis=2)
+            kd = np.argmin(dd, axis=1)
+            target = all_doors[kd]
+            if in_zone.any():
+                target = np.where(in_zone[:, None], sim.exit_door(P, zone_of), target)
+            vd = target - P
+            dk = np.linalg.norm(vd, axis=1)
+            seen = np.clip(1.0 - dk / max(1e-6, float(sim.cfg.social.sight_m)), 0.0, 1.0)
+            put_vec("door", seen, vd / (dk[:, None] + 1e-9) * (seen > 0)[:, None])
+
     # ---- vomeronasal: only what the nose is actually on ----------------- #
     # Not scaled by smell_ability: methimazole strips the main olfactory
     # epithelium and largely spares the vomeronasal organ.
     level, code = sim.nose_contact(elapsed_s)
+    vno = getattr(sim, "vno", None)
+    if vno is not None and len(vno) == n:        # an animal without the organ reads nothing with it
+        level = level * vno
     put("vno_contact", level)
     for k in range(code.shape[1]):
         put(f"vno_mup_{k}", level * code[:, k])

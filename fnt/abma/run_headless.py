@@ -235,7 +235,10 @@ def main(argv=None) -> int:
                         "anosmic), 'choice' (food or water, hungry vs "
                         "thirsty), 'search' (area-restricted search after "
                         "food is lost), 'doorway' (chow in a walled box: "
-                        "with and without a nose), or 'all'. 'chase' checks the "
+                        "with and without a nose), or 'all'. 'partner' is the "
+                        "partner preference test (a tethered partner and a "
+                        "tethered stranger; needs a brain raised with --life). "
+                        "'chase' checks the "
                         "contest physics instead: a scripted chaser and "
                         "fleer across arena sizes. Needs no config; add "
                         "--brain to test a learned brain, omit it to test the "
@@ -348,6 +351,23 @@ def main(argv=None) -> int:
             import pandas as pd
             pd.DataFrame(rows).to_csv(args.structure_out, index=False)
             print(f"table -> {args.structure_out}")
+        return 0
+
+    if args.assay == "partner":
+        from .core import assays
+        try:
+            make = assays.policy_factory(args.brain, anatomy=args.anatomy or "",
+                                         weights=args.anatomy_weights or "")
+        except (ValueError, FileNotFoundError) as e:
+            p.error(str(e))
+        if make is None:
+            p.error("--assay partner needs --brain (or --anatomy with "
+                    "--anatomy-weights): the rule-based animal has no attachments")
+        r = assays.partner_battery(make, trials=args.assay_trials,
+                                   species=args.species, seed=args.seed or 0)
+        print("PARTNER PREFERENCE TEST  (a tethered partner at one end, a "
+              "tethered stranger at the other, 30 minutes)")
+        print(assays.format_partner(r))
         return 0
 
     if args.assay and args.assay != "vitals":

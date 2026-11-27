@@ -115,6 +115,7 @@ python -m fnt.abma --assay all                          # the rule-based animal
 | `search` | Food is removed after 40 s of eating. Does it search where the food was? |
 | `doorway` | Chow in a walled box behind two doorways; with and without a nose. |
 | `vitals` | Your config: does every animal eat and drink, and what do they do to each other? |
+| `partner` | The partner preference test: a tethered partner at one end of a long box, a tethered stranger at the other, 30 minutes. Run attached with a nose, without one, without a vomeronasal organ and unattached. Needs a brain raised with `--life`. With an anatomy brain that keeps its own attachments (`--anatomy NAME --anatomy-weights W`), each test begins with ten minutes beside the partner-to-be, and a fifth condition loses the sense of smell after that pairing. |
 
 ### Twin experiments: one life, lived twice
 
@@ -149,6 +150,39 @@ Brains are written to `~/ABMA_brains/` and appear in the window and in
 and thirsty animals spend at food and water and how often a need picks the
 right goal.
 
+| Option | What it does |
+|---|---|
+| `--life` | The animals also tire, get cold and become attached (below). The log then adds how much they rest, touch and stay with a partner. |
+| `--attached X` | With `--life`: share of animals that arrive attached to another animal of their world (default 0.5). |
+| `--bond-in-brain` | With `--life` and an anatomy spec that has plastic connections: attachments are written by the brain itself. Each life begins with the dealt pairs held together for three minutes while the body reports a mating. |
+| `--social-param NAME=VALUE` | With `--life`: override one value of the settings below. Repeatable. |
+| `--torch-threads N` | Threads the weight update may use. Set it to a few on a computer busy with other work. |
+
+## Rest, warmth and attachment (experimental)
+
+Off unless a config turns it on (`social.enabled`, or `--life` in training).
+Three more needs, each uncomfortable and nothing else:
+
+- **Tired.** Rises while awake, faster while moving; falls at rest.
+- **Cold.** Falls in a box or under a hut, and for each body it is touching.
+  Warmth needs no nose.
+- **Separation distress.** Rises in an animal that has an attachment while the
+  partner's odour is not close by; falls while it is.
+
+An attachment forms between animals in contact and steps up at a mating, as
+far as the animal can take in the other's odour. Which nose that needs is a
+setting, because it is not settled for the prairie vole: `bond_needs_moe`
+(main olfaction, the default), `bond_needs_vno` (the vomeronasal organ),
+`read_by_vno`. An animal's vomeronasal organ is its own trait, `vno_ability`,
+separate from `smell_ability`; methimazole acts on `smell_ability` only.
+
+By default the engine keeps the attachments in a table and hands the brain a
+ready-made "partner odour" and "stranger odour". With `bond_in_brain` the
+engine hands over neither: the brain gets the mixed odour signatures of the
+animals nearby (`olf_id_0`..`olf_id_23`) and the fact of a mating (`mating`),
+and separation distress follows what the brain's own plastic connections hold
+(see "Connections that experience changes").
+
 ## Contest physics (experimental)
 
 By default a same-sex contest is a dice roll made by the engine. Setting
@@ -173,8 +207,9 @@ the known limits.
 
 `--anatomy c57_male` gives every animal a brain built from an anatomy spec: one
 block of model neurons per brain area, connected only where the spec lists a
-projection. The shipped spec is a reduced male C57BL/6J house mouse (44 areas,
-311 model neurons). **It is untrained**: the weights are random draws inside
+projection. The shipped specs are a reduced male C57BL/6J house mouse
+(`c57_male`: 44 areas, 311 model neurons) and a draft prairie vole
+(`prairie_vole`: 45 areas, 371 model neurons, either sex). **Both are untrained as shipped**: the weights are random draws inside
 the wiring, so the behaviour means nothing yet. It is for seeing where
 activity goes and what changes when one connection or one receptor level is
 changed.
@@ -220,6 +255,72 @@ Training changes only the strength of connections the spec already has, and
 never a projection's sign. The animal is scored on nothing but its own bodily
 needs. Weights go to `~/ABMA_brains/anatomy/`; `--resume NAME` continues a
 run. Expect hours, not minutes.
+
+### What a spec may say beyond areas and projections
+
+These keys are optional; a spec without them runs as before.
+
+| Key | What it does |
+|---|---|
+| `"species"` | The animal the spec describes (`"Prairie vole"`); training then raises that species. |
+| `"dynamics": {"tick_s", "tau_s", "sweep"}` | How often the network ticks and how fast a model neuron follows its drive. With `"sweep": true` the areas are updated in order from the senses inward within a tick and each area's own inhibition is balanced inside the tick. Use it for a tick of about a second; without it a coarse tick makes areas flip on and off and delays a signal by one projection per tick. |
+| `"lesion": {"MOE": "smell_ability", "VNO": "vno_ability"}` | The cells of a sense organ die with a sense of the body. An animal with half its sense of smell has half of that organ's cells, permanently silent; which cells go is fixed for each animal. |
+| `"entry_gain": {"PVN": {"mating": 3.0}}` | Every cell of an area answers a channel with this weight (the entry table gives a channel one cell). |
+| `"plasticity": [...]` | Projections whose strength an animal's own experience changes (below). |
+
+### Connections that experience changes
+
+A projection listed under `"plasticity"` gets, in every animal, extra weights
+that start at zero and are written during its life:
+
+```
+"plasticity": [{"projection": "MOE>MOB", "gate": ["OT", "DA"], "pre_channels": "olf_id_",
+                "rate_per_s": 0.02, "gate_threshold": 0.5, "pre_threshold": 0.35,
+                "cap": 1.0, "decay_days": 30}]
+```
+
+A weight grows while its source cell fires above `pre_threshold`, its target
+cell is active and every `gate` neuromodulator is above `gate_threshold`. The
+weights onto one target cell share a budget (`cap`), and fade over
+`decay_days`. `pre_channels` limits writing to the source cells whose own
+sensor channel starts with that text. Training does not touch these weights;
+it replays them.
+
+The shipped `prairie_vole` spec (a draft) uses this for a partner memory: a
+mating reaches the PVN and the VTA, oxytocin and dopamine rise, and the odour
+signature the nose is carrying is written into the first olfactory synapse.
+Nothing tells the brain who anyone is. Three things about it are assumptions,
+and the spec says so: that outbred voles each have their own odour signature
+(three of 24 components per animal), that the memory sits at the first
+olfactory synapse, and every number of the rule.
+
+Methimazole is given with a group's `treatment` (`drug: methimazole`, `dose`
+0 to 1, `day_offset` in days from release; a positive offset gives it during
+the run). With a spec that has a `lesion` table, the dose kills that share of
+the olfactory sensory cells, and whatever was written onto their synapses goes
+with them.
+
+### Starting from a brain that already behaves
+
+Reward alone has not so far taught an anatomy brain to forage in the time we
+can run. Two steps before training help:
+
+- **Settling.** In the untrained network some areas are silent for good and
+  others pinned on. A silent cell passes no learning signal.
+  `python -m fnt.abma.learn.settle --anatomy prairie_vole` moves each cell's
+  resting drive until its mean rate over nursery lives sits at a target;
+  weights are not touched.
+- **Teaching by example.** `python -m fnt.abma.learn.imitate --name NAME
+  --teacher vole_doorways --start prairie_vole_settled --own 0.5` shows the
+  anatomy brain what a generic learned brain sensed and moves its weights (same wiring and sign limits)
+  until its own muscles command what that brain commanded. A share of the
+  lives are the student's own, with the teacher saying what it would have done
+  there.
+
+Reward-only training then continues from the taught brain: add
+`--critic-warmup 8` to `python -m fnt.abma.learn --anatomy ... --resume NAME`
+so the critic catches up before the brain is touched. A brain started this
+way has to be described as such.
 
 ### The brain map
 

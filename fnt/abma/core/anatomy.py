@@ -59,6 +59,11 @@ from .senses import SENSORS, PlaceMemory, SenseParams, sense
 BODY_MODULATORS = {"CRF": "stress", "T": "male"}
 #: the muscles the engine (or the record) reads; a spec must have all of them
 MUSCLES = ("TURN", "SPEED", "BITE", "DET", "EUS")
+#: A spec may say that the cells of a sense organ die with one of the body's
+#: senses (``"lesion": {"MOE": "smell_ability"}``): an animal with half its
+#: sense of smell then has half of that organ's units, permanently silent.
+#: These are the body's arrays those names refer to.
+LESION_SOURCES = {"smell_ability": "smell", "vno_ability": "vno"}
 #: channels that carry a direction or a signed quantity (the rest are levels)
 _SIGNED = ("_fwd", "_lat", "last_turn", "clock_sin", "clock_cos", "other_size")
 _SIGNS = ("+", "-", "±")
@@ -236,16 +241,24 @@ class AnatomicalBrain:
     only in an edit are otherwise identical cell for cell.
     """
 
-    def __init__(self, spec: dict, seed: int = 0, tick_s: float = 0.25,
-                 tau_s: float = 0.6, g_proj: float = 2.6, g_local: float = 0.5,
+    def __init__(self, spec: dict, seed: int = 0, tick_s: float | None = None,
+                 tau_s: float | None = None, g_proj: float = 2.6, g_local: float = 0.5,
                  bias: float = 0.25, noise: float = 0.15, k_inh: float = 3.0,
                  mod_gain: float = 0.5, max_turn_rad_s: float = 2.5,
                  strengths: dict | None = None, receptors: dict | None = None,
                  weights: dict | None = None):
         check_spec(spec)
         rng = np.random.default_rng(seed)
-        self.spec, self.seed, self.tick_s = spec, int(seed), float(tick_s)
+        # how often the network ticks and how fast a unit follows its drive: an
+        # argument wins, then the spec's own ``dynamics``, then the defaults
+        dyn = spec.get("dynamics", {})
+        tick_s = float(dyn.get("tick_s", 0.25) if tick_s is None else tick_s)
+        tau_s = float(dyn.get("tau_s", 0.6) if tau_s is None else tau_s)
+        self.spec, self.seed, self.tick_s = spec, int(seed), tick_s
         self.alpha = min(1.0, tick_s / tau_s)
+        #: update the areas in order from the senses inward within a tick,
+        #: each area's own inhibition balanced inside the tick (see ``_sweep``)
+        self.sweep = bool(dyn.get("sweep", False))
         self.noise, self.max_turn = float(noise), float(max_turn_rad_s)
         self.ids = [r["id"] for r in spec["regions"]]
         self.sl, k = {}, 0
@@ -262,6 +275,19 @@ class AnatomicalBrain:
         same = self.region_of[:, None] == self.region_of[None, :]
         self.pool = same / np.bincount(self.region_of)[self.region_of][None, :]
         self.k_inh = float(k_inh)
+        #: for ``sweep``: the units of each level, and that level's own pooling
+        self.levels = []
+        if self.sweep:
+            order = {rid: i for i, rid in enumerate(self.ids)}
+            depth = {}
+            for rid in self.ids:
+                srcs = [p[0] for p in spec["projections"] if p[1] == rid and order[p[0]] < order[rid]]
+                depth[rid] = 1 + max([depth[a] for a in srcs], default=-1)
+            for d in sorted(set(depth.values())):
+                idx = np.concatenate([np.arange(self.sl[rid].start, self.sl[rid].stop)
+                                      for rid in self.ids if depth[rid] == d])
+                self.levels.append({"idx": idx, "pool": self.pool[np.ix_(idx, idx)],
+                                    "areas": [rid for rid in self.ids if depth[rid] == d]})
 
         strengths = dict(strengths or {})
         known = {f"{p[0]}>{p[1]}" for p in spec["projections"]}
@@ -323,6 +349,12 @@ class AnatomicalBrain:
                         Win[s.start + j, col[name]] = w
                     elif name not in self.unwired:
                         self.unwired.append(name)
+        for rid, gains in (spec.get("entry_gain") or {}).items():
+            if rid not in self.sl:
+                raise ValueError(f"anatomy spec: entry_gain names an unknown area {rid}")
+            for name, g in gains.items():      # every cell of the area, the same weight
+                if name in col:
+                    Win[self.sl[rid], col[name]] = float(g)
         self.Win = Win
         self.in_mask = Win != 0.0
 
@@ -345,6 +377,53 @@ class AnatomicalBrain:
                 dens[self.sl[rid]] = lev / 3.0
             self.mods.append((m["id"], m["source"], dens * mod_gain))
         self._body_col = {mid: col[name] for mid, name in BODY_MODULATORS.items() if name in col}
+        #: sense organs whose cells die with a sense of the body: (first unit,
+        #: last unit + 1, the body's array, the sensor columns that organ takes)
+        self.lesion = []
+        for rid, source in (spec.get("lesion") or {}).items():
+            if rid not in self.sl or source not in LESION_SOURCES:
+                raise ValueError(f"anatomy spec: lesion {rid}: {source} is not an area and one of {sorted(LESION_SOURCES)}")
+            cols = np.array([col[c] for c in spec["entry"].get(rid, []) if c in col], int)
+            self.lesion.append((self.sl[rid].start, self.sl[rid].stop, LESION_SOURCES[source], cols))
+        #: projections whose strength an animal's own experience changes
+        #: (``spec["plasticity"]``): each animal carries extra weights on them,
+        #: zero at birth, written while the gate modulators are high
+        self.plastic = []
+        signs = {f"{p[0]}>{p[1]}": p[2] for p in spec["projections"]}
+        for p in spec.get("plasticity") or []:
+            a, _, b = str(p.get("projection", "")).partition(">")
+            if signs.get(f"{a}>{b}") != "+":
+                raise ValueError(f"anatomy spec: plasticity {a}>{b}: not an excitatory projection of this spec")
+            gates = []
+            for mid in p.get("gate", []):
+                m = next((m_ for m_ in spec["modulators"] if m_["id"] == mid), None)
+                if m is None:
+                    raise ValueError(f"anatomy spec: plasticity {a}>{b}: no modulator {mid}")
+                if mid in self._body_col:
+                    gates.append(("body", self._body_col[mid]))
+                elif m.get("source"):
+                    gates.append(("area", self.sl[m["source"]]))
+                else:
+                    raise ValueError(f"anatomy spec: plasticity {a}>{b}: modulator {mid} has no level")
+            # which source cells are written on: all of them, or only those whose own channel
+            # (the one a sense cell mainly answers to) starts with "pre_channels"
+            width = self.sl[a].stop - self.sl[a].start
+            mask = np.ones(width)
+            prefix = p.get("pre_channels")
+            if prefix:
+                chans = spec["entry"].get(a, [])
+                if len(chans) > width:
+                    raise ValueError(f"anatomy spec: plasticity {a}>{b}: pre_channels needs a cell per channel "
+                                     f"({a} has {width} cells for {len(chans)} channels)")
+                mask = np.array([1.0 if j < len(chans) and chans[j].startswith(prefix) else 0.0
+                                 for j in range(width)])
+            self.plastic.append({"name": f"{a}>{b}", "post": self.sl[b], "pre": self.sl[a], "gates": gates,
+                                 "pre_mask": mask,
+                                 "rate": float(p.get("rate_per_s", 0.02)),
+                                 "gate_threshold": float(p.get("gate_threshold", 0.4)),
+                                 "pre_threshold": float(p.get("pre_threshold", 0.35)),
+                                 "cap": float(p.get("cap", 1.0)),
+                                 "decay": 1.0 / (86400.0 * float(p.get("decay_days", 30.0)))})
         self.sense_units = np.concatenate([np.arange(self.sl[r["id"]].start, self.sl[r["id"]].stop)
                                            for r in spec["regions"] if r["class"] == "sense"])
         #: every muscle unit, in spec order: what a learner treats as the action
@@ -370,13 +449,71 @@ class AnatomicalBrain:
     def initial_state(self, n: int) -> np.ndarray:
         return np.zeros((n, self.n))
 
+    # ---- connections that experience changes ---------------------------- #
+    def initial_fast(self, n: int) -> list:
+        """The experience-written weights of ``n`` newborn animals: one
+        ``(animals, target cells, source cells)`` array of zeros per plastic
+        projection."""
+        return [np.zeros((n, p["post"].stop - p["post"].start, p["pre"].stop - p["pre"].start))
+                for p in self.plastic]
+
+    @staticmethod
+    def _above(rate, threshold):
+        """How far a rate is above a threshold, as 0-1 of the room left."""
+        return np.clip((rate - threshold) / max(1e-6, 1.0 - threshold), 0.0, 1.0)
+
+    def _sends(self, p: dict, r: np.ndarray) -> np.ndarray:
+        """What the source cells of a plastic projection send through their
+        experience-written synapses: how far each is above rest, and nothing
+        from a cell the projection is not written on."""
+        return self._above(r[:, p["pre"]], p["pre_threshold"]) * p["pre_mask"]
+
+    def gate(self, p: dict, r: np.ndarray, obs: np.ndarray) -> np.ndarray:
+        """How open a plastic projection is to change, per animal (0-1):
+        the product of how far each gate modulator is above threshold."""
+        g = np.ones(len(r))
+        for kind, ref in p["gates"]:
+            level = np.clip(obs[:, ref], 0.0, 1.0) if kind == "body" else r[:, ref].mean(axis=1)
+            g = g * self._above(level, p["gate_threshold"])
+        return g
+
+    def learn(self, fast: list, r: np.ndarray, new: np.ndarray, obs: np.ndarray,
+              gate_r: np.ndarray | None = None) -> None:
+        """One tick of experience, written into ``fast`` in place. ``r`` is the
+        activity the source cells had when they drove their targets; the gate
+        modulators are read from ``gate_r`` (``r`` if not given)."""
+        for p, Fp in zip(self.plastic, fast):
+            src = self._sends(p, r)
+            Fp += self.tick_s * (p["rate"] * self.gate(p, r if gate_r is None else gate_r, obs)[:, None, None]
+                                 * new[:, p["post"], None] * src[:, None, :] - p["decay"] * Fp)
+            np.maximum(Fp, 0.0, out=Fp)
+            total = Fp.sum(axis=2, keepdims=True)                 # a target cell's budget
+            Fp *= np.minimum(1.0, p["cap"] / np.maximum(total, 1e-9))
+
+    def memory(self, r: np.ndarray, fast: list):
+        """What the first plastic projection holds, per animal: ``(stored,
+        match)``. ``stored`` is how much of its budget is written (0-1);
+        ``match`` is how well what is arriving now fits what is written
+        (0-1: 1 when every source cell that was written is firing fully)."""
+        if not self.plastic:
+            return np.zeros(len(r)), np.zeros(len(r))
+        p, Fp = self.plastic[0], fast[0]
+        src = self._sends(p, r)
+        stored = Fp.sum(axis=2).mean(axis=1) / p["cap"]
+        drive = np.einsum("abj,aj->ab", Fp, src).mean(axis=1) / p["cap"]
+        return np.clip(stored, 0.0, 1.0), np.clip(drive / np.maximum(stored, 1e-6), 0.0, 1.0) * (stored > 1e-4)
+
     def step(self, r: np.ndarray, obs: np.ndarray, rng: np.random.Generator,
-             noise: np.ndarray | None = None, pre: bool = False):
+             noise: np.ndarray | None = None, pre: bool = False, alive: np.ndarray | None = None,
+             fast: list | None = None):
         """One tick. Returns the new ``r`` (the old one is not modified).
+        ``fast`` (from :meth:`initial_fast`) is each animal's experience-written
+        weights: they add to the drive, and this tick is written into them.
 
         ``noise`` replaces the usual small noise in every cell (a learner
         passes noise on the muscle units only); ``pre=True`` also returns the
-        drive every cell had, noise included."""
+        drive every cell had, noise included. ``alive`` is ``(animals, units)``
+        of 1 and 0: a dead cell stays at zero whatever drives it."""
         obs = np.asarray(obs, float)
         gain = np.ones((len(obs), self.n))
         for mid, source, dens in self.mods:
@@ -387,10 +524,87 @@ class AnatomicalBrain:
             else:
                 continue
             gain += level[:, None] * dens[None, :]
+        if self.sweep:
+            return self._sweep(r, obs, gain, rng, noise, pre, alive, fast)
         x = r @ self.W.T + obs @ self.Win.T + self.bias - self.k_inh * (r @ self.pool.T)
+        if fast:
+            for p, Fp in zip(self.plastic, fast):
+                x[:, p["post"]] += np.einsum("abj,aj->ab", Fp, self._sends(p, r))
         x = gain * x + (self.noise * rng.standard_normal(x.shape) if noise is None else noise)
         new = r + self.alpha * (np.tanh(np.maximum(x, 0.0)) - r)
+        if alive is not None:
+            new = new * alive
+        if fast:
+            self.learn(fast, r, new, obs)
         return (new, x) if pre else new
+
+    BALANCE_STEPS = 14
+
+    def _sweep(self, r, obs, gain, rng, noise, pre, alive, fast):
+        """One tick with the areas taken in levels (``dynamics.sweep``)."""
+        drive = obs @ self.Win.T + self.bias
+        nz = self.noise * rng.standard_normal(r.shape) if noise is None else noise
+        new, X = r.copy(), np.zeros_like(r)
+        for lv in self.levels:
+            idx = lv["idx"]
+            e = new @ self.W[idx].T + drive[:, idx]
+            if fast:
+                for p, Fp in zip(self.plastic, fast):
+                    if p["post"].start in idx:
+                        loc = np.searchsorted(idx, np.arange(p["post"].start, p["post"].stop))
+                        e[:, loc] += np.einsum("abj,aj->ab", Fp, self._sends(p, new))
+            g, n_ = gain[:, idx], nz[:, idx]
+            lo, hi = np.zeros_like(e), np.ones_like(e)
+            for _ in range(self.BALANCE_STEPS):       # each area's mean rate, balanced against its own inhibition
+                mid = 0.5 * (lo + hi)
+                up = np.tanh(np.maximum(g * (e - self.k_inh * mid) + n_, 0.0)) @ lv["pool"].T > mid
+                lo, hi = np.where(up, mid, lo), np.where(up, hi, mid)
+            x = g * (e - self.k_inh * 0.5 * (lo + hi)) + n_
+            val = r[:, idx] + self.alpha * (np.tanh(np.maximum(x, 0.0)) - r[:, idx])
+            if alive is not None:
+                val = val * alive[:, idx]
+            new[:, idx], X[:, idx] = val, x
+        if fast:
+            self.learn(fast, new, new, obs, gate_r=r)
+        return (new, X) if pre else new
+
+    def cells_alive(self, uid, senses: dict) -> np.ndarray | None:
+        """``(animals, units)`` of 1 and 0 for the spec's ``lesion`` table,
+        or ``None`` when the spec has none.
+
+        ``senses`` maps a body array's name to its per-animal values (0-1):
+        the share of that organ's cells an animal still has. Which cells go
+        first is fixed for each animal (drawn from its ``uid``), so a deeper
+        lesion always includes a shallower one and regrowth undoes it in
+        reverse order."""
+        if not self.lesion:
+            return None
+        uid = np.asarray(uid)
+        alive = np.ones((len(uid), self.n))
+        for a, b, source, _ in self.lesion:
+            keep = np.clip(np.asarray(senses[source], float), 0.0, 1.0)
+            width = b - a
+            for i, u in enumerate(uid):
+                order = np.random.default_rng([int(u) & 0x7FFFFFFF, a, self.seed & 0x7FFFFFFF, 0x4C45]).permutation(width)
+                dead = order[:int(round((1.0 - keep[i]) * width))]
+                alive[i, a + dead] = 0.0
+        return alive
+
+    def whole_senses(self, obs: np.ndarray, senses: dict) -> np.ndarray:
+        """The input as a surviving cell of a lesioned organ gets it.
+
+        The engine scales every olfactory channel by ``smell_ability``, which
+        is the right input for a brain with no sense organs of its own. Here
+        the loss is already in the cells that are gone, so the ones that are
+        left must get the odour undiminished, or the loss is counted twice."""
+        if not self.lesion:
+            return obs
+        out = np.array(obs, float)
+        for _, _, source, cols in self.lesion:
+            if source == "smell" and len(cols):
+                s = np.asarray(senses[source], float)
+                out[:, cols] = out[:, cols] / np.where(s > 1e-6, s, 1.0)[:, None]
+        return out
 
     def commands(self, r: np.ndarray):
         """Turn (rad/s), speed (0..1), bite (bool), and the two urination
@@ -423,6 +637,15 @@ class AnatomicalPolicy(Policy):
         self.rng = np.random.default_rng([int(noise_seed), brain.seed, 7919])
         self.memory: PlaceMemory | None = None
         self.r = None
+        #: (animals, units) of 1 and 0 where the spec ties a sense organ's
+        #: cells to a sense of the body; rebuilt when a sense changes
+        self.alive = None
+        self._alive_key = None
+        #: each animal's experience-written weights (``brain.initial_fast``),
+        #: and what the first plastic projection holds: how much is stored
+        #: and how well the present input matches it (see ``brain.memory``)
+        self.fast = None
+        self.stored = self.match = None
         self.last_speed = self.last_turn = None
         self.last_obs = None
         self.turn = self.speed = self.bite = self.wall = self.sphincter = None
@@ -444,6 +667,7 @@ class AnatomicalPolicy(Policy):
     def _ensure(self, n: int) -> None:
         if self.r is None:
             self.r = self.brain.initial_state(n)
+            self.fast = self.brain.initial_fast(n)
             self.memory = PlaceMemory(n)
             self.last_speed, self.last_turn = np.zeros(n), np.zeros(n)
             self.turn, self.speed = np.zeros(n), np.zeros(n)
@@ -453,6 +677,7 @@ class AnatomicalPolicy(Policy):
         if n > have:                              # the roster grew mid-run
             pad = n - have
             self.r = np.vstack([self.r, self.brain.initial_state(pad)])
+            self.fast = [np.concatenate([f, g]) for f, g in zip(self.fast, self.brain.initial_fast(pad))]
             self.memory.resize(n)
             for name in ("last_speed", "last_turn", "turn", "speed", "wall", "sphincter"):
                 setattr(self, name, np.concatenate([getattr(self, name), np.zeros(pad)]))
@@ -462,6 +687,15 @@ class AnatomicalPolicy(Policy):
         n = sim.n
         self._ensure(n)
         obs, perc = sense(sim, elapsed_s, self.memory, self.params, self.last_speed, self.last_turn)
+        if self.brain.lesion:
+            senses = {"smell": sim.smell[:n], "vno": getattr(sim, "vno", np.ones(n))[:n]}
+            key = (n, senses["smell"].tobytes(), senses["vno"].tobytes())
+            if key != self._alive_key:               # methimazole took effect, or the roster grew
+                self.alive, self._alive_key = self.brain.cells_alive(sim.uid[:n], senses), key
+                for p, Fp in zip(self.brain.plastic, self.fast):   # a dead cell's synapses go with it
+                    Fp *= self.alive[:, None, p["pre"]] * self.alive[:, p["post"], None]
+            obs = self.brain.whole_senses(obs, senses).astype(np.float32)
+            self.r = self.r * self.alive
         self.last_obs = obs
         # the first call ticks at once; after that the clock runs with the engine
         self._clock = self._clock + dt if np.isfinite(self._clock) else self.brain.tick_s
@@ -471,18 +705,21 @@ class AnatomicalPolicy(Policy):
         bit = np.zeros(n, bool)
         for _ in range(ticks):
             if self.train_std is None:
-                self.r = self.brain.step(self.r, obs, self.rng)
+                self.r = self.brain.step(self.r, obs, self.rng, alive=self.alive, fast=self.fast)
             else:
                 out = self.brain.out_units
                 noise = np.zeros((n, self.brain.n))
                 noise[:, out] = self.train_std * self.rng.standard_normal((n, len(out)))
-                self.r, x = self.brain.step(self.r, obs, self.rng, noise=noise, pre=True)
+                self.r, x = self.brain.step(self.r, obs, self.rng, noise=noise, pre=True, alive=self.alive,
+                                            fast=self.fast)
                 self.u = x[:, out].astype(np.float32)
             self.turn, self.speed, b, (self.wall, self.sphincter) = self.brain.commands(self.r)
             bit |= b
         if ticks:
             self._clock -= ticks * self.brain.tick_s
             self.bite = bit
+            if self.brain.plastic:
+                self.stored, self.match = self.brain.memory(self.r, self.fast)
         heading = sim.H + self.turn * dt
         self.last_speed, self.last_turn = self.speed, self.turn / self.brain.max_turn
         perc.update(speed_frac=np.where(sim.alive, self.speed, 0.0), resting=self.speed < self.REST_FRAC,
@@ -490,6 +727,14 @@ class AnatomicalPolicy(Policy):
                     bite=(self.bite & sim.alive) if ticks else np.zeros(n, bool),
                     bladder_wall=self.wall, sphincter=self.sphincter)
         return np.stack([np.cos(heading), np.sin(heading)], axis=1), perc
+
+    def partner_memory(self, n: int):
+        """``(stored, match)`` for the first ``n`` animals, or ``None`` when
+        this brain has no plastic projection: what the engine reads when an
+        attachment is kept in the brain (``SocialParams.bond_in_brain``)."""
+        if not self.brain.plastic or self.stored is None or len(self.stored) < n:
+            return None
+        return self.stored[:n], self.match[:n]
 
     def frame_extra(self, n: int) -> dict:
         """Activity for the live view and the run record, under the names the
