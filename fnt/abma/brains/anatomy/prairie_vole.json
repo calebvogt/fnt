@@ -332,7 +332,7 @@
    "class": "internal",
    "col": 3,
    "n": 8,
-   "note": "Dopamine. Mating raises extracellular dopamine in the nucleus accumbens by about half.",
+   "note": "Dopamine. A mating, a meal when hungry and a drink when thirsty all reach it; mating raises extracellular dopamine in the nucleus accumbens by about half.",
    "evidence": [
     "gingrich2000"
    ]
@@ -1874,7 +1874,9 @@
    "mating"
   ],
   "VTA": [
-   "mating"
+   "mating",
+   "eating",
+   "drinking"
   ]
  },
  "evidence": {
@@ -2128,6 +2130,22 @@
    "doi": "10.1038/nn2027",
    "finding": "Skin cooling reaches the preoptic thermoregulatory centre through the lateral parabrachial nucleus (rat)."
   },
+  "berridge1998": {
+   "kind": "paper",
+   "cite": "Berridge & Robinson 1998",
+   "journal": "Brain Res Brain Res Rev",
+   "pmid": "9858756",
+   "doi": "10.1016/s0165-0173(98)00019-8",
+   "finding": "Dopamine systems are needed for 'wanting' incentives (the incentive salience attributed to reward-related stimuli), not for 'liking' them or for learning new likes and dislikes."
+  },
+  "gadziola2015": {
+   "kind": "paper",
+   "cite": "Gadziola et al. 2015",
+   "journal": "J Neurosci",
+   "pmid": "25788670",
+   "doi": "10.1523/JNEUROSCI.4750-14.2015",
+   "finding": "Olfactory tubercle neurons (ventral striatum with monosynaptic input from the olfactory bulb) encode the learned valence of odours in behaving mice: rewarded odours evoke greater firing, before the behavioural decision."
+  },
   "ross2009": {
    "kind": "paper",
    "cite": "Ross et al. 2009",
@@ -2161,7 +2179,9 @@
    "mating": 3.0
   },
   "VTA": {
-   "mating": 3.0
+   "mating": 3.0,
+   "eating": 3.0,
+   "drinking": 3.0
   }
  },
  "plasticity": [
@@ -2183,6 +2203,29 @@
     "ross2009"
    ],
    "pre_channels": "olf_id_"
+  },
+  {
+   "projection": "MOE>MOB",
+   "gate": [
+    "DA"
+   ],
+   "pre_channels": [
+    "olf_food",
+    "olf_water",
+    "olf_male",
+    "olf_female",
+    "olf_estrous"
+   ],
+   "rate_per_s": 0.01,
+   "gate_threshold": 0.7,
+   "pre_threshold": 0.35,
+   "cap": 0.6,
+   "decay_days": 10,
+   "basis": "Incentive salience (Berridge & Robinson 1998): dopamine does not make a reward pleasant, it makes the cues that came with it wanted. Here the odours present while dopamine is high (food odour at a meal, water odour at a drink, the other sex's odour at a mating) are written into the sensory cells' synapses onto the bulb, so those odours afterwards drive the bulb, and everything downstream of it, harder. In the animal the odour-reward association is found in the olfactory tubercle, ventral striatum that the bulb reaches in one synapse (Gadziola et al. 2015); this draft has no tubercle and writes at the first olfactory synapse for the same reason as the partner memory. Numbers are ours.",
+   "evidence": [
+    "berridge1998",
+    "gadziola2015"
+   ]
   }
  ]
 }

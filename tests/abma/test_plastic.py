@@ -60,7 +60,7 @@ def match(brain, r, fast, sig, smell=None):
 
 
 def test_the_vole_spec_has_a_plastic_projection_and_a_mating_reaches_the_brain(brain):
-    assert [p["name"] for p in brain.plastic] == ["MOE>MOB"]
+    assert [p["name"] for p in brain.plastic] == ["MOE>MOB", "MOE>MOB"]      # who the partner is; which cues came with a reward
     for area in ("PVN", "VTA"):
         assert (brain.Win[brain.sl[area], COL["mating"]] == 3.0).all()
 
@@ -208,3 +208,66 @@ def test_a_bonded_brain_is_stressed_by_a_stranger_close_by_and_not_by_its_partne
     assert stored < 0.05 and unbonded < with_stranger - 10.0
     stored, no_nose = stress_beside(2, smell=0.0)           # no epithelium: nothing stored, nothing smelled
     assert stored < 0.05 and no_nose < with_stranger - 10.0
+
+
+def test_a_meal_when_hungry_strengthens_the_food_odour_and_nothing_else():
+    """Incentive salience: dopamine alone writes the cues that came with the reward."""
+    import copy
+    spec = copy.deepcopy(anatomy.load_spec("prairie_vole"))
+    assert [p.get("gate") for p in spec["plasticity"]] == [["OT", "DA"], ["DA"]]
+    spec["plasticity"][1]["gate_threshold"] = 0.5          # an unsettled, untrained VTA does not reach the spec's 0.7
+    b = anatomy.AnatomicalBrain(spec, seed=0)
+    cue, who = b.plastic[1], b.plastic[0]
+    names = spec["entry"]["MOE"]
+    assert all(names[j].startswith(("olf_food", "olf_water", "olf_male", "olf_female", "olf_estrous"))
+               for j in np.nonzero(cue["pre_mask"])[0])
+    assert not (cue["pre_mask"] * who["pre_mask"]).any()   # the two memories are written on different cells
+
+    def live(eating):
+        n = 2
+        o = np.zeros((n, len(SENSORS)))
+        o[:, COL["olf_food"]], o[:, COL["hunger"]], o[:, COL["eating"]] = 1.0, 0.9, eating
+        r, fast = b.initial_state(n), b.initial_fast(n)
+        rng = np.random.default_rng(0)
+        for _ in range(300):
+            r = b.step(r, o, rng, fast=fast)
+        return fast
+
+    fast = live(1.0)
+    food_cell = names.index("olf_food")
+    assert fast[1][:, :, food_cell].sum() > 0.05           # the food odour's own cell was written on
+    assert fast[0].max() == 0.0                            # no mating: the partner memory is untouched
+    assert fast[1][:, :, np.nonzero(who["pre_mask"])[0]].max() == 0.0
+    assert live(0.0)[1].max() == 0.0                       # the same odour without a meal: nothing
+
+
+def test_eating_and_drinking_are_felt_in_proportion_to_the_need():
+    from fnt.abma.core.assays import cohort
+    from fnt.abma.core.config import ArenaConfig, ExperimentConfig, ResourceObject
+    from fnt.abma.core.simulation import Simulation
+    from fnt.abma.core import senses as sn
+
+    cfg = ExperimentConfig(name="e", arena=ArenaConfig(width=1.0, height=1.0,
+                                                       objects=[ResourceObject("food", 0.5, 0.5, 0.2)]),
+                           groups=[cohort("Prairie vole", "F", 2)], dt=1.0, seed=1, days=1.0, n_trials=1,
+                           start_datetime="2026-06-15T12:00:00")
+    cfg.brain.enabled, cfg.brain.anatomy = True, "prairie_vole"
+    sim = Simulation(cfg, 0)
+    sim.P[:] = (0.5, 0.5)
+    sim.hunger[:] = (80.0, 5.0)
+    sim.policy._ensure(sim.n)
+    obs, _ = sn.sense(sim, 0.0, sim.policy.memory, sim.policy.params)
+    e = obs[:, COL["eating"]]
+    assert obs[:, COL["at_food"]].min() == 1.0 and e[0] == pytest.approx(0.8, abs=0.02) and e[1] < 0.1
+    assert obs[:, COL["drinking"]].max() == 0.0
+
+
+def test_weights_raised_before_a_channel_existed_get_the_specs_entry_gain():
+    spec = anatomy.load_spec("prairie_vole")
+    b = anatomy.AnatomicalBrain(spec, seed=0)
+    old = {"W": b.W0.copy(), "Win": b.Win.copy(), "bias": b.bias.copy()}
+    old["Win"][:, COL["eating"]] = 0.0                      # as if raised before `eating` existed
+    old["Win"][b.sl["VTA"], COL["mating"]] = 1.25           # a connection training has changed stays as it is
+    b2 = anatomy.AnatomicalBrain(spec, seed=0, weights=old)
+    assert (b2.Win[b2.sl["VTA"], COL["eating"]] == 3.0).all()
+    assert (b2.Win[b2.sl["VTA"], COL["mating"]] == 1.25).all()

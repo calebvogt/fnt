@@ -300,6 +300,17 @@ and the spec says so: that outbred voles each have their own odour signature
 (three of 24 components per animal), that the memory sits at the first
 olfactory synapse, and every number of the rule.
 
+The same spec has a second memory on the same projection, gated by dopamine
+alone: **incentive salience**. A meal when hungry, a drink when thirsty and a
+mating all reach the VTA (the channels `eating` and `drinking` are 1 at food
+or water times how hungry or thirsty the animal is). While dopamine is high,
+the odours present (food, water, the other sex) are written into their own
+sensory cells' synapses, so those odours afterwards drive the bulb harder.
+`pre_channels` takes a list of prefixes for this. On a brain taught before
+this existed the effect on behaviour is small (a few percent more speed toward
+a food odour after five minutes of eating): the cue is stronger, and nothing
+has yet taught the brain to lean on it.
+
 Methimazole is given with a group's `treatment` (`drug: methimazole`, `dose`
 0 to 1, `day_offset` in days from release; a positive offset gives it during
 the run). With a spec that has a `lesion` table, the dose kills that share of

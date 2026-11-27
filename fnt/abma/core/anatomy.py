@@ -415,6 +415,7 @@ class AnatomicalBrain:
                 if len(chans) > width:
                     raise ValueError(f"anatomy spec: plasticity {a}>{b}: pre_channels needs a cell per channel "
                                      f"({a} has {width} cells for {len(chans)} channels)")
+                prefix = tuple(prefix) if isinstance(prefix, (list, tuple)) else (prefix,)
                 mask = np.array([1.0 if j < len(chans) and chans[j].startswith(prefix) else 0.0
                                  for j in range(width)])
             self.plastic.append({"name": f"{a}>{b}", "post": self.sl[b], "pre": self.sl[a], "gates": gates,
@@ -436,7 +437,14 @@ class AnatomicalBrain:
                 raise ValueError("these trained weights were made for a different spec")
             if (W0[(S == 0) & ~local] != 0).any() or (W0 * S < 0).any():
                 raise ValueError("these trained weights wire cells the spec does not, or flip a projection's sign")
-            self.W0, self.Win, self.bias = W0, Win_t * self.in_mask, b
+            Win_t = Win_t * self.in_mask
+            # entry_gain is anatomy: weights raised before a channel existed have no connection for it
+            # (all zeros), and get the spec's
+            for rid, gains in (spec.get("entry_gain") or {}).items():
+                for name, g in gains.items():
+                    if name in col and not Win_t[self.sl[rid], col[name]].any():
+                        Win_t[self.sl[rid], col[name]] = float(g)
+            self.W0, self.Win, self.bias = W0, Win_t, b
             self.W = W0 * mult
 
     def unit_names(self) -> list[str]:

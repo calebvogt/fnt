@@ -95,6 +95,7 @@ SENSORS: list[str] = [
     *[f"olf_id_{k}" for k in range(12)],
     *[f"olf_id_{k}" for k in range(12, 24)],   # added later; kept at the end so older weights line up
     "libido",                                # the pull toward the other sex (0 unless SocialParams turns it on)
+    "eating", "drinking",                    # at food / at water, scaled by how much it is needed
 ]
 
 #: The interoceptive channels that also act as neuromodulators — they gate the
@@ -112,7 +113,7 @@ GROUPS: dict[str, list[str]] = {
     "olfaction": [s for s in SENSORS if s.startswith("olf_") and not s.startswith("olf_id_")],
     "touch": ["wall_ahead", "wall_left", "wall_right",
               "other", "other_fwd", "other_lat"],
-    "taste": ["at_food", "at_water", "grass"],
+    "taste": ["at_food", "at_water", "grass", "eating", "drinking"],
     "memory": [s for s in SENSORS
                if s.startswith(("home", "mem_"))],
     "interoception": ["hunger", "thirst", "bladder", "stress", "pain",
@@ -392,6 +393,9 @@ def sense(sim, elapsed_s: float, memory: PlaceMemory, params: SenseParams,
     put("wall_right", rays[:, 2])
     put("at_food", at_food.astype(float))
     put("at_water", at_water.astype(float))
+    # a reward as the body reports it: worth as much as the need it answers
+    put("eating", at_food * np.clip(sim.hunger / 100.0, 0.0, 1.0))
+    put("drinking", at_water * np.clip(sim.thirst / 100.0, 0.0, 1.0))
     # only refreshed while a sward exists, and not grown when a protocol event
     # adds animals — so trust it only when it matches the roster
     grass = getattr(sim, "grass_cm", None)
