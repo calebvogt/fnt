@@ -65,6 +65,8 @@ class SocialState:
         #: a mating as the body reports it to the brain: 1 when it happens,
         #: fading over ``mating_trace_s``
         self.mated = np.zeros(n)
+        #: the pull toward the other sex (0-100; stays 0 unless libido_rise_h > 0)
+        self.libido = np.zeros(n)
         self._sig = None
         self._shelter = self._shelters(sim)
 
@@ -74,7 +76,7 @@ class SocialState:
         if n <= have:
             return
         pad = n - have
-        for name in ("tired", "cold", "lonely", "rest_s", "touch_s", "partner_touch_s", "mated"):
+        for name in ("tired", "cold", "lonely", "rest_s", "touch_s", "partner_touch_s", "mated", "libido"):
             setattr(self, name, np.concatenate([getattr(self, name), np.zeros(pad)]))
         A = np.zeros((n, n))
         A[:have, :have] = self.A
@@ -250,7 +252,17 @@ class SocialState:
             stranger = someone * (1.0 - with_partner)
         sim.stress = np.clip(sim.stress + dth * p.stranger_stress_h * bond * stranger, 0.0, 100.0)
 
-        for arr in (self.tired, self.cold, self.lonely, self.mated):
+        # ---- the pull toward the other sex ------------------------------- #
+        if p.libido_rise_h > 0.0:
+            other = sim.sex_m[:, None] != sim.sex_m[None, :]
+            reach = max(1e-6, float(sim.cfg.policy.perception_r))
+            air = np.clip((np.exp(-d / reach) * other * sim.identity[None, :]).sum(axis=1), 0.0, 1.0) * sim.smell
+            skin = ((d < sim.contact_r) & other).any(axis=1) * sim.vno
+            taken_in = np.maximum(air, skin)
+            self.libido = np.clip(self.libido + dth * (p.libido_rise_h * (1.0 - taken_in)
+                                                       - p.libido_fall_h * taken_in), 0.0, 100.0)
+
+        for arr in (self.tired, self.cold, self.lonely, self.mated, self.libido):
             arr[~alive] = 0.0
         self.mated *= np.exp(-dt / max(1.0, p.mating_trace_s))
 
@@ -276,6 +288,7 @@ class SocialState:
         it can smell the other and has room for it."""
         self.resize(sim.n)
         self.mated[[i, j]] = 1.0
+        self.libido[[i, j]] = np.maximum(0.0, self.libido[[i, j]] - self.p.libido_mating)
         recog = self._learns(sim)
         room = self._room(self.A)
         for a, b in ((i, j), (j, i)):
@@ -286,4 +299,4 @@ class SocialState:
     def discomfort(self) -> np.ndarray:
         p = self.p
         return (p.w_tired * (self.tired / 100.0) ** 2 + p.w_cold * (self.cold / 100.0) ** 2
-                + p.w_lonely * (self.lonely / 100.0) ** 2)
+                + p.w_lonely * (self.lonely / 100.0) ** 2 + p.w_libido * (self.libido / 100.0) ** 2)

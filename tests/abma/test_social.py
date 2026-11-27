@@ -200,6 +200,34 @@ def test_an_animal_without_a_vomeronasal_organ_reads_nothing_with_it():
     assert obs[without, index("vno_contact")] == 0.0
 
 
+def test_the_pull_toward_the_other_sex_is_quieted_by_its_odour_through_either_nose():
+    APART = np.array([[0.3, 0.3], [1.7, 1.7]])
+
+    def libido_after(place, smell=1.0, vno=1.0, males=1, females=1, **sp):
+        cfg = world(males=males, females=females, smell=smell, libido_rise_h=20.0, **sp)
+        for g in cfg.groups:
+            g.traits.vno_ability = vno
+        sim = Simulation(cfg, 0, policy=Still())
+        sim.soc.libido[:] = 50.0
+        run(sim, 1800, place=place)
+        return sim.soc.libido.copy()
+
+    assert Simulation(world(), 0, policy=Still()).soc.libido.max() == 0.0          # off by default
+    assert (libido_after(APART) > 52.0).all()                                      # alone: it rises
+    assert (libido_after(TOGETHER) < 5.0).all()                                    # beside the other sex: quiet
+    assert (libido_after(np.array([[1.0, 1.0], [1.4, 1.0]])) < 40.0).all()         # smelled 40 cm off: falling
+    # no epithelium: the air carries nothing, contact still does (the vomeronasal organ is spared)
+    assert (libido_after(np.array([[1.0, 1.0], [1.4, 1.0]]), smell=0.0) > 55.0).all()
+    assert (libido_after(TOGETHER, smell=0.0) < 5.0).all()
+    assert (libido_after(TOGETHER, smell=0.0, vno=0.0) > 55.0).all()               # neither nose: nothing helps
+    assert (libido_after(TOGETHER, males=2, females=0) > 55.0).all()               # the same sex does not count
+    sim = Simulation(world(libido_rise_h=20.0), 0, policy=Still())
+    sim.soc.libido[:] = 80.0
+    sim.soc.on_mating(sim, 0, 1)
+    assert (sim.soc.libido == 30.0).all()                                          # a mating takes 50 off
+    assert sim.soc.discomfort().min() > 0.0
+
+
 def test_a_mating_steps_attachment_up():
     sim = Simulation(world(), 0, policy=Still())
     run(sim, 10, place=APART)

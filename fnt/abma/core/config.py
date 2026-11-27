@@ -481,6 +481,14 @@ class SocialParams:
     lonely_fall_h: float = 150.0     # points per hour while the partner is smelled close by
     stranger_stress_h: float = 80.0  # stress per hour: attached, an unattached animal smelled at contact
     stranger_r_m: float = 0.30       # how near that animal must be
+    # --- the pull toward the other sex (off while libido_rise_h is 0) ------ #
+    #: Rises by itself; falls while the odour of an animal of the other sex is
+    #: taken in: through the air by main olfaction, or on contact through the
+    #: vomeronasal organ. A mating takes ``libido_mating`` points off it.
+    libido_rise_h: float = 0.0       # points per hour with no such odour
+    libido_fall_h: float = 300.0     # points per hour at full odour
+    libido_mating: float = 50.0
+    w_libido: float = 0.5
     #: Where an attachment is kept. False: in the engine's table (``A``), which
     #: also hands the brain ready-made partner and stranger odours. True: only
     #: in the brain's own plastic connections (an anatomy spec's

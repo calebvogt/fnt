@@ -212,7 +212,10 @@ class Trainer:
                               n_out=3 if cur.contest else 2)
         self.agent_steps = 0
         if resume is not None:
-            self.net.load_brain(resume, wake=("tired", "cold", "lonely") if cur.life else ())
+            wake = ("tired", "cold", "lonely") if cur.life else ()
+            if cur.life and float((cur.social_params or {}).get("libido_rise_h", 0.0)) > 0.0:
+                wake += ("libido",)
+            self.net.load_brain(resume, wake=wake)
             self.agent_steps = int(resume.meta.get("agent_steps", 0))
         self.opt = torch.optim.Adam(self.net.parameters(), lr=hp.lr, eps=1e-5)
         self.iteration = 0

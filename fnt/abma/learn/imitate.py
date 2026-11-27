@@ -72,6 +72,9 @@ def main():
     ap.add_argument("--bond-in-brain", action="store_true",
                     help="with --life: lives begin with the dealt pairs held together (see nursery)")
     ap.add_argument("--attached", type=float, default=0.5)
+    ap.add_argument("--social-param", action="append", default=[], metavar="NAME=VALUE",
+                    help="with --life: override one SocialParams value (repeatable). Use the values the teacher "
+                         "was raised with, or it is shown worlds it does not know")
     ap.add_argument("--own", type=float, default=0.0,
                     help="share of each iteration's worlds that the STUDENT lives in (the teacher then says what it "
                          "would have done there): a student shown only the teacher's lives never sees the places "
@@ -82,7 +85,8 @@ def main():
 
     spec = anatomy.load_spec(a.spec)
     cur = Curriculum(species=spec.get("species", "House mouse"), boxes=a.boxes, anosmic=a.anosmic,
-                     life=a.life, bond_in_brain=a.bond_in_brain, attached=a.attached)
+                     life=a.life, bond_in_brain=a.bond_in_brain, attached=a.attached,
+                     social_params={k: float(v) for k, _, v in (s_.partition("=") for s_ in a.social_param)})
     cur.tick_s = float(spec.get("dynamics", {}).get("tick_s", 0.25))
     teacher = Brain.load(find_brain(a.teacher))
     t_w = teacher.weights if hasattr(teacher, "weights") else teacher.w

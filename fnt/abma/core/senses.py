@@ -94,6 +94,7 @@ SENSORS: list[str] = [
     # twelve components, each animal carrying its own combination
     *[f"olf_id_{k}" for k in range(12)],
     *[f"olf_id_{k}" for k in range(12, 24)],   # added later; kept at the end so older weights line up
+    "libido",                                # the pull toward the other sex (0 unless SocialParams turns it on)
 ]
 
 #: The interoceptive channels that also act as neuromodulators — they gate the
@@ -103,6 +104,7 @@ MODULATORS: list[str] = [
     "aggression", "boldness", "sociability", "exploration",
     "hurt", "fatigue",
     "tired", "cold", "lonely",
+    "libido",
 ]
 
 #: Channel groups, for display and for ablating a whole sense at once.
@@ -120,7 +122,7 @@ GROUPS: dict[str, list[str]] = {
     "contest": ["hurt", "hurt_fwd", "hurt_lat", "fatigue", "in_cover", "cover",
                 "cover_fwd", "cover_lat", "other_closing", "other_size"],
     "vomeronasal": [s for s in SENSORS if s.startswith("vno_")],   # the organ: an animal with no vno_ability gets none of these
-    "social": ["tired", "cold", "lonely", "touch", "mating"],
+    "social": ["tired", "cold", "lonely", "touch", "mating", "libido"],
     "identity": [f"olf_id_{k}" for k in range(24)],
     "sight": ["door", "door_fwd", "door_lat", "in_box"],
 }
@@ -448,6 +450,7 @@ def sense(sim, elapsed_s: float, memory: PlaceMemory, params: SenseParams,
         put("vno_partner", v_partner)
         put("vno_stranger", v_stranger)
         put("mating", soc.mated[:n])
+        put("libido", soc.libido[:n] / 100.0)
         # who is near, as a mixture of signatures: no name, no "partner"
         sig = soc.signatures(sim)
         mix = np.clip(wj @ sig, 0.0, 1.0) * np.asarray(smell, float)[:n, None]

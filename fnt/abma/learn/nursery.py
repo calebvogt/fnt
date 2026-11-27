@@ -367,6 +367,8 @@ def _arrive_social(sim, cur: Curriculum, rng) -> None:
     #: arrived, the separation distress each is left with afterwards)
     sim._wedding = []
     soc.tired[:] = rng.uniform(*cur.tired_on_arrival, n)
+    if sim.cfg.social.libido_rise_h > 0.0:
+        soc.libido[:] = rng.uniform(0.0, 90.0, n)
     soc.cold[:] = rng.uniform(0.0, sim.cfg.social.cold_alone, n)
     free = list(rng.permutation(n))
     males = [i for i in free if sim.sex_m[i] > 0.5]

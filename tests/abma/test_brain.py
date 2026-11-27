@@ -120,7 +120,7 @@ def test_brain_is_matched_to_the_body_by_sensor_name(tmp_path):
     """A brain trained before a sensor existed still loads; one that needs a
     sensor the body has lost refuses rather than reading zeros."""
     b = Brain.random(3)
-    drop = senses.SENSORS[-1]
+    drop = [s for s in senses.SENSORS if s not in senses.MODULATORS][-1]   # a sense that is not also a neuromodulator
     keep = [i for i, s in enumerate(b.sensors) if s != drop]
     older = Brain({**b.w, "W1": b.w["W1"][:, keep]},
                   {**b.meta, "sensors": [b.sensors[i] for i in keep]})

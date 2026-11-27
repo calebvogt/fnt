@@ -161,13 +161,19 @@ right goal.
 ## Rest, warmth and attachment (experimental)
 
 Off unless a config turns it on (`social.enabled`, or `--life` in training).
-Three more needs, each uncomfortable and nothing else:
+More needs, each uncomfortable and nothing else:
 
 - **Tired.** Rises while awake, faster while moving; falls at rest.
 - **Cold.** Falls in a box or under a hut, and for each body it is touching.
   Warmth needs no nose.
 - **Separation distress.** Rises in an animal that has an attachment while the
   partner's odour is not close by; falls while it is.
+
+A fourth need is off until `libido_rise_h` is set above 0: **the pull toward
+the other sex**. It rises by itself and falls while the animal takes in the
+odour of an animal of the other sex, through the air by main olfaction or on
+contact through the vomeronasal organ; a mating takes a step off it. An animal
+with no olfactory epithelium can quiet it only by contact.
 
 An attachment forms between animals in contact and steps up at a mating, as
 far as the animal can take in the other's odour. Which nose that needs is a
