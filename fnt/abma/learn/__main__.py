@@ -94,6 +94,14 @@ def main(argv=None) -> int:
     p.add_argument("--social-param", action="append", default=[], metavar="NAME=VALUE",
                    help="With --life: override one SocialParams value "
                         "(repeatable), e.g. cold_alone=60.")
+    p.add_argument("--bite-bias", type=float, default=-1.0,
+                   help="With --contest: starting bias of a new bite output. "
+                        "-1 (default) bites on about 5%% of ticks before "
+                        "anything is learned; -3 essentially never.")
+    p.add_argument("--bite-noise", type=float, default=-0.5, metavar="LOG_SD",
+                   help="With --contest: the log-sd the bite output's noise "
+                        "starts at; a value other than the default is also "
+                        "the most it may reach.")
     p.add_argument("--critic-warmup", type=int, default=0, metavar="N",
                    help="With --anatomy: for the first N iterations only the "
                         "critic learns. Use it when resuming a brain that was "
@@ -121,7 +129,9 @@ def main(argv=None) -> int:
     if a.anatomy:
         return _raise_anatomy(a, cur)
     hp = Hyper(workers=a.workers, worlds=a.worlds, lr=a.lr,
-               entropy=a.entropy, seed=a.seed, torch_threads=a.torch_threads)
+               entropy=a.entropy, seed=a.seed, torch_threads=a.torch_threads,
+               bite_bias=a.bite_bias, bite_log_std=a.bite_noise,
+               bite_log_std_max=0.5 if a.bite_noise == -0.5 else a.bite_noise)
     resume = Brain.load(find_brain(a.resume)) if a.resume else None
     tr = Trainer(hp, cur, a.out, name=a.name, resume=resume)
     deadline = time.time() + a.minutes * 60.0

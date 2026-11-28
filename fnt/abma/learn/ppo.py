@@ -60,6 +60,13 @@ class Hyper:
     value_coef: float = 0.5
     max_grad: float = 0.5
     max_turn: float = 1.5        # radians per tick
+    #: a bite output (contest worlds): its starting bias, the log-sd its
+    #: noise starts at, and the most that log-sd may reach. A bite is the
+    #: command being above zero, so bias -1 with sd exp(-0.5) fires on about
+    #: 5% of ticks before anything is learned.
+    bite_bias: float = -1.0
+    bite_log_std: float = -0.5
+    bite_log_std_max: float = 0.5
     #: spread of the initial neuromodulator weights (see TorchBrain)
     gain_init: float = 1.5
     #: threads the weight update may use (0 = PyTorch's default, every core).
@@ -74,7 +81,8 @@ class TorchBrain(nn.Module):
     """The trainable twin of :class:`fnt.abma.core.brain.Brain`."""
 
     def __init__(self, n_sensory: int = 64, n_rnn: int = 64,
-                 gain_init: float = 1.5, n_out: int = 2):
+                 gain_init: float = 1.5, n_out: int = 2,
+                 bite_bias: float = -1.0, bite_log_std: float = -0.5):
         super().__init__()
         own = {name: i for i, name in enumerate(SENSORS)}
         self.register_buffer(
@@ -94,7 +102,8 @@ class TorchBrain(nn.Module):
             nn.init.zeros_(lin.bias)
         if n_out > 2:
             with torch.no_grad():           # biting starts rare, not half the time
-                self.Wo.bias[2:] = -1.0
+                self.Wo.bias[2:] = float(bite_bias)
+                self.log_std[2:] = float(bite_log_std)
         # Every sensory unit is born with its own random sensitivity to each
         # neuromodulator — some are turned up by hunger, some down, some
         # ignore it — the way a receptor is expressed in some cells and not
@@ -209,7 +218,8 @@ class Trainer:
         if hp.torch_threads > 0:
             torch.set_num_threads(int(hp.torch_threads))
         self.net = TorchBrain(hp.n_sensory, hp.n_rnn, hp.gain_init,
-                              n_out=3 if cur.contest else 2)
+                              n_out=3 if cur.contest else 2,
+                              bite_bias=hp.bite_bias, bite_log_std=hp.bite_log_std)
         self.agent_steps = 0
         if resume is not None:
             wake = ("tired", "cold", "lonely") if cur.life else ()
@@ -340,6 +350,8 @@ class Trainer:
                 self.opt.step()
                 with torch.no_grad():
                     net.log_std.clamp_(-2.5, 0.5)
+                    if net.log_std.shape[0] > 2:
+                        net.log_std[2:].clamp_(max=hp.bite_log_std_max)
                     stats["pg"] += pg.item()
                     stats["v"] += v_loss.item()
                     stats["ent"] += ent.item()

@@ -369,6 +369,9 @@ def _arrive_social(sim, cur: Curriculum, rng) -> None:
     soc.tired[:] = rng.uniform(*cur.tired_on_arrival, n)
     if sim.cfg.social.libido_rise_h > 0.0:
         soc.libido[:] = rng.uniform(0.0, 90.0, n)
+    if sim.cfg.social.stranger_stress_h > 100.0:      # only where a run has made strangers matter (default 80)
+        # so that a little more stress, or a little less, is worth something within one short life
+        sim.stress[:] = rng.uniform(0.0, 70.0, n)
     soc.cold[:] = rng.uniform(0.0, sim.cfg.social.cold_alone, n)
     free = list(rng.permutation(n))
     males = [i for i in free if sim.sex_m[i] > 0.5]
