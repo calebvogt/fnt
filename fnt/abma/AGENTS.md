@@ -61,6 +61,12 @@ we can afford. The route that works:
 3. `python -m fnt.abma.learn --anatomy SPEC --resume N --critic-warmup 8`:
    reward alone from there holds and improves it.
 
+New behaviour has so far come from a teacher, not from reward: a generic brain
+is raised on the new need (about ten times faster than an anatomy brain), and
+the anatomy brain is taught from it in the same worlds (`imitate --life
+--social-param ...`). Reward-only training of the anatomy brain has held what
+it was taught and has not added anything.
+
 Things already found the hard way:
 
 - At a tick of about a second the all-at-once update oscillates (an area's
@@ -72,7 +78,25 @@ Things already found the hard way:
 - A plastic connection is only as specific as the activity of its source
   cells. In a random recurrent network that is the sense organ's own cells.
 - A reward that moves a few points in a 17-minute nursery life teaches
-  nothing. Check the arithmetic of a new need before training on it.
+  nothing. Check the arithmetic of a new need before training on it, and
+  remember that discomfort is quadratic: ten points gained from a level of 10
+  are worth a tenth of ten points gained from 60. Three overnight runs were
+  flat for this reason (separation distress, then stress from strangers twice).
+- A need that a heap of animals satisfies for everyone teaches nothing
+  selective. In a pile the partner is always within smelling range.
+- A new output starts as noise. A bite output added to a brain that had none
+  fired on 5% of ticks, and the entropy bonus raised its noise until a third of
+  the animals died; that was exploration, not policy. Use `--bite-bias` and
+  `--bite-noise`, and read `log_std` in the training log before interpreting a
+  behaviour that appears with a new output. In `--contest` worlds nobody "wins":
+  the dice-roll fight (and its stress relief) does not run there.
+- Four replicates of a 10-day trial are not enough to compare two versions of
+  a brain. A saline VoleCosm run comes out as one heap or as animals split
+  across boxes, more or less at random; a difference of 0.40 against 0.56 in
+  top-partner share between four and four vanished with eight and eight.
+- After launching a job, read its log once it has had a minute. A job that
+  dies at once on a missing import looks, from its process id, like one that
+  started.
 - Training is CPU-bound. Use `--torch-threads` and below-normal priority on a
   computer that is also doing other work.
 
